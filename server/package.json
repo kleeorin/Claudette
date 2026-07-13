@@ -1,0 +1,24 @@
+{
+  "name": "@claudette/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@claudette/shared": "*",
+    "@fastify/static": "^7.0.4",
+    "fastify": "^4.28.1",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.2"
+  }
+}

@@ -1,0 +1,587 @@
+import { useEffect, useRef, useState } from 'react'
+import type { ConversationMeta, PermissionMode } from '@claudette/shared'
+import { useChat, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
+import { useSessions } from '../store/sessions'
+import { ToolDetail, toolHeadline, toolArg } from '../lib/toolFormat'
+import { Markdown } from './Markdown'
+import { ResumePicker } from './ResumePicker'
+import { api } from '../api/client'
+
+// Native chat frontend for a Claude session — ported from ClaudeMaster. Renders
+// the structured transcript, streams tokens, and surfaces permission /
+// AskUserQuestion prompts as native cards. Handles /clear + /resume natively
+// (P1.14); other slash commands pass through as a turn. Permission-mode switch
+// lives in the MetaBar (P1.4).
+export function ChatView({ sessionId, isActive }: { sessionId: string; isActive: boolean }) {
+  const { transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
+  const { sessions, setMode } = useSessions()
+  const session = sessions.find((s) => s.id === sessionId)
+  const [showResume, setShowResume] = useState(false)
+  const state = session?.state ?? 'idle'
+  const items = transcriptFor(sessionId)
+  const pending = pendingFor(sessionId)
+  const meta = metaFor(sessionId)
+  const [draft, setDraft] = useState('')
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const running = state === 'running' || state === 'waiting'
+
+  // Keep the newest content in view while this session is the one on screen.
+  useEffect(() => {
+    if (isActive) bottomRef.current?.scrollIntoView({ block: 'end' })
+  }, [items.length, pending, isActive])
+
+  // Slash-command menu: the two natively-handled commands (/clear, /resume) plus
+  // the session's own init `slash_commands` (which pass through as a turn).
+  const showSlash = draft.startsWith('/') && !draft.includes(' ') && !draft.includes('\n')
+  const q = draft.slice(1).toLowerCase()
+  const suggestions = showSlash
+    ? [...NATIVE_SLASH, ...slashCommandsFor(sessionId)]
+        .filter((c, i, a) => a.indexOf(c) === i)
+        .filter((c) => c.toLowerCase().startsWith(q))
+        .slice(0, 8)
+    : []
+
+  // Returns true if handled natively (don't send as a turn). /clear starts a fresh
+  // conversation + wipes the transcript; /resume opens the conversation picker.
+  const handleSlash = (t: string): boolean => {
+    if (t === '/clear') { clearTranscript(sessionId); void api.http.restartFresh(sessionId); return true }
+    if (t === '/resume') { setShowResume(true); return true }
+    return false
+  }
+
+  const submit = () => {
+    const t = draft.trim()
+    if (!t) return
+    if (handleSlash(t)) { setDraft(''); return }
+    sendTurn(sessionId, draft)
+    setDraft('')
+  }
+
+  // Pick a past conversation: wipe the pane, replay its history, then rebind the
+  // engine via --resume so the next turn continues it.
+  const pickResume = async (meta: ConversationMeta) => {
+    setShowResume(false)
+    if (!session) return
+    clearTranscript(sessionId)
+    loadTranscript(sessionId, await api.http.readConversation(session.cwd, meta.id))
+    await api.http.resumeInto(sessionId, meta.id)
+  }
+
+  if (!session) {
+    return (
+      <div className="flex items-center justify-center h-full text-ctp-overlay text-xs">
+        No session selected.
+      </div>
+    )
+  }
+
+  return (
+    <div className="relative flex flex-col h-full bg-ctp-base text-ctp-text">
+      {showResume && <ResumePicker cwd={session.cwd} onPick={pickResume} onClose={() => setShowResume(false)} />}
+      <MetaBar
+        meta={meta}
+        title={session.name}
+        cwd={session.cwd}
+        mode={session.permissionMode ?? 'default'}
+        onSetMode={(m) => setMode(sessionId, m)}
+      />
+      {state === 'exited' && (
+        <div className="shrink-0 px-4 py-2 bg-ctp-red/10 border-b border-ctp-red/30 text-[11px] text-ctp-red whitespace-pre-wrap">
+          ⚠ Claude exited{session.exitError ? ` — ${session.exitError}` : ''}
+        </div>
+      )}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-5 sm:py-6 text-[13px]">
+          {items.length === 0 && (
+            <div className="text-ctp-overlay text-sm select-none pt-16 text-center">
+              Send a message to start the conversation.
+            </div>
+          )}
+          {items
+            // Drop signature-only "thinking" blocks (no readable text) so they
+            // leave neither an empty toggle nor a phantom spacing gap.
+            .filter((it) => it.kind !== 'thinking' || it.streaming || it.text.trim())
+            .map((it, i, shown) => (
+              <div key={it.id} className={gapClass(it, shown[i - 1])}>
+                <Item item={it} />
+              </div>
+            ))}
+
+          {pending && (
+            <div className="mt-4">
+              {pending.toolName === 'AskUserQuestion' ? (
+                <AskUserQuestionCard
+                  input={pending.input}
+                  onAnswer={(answers) => respond(sessionId, pending.requestId, { behavior: 'allow', updatedInput: { ...(pending.input as Record<string, unknown>), answers } })}
+                  onDismiss={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Dismissed by user' })}
+                />
+              ) : (
+                <PermissionCard
+                  toolName={pending.toolName}
+                  description={pending.description}
+                  input={pending.input}
+                  suggestions={pending.suggestions}
+                  onAllow={() => respond(sessionId, pending.requestId, { behavior: 'allow' })}
+                  onAllowAlways={() => respond(sessionId, pending.requestId, { behavior: 'allow', updatedPermissions: pending.suggestions })}
+                  onDeny={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Denied by user' })}
+                />
+              )}
+            </div>
+          )}
+
+          {state === 'running' && !pending && (
+            <div className="mt-4 flex items-center gap-2 text-ctp-overlay text-xs animate-fade-in">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-ctp-green animate-pulse" />
+              Working…
+              <button
+                onClick={() => interrupt(sessionId)}
+                title="Interrupt Claude (Esc)"
+                className="px-1.5 py-0.5 rounded text-ctp-red/90 hover:bg-ctp-red/10 hover:text-ctp-red transition-colors"
+              >
+                Stop
+              </button>
+            </div>
+          )}
+          <div ref={bottomRef} />
+        </div>
+      </div>
+
+      <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
+        <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3 relative">
+          {suggestions.length > 0 && (
+            <div className="absolute bottom-full left-6 mb-2 w-64 rounded-lg border border-ctp-surface1 bg-ctp-mantle shadow-pop overflow-hidden z-10">
+              {suggestions.map((c) => {
+                const native = NATIVE_SLASH.includes(c)
+                return (
+                  <button
+                    key={c}
+                    onClick={() => { if (native) { handleSlash('/' + c); setDraft('') } else setDraft('/' + c + ' ') }}
+                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-ctp-surface0/60 flex justify-between items-center"
+                  >
+                    <span className="font-mono text-ctp-text">/{c}</span>
+                    {native && <span className="text-[10px] text-ctp-overlay">native</span>}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+          <div className="rounded-xl border border-ctp-surface0 bg-ctp-mantle focus-within:border-ctp-accent/50 focus-within:ring-1 focus-within:ring-ctp-accent/25 transition-colors">
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
+                else if (e.key === 'Escape' && running) { e.preventDefault(); interrupt(sessionId) }
+              }}
+              rows={2}
+              placeholder={running ? 'Claude is working… (Esc to interrupt)' : 'Message Claude…  (Enter to send · Shift+Enter for newline · / for commands)'}
+              className="w-full resize-none bg-transparent outline-none px-3.5 pt-2.5 pb-1 text-sm placeholder:text-ctp-overlay"
+            />
+            <div className="flex justify-between items-center px-2.5 pb-2 pt-0.5">
+              <span className="text-[10px] text-ctp-overlay capitalize">{state}</span>
+              <div className="flex gap-2">
+                {/* While Claude works, a prominent Stop button (also Esc). Send is
+                    still offered alongside it if the user has typed a follow-up. */}
+                {running && (
+                  <button
+                    onClick={() => interrupt(sessionId)}
+                    title="Interrupt Claude (Esc)"
+                    className="text-xs px-3 py-1 rounded-md bg-ctp-red/90 text-ctp-base font-medium hover:brightness-110 active:brightness-95 transition inline-flex items-center gap-1.5"
+                  >
+                    <span className="inline-block w-2 h-2 rounded-[2px] bg-ctp-base" /> Stop
+                  </button>
+                )}
+                {(!running || draft.trim()) && (
+                  <button
+                    onClick={submit}
+                    disabled={!draft.trim()}
+                    className="text-xs px-3.5 py-1 rounded-md bg-ctp-accent text-ctp-base font-medium hover:brightness-110 active:brightness-95 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                  >
+                    Send
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Slash commands Claudette handles itself (not passed through as a turn).
+const NATIVE_SLASH = ['clear', 'resume']
+
+// Vertical rhythm between transcript items: prose (user/assistant text) gets room
+// to breathe; tool calls, their results, and consecutive tool rows pull into tight
+// clusters so tool chatter reads as a subordinate group, not a stack of cards.
+function gapClass(it: TranscriptItem, prev?: TranscriptItem): string {
+  if (!prev) return ''
+  const toolish = (k?: string) => k === 'tool_use' || k === 'tool_result'
+  switch (it.kind) {
+    case 'tool_result': return 'mt-0.5'
+    case 'tool_use': return toolish(prev.kind) ? 'mt-1' : 'mt-4'
+    case 'user': return 'mt-6'
+    case 'text': return 'mt-4'
+    case 'thinking': return 'mt-3'
+    case 'notice': return 'mt-2'
+    default: return 'mt-4'
+  }
+}
+
+function Item({ item }: { item: TranscriptItem }) {
+  switch (item.kind) {
+    case 'user':
+      return (
+        <div className="flex justify-end animate-fade-in">
+          <div className="max-w-[85%] rounded-2xl rounded-br-md bg-ctp-accent/12 border border-ctp-accent/25 px-3.5 py-2 whitespace-pre-wrap text-ctp-text">
+            {item.text}
+          </div>
+        </div>
+      )
+    case 'text':
+      return (
+        <div className="leading-relaxed break-words text-ctp-text">
+          <Markdown text={item.text} />
+          {item.streaming && <span className="inline-block w-1.5 h-3.5 -mb-0.5 ml-0.5 bg-ctp-accent/80 animate-pulse" />}
+        </div>
+      )
+    case 'thinking':
+      // Some models (e.g. Fable) emit thinking as encrypted, signature-only blocks
+      // with no readable text — a "thinking":"" content block. Rendering an empty
+      // "Thinking" toggle for those is just noise, so suppress when there's no body.
+      if (!item.text.trim()) return null
+      return item.streaming
+        ? <div className="text-ctp-overlay italic whitespace-pre-wrap text-xs">{item.text}<span className="inline-block w-1 h-3 ml-0.5 bg-ctp-overlay animate-pulse" /></div>
+        : <Collapsible label="Thinking" tone="overlay" body={item.text} />
+    case 'tool_use':
+      return <ToolRow name={item.name} input={item.input} />
+    case 'tool_result':
+      return <ResultRow content={item.content} isError={item.isError} />
+    case 'result':
+      return (
+        <div className="border-t border-ctp-surface0/60 pt-1.5 space-y-1">
+          {item.errorText && (
+            <div className="rounded border border-ctp-red/40 bg-ctp-red/10 px-2.5 py-1.5 text-xs text-ctp-red whitespace-pre-wrap">
+              ⚠ {item.errorText}
+            </div>
+          )}
+          <div className="text-[10px] text-ctp-overlay">
+            {item.durationMs != null ? `${(item.durationMs / 1000).toFixed(1)}s` : ''}
+            {item.costUsd != null ? ` · $${item.costUsd.toFixed(4)}` : ''}
+          </div>
+        </div>
+      )
+    case 'notice':
+      return <div className="text-[11px] text-ctp-red/80 whitespace-pre-wrap font-mono">{item.text}</div>
+  }
+}
+
+// Compact, collapsed-by-default tool call — a dim one-liner (`⏺ Read(client.ts)`)
+// that expands to the full ToolDetail on click. Keeps tool chatter subordinate to
+// the assistant's prose, matching the Claude Code CLI's hierarchy.
+function ToolRow({ name, input }: { name: string; input: unknown }) {
+  const [open, setOpen] = useState(false)
+  const arg = toolArg(name, (input ?? {}) as Record<string, unknown>)
+  return (
+    <div className="group animate-fade-in">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-baseline gap-1.5 text-left text-[12px] text-ctp-overlay hover:text-ctp-subtext w-full"
+        title={toolHeadline(name, (input ?? {}) as Record<string, unknown>)}
+      >
+        <span className="text-ctp-mauve/70 shrink-0">⏺</span>
+        <span className="font-medium text-ctp-subtext shrink-0">{name}</span>
+        {arg && <span className="font-mono text-ctp-overlay truncate">{arg}</span>}
+        <span className="ml-auto shrink-0 text-ctp-surface2 opacity-0 group-hover:opacity-100 transition-opacity">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="mt-1 mb-1.5 ml-4 pl-2 border-l border-ctp-surface0 text-xs">
+          <ToolDetail name={name} input={input} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Compact tool result — an indented `⎿` summary line (first line + line count),
+// expandable to the full output. Errors surface in red but stay one line until opened.
+function ResultRow({ content, isError }: { content: string; isError: boolean }) {
+  const [open, setOpen] = useState(false)
+  const lines = content.split('\n')
+  const firstLine = lines.find((l) => l.trim().length > 0) ?? ''
+  const extra = lines.length > 1 ? ` +${lines.length - 1} lines` : ''
+  const summary = isError ? (firstLine || 'error') : (firstLine || `${lines.length} line${lines.length === 1 ? '' : 's'}`)
+  const color = isError ? 'text-ctp-red/80' : 'text-ctp-overlay'
+  return (
+    <div className="ml-4 animate-fade-in">
+      <button onClick={() => setOpen((v) => !v)} className={`flex items-baseline gap-1.5 text-left text-[11.5px] ${color} hover:text-ctp-subtext w-full`}>
+        <span className="text-ctp-surface2 shrink-0">⎿</span>
+        <span className="truncate font-mono">{truncateLine(summary, 100)}</span>
+        {extra && <span className="text-ctp-surface2 shrink-0">{extra}</span>}
+      </button>
+      {open && (
+        <pre className="mt-1 mb-1 ml-4 pl-2 border-l border-ctp-surface0 whitespace-pre-wrap font-mono text-[11px] text-ctp-subtext max-h-80 overflow-y-auto">
+          {content}
+        </pre>
+      )}
+    </div>
+  )
+}
+
+function truncateLine(s: string, n: number): string { return s.length > n ? s.slice(0, n) + '…' : s }
+
+function Collapsible({ label, body, tone }: { label: string; body: string; tone: 'overlay' | 'subtext' | 'red' }) {
+  const [open, setOpen] = useState(false)
+  const color = tone === 'red' ? 'text-ctp-red/80' : tone === 'subtext' ? 'text-ctp-subtext' : 'text-ctp-overlay'
+  const preview = body.length > 120 ? body.slice(0, 120) + '…' : body
+  return (
+    <div className={`text-xs ${color}`}>
+      <button onClick={() => setOpen((v) => !v)} className="hover:text-ctp-text">
+        {open ? '▾' : '▸'} {label}
+      </button>
+      <pre className="mt-1 whitespace-pre-wrap font-mono text-[11px] pl-4 opacity-90">
+        {open ? body : preview}
+      </pre>
+    </div>
+  )
+}
+
+// Compact token count: 210_234 → "210k". Sub-1k values shown as-is.
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
+}
+
+function limitLabel(type?: string): string {
+  if (type === 'five_hour') return 'Session'
+  if (type === 'weekly' || type === 'seven_day') return 'Weekly'
+  return (type ?? 'limit').replace(/_/g, ' ')
+}
+const LIMIT_RANK: Record<string, number> = { five_hour: 0, weekly: 1, seven_day: 1 }
+
+// Always-visible status bar: session title + cwd, then model, real context usage
+// (tokens + %), cost, and a chip per rate-limit window (session / weekly).
+function MetaBar({ meta, title, cwd, mode, onSetMode }: {
+  meta: SessionMeta; title?: string; cwd?: string
+  mode: PermissionMode; onSetMode: (mode: PermissionMode) => void
+}) {
+  const tokens = meta.contextTokens
+  const win = meta.contextWindow
+  const pct = win && tokens != null ? Math.min(100, Math.round((tokens / win) * 100)) : undefined
+  const barColor = pct == null ? 'bg-ctp-accent' : pct >= 92 ? 'bg-ctp-red' : pct >= 80 ? 'bg-ctp-yellow' : 'bg-ctp-accent'
+  const limits = meta.limits
+    ? Object.values(meta.limits).sort((a, b) => (LIMIT_RANK[a.rateLimitType ?? ''] ?? 9) - (LIMIT_RANK[b.rateLimitType ?? ''] ?? 9))
+    : []
+
+  return (
+    <div className="shrink-0 flex items-center flex-wrap gap-x-3 gap-y-1 px-4 sm:px-5 min-h-[3rem] py-1.5 border-b border-ctp-surface0">
+      {/* Session identity — hidden on mobile (the top bar already shows the name). */}
+      <div className="hidden md:flex min-w-0 items-baseline gap-2">
+        {title && <span className="text-sm font-medium text-ctp-text truncate max-w-[16rem]">{title}</span>}
+        {cwd && <span className="text-[11px] text-ctp-overlay font-mono truncate max-w-[20rem]">{cwd.replace(/^\/home\/[^/]+/, '~')}</span>}
+      </div>
+
+      <div className="md:ml-auto flex items-center flex-wrap gap-x-3 gap-y-1 text-[10px] text-ctp-overlay">
+        <ModeSelect mode={mode} onSetMode={onSetMode} />
+        <span className="text-ctp-subtext font-mono" title={meta.model ? undefined : 'The model and context appear after your first message this session.'}>
+          {meta.model ?? 'model · after first message'}
+        </span>
+
+        <span className="flex items-center gap-1.5" title="Context window used (input + cached tokens) vs the model's limit">
+          <span className="text-ctp-overlay">ctx</span>
+          <span className="inline-block w-16 h-1.5 rounded-full bg-ctp-surface0 overflow-hidden align-middle">
+            {pct !== undefined && <span className={`block h-full rounded-full ${barColor}`} style={{ width: `${pct}%` }} />}
+          </span>
+          {tokens != null && win
+            ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pct}%)</span>
+            : <span className="text-ctp-surface2">—</span>}
+        </span>
+
+        {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} />)}
+
+        {meta.costUsd !== undefined && (
+          <span className="text-ctp-overlay tabular-nums" title="Total cost this session">${meta.costUsd.toFixed(4)}</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Live permission-mode switch (P1.4). Applies over the control protocol when the
+// session is running (instant), else on the next launch — the returned status says
+// which, shown briefly so the user knows it took.
+const MODE_LABEL: Record<PermissionMode, string> = {
+  default: 'prompt', acceptEdits: 'auto-edit', plan: 'plan', bypassPermissions: 'bypass',
+}
+function ModeSelect({ mode, onSetMode }: { mode: PermissionMode; onSetMode: (m: PermissionMode) => Promise<{ applied: string; reason?: string }> | void }) {
+  const [hint, setHint] = useState<string | null>(null)
+  const change = async (m: PermissionMode) => {
+    const r = await onSetMode(m)
+    if (r && 'applied' in r) {
+      const msg = r.applied === 'live' ? 'applied' : r.applied === 'relaunched' ? 'relaunching…' : 'applies on next run'
+      setHint(msg)
+      setTimeout(() => setHint(null), 2500)
+    }
+  }
+  return (
+    <span className="flex items-center gap-1" title="Permission mode — how Claude's tool use is gated">
+      <select
+        value={mode}
+        onChange={(e) => void change(e.target.value as PermissionMode)}
+        className="bg-ctp-surface0 text-ctp-subtext rounded px-1 py-0.5 outline-none hover:text-ctp-text cursor-pointer"
+      >
+        {(Object.keys(MODE_LABEL) as PermissionMode[]).map((m) => (
+          <option key={m} value={m}>{MODE_LABEL[m]}</option>
+        ))}
+      </select>
+      {hint && <span className="text-ctp-overlay">{hint}</span>}
+    </span>
+  )
+}
+
+function RateChip({ rl }: { rl: RateLimitInfo }) {
+  const status = rl.status ?? 'allowed'
+  const ok = status === 'allowed'
+  const bad = /reject|exceed|block|limit_reached/i.test(status)
+  const color = bad ? 'text-ctp-red' : ok ? 'text-ctp-overlay' : 'text-ctp-yellow'
+  const resets = rl.resetsAt
+    ? `resets ${new Date(rl.resetsAt * 1000).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })}`
+    : ''
+  const usedPct = typeof rl.percentUsed === 'number' ? ` ${Math.round(rl.percentUsed)}%` : ''
+  const label = limitLabel(rl.rateLimitType)
+  return (
+    <span className={color} title={`${label} limit: ${status}${rl.isUsingOverage ? ' (using overage)' : ''}${resets ? ` · ${resets}` : ''}`}>
+      {ok ? '●' : '▲'} {label}{usedPct}{rl.isUsingOverage ? ' · overage' : ''}
+      {rl.resetsAt ? <span className="text-ctp-surface2"> · {new Date(rl.resetsAt * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span> : null}
+    </span>
+  )
+}
+
+// Interactive AskUserQuestion: the user picks option(s) per question; the
+// selection is fed back as the tool's answer (updatedInput.answers, keyed by
+// question text). Single-select picks one; multiSelect toggles several; an
+// "Other…" field allows a free-text answer.
+interface AskQuestion { question: string; header?: string; multiSelect?: boolean; options: Array<{ label: string; description?: string }> }
+function AskUserQuestionCard({ input, onAnswer, onDismiss }: {
+  input: unknown
+  onAnswer: (answers: Record<string, string>) => void
+  onDismiss: () => void
+}) {
+  const qs: AskQuestion[] = Array.isArray((input as { questions?: unknown })?.questions)
+    ? ((input as { questions: AskQuestion[] }).questions)
+    : []
+  const [sel, setSel] = useState<Record<number, string[]>>({})
+  const [other, setOther] = useState<Record<number, string>>({})
+
+  const toggle = (qi: number, label: string, multi: boolean) =>
+    setSel((s) => {
+      const cur = s[qi] ?? []
+      if (!multi) return { ...s, [qi]: [label] }
+      return { ...s, [qi]: cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label] }
+    })
+
+  const valueFor = (qi: number): string => {
+    const chosen = [...(sel[qi] ?? [])]
+    const o = other[qi]?.trim()
+    if (o) chosen.push(o)
+    return chosen.join(', ')
+  }
+  const answered = qs.length > 0 && qs.every((_, qi) => valueFor(qi).length > 0)
+
+  const submit = () => {
+    const answers: Record<string, string> = {}
+    qs.forEach((q, qi) => { answers[q.question] = valueFor(qi) })
+    onAnswer(answers)
+  }
+
+  return (
+    <div className="rounded-lg border border-ctp-blue/50 bg-ctp-blue/10 px-3 py-2.5 space-y-3">
+      {qs.map((q, qi) => (
+        <div key={qi} className="space-y-1">
+          <div className="text-xs text-ctp-text font-medium">{q.question}</div>
+          <div className="flex flex-col gap-1">
+            {q.options.map((op, oi) => {
+              const active = (sel[qi] ?? []).includes(op.label)
+              return (
+                <button
+                  key={oi}
+                  onClick={() => toggle(qi, op.label, !!q.multiSelect)}
+                  className={`text-left text-xs px-2 py-1 rounded border transition-colors ${active ? 'border-ctp-blue bg-ctp-blue/20 text-ctp-text' : 'border-ctp-surface1 text-ctp-subtext hover:bg-ctp-surface0'}`}
+                >
+                  <span className="font-medium">{op.label}</span>
+                  {op.description ? <span className="text-ctp-overlay"> — {op.description}</span> : null}
+                </button>
+              )
+            })}
+            <input
+              value={other[qi] ?? ''}
+              onChange={(e) => setOther((s) => ({ ...s, [qi]: e.target.value }))}
+              placeholder="Other…"
+              className="text-xs px-2 py-1 rounded bg-ctp-surface0 text-ctp-text outline-none placeholder:text-ctp-overlay focus:ring-1 focus:ring-ctp-blue"
+            />
+          </div>
+        </div>
+      ))}
+      <div className="flex gap-2">
+        <button onClick={submit} disabled={!answered} className="text-xs px-3 py-0.5 rounded bg-ctp-blue/80 hover:bg-ctp-blue text-ctp-base font-medium disabled:opacity-40 disabled:cursor-not-allowed">
+          Submit
+        </button>
+        <button onClick={onDismiss} className="text-xs px-3 py-0.5 rounded bg-ctp-surface0 hover:bg-ctp-surface1 text-ctp-subtext">
+          Dismiss
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function PermissionCard({
+  toolName, description, input, suggestions, onAllow, onAllowAlways, onDeny,
+}: {
+  toolName: string; description?: string; input: unknown; suggestions: unknown[]
+  onAllow: () => void; onAllowAlways: () => void; onDeny: () => void
+}) {
+  const headline = toolHeadline(toolName, (input ?? {}) as Record<string, unknown>)
+  const always = suggestions.length > 0 ? suggestionLabel(suggestions) : undefined
+  return (
+    <div className="rounded-lg border border-ctp-yellow/50 bg-ctp-yellow/10 px-3 py-2.5">
+      <div className="text-xs text-ctp-yellow font-medium mb-0.5">
+        {headline}?
+      </div>
+      <div className="text-[10px] text-ctp-overlay mb-1.5">
+        {toolName}{description && description !== headline ? ` · ${description}` : ''}
+      </div>
+      <div className="text-[11px] text-ctp-subtext max-h-48 overflow-y-auto mb-2 pr-1">
+        <ToolDetail name={toolName} input={input} />
+      </div>
+      <div className="flex gap-2 flex-wrap">
+        <button onClick={onAllow} className="text-xs px-3 py-0.5 rounded bg-ctp-green/80 hover:bg-ctp-green text-ctp-base font-medium">
+          Allow once
+        </button>
+        {always && (
+          <button onClick={onAllowAlways} className="text-xs px-3 py-0.5 rounded bg-ctp-green/20 hover:bg-ctp-green/30 text-ctp-green font-medium">
+            {always}
+          </button>
+        )}
+        <button onClick={onDeny} className="text-xs px-3 py-0.5 rounded bg-ctp-surface0 hover:bg-ctp-surface1 text-ctp-subtext">
+          Deny
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Label the "allow always" button from the request's first permission suggestion.
+function suggestionLabel(suggestions: unknown[]): string {
+  const s = suggestions[0] as { type?: string; mode?: string; destination?: string; rules?: Array<{ toolName?: string; ruleContent?: string }> }
+  if (s?.type === 'setMode') {
+    if (s.mode === 'acceptEdits') return 'Accept edits (session)'
+    return `Switch to ${s.mode}`
+  }
+  if (s?.type === 'addRules') {
+    const r = s.rules?.[0]
+    const name = r ? (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName) : ''
+    const persists = s.destination && s.destination !== 'session'
+    return `Always allow ${name}${persists ? '' : ' (session)'}`
+  }
+  return "Allow, don't ask"
+}

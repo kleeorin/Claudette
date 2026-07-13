@@ -1,0 +1,10 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+*.tsbuildinfo
+.claudette/
+.claudette-token
+# Generated phone-pairing QR — encodes the URL WITH the access token; never commit.
+/qr.png

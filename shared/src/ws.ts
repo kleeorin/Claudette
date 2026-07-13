@@ -1,0 +1,119 @@
+import type {
+  ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
+  SessionInfo, SessionState, SetModeResult, ConversationMeta, ActivePane,
+} from './types'
+import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus } from './notebook'
+
+// The app WebSocket envelope. One socket per browser tab; topics are multiplexed
+// on the `type` field. The unions below are the typed contract for both ends;
+// they grow as Phase 1 topics land (pty, notebook:update, appcontrol). Because
+// Claudette is single-user, server→client events are broadcast to every open tab
+// (all tabs mirror the same session set).
+
+// --- client → server ---------------------------------------------------------
+
+export type WsClientMessage =
+  | { type: 'ping' }
+  // Native turn I/O for a session (lifecycle create/list/destroy/… is HTTP).
+  | { type: 'session:send'; id: string; text: string }
+  | { type: 'session:interrupt'; id: string }
+  | { type: 'session:permission'; id: string; requestId: string; decision: PermissionDecision }
+  // What a session is currently viewing (its active content tab), published on tab/
+  // session switch. `pane` is null when the Claude tab is focused. Backs the
+  // path-less, active-pane-targeted app-control notebook tools (read_active_pane,
+  // and the cell tools when Claude omits `path`).
+  | { type: 'session:activePane'; id: string; pane: ActivePane | null }
+  // Notebook ops + locks from a UI (human origin). The server holds the
+  // authoritative doc; the UI is a view that sends ops and renders `notebook:update`.
+  // (Wired for the notebook UI in P1.15; the types land now so the server broadcasts
+  // have a typed channel.)
+  | { type: 'notebook:op'; op: NotebookOp }
+  | { type: 'notebook:claim'; notebookId: string; cellId: string; reason: LockReason }
+  | { type: 'notebook:release'; notebookId: string; cellId: string }
+  // Terminal pane I/O (lifecycle create/destroy is HTTP). Keystrokes + resize go up;
+  // pty output + exit come back down (namespaced by pane id).
+  | { type: 'pane:input'; id: string; data: string }
+  | { type: 'pane:resize'; id: string; cols: number; rows: number }
+
+// --- server → client ---------------------------------------------------------
+
+export type WsServerMessage =
+  | { type: 'hello'; version: string }
+  | { type: 'pong'; ts: number }
+  // A snapshot of all sessions, sent on connect so a fresh tab renders the list.
+  | { type: 'session:list'; sessions: SessionInfo[] }
+  // Per-session streaming events (namespaced by session id).
+  | { type: 'session:event'; id: string; event: ClaudeEvent }
+  | { type: 'session:permission'; id: string; request: PermissionRequest }
+  | { type: 'session:state'; id: string; state: SessionState }
+  | { type: 'session:ready'; id: string; claudeSessionId: string }
+  | { type: 'session:exit'; id: string; failed: boolean; error: string }
+  // Authoritative notebook doc pushed after every applied op / external reload, and
+  // the current human-held cell locks. Full-doc snapshots for now (deltas are a
+  // later optimization). Broadcast to every tab (single-user; all tabs mirror it).
+  | { type: 'notebook:update'; doc: NotebookDoc }
+  // The cell a just-applied op touched, so the view can select + reveal it. `reveal`
+  // is true for Claude's edits and for structural ops (add/insert/delete/move/type) —
+  // the view scrolls those into view; a plain human text edit (typing/undo) only
+  // re-selects, so it never yanks the scroll while the user is in the cell.
+  | { type: 'notebook:focus'; notebookId: string; cellId: string; reveal: boolean }
+  | { type: 'notebook:locks'; notebookId: string; locks: CellLock[] }
+  | { type: 'notebook:kernel'; notebookId: string; status: KernelStatus }
+  // Steer a session's UI to focus a notebook tab — emitted when Claude calls the
+  // app-control `open_notebook` tool so the notebook it's about to work on becomes
+  // the one the user is looking at (in that same session). The doc itself arrives
+  // via a `notebook:update`; this only moves focus.
+  | { type: 'session:focusPane'; id: string; notebookId: string; path: string }
+  | { type: 'pane:output'; id: string; data: string }
+  | { type: 'pane:exit'; id: string }
+
+// --- HTTP request/response ----------------------------------------------------
+
+// GET /api/health
+export interface HealthResponse {
+  ok: boolean
+  version: string
+  ts: number
+}
+
+// POST /api/session/create
+export interface CreateSessionRequest {
+  name: string
+  cwd: string
+  rootDir?: string
+  parentId?: string
+  resume?: boolean
+  claudeSessionId?: string
+  agentId?: string
+  model?: string
+  permissionMode?: PermissionMode
+}
+export interface CreateSessionResponse { id: string }
+
+// GET /api/session/list
+export interface ListSessionsResponse { sessions: SessionInfo[] }
+
+// POST /api/session/destroy | /api/session/relaunch  { id }
+export interface SessionIdRequest { id: string }
+export interface OkResponse { ok: boolean }
+
+// POST /api/session/setMode { id, mode } → SetModeResult
+export interface SetModeRequest { id: string; mode: PermissionMode }
+export type { SetModeResult }
+
+// Re-export the session id request under intent-revealing aliases for routes.
+export type DestroySessionRequest = SessionIdRequest
+export type RelaunchSessionRequest = SessionIdRequest
+
+// POST /api/session/restartFresh { id }  — the native /clear (fresh conversation)
+export type RestartFreshRequest = SessionIdRequest
+// POST /api/session/resumeInto { id, claudeSessionId } — rebind to a past conversation
+export interface ResumeIntoRequest { id: string; claudeSessionId: string }
+// GET /api/session/conversations?cwd=…  → resumable conversations for that folder
+export interface ConversationsResponse { conversations: ConversationMeta[] }
+// GET /api/session/conversation?cwd=…&id=…  → the conversation replayed as events
+export interface ConversationResponse { events: ClaudeEvent[] }
+
+// POST /api/pane/create { cwd } → { id }   |   POST /api/pane/destroy { id }
+export interface CreatePaneRequest { cwd: string }
+export interface CreatePaneResponse { id: string }

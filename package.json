@@ -1,0 +1,22 @@
+{
+  "name": "claudette",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Web-based harness and shell for Claude Code, with a notebook where Claude is a first-class extension.",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm run dev -w @claudette/server",
+    "dev:web": "npm run dev -w @claudette/web",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.5.2"
+  }
+}
