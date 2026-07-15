@@ -1,7 +1,7 @@
 import {
   createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode,
 } from 'react'
-import type { NotebookDoc, CellLock, LockReason, KernelStatus, NbCellType } from '@claudette/shared'
+import type { NotebookDoc, CellLock, LockReason, KernelStatus, NbCellType, KernelSpecsResponse } from '@claudette/shared'
 import { api } from '../api/client'
 
 // The notebook store is a pure VIEW over the server-owned doc (PLAN §4) — the
@@ -20,13 +20,17 @@ interface ContextValue {
   openPath: (path: string) => Promise<string | null>   // returns error string or null
   createPath: (path: string) => Promise<string | null>
   close: (notebookId: string) => void
+  // Did THIS client open the notebook locally (Files dock / New), vs it arriving
+  // pushed from the server (a Claude tool)? Locally-opened ones attach to the active
+  // session; server-pushed ones attach only via `focusPane` (the calling session).
+  wasLocallyOpened: (notebookId: string) => boolean
   // per-notebook view state
   locksFor: (notebookId: string) => CellLock[]
   kernelFor: (notebookId: string) => KernelStatus
   isRunning: (notebookId: string, cellId: string) => boolean
   // mutations (intents → server)
   updateSource: (notebookId: string, cellId: string, source: string) => void
-  addCell: (notebookId: string, cellType: NbCellType, afterCellId?: string) => void
+  addCell: (notebookId: string, cellType: NbCellType, afterCellId?: string, source?: string) => void
   insertCell: (notebookId: string, index: number, cellType: NbCellType) => void
   deleteCell: (notebookId: string, cellId: string) => void
   moveCell: (notebookId: string, cellId: string, toIndex: number) => void
@@ -38,6 +42,14 @@ interface ContextValue {
   keepMine: (notebookId: string) => void
   claim: (notebookId: string, cellId: string, reason: LockReason) => void
   release: (notebookId: string, cellId: string) => void
+  // undo/redo + kernel controls
+  undo: (notebookId: string) => void
+  redo: (notebookId: string) => void
+  clearOutputs: (notebookId: string) => void
+  kernelSpecs: () => Promise<KernelSpecsResponse>
+  restartKernel: (notebookId: string) => void
+  interruptKernel: (notebookId: string) => void
+  setKernelSpec: (notebookId: string, name: string) => void
 }
 
 const NotebooksContext = createContext<ContextValue | null>(null)
@@ -51,6 +63,9 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
   const [activeId, setActiveId] = useState<string | null>(null)
   const activeRef = useRef<string | null>(null); activeRef.current = activeId
   const kernelRef = useRef<Record<string, KernelStatus>>({}); kernelRef.current = kernels
+  // Notebooks this client opened via a user action (Files dock / New) — the only
+  // ones the shell auto-attaches to the active session.
+  const localIds = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     const offUpd = api.on.notebookUpdate((doc) => {
@@ -76,6 +91,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     const res = await api.notebook.open(path)
     if (res.error || !res.doc) return res.error ?? 'failed to open notebook'
     const doc = res.doc
+    localIds.current.add(doc.notebookId)
     setDocs((prev) => ({ ...prev, [doc.notebookId]: doc }))
     setOrder((prev) => prev.includes(doc.notebookId) ? prev : [...prev, doc.notebookId])
     setActiveId(doc.notebookId)
@@ -86,6 +102,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     const res = await api.notebook.create(path)
     if (res.error || !res.doc) return res.error ?? 'failed to create notebook'
     const doc = res.doc
+    localIds.current.add(doc.notebookId)
     setDocs((prev) => ({ ...prev, [doc.notebookId]: doc }))
     setOrder((prev) => prev.includes(doc.notebookId) ? prev : [...prev, doc.notebookId])
     setActiveId(doc.notebookId)
@@ -129,11 +146,12 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     active: activeId ? docs[activeId] ?? null : null,
     setActive: setActiveId,
     openPath, createPath, close,
+    wasLocallyOpened: (id) => localIds.current.has(id),
     locksFor: (id) => locks[id] ?? [],
-    kernelFor: (id) => kernels[id] ?? 'idle',
+    kernelFor: (id) => kernels[id] ?? 'none',
     isRunning: (id, cellId) => running[id]?.has(cellId) ?? false,
     updateSource: (notebookId, cellId, source) => api.notebook.op({ op: 'editCell', notebookId, cellId, source }),
-    addCell: (notebookId, cellType, afterCellId) => api.notebook.op({ op: 'addCell', notebookId, cellType, afterCellId }),
+    addCell: (notebookId, cellType, afterCellId, source) => api.notebook.op({ op: 'addCell', notebookId, cellType, afterCellId, source }),
     insertCell: (notebookId, index, cellType) => api.notebook.op({ op: 'insertCell', notebookId, index, cellType }),
     deleteCell: (notebookId, cellId) => api.notebook.op({ op: 'deleteCell', notebookId, cellId }),
     moveCell: (notebookId, cellId, toIndex) => api.notebook.op({ op: 'moveCell', notebookId, cellId, toIndex }),
@@ -145,6 +163,13 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     keepMine: (notebookId) => { void api.notebook.keepMine(notebookId) },
     claim: (notebookId, cellId, reason) => api.notebook.claim(notebookId, cellId, reason),
     release: (notebookId, cellId) => api.notebook.release(notebookId, cellId),
+    undo: (notebookId) => { void api.notebook.undo(notebookId) },
+    redo: (notebookId) => { void api.notebook.redo(notebookId) },
+    clearOutputs: (notebookId) => { void api.notebook.clearOutputs(notebookId) },
+    kernelSpecs: () => api.notebook.kernelSpecs(),
+    restartKernel: (notebookId) => { void api.notebook.kernelRestart(notebookId) },
+    interruptKernel: (notebookId) => { void api.notebook.kernelInterrupt(notebookId) },
+    setKernelSpec: (notebookId, name) => { void api.notebook.kernelSetSpec(notebookId, name) },
   }
 
   return <NotebooksContext.Provider value={value}>{children}</NotebooksContext.Provider>

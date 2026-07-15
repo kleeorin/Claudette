@@ -2,7 +2,7 @@ import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
   SessionInfo, SessionState, SetModeResult, ConversationMeta, ActivePane,
 } from './types'
-import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus } from './notebook'
+import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
 
 // The app WebSocket envelope. One socket per browser tab; topics are multiplexed
 // on the `type` field. The unions below are the typed contract for both ends;
@@ -117,3 +117,6 @@ export interface ConversationResponse { events: ClaudeEvent[] }
 // POST /api/pane/create { cwd } → { id }   |   POST /api/pane/destroy { id }
 export interface CreatePaneRequest { cwd: string }
 export interface CreatePaneResponse { id: string }
+
+// GET /api/notebook/kernelspecs → the kernels the user can pick, + Jupyter's default.
+export interface KernelSpecsResponse { specs: KernelSpec[]; default: string }

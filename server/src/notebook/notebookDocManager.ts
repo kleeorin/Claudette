@@ -24,6 +24,7 @@ import { parseNotebook, serializeNotebook, emptyNotebookText, emptyCodeCell, typ
 type Origin = 'human' | 'claude'
 
 const IDLE_LOCK_MS = 30_000  // a focus/dirty lock auto-releases after this idle window
+const MAX_HISTORY = 50       // undo/redo depth per notebook (snapshots of the cells array)
 
 interface OpenNotebook {
   doc: NotebookDoc
@@ -33,6 +34,8 @@ interface OpenNotebook {
   locks: Map<string, CellLock>           // cellId → lock (human-held)
   lockTimers: Map<string, NodeJS.Timeout>
   writing: boolean                       // a persist is in flight (suppress our own watch echo)
+  undo: NbCell[][]                       // snapshots of `cells` BEFORE each edit/structural op
+  redo: NbCell[][]                       // snapshots undone, redoable
 }
 
 export class NotebookDocManager extends EventEmitter {
@@ -71,10 +74,13 @@ export class NotebookDocManager extends EventEmitter {
       metadata: meta.metadata,
       version: 0,
       dirty: false,
+      canUndo: false,
+      canRedo: false,
     }
     const nb: OpenNotebook = {
       doc, meta, baseline: text,
       locks: new Map(), lockTimers: new Map(), writing: false,
+      undo: [], redo: [],
     }
     this.open.set(notebookId, nb)
     this.byPath.set(abs, notebookId)
@@ -123,6 +129,10 @@ export class NotebookDocManager extends EventEmitter {
     }
 
     const idx = (cellId: string) => doc.cells.findIndex((c) => c.id === cellId)
+
+    // Snapshot the cells BEFORE mutating; committed to the undo stack only if the op
+    // succeeds (the notFound branches return before we reach the commit below).
+    const before = snapshotCells(doc.cells)
 
     // The cell this op leaves the user's attention on — broadcast as `opFocus` so
     // the view can select + reveal it (see the 'notebook:focus' WS message).
@@ -184,6 +194,8 @@ export class NotebookDocManager extends EventEmitter {
       }
     }
 
+    // The op succeeded — bank the pre-op snapshot for undo (drops the redo branch).
+    this.pushHistory(nb, before)
     doc.version++
     doc.dirty = true
     this.emit('update', doc)
@@ -191,6 +203,80 @@ export class NotebookDocManager extends EventEmitter {
     // human text edit only re-selects, so typing/undo never fights the scroll.
     if (focusId) this.emit('opFocus', doc.notebookId, focusId, origin === 'claude' || op.op !== 'editCell')
     return { ok: true, version: doc.version }
+  }
+
+  // --- undo / redo ---------------------------------------------------------
+
+  // Bank a pre-op snapshot; a fresh edit invalidates the redo branch. Capped depth.
+  private pushHistory(nb: OpenNotebook, before: NbCell[]): void {
+    nb.undo.push(before)
+    if (nb.undo.length > MAX_HISTORY) nb.undo.shift()
+    nb.redo = []
+    this.refreshHistoryFlags(nb)
+  }
+  private refreshHistoryFlags(nb: OpenNotebook): void {
+    nb.doc.canUndo = nb.undo.length > 0
+    nb.doc.canRedo = nb.redo.length > 0
+  }
+  // Drop history when the doc is replaced wholesale from disk (the snapshots no
+  // longer describe reachable states).
+  private resetHistory(nb: OpenNotebook): void {
+    nb.undo = []
+    nb.redo = []
+    this.refreshHistoryFlags(nb)
+  }
+
+  // Restore the previous (undo) / next (redo) cells snapshot; the current state moves
+  // onto the opposite stack. Returns false when there is nothing to step to.
+  undo(notebookId: string): boolean { return this.step(notebookId, 'undo') }
+  redo(notebookId: string): boolean { return this.step(notebookId, 'redo') }
+  private step(notebookId: string, dir: 'undo' | 'redo'): boolean {
+    const nb = this.open.get(notebookId)
+    if (!nb) return false
+    const from = dir === 'undo' ? nb.undo : nb.redo
+    const to = dir === 'undo' ? nb.redo : nb.undo
+    const snap = from.pop()
+    if (!snap) return false
+    const prev = nb.doc.cells
+    to.push(snapshotCells(prev))
+    nb.doc.cells = snap
+    nb.doc.version++
+    nb.doc.dirty = true
+    this.refreshHistoryFlags(nb)
+    this.emit('update', nb.doc)
+    // Best-effort: reveal the first cell that differs between the two states.
+    const focusId = firstChangedCellId(prev, snap)
+    if (focusId) this.emit('opFocus', notebookId, focusId, true)
+    return true
+  }
+
+  // Clear every code cell's outputs + execution count (undoable). Marks dirty so a
+  // save persists the cleared state.
+  clearAllOutputs(notebookId: string): void {
+    const nb = this.open.get(notebookId)
+    if (!nb) return
+    const before = snapshotCells(nb.doc.cells)
+    let changed = false
+    for (const c of nb.doc.cells) {
+      if (c.cellType !== 'code') continue
+      if ((c.outputs?.length ?? 0) === 0 && c.executionCount == null) continue
+      c.outputs = []
+      c.executionCount = null
+      changed = true
+    }
+    if (!changed) return
+    this.pushHistory(nb, before)
+    nb.doc.version++
+    nb.doc.dirty = true
+    this.emit('update', nb.doc)
+  }
+
+  // Record the selected kernelspec name on the doc (drives the header picker label).
+  setKernelName(notebookId: string, name: string): void {
+    const nb = this.open.get(notebookId)
+    if (!nb || nb.doc.kernelName === name) return
+    nb.doc.kernelName = name
+    this.emit('update', nb.doc)
   }
 
   // Resolve a 0-based index to a stable cellId against the current doc. The MCP
@@ -323,6 +409,7 @@ export class NotebookDocManager extends EventEmitter {
     nb.doc.metadata = meta.metadata
     nb.baseline = text
     nb.doc.version++
+    this.resetHistory(nb)
     this.emit('update', nb.doc)
   }
 
@@ -339,6 +426,7 @@ export class NotebookDocManager extends EventEmitter {
     nb.doc.dirty = false
     nb.doc.conflict = false
     nb.doc.version++
+    this.resetHistory(nb)
     this.emit('update', nb.doc)
   }
 
@@ -370,6 +458,21 @@ function makeCell(cellType: NbCellType, source?: string): NbCell {
   const cell: NbCell = { id: randomUUID(), cellType, source: source ?? '', metadata: {} }
   if (cellType === 'code') { cell.outputs = []; cell.executionCount = null }
   return cell
+}
+// Deep copy of the cells array for the undo/redo stacks (outputs included).
+function snapshotCells(cells: NbCell[]): NbCell[] {
+  return structuredClone(cells)
+}
+// The id of the first cell that differs between two states (for undo/redo reveal).
+function firstChangedCellId(a: NbCell[], b: NbCell[]): string | undefined {
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i]; const y = b[i]
+    if (!x || !y || x.id !== y.id || x.source !== y.source || x.cellType !== y.cellType) {
+      return (y ?? x)?.id
+    }
+  }
+  return b[0]?.id
 }
 function clamp(n: number, lo: number, hi: number): number { return Math.max(lo, Math.min(hi, n)) }
 function notFound(cellId: string): NotebookOpResult {

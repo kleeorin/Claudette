@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode } from '@claudette/shared'
 import { useChat, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
@@ -7,6 +7,12 @@ import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
 import { api } from '../api/client'
 
+// Sessions already auto-resumed this app load — so revisiting a session (or a
+// /clear that empties the transcript) doesn't re-pull the old conversation.
+// Resets on a full page reload (module re-eval), which is exactly when we DO want
+// to resume again. Module-level so it survives ChatView remounts.
+const autoResumed = new Set<string>()
+
 // Native chat frontend for a Claude session — ported from ClaudeMaster. Renders
 // the structured transcript, streams tokens, and surfaces permission /
 // AskUserQuestion prompts as native cards. Handles /clear + /resume natively
@@ -14,7 +20,7 @@ import { api } from '../api/client'
 // lives in the MetaBar (P1.4).
 export function ChatView({ sessionId, isActive }: { sessionId: string; isActive: boolean }) {
   const { transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
-  const { sessions, setMode } = useSessions()
+  const { sessions, setMode, isFresh, markBusy } = useSessions()
   const session = sessions.find((s) => s.id === sessionId)
   const [showResume, setShowResume] = useState(false)
   const state = session?.state ?? 'idle'
@@ -23,12 +29,72 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const meta = metaFor(sessionId)
   const [draft, setDraft] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
+  const taRef = useRef<HTMLTextAreaElement>(null)
   const running = state === 'running' || state === 'waiting'
+
+  // --- input history (shell-like Up/Down over the messages you've sent) ---------
+  // The turns you've sent this session, oldest→newest. `histPtr` counts steps back
+  // (0 = the live draft); `stashRef` holds the in-progress draft while browsing.
+  const sentHistory = useMemo(() => items.filter((it) => it.kind === 'user').map((it) => it.text), [items])
+  const [histPtr, setHistPtr] = useState(0)
+  const stashRef = useRef('')
+  const caretToEnd = () => requestAnimationFrame(() => { const ta = taRef.current; if (ta) ta.selectionStart = ta.selectionEnd = ta.value.length })
+  // Up: older message. Only hijacks Up when the caret is at the very start (so
+  // multi-line editing still works), unless we're already browsing history.
+  const recallPrev = (ta: HTMLTextAreaElement): boolean => {
+    if (sentHistory.length === 0) return false
+    const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0
+    if (histPtr === 0 && !atStart) return false
+    const next = Math.min(histPtr + 1, sentHistory.length)
+    if (histPtr === 0) stashRef.current = draft
+    if (next !== histPtr) { setHistPtr(next); setDraft(sentHistory[sentHistory.length - next]); caretToEnd() }
+    return true
+  }
+  // Down: newer message; stepping past the newest restores the stashed draft.
+  const recallNext = (ta: HTMLTextAreaElement): boolean => {
+    if (histPtr === 0) return false
+    const atEnd = ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length
+    if (!atEnd) return false
+    const next = histPtr - 1
+    setHistPtr(next)
+    setDraft(next === 0 ? stashRef.current : sentHistory[sentHistory.length - next])
+    caretToEnd()
+    return true
+  }
+
+  // Is Claude *actively thinking* right now? That's a sub-phase of 'running' the
+  // server doesn't distinguish — we read it off the live transcript: the newest
+  // item is a still-streaming thinking block with readable text. Its tail feeds a
+  // live ticker at the composer so you can see the thought without scrolling up.
+  const last = items[items.length - 1]
+  const thinking = last && last.kind === 'thinking' && last.streaming ? last.text.trim() : ''
+  const thinkTail = thinking.length > 180 ? '…' + thinking.slice(-180) : thinking
 
   // Keep the newest content in view while this session is the one on screen.
   useEffect(() => {
     if (isActive) bottomRef.current?.scrollIntoView({ block: 'end' })
   }, [items.length, pending, isActive])
+
+  // Auto-resume on load: a RESTORED session (not one just created) with an empty
+  // transcript pulls in its latest conversation — the equivalent of /resume picking
+  // the top entry — so a page reload lands you back where you were. Once per session
+  // per app load; never disturbs a running turn.
+  useEffect(() => {
+    if (!session || autoResumed.has(sessionId)) return
+    if (isFresh(sessionId) || items.length > 0 || running) return
+    autoResumed.add(sessionId)
+    const cwd = session.cwd
+    void (async () => {
+      try {
+        const list = await api.http.listConversations(cwd)
+        const latest = list[0]
+        if (!latest) return
+        clearTranscript(sessionId)
+        loadTranscript(sessionId, await api.http.readConversation(cwd, latest.id))
+        await api.http.resumeInto(sessionId, latest.id)
+      } catch { /* best-effort; the user can still /resume manually */ }
+    })()
+  }, [session, sessionId, items.length, running, isFresh, clearTranscript, loadTranscript])
 
   // Slash-command menu: the two natively-handled commands (/clear, /resume) plus
   // the session's own init `slash_commands` (which pass through as a turn).
@@ -52,8 +118,10 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const submit = () => {
     const t = draft.trim()
     if (!t) return
+    setHistPtr(0); stashRef.current = ''
     if (handleSlash(t)) { setDraft(''); return }
     sendTurn(sessionId, draft)
+    markBusy(sessionId)   // show Working…/interrupt immediately, before the WS round-trip
     setDraft('')
   }
 
@@ -166,12 +234,36 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
             </div>
           )}
           <div className="rounded-xl border border-ctp-surface0 bg-ctp-mantle focus-within:border-ctp-accent/50 focus-within:ring-1 focus-within:ring-ctp-accent/25 transition-colors">
+            {/* Live activity right at the composer: the current thought while
+                thinking, else a working pulse — so there's always a signal here. */}
+            {running && (
+              <div className="px-3.5 pt-2 pb-1.5 border-b border-ctp-surface0/70">
+                {thinkTail ? (
+                  <div className="flex items-start gap-1.5">
+                    <span className="shrink-0 text-ctp-mauve animate-pulse leading-none pt-px" aria-hidden>💭</span>
+                    <span className="text-[11px] leading-snug italic text-ctp-subtext/90 break-words line-clamp-2">
+                      {thinkTail}
+                    </span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-[11px] text-ctp-overlay">
+                    <span className="inline-block w-1.5 h-1.5 rounded-full bg-ctp-green animate-pulse" />
+                    {state === 'waiting' ? 'Waiting for you…' : 'Working…'}
+                  </div>
+                )}
+              </div>
+            )}
             <textarea
+              ref={taRef}
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => { setDraft(e.target.value); setHistPtr(0) }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
                 else if (e.key === 'Escape' && running) { e.preventDefault(); interrupt(sessionId) }
+                // Shell-like history: Up recalls the previous message you sent, Down
+                // walks back toward the live draft. Skipped while the slash menu is open.
+                else if (e.key === 'ArrowUp' && !suggestions.length) { if (recallPrev(e.currentTarget)) e.preventDefault() }
+                else if (e.key === 'ArrowDown' && !suggestions.length) { if (recallNext(e.currentTarget)) e.preventDefault() }
               }}
               rows={2}
               placeholder={running ? 'Claude is working… (Esc to interrupt)' : 'Message Claude…  (Enter to send · Shift+Enter for newline · / for commands)'}
@@ -268,7 +360,6 @@ function Item({ item }: { item: TranscriptItem }) {
           )}
           <div className="text-[10px] text-ctp-overlay">
             {item.durationMs != null ? `${(item.durationMs / 1000).toFixed(1)}s` : ''}
-            {item.costUsd != null ? ` · $${item.costUsd.toFixed(4)}` : ''}
           </div>
         </div>
       )
@@ -398,10 +489,6 @@ function MetaBar({ meta, title, cwd, mode, onSetMode }: {
         </span>
 
         {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} />)}
-
-        {meta.costUsd !== undefined && (
-          <span className="text-ctp-overlay tabular-nums" title="Total cost this session">${meta.costUsd.toFixed(4)}</span>
-        )}
       </div>
     </div>
   )

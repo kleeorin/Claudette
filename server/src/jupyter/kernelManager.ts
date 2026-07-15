@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events'
+import type { KernelSpec } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
 import { JupyterManager, type JupyterInfo } from './jupyterManager'
 import { KernelClient, type KernelStatus } from './kernelClient'
@@ -11,6 +12,16 @@ import { KernelClient, type KernelStatus } from './kernelClient'
 export class KernelManager extends EventEmitter {
   private clients = new Map<string, KernelClient>()   // notebookId → client
   private status = new Map<string, KernelStatus>()
+  private specByNotebook = new Map<string, string>()  // notebookId → chosen kernelspec name
+  // The default kernelspec for notebooks that haven't chosen one. Seeded from
+  // CLAUDETTE_DEFAULT_KERNEL (set it to e.g. 'python-autovenv' to make the auto-venv
+  // kernel the permanent default), and updated to whatever the user last picked so
+  // the choice carries to notebooks opened afterwards.
+  private defaultSpec = process.env.CLAUDETTE_DEFAULT_KERNEL || 'python3'
+
+  private specName(notebookId: string): string {
+    return this.specByNotebook.get(notebookId) ?? this.defaultSpec
+  }
 
   // Fires when the Jupyter server is first up — index.ts uses it to point the
   // JupyterProxy at the (lazily-started) server without forcing an early spawn.
@@ -48,10 +59,12 @@ export class KernelManager extends EventEmitter {
     const relPath = doc.path.replace(/^\/+/, '')
 
     const info = await this.info()
+    const spec = this.specName(notebookId)
+    this.docs.setKernelName(notebookId, spec)
     const res = await fetch(`${info.url}/api/kernels`, {
       method: 'POST',
       headers: { Authorization: `token ${info.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'python3', path: relPath }),
+      body: JSON.stringify({ name: spec, path: relPath }),
     })
     if (!res.ok) throw new Error(`failed to start kernel: ${res.status} ${await res.text()}`)
     const { id } = await res.json() as { id: string }
@@ -63,6 +76,34 @@ export class KernelManager extends EventEmitter {
     this.clients.set(notebookId, client)
     this.docs.bindKernel(notebookId, id)
     return client
+  }
+
+  // Available kernelspecs (starts Jupyter lazily if needed — the same server a run
+  // would spin up). Returns Jupyter's default so the UI can preselect it.
+  async listKernelSpecs(): Promise<{ specs: KernelSpec[]; default: string }> {
+    const info = await this.info()
+    const res = await fetch(`${info.url}/api/kernelspecs`, { headers: { Authorization: `token ${info.token}` } })
+    if (!res.ok) throw new Error(`failed to list kernelspecs: ${res.status}`)
+    const data = await res.json() as {
+      default: string
+      kernelspecs: Record<string, { name: string; spec: { display_name: string; language: string } }>
+    }
+    const specs = Object.values(data.kernelspecs).map((k) => ({
+      name: k.name, displayName: k.spec.display_name, language: k.spec.language,
+    }))
+    return { specs, default: data.default }
+  }
+
+  // Choose the kernelspec a notebook uses and START it now (Jupyter-style: picking a
+  // kernel launches it, so the header goes no-kernel → starting → idle instead of
+  // sitting on "no kernel"). The pick also becomes the default for notebooks opened
+  // afterwards. A running kernel on the old spec is shut down first.
+  async setKernelSpec(notebookId: string, name: string): Promise<void> {
+    this.specByNotebook.set(notebookId, name)
+    this.defaultSpec = name
+    this.docs.setKernelName(notebookId, name)
+    if (this.clients.has(notebookId)) this.shutdown(notebookId)
+    await this.ensureKernel(notebookId)
   }
 
   // Run one cell: clear its outputs, execute the source, stream outputs back into
@@ -96,7 +137,12 @@ export class KernelManager extends EventEmitter {
   kernelStatus(notebookId: string): KernelStatus | undefined { return this.status.get(notebookId) }
 
   interrupt(notebookId: string): Promise<void> { return this.clients.get(notebookId)?.interrupt() ?? Promise.resolve() }
-  restart(notebookId: string): Promise<void> { return this.clients.get(notebookId)?.restart() ?? Promise.resolve() }
+  restart(notebookId: string): Promise<void> {
+    const client = this.clients.get(notebookId)
+    if (!client) return Promise.resolve()
+    this.setStatus(notebookId, 'starting')   // reflect the restart immediately; idle arrives via the socket
+    return client.restart()
+  }
 
   shutdown(notebookId: string): void {
     const client = this.clients.get(notebookId)
@@ -105,6 +151,7 @@ export class KernelManager extends EventEmitter {
     client.dispose()
     this.clients.delete(notebookId)
     this.docs.bindKernel(notebookId, undefined)
+    this.setStatus(notebookId, 'none')   // no kernel now — clears the bogus 'idle'
   }
 
   destroy(): void {

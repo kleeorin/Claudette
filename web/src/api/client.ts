@@ -8,7 +8,7 @@ import type {
   ConversationMeta, ConversationsResponse, ConversationResponse,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
-  ActivePane,
+  ActivePane, KernelSpecsResponse,
 } from '@claudette/shared'
 
 // The single place the SPA talks to the server — replaces ClaudeMaster's Electron
@@ -201,6 +201,13 @@ export const api = {
     save: (notebookId: string) => post<OkResponse>('/api/notebook/save', { notebookId }),
     reload: (notebookId: string) => post<OkResponse>('/api/notebook/reload', { notebookId }),
     keepMine: (notebookId: string) => post<OkResponse>('/api/notebook/keepMine', { notebookId }),
+    undo: (notebookId: string) => post<OkResponse>('/api/notebook/undo', { notebookId }),
+    redo: (notebookId: string) => post<OkResponse>('/api/notebook/redo', { notebookId }),
+    clearOutputs: (notebookId: string) => post<OkResponse>('/api/notebook/clearOutputs', { notebookId }),
+    kernelSpecs: async (): Promise<KernelSpecsResponse> => (await fetch('/api/notebook/kernelspecs')).json(),
+    kernelRestart: (notebookId: string) => post<OkResponse>('/api/notebook/kernel/restart', { notebookId }),
+    kernelInterrupt: (notebookId: string) => post<OkResponse>('/api/notebook/kernel/interrupt', { notebookId }),
+    kernelSetSpec: (notebookId: string, name: string) => post<OkResponse>('/api/notebook/kernel/setSpec', { notebookId, name }),
     op: (op: NotebookOp) => send({ type: 'notebook:op', op }),
     claim: (notebookId: string, cellId: string, reason: LockReason) =>
       send({ type: 'notebook:claim', notebookId, cellId, reason }),

@@ -100,7 +100,7 @@ app.get<{ Querystring: { token?: string } }>('/api/auth', async (req, reply) => 
 })
 
 registerSessionRoutes(app, sessions)
-registerNotebookRoutes(app, notebooks)
+registerNotebookRoutes(app, notebooks, kernels)
 registerPaneRoutes(app, panes)
 registerFsRoutes(app)
 registerGitRoutes(app)

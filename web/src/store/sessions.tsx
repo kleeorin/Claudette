@@ -17,6 +17,16 @@ interface ContextValue {
   create: (name: string, cwd: string, opts?: { model?: string }) => Promise<string>
   destroy: (id: string) => Promise<void>
   setMode: (id: string, mode: PermissionMode) => Promise<SetModeResult>
+  // Was this session created in THIS app load (vs restored from persistence)? A
+  // fresh session stays fresh; a restored one auto-resumes its latest conversation.
+  isFresh: (id: string) => boolean
+  // Optimistically flip an idle session to 'running' the moment a turn is sent, so
+  // the working/thinking indicator + interrupt appear instantly (not after the WS
+  // round-trip). The server's real state events reconcile it.
+  markBusy: (id: string) => void
+  // Sessions that finished a turn (or errored) while you were NOT viewing them — the
+  // sidebar shows a red "needs attention" light until you switch to them.
+  attention: Set<string>
 }
 
 const SessionsContext = createContext<ContextValue | null>(null)
@@ -26,6 +36,13 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
   const activeRef = useRef<string | null>(null); activeRef.current = activeId
+  // Sessions created via create() this app load (not restored) — kept out of the
+  // auto-resume path so a brand-new session starts empty.
+  const freshRef = useRef<Set<string>>(new Set())
+  // Background sessions that finished / errored while unviewed — cleared on view.
+  const [attention, setAttention] = useState<Set<string>>(new Set())
+  const prevStateRef = useRef<Map<string, SessionState>>(new Map())
+  const flagAttention = (id: string) => setAttention((a) => a.has(id) ? a : new Set(a).add(id))
 
   // Patch a single session's fields in place (state/exit), leaving order intact.
   const patch = useCallback((id: string, fields: Partial<SessionInfo>) => {
@@ -38,10 +55,22 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
       // Default the selection to the first session once one exists.
       if (!activeRef.current && list.length) setActiveId(list[0].id)
     })
-    const offState = api.on.stateChange((id, state: SessionState) => patch(id, { state }))
-    const offReady = api.on.ready((id) => patch(id, { state: 'idle' }))
+    const offState = api.on.stateChange((id, state: SessionState) => {
+      const prev = prevStateRef.current.get(id)
+      prevStateRef.current.set(id, state)
+      patch(id, { state })
+      // Turn finished on a session you're not watching → flag it for attention.
+      if (state === 'idle' && (prev === 'running' || prev === 'waiting') && id !== activeRef.current) flagAttention(id)
+    })
+    // `ready` (engine system/init) marks a (re)started engine idle — BUT the CLI
+    // inits lazily, so init often lands AFTER the first turn already set 'running'.
+    // Clobbering that to idle mid-turn hid the working indicator + interrupt for the
+    // whole turn. Only settle to idle when a turn isn't in flight.
+    const offReady = api.on.ready((id) =>
+      setSessions((prev) => prev.map((s) =>
+        s.id === id && s.state !== 'running' && s.state !== 'waiting' ? { ...s, state: 'idle' } : s)))
     const offExit = api.on.exit((id, failed, error) => {
-      if (failed) patch(id, { state: 'exited', exitError: error })
+      if (failed) { patch(id, { state: 'exited', exitError: error }); if (id !== activeRef.current) flagAttention(id) }
       else {
         // Normal close: drop the row; move the selection off it if needed.
         setSessions((prev) => prev.filter((s) => s.id !== id))
@@ -59,6 +88,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
 
   const create = useCallback(async (name: string, cwd: string, opts?: { model?: string }): Promise<string> => {
     const { id } = await api.http.createSession({ name, cwd, model: opts?.model })
+    freshRef.current.add(id)   // a user-created session stays fresh (no auto-resume)
     // Optimistically add + select; the next list/state event reconciles.
     setSessions((prev) => prev.some((s) => s.id === id) ? prev
       : [...prev, { id, name, cwd, rootDir: cwd, model: opts?.model, state: 'idle' }])
@@ -81,8 +111,22 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     return res
   }, [patch])
 
+  const isFresh = useCallback((id: string) => freshRef.current.has(id), [])
+
+  // Viewing a session clears its attention flag (however it became active: click,
+  // create, default selection, or Claude focusing it).
+  useEffect(() => {
+    if (activeId) setAttention((a) => a.has(activeId) ? (() => { const n = new Set(a); n.delete(activeId); return n })() : a)
+  }, [activeId])
+
+  // Only idle→running: never override 'waiting' (a live permission prompt) or clobber
+  // an already-running / exited session.
+  const markBusy = useCallback((id: string) => {
+    setSessions((prev) => prev.map((s) => (s.id === id && s.state === 'idle' ? { ...s, state: 'running' } : s)))
+  }, [])
+
   return (
-    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, destroy, setMode }}>
+    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, destroy, setMode, isFresh, markBusy, attention }}>
       {children}
     </SessionsContext.Provider>
   )

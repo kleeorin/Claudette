@@ -12,6 +12,7 @@ import { FileEditorView } from './components/FileEditorView'
 import { FileBrowser } from './components/FileBrowser'
 import { AuthGate } from './components/AuthGate'
 import { api } from './api/client'
+import { useNotifications, type NotificationsApi } from './lib/notifications'
 import type { SessionInfo, ActivePane } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
@@ -40,9 +41,12 @@ type Pane = { tabs: Content[]; active: Content | null }
 const EMPTY_PANE: Pane = { tabs: [], active: null }
 
 function Shell() {
-  const { sessions, activeId } = useSessions()
+  const { sessions, activeId, setActive } = useSessions()
   const notebooks = useNotebooks()
   const [drawer, setDrawer] = useState(false)
+
+  // Background-session signals: sound (default on) + optional desktop notifications.
+  const notif = useNotifications(sessions, activeId, setActive)
 
   // Content panes per session — switching sessions swaps the whole tab set + focus.
   const [bySession, setBySession] = useState<Record<string, Pane>>({})
@@ -128,7 +132,11 @@ function Shell() {
     for (const id of ids) {
       if (seenNb.current.has(id)) continue
       seenNb.current.add(id)
-      if (activeId) setPane(activeId, (p) => ({
+      // Only a notebook THIS user opened attaches to the session they're viewing.
+      // A notebook a Claude tool opened arrives pushed from the server; it attaches
+      // to the CALLING session via `focusPane` below — never leaks into whatever
+      // session you happen to be looking at.
+      if (activeId && notebooks.wasLocallyOpened(id)) setPane(activeId, (p) => ({
         tabs: p.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'notebook', id }],
         active: { kind: 'notebook', id },
       }))
@@ -247,6 +255,7 @@ function Shell() {
               onToggleDock={toggleDock}
               termOpen={termOpen}
               onToggleTerm={toggleTerm}
+              notif={notif}
             />
 
             {/* Upper region: Claude, plus content beside it when a tab is active. */}
@@ -334,7 +343,7 @@ type Tab = { key: string; kind: 'notebook' | 'file'; id: string; label: string; 
 
 // Tab strip: Chat + one tab per open content item, then the dock toggles (Files /
 // Git / Terminal) and the companion-orientation control.
-function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout, onSetLayout, showLayout, dock, onToggleDock, termOpen, onToggleTerm }: {
+function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout, onSetLayout, showLayout, dock, onToggleDock, termOpen, onToggleTerm, notif }: {
   tabs: Tab[]
   active: Content | null
   onSelectChat: () => void
@@ -343,6 +352,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
   layout: 'side' | 'stack'; onSetLayout: (l: 'side' | 'stack') => void; showLayout: boolean
   dock: 'files' | 'git' | null; onToggleDock: (w: 'files' | 'git') => void
   termOpen: boolean; onToggleTerm: () => void
+  notif: NotificationsApi
 }) {
   const tab = (on: boolean) =>
     `px-3 h-8 flex items-center gap-1.5 text-xs border-b-2 -mb-px whitespace-nowrap transition-colors ${
@@ -385,8 +395,63 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         <button className={toggle(dock === 'files')} onClick={() => onToggleDock('files')} title="Files browser">Files</button>
         <button className={toggle(dock === 'git')} onClick={() => onToggleDock('git')} title="Git panel">Git</button>
         <button className={toggle(termOpen)} onClick={onToggleTerm} title="Terminal">Terminal</button>
+        <SoundToggle notif={notif} />
+        <NotifyBell notif={notif} />
       </div>
     </div>
+  )
+}
+
+// Completion-sound toggle (on by default; no permission needed). A background
+// session finishing / needing input chimes unless muted here.
+function SoundToggle({ notif }: { notif: NotificationsApi }) {
+  const on = notif.soundOn
+  return (
+    <button
+      onClick={notif.toggleSound}
+      title={on ? 'Completion sound on — click to mute' : 'Completion sound muted — click to unmute'}
+      aria-label={on ? 'Mute completion sound' : 'Unmute completion sound'}
+      aria-pressed={on}
+      className={`w-6 h-6 flex items-center justify-center rounded transition-colors hover:bg-ctp-surface0 ${on ? 'text-ctp-accent' : 'text-ctp-overlay hover:text-ctp-subtext'}`}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M11 5 6 9H2v6h4l5 4V5z" />
+        {on
+          ? <><path d="M15.5 8.5a5 5 0 0 1 0 7" /><path d="M18.5 5.5a9 9 0 0 1 0 13" /></>
+          : <path d="M22 9l-6 6M16 9l6 6" />}
+      </svg>
+    </button>
+  )
+}
+
+// Toggle for background-session desktop notifications (needs OS permission). The
+// sound + sidebar light work without this; the bell adds system notifications that
+// pop even when the app tab is focused (for a session you're not looking at).
+function NotifyBell({ notif }: { notif: NotificationsApi }) {
+  const blocked = notif.permission === 'denied' || notif.permission === 'unsupported'
+  const title = notif.permission === 'unsupported'
+    ? 'Desktop notifications not supported by this browser'
+    : notif.permission === 'denied'
+      ? 'Desktop notifications blocked — allow them in your browser settings'
+      : notif.enabled
+        ? 'Desktop notifications on — click to turn off'
+        : 'Also send a desktop notification when a background session finishes or needs input'
+  const color = notif.enabled ? 'text-ctp-accent' : blocked ? 'text-ctp-overlay/50' : 'text-ctp-overlay hover:text-ctp-subtext'
+  return (
+    <button
+      onClick={notif.toggle}
+      disabled={notif.permission === 'unsupported'}
+      title={title}
+      aria-label={title}
+      aria-pressed={notif.enabled}
+      className={`w-6 h-6 flex items-center justify-center rounded transition-colors hover:bg-ctp-surface0 ${color} disabled:cursor-not-allowed`}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+        <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+        {(!notif.enabled || blocked) && <path d="M2 2l20 20" />}
+      </svg>
+    </button>
   )
 }
 
@@ -414,7 +479,7 @@ function Empty() {
 }
 
 function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void; width: number }) {
-  const { sessions, activeId, setActive, destroy, connected } = useSessions()
+  const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
   const [showNew, setShowNew] = useState(false)
   const pick = (id: string) => { setActive(id); onClose() }
 
@@ -444,7 +509,7 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
         <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
           {sessions.length === 0 && <div className="px-2 py-2 text-xs text-ctp-overlay">No sessions yet.</div>}
           {sessions.map((s) => (
-            <SessionRow key={s.id} session={s} active={s.id === activeId} onSelect={() => pick(s.id)} onClose={() => void destroy(s.id)} />
+            <SessionRow key={s.id} session={s} active={s.id === activeId} attention={attention.has(s.id)} onSelect={() => pick(s.id)} onClose={() => void destroy(s.id)} />
           ))}
         </div>
 
@@ -542,15 +607,20 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   )
 }
 
-function SessionRow({ session, active, onSelect, onClose }: { session: SessionInfo; active: boolean; onSelect: () => void; onClose: () => void }) {
+function SessionRow({ session, active, attention, onSelect, onClose }: { session: SessionInfo; active: boolean; attention: boolean; onSelect: () => void; onClose: () => void }) {
   return (
     <div onClick={onSelect} className={`group relative rounded-md px-2.5 py-2 cursor-pointer flex items-center gap-2.5 transition-colors ${active ? 'bg-ctp-surface0' : 'hover:bg-ctp-surface0/50'}`}>
       {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-ctp-accent" />}
-      <StateDot state={session.state} />
+      {/* A finished/errored background session gets a red attention light until viewed. */}
+      {attention
+        ? <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-ctp-red shadow-[0_0_8px_2px] shadow-ctp-red/60 animate-pulse" title="Finished — needs your attention" />
+        : <StateDot state={session.state} />}
       <div className="min-w-0 flex-1">
-        <div className={`truncate text-sm ${active ? 'text-ctp-text' : 'text-ctp-subtext'}`}>{session.name}</div>
+        <div className={`truncate text-sm ${attention ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`}>{session.name}</div>
         <div className="truncate text-[10px] text-ctp-overlay font-mono">{prettyPath(session.cwd)}</div>
       </div>
+      {/* Live status word — hidden while hovering so it doesn't fight the ✕. */}
+      <span className="md:group-hover:hidden">{attention ? <span className="text-[10px] text-ctp-red">done</span> : <StateLabel state={session.state} />}</span>
       <button onClick={(e) => { e.stopPropagation(); onClose() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red text-xs transition-opacity px-1.5 py-1" title="Close session">✕</button>
     </div>
   )
@@ -558,12 +628,21 @@ function SessionRow({ session, active, onSelect, onClose }: { session: SessionIn
 
 function StateDot({ state }: { state: string }) {
   const map: Record<string, string> = {
-    running: 'bg-ctp-green shadow-[0_0_6px] shadow-ctp-green/50 animate-pulse',
-    waiting: 'bg-ctp-yellow',
+    running: 'bg-ctp-green shadow-[0_0_8px_2px] shadow-ctp-green/60 animate-pulse',
+    waiting: 'bg-ctp-yellow shadow-[0_0_8px_2px] shadow-ctp-yellow/60 animate-pulse',
     exited: 'bg-ctp-red',
     idle: 'bg-ctp-surface2',
   }
-  return <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${map[state] ?? map.idle}`} title={state} />
+  return <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${map[state] ?? map.idle}`} title={state} />
+}
+
+// Tiny live status word beside a session in the sidebar — only for the states that
+// mean "this session needs watching", so an active session reads at a glance.
+function StateLabel({ state }: { state: string }) {
+  if (state === 'running') return <span className="text-[10px] text-ctp-green shrink-0">working</span>
+  if (state === 'waiting') return <span className="text-[10px] text-ctp-yellow shrink-0 animate-pulse">needs you</span>
+  if (state === 'exited') return <span className="text-[10px] text-ctp-red shrink-0">exited</span>
+  return null
 }
 
 // Shorten a home path to `~/…` for the sidebar.

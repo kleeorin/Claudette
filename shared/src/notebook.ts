@@ -6,8 +6,17 @@
 export type NbCellType = 'code' | 'markdown' | 'raw'
 
 // Kernel lifecycle as surfaced to the UI (mirrors Jupyter's execution_state plus
-// our starting/dead bookends).
-export type KernelStatus = 'starting' | 'idle' | 'busy' | 'dead'
+// our starting/dead bookends). 'none' = no kernel started yet (or shut down) — the
+// default before the first run, so the UI shows "No kernel" instead of a bogus idle.
+export type KernelStatus = 'none' | 'starting' | 'idle' | 'busy' | 'dead'
+
+// An available Jupyter kernelspec (for the kernel picker). `name` is the id passed
+// to POST /api/kernels; `displayName`/`language` are for the UI.
+export interface KernelSpec {
+  name: string
+  displayName: string
+  language: string
+}
 
 // nbformat output kept loose (stream / execute_result / display_data / error).
 export interface NbOutput {
@@ -33,6 +42,9 @@ export interface NotebookDoc {
   dirty: boolean             // unsaved changes vs disk
   conflict?: boolean         // disk changed under us while we had unsaved edits
   kernelId?: string          // bound kernel, if any
+  kernelName?: string        // selected kernelspec name (e.g. 'python3'); undefined = default
+  canUndo?: boolean          // undo history has an entry (drives the toolbar button)
+  canRedo?: boolean          // redo history has an entry
 }
 
 // Ops — the ONLY way to mutate a doc, from the UI or from Claude (same path).

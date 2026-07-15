@@ -68,11 +68,20 @@ export function registerNotebookTools(
     return p.path
   }
 
-  // Resolve + open in one step — the entry point for every path-optional tool.
-  async function targetDoc(sessionId: string, args: Record<string, unknown>): Promise<NotebookDoc | McpToolResult> {
+  // Resolve + open in one step — the entry point for every path-optional tool. When
+  // a tool FRESHLY opens a notebook (not already open), focus it in the CALLING
+  // session so the change lands where Claude is working — never in whatever session
+  // the user happens to be viewing. `focus:false` for read (don't pop a tab just to
+  // inspect). A notebook already open in the calling pane isn't re-focused.
+  async function targetDoc(sessionId: string, args: Record<string, unknown>, focus = true): Promise<NotebookDoc | McpToolResult> {
     const t = resolveNotebook(sessionId, args)
     if (typeof t !== 'string') return t
-    return openByPath(t)
+    const already = docs.getByPath(t)
+    if (already) return already
+    const doc = await openByPath(t)
+    if (isErr(doc)) return doc
+    if (focus) onFocus(sessionId, doc)
+    return doc
   }
 
   // Resolve a 0-based index against the doc → cellId (with a clear out-of-range error).
@@ -120,7 +129,7 @@ export function registerNotebookTools(
     description: 'Read a notebook (the active pane unless `path` is given): returns each cell with its 0-based index, type, source, and a summary of its outputs. Use this to see the current authoritative state (including run outputs) before editing by index.',
     inputSchema: { type: 'object', properties: { ...pathProp }, required: [] },
     handler: async (sid, args) => {
-      const doc = await targetDoc(sid, args)
+      const doc = await targetDoc(sid, args, false)   // reading shouldn't pop a tab
       if (isErr(doc)) return doc
       return { text: JSON.stringify({ path: doc.path, kernel: doc.kernelId ? 'running' : 'none', cells: doc.cells.map(describeCell) }, null, 1) }
     },

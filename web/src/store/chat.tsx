@@ -27,6 +27,10 @@ export interface RateLimitInfo {
   rateLimitType?: string
   overageStatus?: string
   isUsingOverage?: boolean
+  // The CLI's rate_limit_event reports usage as `utilization` (a 0–1 fraction on
+  // the anthropic-ratelimit-unified-*-utilization header); we normalize it into
+  // `percentUsed` (0–100) at ingestion. `percentUsed` is kept for the display path.
+  utilization?: number
   percentUsed?: number
 }
 export interface SessionMeta {
@@ -175,13 +179,21 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
       else if (fromReplay && b.type === 'thinking' && b.thinking) out.push({ kind: 'thinking', id: nextId(), text: String(b.thinking) })
     }
   } else if (e.type === 'user') {
-    const content = (e as { message?: { content?: unknown[] } }).message?.content ?? []
-    for (const b of content as Array<Record<string, unknown>>) {
-      if (b.type === 'tool_result') {
-        out.push({
-          kind: 'tool_result', id: nextId(),
-          toolUseId: String(b.tool_use_id), isError: b.is_error === true, content: resultText(b.content),
-        })
+    const content = (e as { message?: { content?: unknown } }).message?.content
+    if (typeof content === 'string') {
+      // A resumed conversation records your prompts as string-content user turns;
+      // surface them as user bubbles (replay only — live turns are echoed locally).
+      if (fromReplay && content.trim()) out.push({ kind: 'user', id: nextId(), text: content })
+    } else if (Array.isArray(content)) {
+      for (const b of content as Array<Record<string, unknown>>) {
+        if (b.type === 'tool_result') {
+          out.push({
+            kind: 'tool_result', id: nextId(),
+            toolUseId: String(b.tool_use_id), isError: b.is_error === true, content: resultText(b.content),
+          })
+        } else if (fromReplay && b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+          out.push({ kind: 'user', id: nextId(), text: b.text })
+        }
       }
     }
   } else if (e.type === 'result') {
@@ -319,10 +331,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         if (reason) dispatch({ type: 'APPEND', sessionId: id, items: [{ kind: 'notice', id: nextId(), text: `⚠ ${reason}` }] })
         return
       }
-      // Proactive rate/usage limit info (drives the session/weekly chips).
+      // Proactive rate/usage limit info (drives the session/weekly chips). The
+      // event carries usage as `utilization` (0–1); normalize to `percentUsed` so
+      // the chip shows "how much is used", not just when the window resets.
       if (e.type === 'rate_limit_event') {
         const info = (e as { rate_limit_info?: RateLimitInfo }).rate_limit_info
-        if (info) dispatch({ type: 'SET_LIMIT', sessionId: id, limitType: info.rateLimitType ?? 'limit', info })
+        if (info) {
+          const percentUsed = typeof info.percentUsed === 'number' ? info.percentUsed
+            : typeof info.utilization === 'number' ? info.utilization * 100
+            : undefined
+          dispatch({ type: 'SET_LIMIT', sessionId: id, limitType: info.rateLimitType ?? 'limit', info: { ...info, percentUsed } })
+        }
         return
       }
       // Each assistant message reports the context size of that model call.
