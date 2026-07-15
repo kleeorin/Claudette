@@ -199,6 +199,26 @@ export class SessionManager extends EventEmitter {
     engine.start()
   }
 
+  // Restart the engine to APPLY a config change (sandbox mounts, etc.), preserving
+  // the conversation via --resume. Unlike relaunch() below — which no-ops on a live
+  // engine because it's for re-spawning a DEAD one — this restarts a running engine
+  // too (kill → the exit handler relaunches via the `replacing` flag, re-reading the
+  // updated config). Without this, added mounts never take effect on a live session.
+  relaunchApply(id: string): void {
+    const session = this.sessions.get(id)
+    if (!session) return
+    session.resume = true
+    session.resumeFallbackTried = false
+    if (session.engine) {
+      session.replacing = true
+      session.engine.kill()
+    } else {
+      this.launch(session)
+      this.emit('stateChange', id, session.state)
+      this.emit('changed')
+    }
+  }
+
   relaunch(id: string): boolean {
     const session = this.sessions.get(id)
     if (!session) return false

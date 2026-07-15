@@ -59,6 +59,13 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     ok: sessions.relaunch(req.body.id),
   }))
 
+  // Resume-preserving restart that applies a config change (e.g. sandbox mounts) even
+  // to a running engine — /api/session/relaunch is a no-op on a live session.
+  app.post<{ Body: SessionIdRequest }>('/api/session/relaunchApply', async (req): Promise<OkResponse> => {
+    sessions.relaunchApply(req.body.id)
+    return { ok: true }
+  })
+
   app.post<{ Body: SetModeRequest }>('/api/session/setMode', async (req): Promise<SetModeResult> =>
     sessions.setPermissionMode(req.body.id, req.body.mode))
 

@@ -48,7 +48,7 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
   const addMount = (m: SandboxMount) => push({ ...cfg, mounts: [...cfg.mounts, m] })
   const relaunch = async () => {
     setBusy(true)
-    try { await api.http.relaunch(session.id); setDirty(false) } finally { setBusy(false) }
+    try { await api.http.relaunchApply(session.id); setDirty(false) } finally { setBusy(false) }
   }
 
   const chip = {

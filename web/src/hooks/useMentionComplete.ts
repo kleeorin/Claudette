@@ -50,7 +50,16 @@ export function useMentionComplete({ draft, setDraft, taRef, cwd }: Args): Menti
   const close = useCallback(() => { setMention(null); setItems([]); setSel(0) }, [])
 
   const sync = useCallback((value: string, caret: number) => {
-    setMention(detectMention(value, caret))
+    const next = detectMention(value, caret)
+    // Keep the SAME object reference when the mention is unchanged, so the fetch
+    // effect (keyed on `mention`) doesn't re-run and reset the selection. Without
+    // this, the keyup after ArrowUp/Down rebuilt an equal-but-new object, refetched,
+    // and snapped `sel` back to 0 — the "pressing down jumps back up" bug.
+    setMention((prev) => {
+      if (!prev && !next) return prev
+      if (prev && next && prev.start === next.start && prev.fragment === next.fragment) return prev
+      return next
+    })
   }, [])
 
   // Fetch the listing whenever the mention's target directory/filter changes.

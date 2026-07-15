@@ -184,6 +184,7 @@ export const api = {
       (await (await fetch('/api/session/list')).json() as ListSessionsResponse).sessions,
     destroySession: (id: string) => post<OkResponse>('/api/session/destroy', { id }),
     relaunch: (id: string) => post<OkResponse>('/api/session/relaunch', { id }),
+    relaunchApply: (id: string) => post<OkResponse>('/api/session/relaunchApply', { id }),
     setMode: (id: string, mode: PermissionMode) => post<SetModeResult>('/api/session/setMode', { id, mode } as SetModeRequest),
     setSandbox: (id: string, sandbox: SandboxConfig) => post<OkResponse>('/api/session/setSandbox', { id, sandbox }),
     restartFresh: (id: string) => post<OkResponse>('/api/session/restartFresh', { id }),
