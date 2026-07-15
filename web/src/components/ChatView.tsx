@@ -6,6 +6,7 @@ import { ToolDetail, toolHeadline, toolArg } from '../lib/toolFormat'
 import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
 import { SandboxControl } from './SandboxControl'
+import { useMentionComplete } from '../hooks/useMentionComplete'
 import { api } from '../api/client'
 
 // Sessions already auto-resumed this app load — so revisiting a session (or a
@@ -32,6 +33,8 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const bottomRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const running = state === 'running' || state === 'waiting'
+  // `@`-mention path autocomplete (interactive citation picker), anchored at cwd.
+  const mention = useMentionComplete({ draft, setDraft, taRef, cwd: session?.cwd ?? '' })
 
   // --- input history (shell-like Up/Down over the messages you've sent) ---------
   // The turns you've sent this session, oldest→newest. `histPtr` counts steps back
@@ -235,6 +238,24 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
               })}
             </div>
           )}
+          {/* @-mention path picker: file/folder autocomplete anchored at the cwd. */}
+          {mention.active && (
+            <div className="absolute bottom-full left-6 mb-2 w-80 rounded-lg border border-ctp-surface1 bg-ctp-mantle shadow-pop overflow-hidden z-10">
+              <div className="px-3 py-1 text-[10px] text-ctp-overlay font-mono truncate border-b border-ctp-surface0/70">
+                {mention.dir.replace(/^\/home\/[^/]+/, '~')}
+              </div>
+              {mention.items.map((it, i) => (
+                <button
+                  key={it.name}
+                  onMouseDown={(e) => { e.preventDefault(); mention.apply(i) }}
+                  className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 ${i === mention.sel ? 'bg-ctp-accent/15 text-ctp-text' : 'hover:bg-ctp-surface0/60 text-ctp-subtext'}`}
+                >
+                  <span aria-hidden>{it.isDir ? '📁' : '📄'}</span>
+                  <span className="font-mono truncate">{it.name}{it.isDir ? '/' : ''}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="rounded-xl border border-ctp-surface0 bg-ctp-mantle focus-within:border-ctp-accent/50 focus-within:ring-1 focus-within:ring-ctp-accent/25 transition-colors">
             {/* Live activity right at the composer: the current thought while
                 thinking, else a working pulse — so there's always a signal here. */}
@@ -258,14 +279,18 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
             <textarea
               ref={taRef}
               value={draft}
-              onChange={(e) => { setDraft(e.target.value); setHistPtr(0) }}
+              onChange={(e) => { setDraft(e.target.value); setHistPtr(0); mention.sync(e.target.value, e.target.selectionStart ?? 0) }}
+              onKeyUp={(e) => mention.sync(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)}
+              onClick={(e) => mention.sync(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)}
               onKeyDown={(e) => {
+                // The @-mention menu gets first crack at nav/complete/dismiss keys.
+                if (mention.onKeyDown(e)) return
                 if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
                 else if (e.key === 'Escape' && running) { e.preventDefault(); interrupt(sessionId) }
                 // Shell-like history: Up recalls the previous message you sent, Down
-                // walks back toward the live draft. Skipped while the slash menu is open.
-                else if (e.key === 'ArrowUp' && !suggestions.length) { if (recallPrev(e.currentTarget)) e.preventDefault() }
-                else if (e.key === 'ArrowDown' && !suggestions.length) { if (recallNext(e.currentTarget)) e.preventDefault() }
+                // walks back toward the live draft. Skipped while a menu is open.
+                else if (e.key === 'ArrowUp' && !suggestions.length && !mention.active) { if (recallPrev(e.currentTarget)) e.preventDefault() }
+                else if (e.key === 'ArrowDown' && !suggestions.length && !mention.active) { if (recallNext(e.currentTarget)) e.preventDefault() }
               }}
               rows={2}
               placeholder={running ? 'Claude is working… (Esc to interrupt)' : 'Message Claude…  (Enter to send · Shift+Enter for newline · / for commands)'}

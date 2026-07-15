@@ -7,7 +7,7 @@ import type {
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
-import { wrapSandbox, sandboxAvailable } from './sandbox'
+import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt } from './sandbox'
 
 // Owns the set of Claude sessions and their engines. Ported from
 // ClaudeMaster's main-process SessionManager, minus the remote/SSH spawn path
@@ -91,12 +91,20 @@ export class SessionManager extends EventEmitter {
     // The session runs as its agent (role): charter + tool scope + model. `general`
     // (the default) contributes nothing, so a plain session is unchanged.
     const agent = getAgent(session.agentId)
+    // Decide confinement first so it can inform the system prompt (a sandboxed
+    // session is told what it can see — see sandboxSystemPrompt).
+    const runCwd = cwd || homedir()
+    const canSandbox = !!session.sandbox?.enabled && sandboxAvailable()
     // Per-session model override wins over the role's default model. Every
     // subsession (has a parentId) also gets the "report back when done" instruction
     // appended, so the orchestration loop closes even if the role charter doesn't
-    // mention it.
-    const systemPrompt = [agent.systemPrompt, session.parentId ? SUBSESSION_REPORT_INSTRUCTION : undefined]
-      .filter(Boolean).join('\n\n') || undefined
+    // mention it. A sandboxed session also gets a note describing its mounts so it
+    // treats hidden paths as "outside the sandbox", not "missing".
+    const systemPrompt = [
+      agent.systemPrompt,
+      session.parentId ? SUBSESSION_REPORT_INSTRUCTION : undefined,
+      canSandbox ? sandboxSystemPrompt(session.sandbox!, runCwd) : undefined,
+    ].filter(Boolean).join('\n\n') || undefined
     const args = claudeArgs({
       sessionId: claudeSessionId, resume, mcpConfig: this.opts.mcpConfig?.(id),
       model: session.model ?? agent.model,
@@ -106,12 +114,9 @@ export class SessionManager extends EventEmitter {
       disallowedTools: agent.disallowedTools,
     })
 
-    // Confinement decision (see SANDBOX.md): wrap `claude …` in bwrap only when the
-    // session requests it AND the host can actually sandbox. Otherwise spawn claude
-    // directly and record sandboxed=false so the UI never shows a false green light.
-    const runCwd = cwd || homedir()
-    const wantSandbox = !!session.sandbox?.enabled
-    const canSandbox = wantSandbox && sandboxAvailable()
+    // Confinement (see SANDBOX.md): wrap `claude …` in bwrap only when the session
+    // requests it AND the host can actually sandbox (decided above). Otherwise spawn
+    // claude directly. Record sandboxed so the UI never shows a false green light.
     const spawn = canSandbox
       ? wrapSandbox(session.sandbox!, args, runCwd)
       : { command: 'claude', args }

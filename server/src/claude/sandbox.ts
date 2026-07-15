@@ -163,6 +163,26 @@ function ensureSandboxConfigJson(configDir: string, home: string): void {
   } catch { /* best-effort; claude will just create a fresh one */ }
 }
 
+// A system-prompt note that makes a sandboxed session AWARE of its confinement, so
+// it explains the boundary instead of treating a hidden path as missing and hunting
+// for it. Lists the same user mounts the wrap exposes (baseline runtime dirs omitted
+// as noise). See SANDBOX.md ("Sandbox-awareness").
+export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
+  const mounts = sortShallowFirst(dedupeMounts([...cfg.mounts, { path: cwd, mode: 'rw' as const }]))
+  const list = mounts.map((m) => `  - ${m.path} (${m.mode === 'rw' ? 'read-write' : 'read-only'})`).join('\n')
+  return [
+    'FILESYSTEM SANDBOX: you are running inside a bubblewrap sandbox. You can ONLY',
+    'read/write these paths (plus your own Claude runtime/config dirs):',
+    list,
+    'Everything else on the host is INVISIBLE — any path outside that list returns',
+    '"No such file or directory" EVEN IF IT EXISTS on the host. So if the user refers',
+    'to a file or folder you cannot find, do NOT conclude it is missing and do NOT go',
+    'hunting for it elsewhere. It is almost certainly outside your sandbox. Say so, and',
+    'ask the user to add it as a mount via the sandbox control (the lock chip in the',
+    'session header) and relaunch. Network access is unrestricted.',
+  ].join('\n')
+}
+
 // --- helpers -----------------------------------------------------------------
 
 // De-dupe mounts by path, later entries winning (so an explicit rw cwd overrides a
