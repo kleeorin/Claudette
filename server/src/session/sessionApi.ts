@@ -3,7 +3,7 @@ import type {
   WsClientMessage, ClaudeEvent, PermissionRequest, SessionState,
   CreateSessionRequest, CreateSessionResponse, ListSessionsResponse,
   SessionIdRequest, OkResponse, SetModeRequest, SetModeResult,
-  ResumeIntoRequest, ConversationsResponse, ConversationResponse,
+  ResumeIntoRequest, ConversationsResponse, ConversationResponse, SandboxConfig,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { listConversations, readConversation } from '../claude/conversations'
@@ -34,10 +34,17 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     const b = req.body
     const id = sessions.create(
       b.name, b.cwd, b.rootDir, b.parentId, b.resume,
-      b.claudeSessionId, b.agentId, b.model, b.permissionMode,
+      b.claudeSessionId, b.agentId, b.model, b.permissionMode, b.sandbox,
     )
     return { id }
   })
+
+  // Update a session's bwrap sandbox config (enable/disable, edit mounts). Applies
+  // on the next launch — relaunch/restartFresh to bring it into force.
+  app.post<{ Body: SessionIdRequest & { sandbox: SandboxConfig } }>(
+    '/api/session/setSandbox', async (req): Promise<OkResponse> => ({
+      ok: sessions.setSandbox(req.body.id, req.body.sandbox),
+    }))
 
   app.get('/api/session/list', async (): Promise<ListSessionsResponse> => ({
     sessions: sessions.list(),

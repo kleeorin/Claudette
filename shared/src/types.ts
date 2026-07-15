@@ -3,6 +3,25 @@
 // remote). We keep the row and show the error instead of silently removing it.
 export type SessionState = 'idle' | 'running' | 'waiting' | 'exited'
 
+// --- Sandbox (bubblewrap) — see SANDBOX.md ------------------------------------
+// One bind into a session's sandbox. `rw` = writable, `ro` = read-only. Overlaps
+// are allowed (a rw pocket inside a ro tree); mounts are emitted shallowest-first
+// so the nesting layers correctly regardless of order.
+export interface SandboxMount {
+  path: string
+  mode: 'rw' | 'ro'
+}
+
+// A session's sandbox request. Strict visibility: only these mounts (plus the
+// runtime baseline that makes claude run) are visible; writes elsewhere fail or
+// land in throwaway tmpfs and never reach the host. `mounts` is seeded with the
+// session's cwd (rw); the user adds more. This is what's REQUESTED — whether it's
+// actually in force is SessionInfo.sandboxed (the host may lack bwrap/userns).
+export interface SandboxConfig {
+  enabled: boolean
+  mounts: SandboxMount[]
+}
+
 export interface SessionInfo {
   id: string
   name: string
@@ -13,6 +32,10 @@ export interface SessionInfo {
   agentId?: string   // the role this session runs as (see main/agents.ts); undefined = 'general'
   model?: string     // per-session model override; undefined = the role's model, else account default
   permissionMode?: PermissionMode  // --permission-mode; undefined/'default' = ordinary prompting
+  sandbox?: SandboxConfig  // requested bwrap confinement (see SANDBOX.md)
+  sandboxed?: boolean      // EFFECTIVE: true only if the last launch actually wrapped in bwrap.
+                           // enabled-but-false ⇒ host can't sandbox (fell back to unconfined) —
+                           // the UI must surface this honestly, never as "sandboxed".
   state: SessionState
   exitError?: string // last output when state === 'exited' (why it failed to start)
 }
@@ -38,6 +61,7 @@ export interface SavedSession {
   agentId?: string       // the role this session runs as (re-applied on restore)
   model?: string         // per-session model override (re-applied on restore)
   permissionMode?: PermissionMode  // per-session mode (re-applied on restore)
+  sandbox?: SandboxConfig  // bwrap confinement config (re-applied on restore)
   claudeSessionId?: string // claude's own --session-id, for --resume on restore
 }
 

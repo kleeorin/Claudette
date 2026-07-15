@@ -3,10 +3,11 @@ import { homedir } from 'os'
 import crypto from 'crypto'
 import type {
   SessionInfo, SessionState, ClaudeEvent, PermissionRequest, PermissionDecision,
-  PermissionMode, SetModeResult, SavedSession,
+  PermissionMode, SetModeResult, SavedSession, SandboxConfig,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
+import { wrapSandbox, sandboxAvailable } from './sandbox'
 
 // Owns the set of Claude sessions and their engines. Ported from
 // ClaudeMaster's main-process SessionManager, minus the remote/SSH spawn path
@@ -26,6 +27,8 @@ import { getAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
 
 interface Session extends SessionInfo {
   engine: ClaudeEngine | null   // null once the Claude process has exited (relaunchable)
+  sandbox?: SandboxConfig       // requested bwrap confinement (see sandbox.ts / SANDBOX.md)
+  sandboxed?: boolean           // EFFECTIVE: did the last launch actually wrap in bwrap
   claudeSessionId: string       // claude's own session id (for --resume)
   startedAt: number             // last launch time, for the fast-failure heuristic
   resume: boolean               // whether Claude was launched with --resume
@@ -64,10 +67,12 @@ export class SessionManager extends EventEmitter {
     agentId?: string,
     model?: string,
     permissionMode?: PermissionMode,
+    sandbox?: SandboxConfig,
   ): string {
     const id = crypto.randomUUID()
     const session: Session = {
       id, name, cwd, rootDir, parentId, agentId, model, permissionMode,
+      sandbox: normalizeSandbox(sandbox, cwd),
       state: 'idle', engine: null, startedAt: 0, resume,
       claudeSessionId: claudeSessionId ?? crypto.randomUUID(),
       stderrTail: '',
@@ -101,10 +106,21 @@ export class SessionManager extends EventEmitter {
       disallowedTools: agent.disallowedTools,
     })
 
+    // Confinement decision (see SANDBOX.md): wrap `claude …` in bwrap only when the
+    // session requests it AND the host can actually sandbox. Otherwise spawn claude
+    // directly and record sandboxed=false so the UI never shows a false green light.
+    const runCwd = cwd || homedir()
+    const wantSandbox = !!session.sandbox?.enabled
+    const canSandbox = wantSandbox && sandboxAvailable()
+    const spawn = canSandbox
+      ? wrapSandbox(session.sandbox!, args, runCwd)
+      : { command: 'claude', args }
+    session.sandboxed = canSandbox
+
     const engine = new ClaudeEngine({
-      command: 'claude',
-      args,
-      cwd: cwd || homedir(),
+      command: spawn.command,
+      args: spawn.args,
+      cwd: runCwd,
       env: process.env as Record<string, string>,
     })
 
@@ -187,6 +203,7 @@ export class SessionManager extends EventEmitter {
     session.resumeFallbackTried = false
     this.launch(session)
     this.emit('stateChange', id, session.state)
+    this.emit('changed')   // launch() recomputed `sandboxed` — propagate it
     return true
   }
 
@@ -282,16 +299,27 @@ export class SessionManager extends EventEmitter {
   }
 
   list(): SessionInfo[] {
-    return Array.from(this.sessions.values()).map(({ id, name, cwd, rootDir, parentId, agentId, model, permissionMode, state }) => ({
-      id, name, cwd, rootDir, parentId, agentId, model, permissionMode, state,
-    }))
+    return Array.from(this.sessions.values()).map((s) => this.toInfo(s))
   }
 
   get(id: string): SessionInfo | undefined {
     const s = this.sessions.get(id)
-    if (!s) return undefined
-    const { name, cwd, rootDir, parentId, agentId, model, permissionMode, state } = s
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, state }
+    return s ? this.toInfo(s) : undefined
+  }
+
+  private toInfo(s: Session): SessionInfo {
+    const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, state } = s
+    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, state }
+  }
+
+  // Change a session's sandbox config. Applies on the next launch (relaunch/restart);
+  // we don't hot-swap a running engine. Persisted so a restart keeps it.
+  setSandbox(id: string, sandbox: SandboxConfig): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    session.sandbox = normalizeSandbox(sandbox, session.cwd)
+    this.emit('changed')
+    return true
   }
 
   // Claude's own session id, for persistence (--resume on restore).
@@ -310,6 +338,7 @@ export class SessionManager extends EventEmitter {
       name: s.name, cwd: s.cwd, rootDir: s.rootDir,
       parentIndex: s.parentId != null ? indexOf.get(s.parentId) : undefined,
       agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
+      sandbox: s.sandbox,
       claudeSessionId: s.claudeSessionId,
     }))
   }
@@ -323,7 +352,7 @@ export class SessionManager extends EventEmitter {
       const id = this.create(
         s.name, s.cwd, s.rootDir, parentId,
         /* resume */ !!s.claudeSessionId, s.claudeSessionId,
-        s.agentId, s.model, s.permissionMode,
+        s.agentId, s.model, s.permissionMode, s.sandbox,
       )
       ids.push(id)
     }
@@ -341,4 +370,16 @@ export class SessionManager extends EventEmitter {
     this.sessions.delete(id)
     this.emit('changed')   // set shrank → re-persist
   }
+}
+
+// Sandbox is ON BY DEFAULT (see SANDBOX.md): when the caller passes no config we
+// seed { enabled: true, mounts: [cwd rw] }. An explicit config is honored as-is but
+// we still guarantee the session's own cwd is present as a writable mount (claude
+// must be able to work in the dir it was opened in). Whether the sandbox is actually
+// in force is decided at launch (host capability) and reported via `sandboxed`.
+function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string): SandboxConfig {
+  if (!sandbox) return { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
+  const hasCwd = cwd && sandbox.mounts.some((m) => m.path === cwd)
+  const mounts = hasCwd || !cwd ? sandbox.mounts : [...sandbox.mounts, { path: cwd, mode: 'rw' as const }]
+  return { enabled: sandbox.enabled, mounts }
 }

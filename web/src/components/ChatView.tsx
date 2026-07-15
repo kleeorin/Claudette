@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ConversationMeta, PermissionMode } from '@claudette/shared'
+import type { ConversationMeta, PermissionMode, SessionInfo } from '@claudette/shared'
 import { useChat, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg } from '../lib/toolFormat'
 import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
+import { SandboxControl } from './SandboxControl'
 import { api } from '../api/client'
 
 // Sessions already auto-resumed this app load — so revisiting a session (or a
@@ -148,6 +149,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       {showResume && <ResumePicker cwd={session.cwd} onPick={pickResume} onClose={() => setShowResume(false)} />}
       <MetaBar
         meta={meta}
+        session={session}
         title={session.name}
         cwd={session.cwd}
         mode={session.permissionMode ?? 'default'}
@@ -452,8 +454,8 @@ const LIMIT_RANK: Record<string, number> = { five_hour: 0, weekly: 1, seven_day:
 
 // Always-visible status bar: session title + cwd, then model, real context usage
 // (tokens + %), cost, and a chip per rate-limit window (session / weekly).
-function MetaBar({ meta, title, cwd, mode, onSetMode }: {
-  meta: SessionMeta; title?: string; cwd?: string
+function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
+  meta: SessionMeta; session: SessionInfo; title?: string; cwd?: string
   mode: PermissionMode; onSetMode: (mode: PermissionMode) => void
 }) {
   const tokens = meta.contextTokens
@@ -473,6 +475,7 @@ function MetaBar({ meta, title, cwd, mode, onSetMode }: {
       </div>
 
       <div className="md:ml-auto flex items-center flex-wrap gap-x-3 gap-y-1 text-[10px] text-ctp-overlay">
+        <SandboxControl session={session} />
         <ModeSelect mode={mode} onSetMode={onSetMode} />
         <span className="text-ctp-subtext font-mono" title={meta.model ? undefined : 'The model and context appear after your first message this session.'}>
           {meta.model ?? 'model · after first message'}

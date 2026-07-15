@@ -1,6 +1,6 @@
 import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
-  SessionInfo, SessionState, SetModeResult, ConversationMeta, ActivePane,
+  SessionInfo, SessionState, SetModeResult, ConversationMeta, ActivePane, SandboxConfig,
 } from './types'
 import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
 
@@ -74,6 +74,10 @@ export interface HealthResponse {
   ok: boolean
   version: string
   ts: number
+  // Whether this host can actually sandbox (bwrap present + userns permitted).
+  // Functional probe, not "binary exists" — see SANDBOX.md. Drives the UI's
+  // "enable sandbox" affordance and the "unavailable" messaging.
+  sandboxAvailable: boolean
 }
 
 // POST /api/session/create
@@ -87,6 +91,7 @@ export interface CreateSessionRequest {
   agentId?: string
   model?: string
   permissionMode?: PermissionMode
+  sandbox?: SandboxConfig  // omit ⇒ server seeds the default (enabled, cwd rw) when available
 }
 export interface CreateSessionResponse { id: string }
 

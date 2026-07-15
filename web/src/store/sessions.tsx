@@ -1,8 +1,8 @@
 import {
   createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode,
 } from 'react'
-import type { SessionInfo, SessionState, PermissionMode, SetModeResult } from '@claudette/shared'
-import { api } from '../api/client'
+import type { SessionInfo, SessionState, PermissionMode, SetModeResult, SandboxConfig } from '@claudette/shared'
+import { api, getHealth } from '../api/client'
 
 // Minimal Phase-1 session store: mirrors the server's session set (via the WS
 // `session:list`/`state`/`exit` topics + the connect-time snapshot) and exposes
@@ -17,6 +17,12 @@ interface ContextValue {
   create: (name: string, cwd: string, opts?: { model?: string }) => Promise<string>
   destroy: (id: string) => Promise<void>
   setMode: (id: string, mode: PermissionMode) => Promise<SetModeResult>
+  // Whether THIS host can actually confine sessions (bwrap present + userns ok).
+  // false ⇒ the sandbox controls explain it's unavailable + how to enable it.
+  sandboxAvailable: boolean
+  // Update a session's bwrap sandbox config (enable/disable, mounts). Applies on the
+  // next launch; the caller relaunches to bring it into force.
+  setSandbox: (id: string, sandbox: SandboxConfig) => Promise<void>
   // Was this session created in THIS app load (vs restored from persistence)? A
   // fresh session stays fresh; a restored one auto-resumes its latest conversation.
   isFresh: (id: string) => boolean
@@ -41,6 +47,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   const freshRef = useRef<Set<string>>(new Set())
   // Background sessions that finished / errored while unviewed — cleared on view.
   const [attention, setAttention] = useState<Set<string>>(new Set())
+  const [sandboxAvailable, setSandboxAvailable] = useState(false)
   const prevStateRef = useRef<Map<string, SessionState>>(new Map())
   const flagAttention = (id: string) => setAttention((a) => a.has(id) ? a : new Set(a).add(id))
 
@@ -111,6 +118,14 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     return res
   }, [patch])
 
+  // Learn once whether this host can sandbox (drives the sandbox controls' messaging).
+  useEffect(() => { getHealth().then((h) => setSandboxAvailable(!!h.sandboxAvailable)).catch(() => {}) }, [])
+
+  const setSandbox = useCallback(async (id: string, sandbox: SandboxConfig): Promise<void> => {
+    patch(id, { sandbox })   // optimistic; the server's session:list broadcast reconciles `sandboxed`
+    await api.http.setSandbox(id, sandbox)
+  }, [patch])
+
   const isFresh = useCallback((id: string) => freshRef.current.has(id), [])
 
   // Viewing a session clears its attention flag (however it became active: click,
@@ -126,7 +141,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, destroy, setMode, isFresh, markBusy, attention }}>
+    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, destroy, setMode, sandboxAvailable, setSandbox, isFresh, markBusy, attention }}>
       {children}
     </SessionsContext.Provider>
   )

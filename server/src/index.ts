@@ -5,6 +5,7 @@ import { existsSync } from 'fs'
 import { fileURLToPath } from 'url'
 import type { WsClientMessage, HealthResponse } from '@claudette/shared'
 import { SessionManager } from './claude/sessionManager'
+import { sandboxAvailable } from './claude/sandbox'
 import { WsHub } from './ws/hub'
 import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage } from './session/sessionApi'
 import { loadState, saveState } from './session/sessionPersistence'
@@ -76,6 +77,10 @@ function persistSessions(): void {
 }
 sessions.on('changed', persistSessions)   // create/destroy/restartFresh/resumeInto/setMode
 sessions.on('ready', persistSessions)     // claudeSessionId finalized
+// Push a fresh session list to every tab whenever the set or a session's config
+// changes, so new sessions and edited fields (e.g. sandbox status) reconcile live
+// across tabs instead of only on reconnect.
+sessions.on('changed', () => hub.broadcast({ type: 'session:list', sessions: sessions.list() }))
 // When a session goes away, drop its active-pane record and its MCP url tokens
 // (the latter was never released before — a small unbounded-map leak).
 sessions.on('exit', (id: string) => { activePanes.release(id); mcp.release(id) })
@@ -84,6 +89,7 @@ app.get('/api/health', async (): Promise<HealthResponse> => ({
   ok: true,
   version: VERSION,
   ts: Date.now(),
+  sandboxAvailable: sandboxAvailable(),
 }))
 
 // Token bootstrap: open the app once as `…/api/auth?token=<secret>` (or the SPA

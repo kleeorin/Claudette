@@ -8,7 +8,7 @@ import type {
   ConversationMeta, ConversationsResponse, ConversationResponse,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
-  ActivePane, KernelSpecsResponse,
+  ActivePane, KernelSpecsResponse, SandboxConfig,
 } from '@claudette/shared'
 
 // The single place the SPA talks to the server — replaces ClaudeMaster's Electron
@@ -185,6 +185,7 @@ export const api = {
     destroySession: (id: string) => post<OkResponse>('/api/session/destroy', { id }),
     relaunch: (id: string) => post<OkResponse>('/api/session/relaunch', { id }),
     setMode: (id: string, mode: PermissionMode) => post<SetModeResult>('/api/session/setMode', { id, mode } as SetModeRequest),
+    setSandbox: (id: string, sandbox: SandboxConfig) => post<OkResponse>('/api/session/setSandbox', { id, sandbox }),
     restartFresh: (id: string) => post<OkResponse>('/api/session/restartFresh', { id }),
     resumeInto: (id: string, claudeSessionId: string) => post<OkResponse>('/api/session/resumeInto', { id, claudeSessionId }),
     listConversations: async (cwd: string): Promise<ConversationMeta[]> =>
