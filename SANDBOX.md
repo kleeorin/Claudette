@@ -96,6 +96,8 @@ Validated on Ubuntu 24.04 (bwrap 0.9.0):
 --bind <CLAUDE_CONFIG_DIR or $HOME/.claude> <same>
 # user mounts (default: cwd rw), shallowest-first; then:
 --chdir <cwd> --setenv HOME <home>
+# Relocate .claude.json INTO the mounted config dir (see below):
+--setenv CLAUDE_CONFIG_DIR <configDir>
 # NB: NO --unshare-net → shared network (loopback MCP + internet work)
 ```
 
@@ -107,12 +109,24 @@ Never hardcode a path. Resolve from the **same environment the child runs with**
 configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
 ```
 
-Bind it at the **identical path** in and out, and leave `HOME`/`CLAUDE_CONFIG_DIR`
-untouched, so claude's resolution inside == outside. This auto-follows local
+Bind it at the **identical path** in and out. This auto-follows local
 (`/home/you/.claude`) vs a remote whose `$HOME` differs (e.g. `/home/.claude`).
 Same trick for the `claude` binary and `node` (both live under `$HOME`, versioned).
 It must be **rw** — claude writes creds/history/session state there; a ro bind
 breaks startup.
+
+**The `.claude.json` gotcha.** Claude's *main* config is a FILE at `$HOME/.claude.json`,
+NOT inside the config dir — and `$HOME` is not mounted. It can't be bind-mounted as a
+file either: claude saves it via write-tmp + atomic `rename()`, which fails `EBUSY`
+onto a bind-mounted file. Fix: set **`CLAUDE_CONFIG_DIR=<the mounted config dir>`**, so
+claude keeps `.claude.json` at `<configDir>/.claude.json` — a real file inside the
+already-mounted rw dir, where atomic saves work. On first sandboxed launch we **seed**
+`<configDir>/.claude.json` from the host's `~/.claude.json` (copy-if-absent) so the
+session inherits the user's trust/prefs instead of a blank config + a "config not
+found" warning. Consequence: sandboxed sessions share `<configDir>/.claude.json`
+(consistent among themselves) which then evolves independently of the host's
+`~/.claude.json`. Acceptable — the heavy state (creds, history, projects) is the
+shared dir; `.claude.json` is mostly trust/onboarding/prefs.
 
 **Known tradeoff:** `~/.claude` holds *every* project's transcripts plus
 `.credentials.json`, so a sandboxed session can still *read* them (write-confinement

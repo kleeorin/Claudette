@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'child_process'
-import { existsSync, realpathSync, lstatSync, readlinkSync } from 'fs'
+import { existsSync, realpathSync, lstatSync, readlinkSync, copyFileSync } from 'fs'
 import { homedir } from 'os'
 import path from 'path'
 import type { SandboxConfig, SandboxMount } from '@claudette/shared'
@@ -134,12 +134,33 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
     args.push(m.mode === 'rw' ? '--bind' : '--ro-bind', m.path, m.path)
   }
 
-  args.push('--chdir', cwd, '--setenv', 'HOME', home)
+  // Claude's main config lives at $HOME/.claude.json — a FILE next to the config
+  // dir, NOT inside it. We can't bind that file directly (it's saved via write-tmp
+  // + atomic rename, which fails EBUSY onto a bind-mounted file), and we don't mount
+  // $HOME. Instead point CLAUDE_CONFIG_DIR at the (already rw-mounted) config dir, so
+  // Claude keeps .claude.json at <configDir>/.claude.json — a real file in a bound
+  // dir, where atomic saves work. Seed it once from the host's ~/.claude.json so the
+  // sandbox starts with the user's prefs/trust instead of a blank config.
+  const configDir = claudeConfigDir()
+  ensureSandboxConfigJson(configDir, home)
+  args.push('--chdir', cwd, '--setenv', 'HOME', home, '--setenv', 'CLAUDE_CONFIG_DIR', configDir)
   // Finally the program: `claude …`. Resolve to an absolute path (PATH inside the
   // sandbox is minimal); fall back to the bare name if resolution fails.
   const claudeBin = which('claude') ?? 'claude'
   args.push(claudeBin, ...claudeArgv)
   return { command: BWRAP, args }
+}
+
+// Seed <configDir>/.claude.json from the host's ~/.claude.json if the former doesn't
+// exist yet, so a first sandboxed run inherits the user's config (trust, prefs,
+// onboarding) rather than starting blank + emitting a "config not found" warning.
+// Only copies when absent — never clobbers a config the sandbox has since evolved.
+function ensureSandboxConfigJson(configDir: string, home: string): void {
+  try {
+    const dest = path.join(configDir, '.claude.json')
+    const src = path.join(home, '.claude.json')
+    if (!existsSync(dest) && existsSync(src)) copyFileSync(src, dest)
+  } catch { /* best-effort; claude will just create a fresh one */ }
 }
 
 // --- helpers -----------------------------------------------------------------

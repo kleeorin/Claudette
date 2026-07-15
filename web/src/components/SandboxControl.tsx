@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { SessionInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 import { useSessions } from '../store/sessions'
 import { api } from '../api/client'
+import { FileBrowser } from './FileBrowser'
 
 // The per-session sandbox chip + popover (see SANDBOX.md). The chip is HONEST:
 // it reflects the EFFECTIVE state (`session.sandboxed`), never the mere request,
@@ -21,6 +22,7 @@ function effectiveState(session: SessionInfo, hostCanSandbox: boolean): Effectiv
 export function SandboxControl({ session }: { session: SessionInfo }) {
   const { sandboxAvailable, setSandbox } = useSessions()
   const [open, setOpen] = useState(false)
+  const [picking, setPicking] = useState(false)   // folder-picker modal open
   const [dirty, setDirty] = useState(false)   // config edited since the running engine launched
   const [busy, setBusy] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -88,8 +90,9 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
           {enabled && (
             <>
               <div className="text-ctp-overlay leading-snug">
-                Claude can only <b>write</b> inside these mounts; everything else is invisible.
-                Network stays <b>open</b> (loopback + internet).
+                Claude can read <b>and write</b> the <span className="text-ctp-blue font-mono">rw</span> mounts,
+                only <b>read</b> the <span className="text-ctp-subtext font-mono">ro</span> ones, and can’t see
+                anything else. Network stays <b>open</b> (loopback + internet).
               </div>
               <div className="space-y-1">
                 {cfg.mounts.length === 0 && <div className="text-ctp-overlay italic">No mounts — nothing writable.</div>}
@@ -110,7 +113,12 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
                   </div>
                 ))}
               </div>
-              <AddMount onAdd={addMount} />
+              <button
+                onClick={() => setPicking(true)}
+                className="w-full rounded border border-dashed border-ctp-surface2 text-ctp-subtext hover:text-ctp-text hover:border-ctp-overlay py-1"
+              >
+                + Add a folder…
+              </button>
             </>
           )}
 
@@ -128,31 +136,20 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
           )}
         </div>
       )}
-    </div>
-  )
-}
 
-function AddMount({ onAdd }: { onAdd: (m: SandboxMount) => void }) {
-  const [path, setPath] = useState('')
-  const [mode, setMode] = useState<'rw' | 'ro'>('ro')
-  const add = () => { const p = path.trim(); if (!p) return; onAdd({ path: p, mode }); setPath('') }
-  return (
-    <div className="flex items-center gap-1 pt-0.5">
-      <input
-        value={path}
-        onChange={(e) => setPath(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Enter') add() }}
-        placeholder="/abs/path to mount…"
-        className="flex-1 min-w-0 bg-ctp-surface0 text-ctp-text rounded px-1.5 py-0.5 outline-none placeholder:text-ctp-overlay font-mono"
-      />
-      <button
-        onClick={() => setMode((x) => (x === 'rw' ? 'ro' : 'rw'))}
-        className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${mode === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface0 text-ctp-subtext'}`}
-        title="Toggle read-only / writable for the added mount"
-      >
-        {mode}
-      </button>
-      <button onClick={add} className="px-1.5 py-0.5 rounded bg-ctp-surface0 text-ctp-subtext hover:text-ctp-text" title="Add mount">+</button>
+      {picking && (
+        <FileBrowser
+          mode="folder"
+          initialPath={session.cwd}
+          onClose={() => setPicking(false)}
+          onPick={(p) => {
+            setPicking(false)
+            // Added folders default to read-only (the safe default for a reference
+            // dir); flip to rw with the per-mount toggle. Skip exact duplicates.
+            if (!cfg.mounts.some((m) => m.path === p)) void addMount({ path: p, mode: 'ro' })
+          }}
+        />
+      )}
     </div>
   )
 }
