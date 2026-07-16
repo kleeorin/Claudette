@@ -470,12 +470,17 @@ function fmtTokens(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 }
 
+// The CLI's weekly window comes in several flavors: seven_day, seven_day_opus,
+// seven_day_sonnet (plus a legacy "weekly"). Treat them all as the Weekly bucket.
+const isWeekly = (t?: string) => t === 'weekly' || (t?.startsWith('seven_day') ?? false)
+
 function limitLabel(type?: string): string {
   if (type === 'five_hour') return 'Session'
-  if (type === 'weekly' || type === 'seven_day') return 'Weekly'
+  if (isWeekly(type)) return 'Weekly'
   return (type ?? 'limit').replace(/_/g, ' ')
 }
-const LIMIT_RANK: Record<string, number> = { five_hour: 0, weekly: 1, seven_day: 1 }
+// Session window first, then any weekly window, then anything unrecognized.
+const limitRank = (t?: string) => (t === 'five_hour' ? 0 : isWeekly(t) ? 1 : 9)
 
 // Always-visible status bar: session title + cwd, then model, real context usage
 // (tokens + %), cost, and a chip per rate-limit window (session / weekly).
@@ -489,10 +494,9 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
   const barColor = pct == null ? 'bg-ctp-accent' : pct >= 92 ? 'bg-ctp-red' : pct >= 80 ? 'bg-ctp-yellow' : 'bg-ctp-accent'
   // The 5-hour ("Session") window always shows. The Weekly window is usually just
   // noise, so only surface it once it's genuinely worth attention: > 85% used.
-  const isWeekly = (t?: string) => t === 'weekly' || t === 'seven_day'
   const limits = (meta.limits ? Object.values(meta.limits) : [])
     .filter((rl) => !isWeekly(rl.rateLimitType) || (rl.percentUsed ?? 0) > 85)
-    .sort((a, b) => (LIMIT_RANK[a.rateLimitType ?? ''] ?? 9) - (LIMIT_RANK[b.rateLimitType ?? ''] ?? 9))
+    .sort((a, b) => limitRank(a.rateLimitType) - limitRank(b.rateLimitType))
 
   return (
     <div className="shrink-0 flex items-center flex-wrap gap-x-3 gap-y-1 px-4 sm:px-5 min-h-[3rem] py-1.5 border-b border-ctp-surface0">
