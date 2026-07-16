@@ -487,9 +487,12 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
   const win = meta.contextWindow
   const pct = win && tokens != null ? Math.min(100, Math.round((tokens / win) * 100)) : undefined
   const barColor = pct == null ? 'bg-ctp-accent' : pct >= 92 ? 'bg-ctp-red' : pct >= 80 ? 'bg-ctp-yellow' : 'bg-ctp-accent'
-  const limits = meta.limits
-    ? Object.values(meta.limits).sort((a, b) => (LIMIT_RANK[a.rateLimitType ?? ''] ?? 9) - (LIMIT_RANK[b.rateLimitType ?? ''] ?? 9))
-    : []
+  // The 5-hour ("Session") window always shows. The Weekly window is usually just
+  // noise, so only surface it once it's genuinely worth attention: > 85% used.
+  const isWeekly = (t?: string) => t === 'weekly' || t === 'seven_day'
+  const limits = (meta.limits ? Object.values(meta.limits) : [])
+    .filter((rl) => !isWeekly(rl.rateLimitType) || (rl.percentUsed ?? 0) > 85)
+    .sort((a, b) => (LIMIT_RANK[a.rateLimitType ?? ''] ?? 9) - (LIMIT_RANK[b.rateLimitType ?? ''] ?? 9))
 
   return (
     <div className="shrink-0 flex items-center flex-wrap gap-x-3 gap-y-1 px-4 sm:px-5 min-h-[3rem] py-1.5 border-b border-ctp-surface0">

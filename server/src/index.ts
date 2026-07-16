@@ -85,6 +85,19 @@ sessions.on('changed', () => hub.broadcast({ type: 'session:list', sessions: ses
 // (the latter was never released before — a small unbounded-map leak).
 sessions.on('exit', (id: string) => { activePanes.release(id); mcp.release(id) })
 
+// Reap all Claude engines when the server goes down so bwrap/claude children don't
+// orphan and linger. Covers Ctrl-C (SIGINT), `kill`/`tsx watch` restarts (SIGTERM),
+// and terminal close (SIGHUP). SIGTERM each engine's process group, then SIGKILL any
+// survivor just before exit — no reliance on --die-with-parent.
+let shuttingDown = false
+function shutdown(): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  sessions.shutdown()
+  setTimeout(() => { sessions.killHard(); process.exit(0) }, 800)
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, shutdown)
+
 app.get('/api/health', async (): Promise<HealthResponse> => ({
   ok: true,
   version: VERSION,

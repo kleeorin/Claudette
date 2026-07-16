@@ -36,6 +36,9 @@ export interface SessionInfo {
   sandboxed?: boolean      // EFFECTIVE: true only if the last launch actually wrapped in bwrap.
                            // enabled-but-false ⇒ host can't sandbox (fell back to unconfined) —
                            // the UI must surface this honestly, never as "sandboxed".
+  sandboxPending?: boolean // the requested sandbox differs from what the RUNNING engine has
+                           // (e.g. a mount was just added). Auto-applied when the session goes
+                           // idle; true only while a turn is in flight and the relaunch waits.
   state: SessionState
   exitError?: string // last output when state === 'exited' (why it failed to start)
 }

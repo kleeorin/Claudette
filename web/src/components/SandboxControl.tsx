@@ -23,8 +23,6 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
   const { sandboxAvailable, setSandbox } = useSessions()
   const [open, setOpen] = useState(false)
   const [picking, setPicking] = useState(false)   // folder-picker modal open
-  const [dirty, setDirty] = useState(false)   // config edited since the running engine launched
-  const [busy, setBusy] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
   // The requested config, defaulting to enabled + the session cwd (rw) — mirrors the
@@ -32,6 +30,11 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
   const cfg: SandboxConfig = session.sandbox ?? { enabled: true, mounts: [{ path: session.cwd, mode: 'rw' }] }
   const enabled = !!session.sandbox?.enabled
   const eff = effectiveState(session, sandboxAvailable)
+  // Server-driven: the running engine's mounts differ from the requested ones. The
+  // server auto-applies this the moment the session is idle; it's only visible while
+  // a turn is still in flight. (Replaces the old ephemeral local "dirty" flag.)
+  const pending = !!session.sandboxPending
+  const running = session.state === 'running' || session.state === 'waiting'
 
   useEffect(() => {
     if (!open) return
@@ -40,16 +43,13 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
     return () => document.removeEventListener('mousedown', onDoc)
   }, [open])
 
-  const push = async (next: SandboxConfig) => { setDirty(true); await setSandbox(session.id, next) }
+  const push = async (next: SandboxConfig) => { await setSandbox(session.id, next) }
   const toggleEnabled = () => push({ ...cfg, enabled: !enabled })
   const setMode = (i: number, mode: 'rw' | 'ro') =>
     push({ ...cfg, mounts: cfg.mounts.map((m, j) => (j === i ? { ...m, mode } : m)) })
   const removeMount = (i: number) => push({ ...cfg, mounts: cfg.mounts.filter((_, j) => j !== i) })
   const addMount = (m: SandboxMount) => push({ ...cfg, mounts: [...cfg.mounts, m] })
-  const relaunch = async () => {
-    setBusy(true)
-    try { await api.http.relaunchApply(session.id); setDirty(false) } finally { setBusy(false) }
-  }
+  const applyNow = () => { void api.http.relaunchApply(session.id) }
 
   const chip = {
     on:          { icon: '🔒', label: 'sandboxed',   cls: 'text-ctp-green',  title: 'Filesystem-isolated · network open. Claude can only write inside the mounts below.' },
@@ -122,16 +122,21 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
             </>
           )}
 
-          {dirty && (
-            <button
-              onClick={relaunch}
-              disabled={busy}
-              className="w-full rounded bg-ctp-blue/20 text-ctp-blue hover:bg-ctp-blue/30 py-1 font-medium disabled:opacity-50"
-            >
-              {busy ? 'Relaunching…' : 'Relaunch to apply'}
-            </button>
+          {/* Pending changes auto-apply the moment the session is idle. While a turn
+              is running the relaunch waits — offer to apply now (ends the turn). */}
+          {pending && running && (
+            <div className="flex items-center gap-2">
+              <span className="text-ctp-yellow flex-1">Changes apply when this turn ends.</span>
+              <button
+                onClick={applyNow}
+                className="rounded bg-ctp-blue/20 text-ctp-blue hover:bg-ctp-blue/30 px-2 py-0.5 font-medium"
+              >
+                Apply now
+              </button>
+            </div>
           )}
-          {!dirty && enabled && !session.sandboxed && sandboxAvailable && (
+          {pending && !running && <div className="text-ctp-overlay animate-pulse">Applying changes…</div>}
+          {!pending && enabled && !session.sandboxed && sandboxAvailable && (
             <div className="text-ctp-overlay">Applies on next launch — relaunch the session to confine it.</div>
           )}
         </div>

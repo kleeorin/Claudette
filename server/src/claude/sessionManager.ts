@@ -29,6 +29,8 @@ interface Session extends SessionInfo {
   engine: ClaudeEngine | null   // null once the Claude process has exited (relaunchable)
   sandbox?: SandboxConfig       // requested bwrap confinement (see sandbox.ts / SANDBOX.md)
   sandboxed?: boolean           // EFFECTIVE: did the last launch actually wrap in bwrap
+  appliedSandboxKey?: string    // sandbox state actually in force at last launch (pending detection)
+  sandboxApplyTimer?: ReturnType<typeof setTimeout>  // debounce for auto-apply-when-idle
   claudeSessionId: string       // claude's own session id (for --resume)
   startedAt: number             // last launch time, for the fast-failure heuristic
   resume: boolean               // whether Claude was launched with --resume
@@ -121,6 +123,7 @@ export class SessionManager extends EventEmitter {
       ? wrapSandbox(session.sandbox!, args, runCwd)
       : { command: 'claude', args }
     session.sandboxed = canSandbox
+    session.appliedSandboxKey = sandboxKey(session.sandbox)   // what's now actually running
 
     const engine = new ClaudeEngine({
       command: spawn.command,
@@ -160,8 +163,9 @@ export class SessionManager extends EventEmitter {
       // rather than treating the exit as a crash/close.
       if (session.replacing) {
         session.replacing = false
-        this.launch(session)
+        this.launch(session)                    // recomputes appliedSandboxKey
         this.emit('stateChange', id, session.state)
+        this.emit('changed')                    // sandboxPending may have cleared → refresh UI
         return
       }
       // A --resume whose target conversation is gone (never written, /clear-ed, or
@@ -323,6 +327,22 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  // Server going down: kill every engine so no bwrap/claude children orphan and
+  // linger (the common cause of leftover processes after Ctrl-C or a tsx-watch
+  // restart). shutdown() SIGTERMs each process group; killHard() SIGKILLs whatever
+  // survives, called just before the process exits.
+  shutdown(): void {
+    for (const s of this.sessions.values()) {
+      if (s.sandboxApplyTimer) clearTimeout(s.sandboxApplyTimer)
+      s.closing = true
+      s.engine?.kill()
+    }
+  }
+
+  killHard(): void {
+    for (const s of this.sessions.values()) s.engine?.killForce()
+  }
+
   list(): SessionInfo[] {
     return Array.from(this.sessions.values()).map((s) => this.toInfo(s))
   }
@@ -334,7 +354,10 @@ export class SessionManager extends EventEmitter {
 
   private toInfo(s: Session): SessionInfo {
     const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, state } = s
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, state }
+    // Pending = a running engine whose applied sandbox differs from the requested one
+    // (auto-applies on idle; visible only while a turn holds it off).
+    const sandboxPending = !!s.engine && sandboxKey(sandbox) !== s.appliedSandboxKey
+    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, state }
   }
 
   // Change a session's sandbox config. Applies on the next launch (relaunch/restart);
@@ -344,7 +367,28 @@ export class SessionManager extends EventEmitter {
     if (!session) return false
     session.sandbox = normalizeSandbox(sandbox, session.cwd)
     this.emit('changed')
+    this.scheduleSandboxApply(id)   // apply now if idle, else when the turn ends
     return true
+  }
+
+  // Auto-apply a pending sandbox change (mounts differ from what's running) by a
+  // resume-preserving relaunch — but only when the session is IDLE (killing a live
+  // turn would be worse than waiting). Debounced so a burst of mount edits coalesces
+  // into one relaunch. When busy, this no-ops; setState re-invokes it on the next idle.
+  private scheduleSandboxApply(id: string): void {
+    const session = this.sessions.get(id)
+    if (!session || !session.engine) return                          // nothing running to update
+    if (sandboxKey(session.sandbox) === session.appliedSandboxKey) return  // already in force
+    if (session.state !== 'idle') return                             // wait; retried on idle
+    if (session.sandboxApplyTimer) clearTimeout(session.sandboxApplyTimer)
+    session.sandboxApplyTimer = setTimeout(() => {
+      const s = this.sessions.get(id)
+      if (!s) return
+      s.sandboxApplyTimer = undefined
+      if (s.engine && s.state === 'idle' && sandboxKey(s.sandbox) !== s.appliedSandboxKey) {
+        this.relaunchApply(id)
+      }
+    }, 700)
   }
 
   // Claude's own session id, for persistence (--resume on restore).
@@ -389,12 +433,24 @@ export class SessionManager extends EventEmitter {
     if (!session || session.state === state) return
     session.state = state
     this.emit('stateChange', id, state)
+    // A turn just ended — apply any sandbox change that was waiting for idle.
+    if (state === 'idle') this.scheduleSandboxApply(id)
   }
 
   private cleanup(id: string): void {
+    const s = this.sessions.get(id)
+    if (s?.sandboxApplyTimer) clearTimeout(s.sandboxApplyTimer)
     this.sessions.delete(id)
     this.emit('changed')   // set shrank → re-persist
   }
+}
+
+// A stable key of the sandbox state that WOULD be applied at launch: 'off' when
+// disabled or the host can't sandbox, else 'on' + the sorted mount set. Comparing
+// this to what a running engine launched with tells us a relaunch is needed.
+function sandboxKey(cfg: SandboxConfig | undefined): string {
+  if (!cfg?.enabled || !sandboxAvailable()) return 'off'
+  return 'on|' + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
 }
 
 // Sandbox is ON BY DEFAULT (see SANDBOX.md): when the caller passes no config we

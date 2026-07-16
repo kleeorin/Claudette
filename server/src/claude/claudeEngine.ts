@@ -128,7 +128,10 @@ export class ClaudeEngine extends EventEmitter {
 
   start(): void {
     const { command, args, cwd, env } = this.spawnCfg
-    const child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    // detached: put the child in its OWN process group so we can signal the whole
+    // tree (bwrap → claude → any tool subprocesses) with process.kill(-pid). Without
+    // this a kill hits only bwrap, and a sandboxed claude can orphan on shutdown.
+    const child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true })
     this.child = child
 
     child.stdout.setEncoding('utf8')
@@ -215,9 +218,28 @@ export class ClaudeEngine extends EventEmitter {
     if (this._turnActive) this.setState('running')
   }
 
+  // Graceful stop: SIGTERM the whole process group, then SIGKILL it if it hasn't
+  // exited. Group-targeted (see `detached` in start) so bwrap AND the claude inside
+  // it AND any tool subprocesses all go — no orphans.
   kill(): void {
-    this.child?.stdin.end()
-    this.child?.kill('SIGTERM')
+    const pid = this.child?.pid
+    try { this.child?.stdin.end() } catch { /* pipe may be gone */ }
+    if (pid == null) return
+    this.signalGroup(pid, 'SIGTERM')
+    setTimeout(() => { if (this.child?.pid === pid) this.signalGroup(pid, 'SIGKILL') }, 3000)
+  }
+
+  // Immediate hard kill of the process group — used on server shutdown, where we
+  // can't wait out a graceful exit.
+  killForce(): void {
+    const pid = this.child?.pid
+    if (pid != null) this.signalGroup(pid, 'SIGKILL')
+  }
+
+  private signalGroup(pid: number, sig: NodeJS.Signals): void {
+    // Negative pid = the whole process group (child is a group leader via detached).
+    // Fall back to signalling just the process if the group send fails.
+    try { process.kill(-pid, sig) } catch { try { process.kill(pid, sig) } catch { /* already gone */ } }
   }
 
   // --- internals -------------------------------------------------------------
