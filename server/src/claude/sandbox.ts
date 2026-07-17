@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'child_process'
-import { existsSync, realpathSync, lstatSync, readlinkSync, copyFileSync } from 'fs'
-import { homedir } from 'os'
+import { existsSync, realpathSync, lstatSync, readlinkSync, copyFileSync, mkdirSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import path from 'path'
 import type { SandboxConfig, SandboxMount } from '@claudette/shared'
 
@@ -115,16 +115,21 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
     else args.push('--ro-bind', d, d)
   }
 
-  // Runtime baseline: DNS, claude/node installs, the (rw) global config dir.
+  // Runtime baseline. Two kinds: the dirs claude needs to EXECUTE (DNS, claude/node
+  // installs), and the OBLIGATORY data mounts — the global config dir (~/.claude,
+  // where creds + memory live) and the project-local .claude — both rw. These are the
+  // only enforced data mounts: they're always present so Claude keeps its config and
+  // memory even when the caller makes cwd read-only or drops it entirely.
   const baseline: SandboxMount[] = [
     ...dnsMounts(),
     ...runtimeInstallMounts(),
     { path: claudeConfigDir(), mode: 'rw' },
+    { path: path.join(cwd, '.claude'), mode: 'rw' },   // local .claude (skipped below if absent)
   ]
 
-  // User mounts on top, with cwd (rw) as the default writable mount if the caller's
-  // config didn't already cover it. De-dupe by path (last wins), drop non-existent.
-  const userMounts = dedupeMounts([...cfg.mounts, { path: cwd, mode: 'rw' as const }])
+  // User mounts as-is. cwd is NO LONGER force-added, so it's fully optional — rw (the
+  // default a new session seeds), ro, or removed. De-dupe by path (last wins).
+  const userMounts = dedupeMounts(cfg.mounts)
 
   // Emit ALL binds shallowest-path-first so a rw pocket nested in a ro tree layers
   // correctly (bwrap applies binds in argv order; a later, deeper bind wins).
@@ -132,6 +137,27 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
   for (const m of allMounts) {
     if (!existsSync(m.path)) continue
     args.push(m.mode === 'rw' ? '--bind' : '--ro-bind', m.path, m.path)
+  }
+
+  // `--chdir cwd` (below) needs cwd to EXIST inside the sandbox. It does whenever a
+  // mount lies on cwd's lineage: cwd itself, an ancestor (cwd sits inside it), or a
+  // descendant like <cwd>/.claude (whose bind auto-creates the parent cwd). Only if
+  // NOTHING touches that lineage — cwd dropped AND no local .claude — do we present
+  // cwd as an empty READ-ONLY mountpoint (an ro-bound empty dir, NOT a writable
+  // `--dir`): chdir still resolves and the project stays invisible, but writes to cwd
+  // fail HARD (EROFS) instead of silently landing in throwaway tmpfs and being lost.
+  const c = path.resolve(cwd)
+  const cwdReachable = allMounts.some((m) => {
+    if (!existsSync(m.path)) return false
+    const mp = path.resolve(m.path)
+    return mp === c || c.startsWith(mp + path.sep) || mp.startsWith(c + path.sep)
+  })
+  if (cwd && !cwdReachable) {
+    const empty = emptyMountpoint()
+    // Refuse to fall back to a writable `--dir`: that would silently swallow any write
+    // to the dropped cwd. Fail the launch loudly instead (surfaced as an exited session).
+    if (!empty) throw new Error(`sandbox: could not create a read-only mountpoint for the dropped cwd (${cwd}); refusing to bind a writable one that would silently lose writes`)
+    args.push('--ro-bind', empty, cwd)
   }
 
   // Claude's main config lives at $HOME/.claude.json — a FILE next to the config
@@ -151,6 +177,24 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
   return { command: BWRAP, args }
 }
 
+// A stable, empty directory to ro-bind onto cwd when the caller dropped cwd and there
+// is no local .claude. Read-only so writes to cwd fail EROFS — a plain `--dir` would be
+// writable tmpfs that silently swallows writes. Preferred location is the host tmp dir:
+// it is NOT itself mounted into the sandbox (the box gets its own tmpfs /tmp), so nothing
+// inside can pollute it and cwd stays genuinely empty; the config dir is a fallback.
+// Returns null only if NEITHER is writable — a broken host — in which case the caller
+// refuses to bind a writable dir and fails the launch loudly.
+function emptyMountpoint(): string | null {
+  for (const base of [tmpdir(), claudeConfigDir()]) {
+    try {
+      const dir = path.join(base, '.claudette-sandbox-empty')
+      mkdirSync(dir, { recursive: true })
+      return dir
+    } catch { /* try the next base */ }
+  }
+  return null
+}
+
 // Seed <configDir>/.claude.json from the host's ~/.claude.json if the former doesn't
 // exist yet, so a first sandboxed run inherits the user's config (trust, prefs,
 // onboarding) rather than starting blank + emitting a "config not found" warning.
@@ -168,7 +212,15 @@ function ensureSandboxConfigJson(configDir: string, home: string): void {
 // for it. Lists the same user mounts the wrap exposes (baseline runtime dirs omitted
 // as noise). See SANDBOX.md ("Sandbox-awareness").
 export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
-  const mounts = sortShallowFirst(dedupeMounts([...cfg.mounts, { path: cwd, mode: 'rw' as const }]))
+  // The obligatory data mounts (global + local .claude) plus the caller's mounts. cwd
+  // is NOT assumed — it's listed only if the config actually mounts it, so a session
+  // with cwd removed/ro is described honestly.
+  const localClaude = path.join(cwd, '.claude')
+  const obligatory: SandboxMount[] = [
+    { path: claudeConfigDir(), mode: 'rw' },
+    ...(existsSync(localClaude) ? [{ path: localClaude, mode: 'rw' as const }] : []),
+  ]
+  const mounts = sortShallowFirst(dedupeMounts([...cfg.mounts, ...obligatory]))
   const list = mounts.map((m) => `  - ${m.path} (${m.mode === 'rw' ? 'read-write' : 'read-only'})`).join('\n')
   return [
     'FILESYSTEM SANDBOX: you are running inside a bubblewrap sandbox. You can ONLY',

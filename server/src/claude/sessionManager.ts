@@ -1,12 +1,14 @@
 import { EventEmitter } from 'events'
 import { homedir } from 'os'
+import { existsSync } from 'fs'
+import path from 'path'
 import crypto from 'crypto'
 import type {
   SessionInfo, SessionState, ClaudeEvent, PermissionRequest, PermissionDecision,
   PermissionMode, SetModeResult, SavedSession, SandboxConfig,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
-import { getAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
+import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt } from './sandbox'
 
 // Owns the set of Claude sessions and their engines. Ported from
@@ -119,11 +121,22 @@ export class SessionManager extends EventEmitter {
     // Confinement (see SANDBOX.md): wrap `claude …` in bwrap only when the session
     // requests it AND the host can actually sandbox (decided above). Otherwise spawn
     // claude directly. Record sandboxed so the UI never shows a false green light.
-    const spawn = canSandbox
-      ? wrapSandbox(session.sandbox!, args, runCwd)
-      : { command: 'claude', args }
+    // wrapSandbox can THROW (e.g. it refuses to give a dropped cwd a writable mount it
+    // can't make read-only — better a visible startup error than silently-lost writes);
+    // surface that as an exited session rather than crashing the create/relaunch call.
+    let spawn: { command: string; args: string[] }
+    try {
+      spawn = canSandbox ? wrapSandbox(session.sandbox!, args, runCwd) : { command: 'claude', args }
+    } catch (e) {
+      session.engine = null
+      session.state = 'exited'
+      const msg = e instanceof Error ? e.message : 'sandbox setup failed'
+      this.emit('stateChange', id, 'exited')
+      this.emit('exit', id, true, msg)
+      return
+    }
     session.sandboxed = canSandbox
-    session.appliedSandboxKey = sandboxKey(session.sandbox)   // what's now actually running
+    session.appliedSandboxKey = sandboxKey(session.sandbox, runCwd)   // what's now actually running
 
     const engine = new ClaudeEngine({
       command: spawn.command,
@@ -275,7 +288,12 @@ export class SessionManager extends EventEmitter {
   // --- turn I/O (replaces keystroke sendInput) -------------------------------
 
   sendUserTurn(id: string, text: string): void {
-    this.sessions.get(id)?.engine?.sendUserTurn(text)
+    const session = this.sessions.get(id)
+    if (!session?.engine) return
+    // A new user message = a new turn: notify listeners so per-turn state (e.g. the
+    // notebook "working target" pin) resets and re-binds to the user's current view.
+    this.emit('userTurn', id)
+    session.engine.sendUserTurn(text)
   }
 
   interrupt(id: string): void {
@@ -319,6 +337,9 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(id)
     if (!session) return
     session.closing = true
+    // User closed this session — tear down resources owned by it (e.g. notebook
+    // kernels). Distinct from 'exit', which also fires on a crash.
+    this.emit('destroyed', id)
     if (session.engine) {
       session.engine.kill()  // fires exit → cleanup + 'exit'
     } else {
@@ -356,8 +377,33 @@ export class SessionManager extends EventEmitter {
     const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, state } = s
     // Pending = a running engine whose applied sandbox differs from the requested one
     // (auto-applies on idle; visible only while a turn holds it off).
-    const sandboxPending = !!s.engine && sandboxKey(sandbox) !== s.appliedSandboxKey
+    const sandboxPending = !!s.engine && sandboxKey(sandbox, cwd) !== s.appliedSandboxKey
     return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, state }
+  }
+
+  // Change a session's role (agent). The charter/tool-scope/model are read at launch,
+  // so we bring the change into force with a resume-preserving relaunch — the new
+  // engine picks up the new role while keeping the conversation. Persisted (agentId is
+  // re-applied on restore). Returns false for an unknown id or agentId.
+  setAgent(id: string, agentId: string): boolean {
+    const session = this.sessions.get(id)
+    if (!session || !isAgent(agentId)) return false
+    if (session.agentId === agentId || (!session.agentId && agentId === 'general')) return true  // no-op
+    session.agentId = agentId
+    this.emit('changed')
+    this.relaunchApply(id)   // re-spawn with the new charter/tools/model (keeps the conversation)
+    return true
+  }
+
+  // Rename a session (display name only). Ignores an empty name. Persisted.
+  rename(id: string, name: string): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    const trimmed = name.trim()
+    if (!trimmed) return false
+    session.name = trimmed
+    this.emit('changed')
+    return true
   }
 
   // Change a session's sandbox config. Applies on the next launch (relaunch/restart);
@@ -378,14 +424,14 @@ export class SessionManager extends EventEmitter {
   private scheduleSandboxApply(id: string): void {
     const session = this.sessions.get(id)
     if (!session || !session.engine) return                          // nothing running to update
-    if (sandboxKey(session.sandbox) === session.appliedSandboxKey) return  // already in force
+    if (sandboxKey(session.sandbox, session.cwd) === session.appliedSandboxKey) return  // already in force
     if (session.state !== 'idle') return                             // wait; retried on idle
     if (session.sandboxApplyTimer) clearTimeout(session.sandboxApplyTimer)
     session.sandboxApplyTimer = setTimeout(() => {
       const s = this.sessions.get(id)
       if (!s) return
       s.sandboxApplyTimer = undefined
-      if (s.engine && s.state === 'idle' && sandboxKey(s.sandbox) !== s.appliedSandboxKey) {
+      if (s.engine && s.state === 'idle' && sandboxKey(s.sandbox, s.cwd) !== s.appliedSandboxKey) {
         this.relaunchApply(id)
       }
     }, 700)
@@ -448,19 +494,25 @@ export class SessionManager extends EventEmitter {
 // A stable key of the sandbox state that WOULD be applied at launch: 'off' when
 // disabled or the host can't sandbox, else 'on' + the sorted mount set. Comparing
 // this to what a running engine launched with tells us a relaunch is needed.
-function sandboxKey(cfg: SandboxConfig | undefined): string {
+function sandboxKey(cfg: SandboxConfig | undefined, cwd: string): string {
   if (!cfg?.enabled || !sandboxAvailable()) return 'off'
-  return 'on|' + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
+  // Fold in whether the obligatory local <cwd>/.claude currently EXISTS: wrapSandbox
+  // binds it only when present, so its appearance/removal changes the real mount set.
+  // Including it here means a .claude created after launch makes the live key differ
+  // from appliedSandboxKey → the next idle auto-relaunches and picks it up (instead of
+  // it staying silently unmounted until a manual relaunch).
+  const localClaude = existsSync(path.join(cwd, '.claude')) ? '1' : '0'
+  return `on|lc${localClaude}|` + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
 }
 
-// Sandbox is ON BY DEFAULT (see SANDBOX.md): when the caller passes no config we
-// seed { enabled: true, mounts: [cwd rw] }. An explicit config is honored as-is but
-// we still guarantee the session's own cwd is present as a writable mount (claude
-// must be able to work in the dir it was opened in). Whether the sandbox is actually
-// in force is decided at launch (host capability) and reported via `sandboxed`.
+// Sandbox is ON BY DEFAULT (see SANDBOX.md): when the caller passes no config we seed
+// { enabled: true, mounts: [cwd rw] } — the convenient default. An explicit config is
+// honored AS-IS: cwd is now OPTIONAL (rw / ro / removed), so we never force it back in.
+// The obligatory data mounts (global + local .claude) are added at launch by
+// wrapSandbox, and claude's working dir stays valid via its --chdir handling there.
+// Whether the sandbox is actually in force is decided at launch (host capability) and
+// reported via `sandboxed`.
 function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string): SandboxConfig {
   if (!sandbox) return { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
-  const hasCwd = cwd && sandbox.mounts.some((m) => m.path === cwd)
-  const mounts = hasCwd || !cwd ? sandbox.mounts : [...sandbox.mounts, { path: cwd, mode: 'rw' as const }]
-  return { enabled: sandbox.enabled, mounts }
+  return { enabled: sandbox.enabled, mounts: sandbox.mounts }
 }

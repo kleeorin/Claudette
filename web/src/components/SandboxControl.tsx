@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { SessionInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 import { useSessions } from '../store/sessions'
 import { api } from '../api/client'
+import { prettyPath } from '../lib/paths'
 import { FileBrowser } from './FileBrowser'
 
 // The per-session sandbox chip + popover (see SANDBOX.md). The chip is HONEST:
@@ -94,12 +95,23 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
                 only <b>read</b> the <span className="text-ctp-subtext font-mono">ro</span> ones, and can’t see
                 anything else. Network stays <b>open</b> (loopback + internet).
               </div>
+              <div className="text-ctp-overlay leading-snug">
+                Always mounted <span className="text-ctp-blue font-mono">rw</span>: Claude’s global config
+                (<span className="font-mono">~/.claude</span>) and this project’s
+                <span className="font-mono"> .claude</span> — so config + memory survive even if you set the
+                project folder read-only or remove it below.
+              </div>
+              <div className="text-ctp-yellow/90 leading-snug">
+                Heads-up: <span className="font-mono">~/.claude</span> also holds your Claude credentials and
+                <b> every</b> project’s transcripts + memory, so a sandboxed session can still <b>read</b> all of
+                that. This confines the <b>workspace</b>, not your secrets.
+              </div>
               <div className="space-y-1">
                 {cfg.mounts.length === 0 && <div className="text-ctp-overlay italic">No mounts — nothing writable.</div>}
                 {cfg.mounts.map((m, i) => (
                   <div key={i} className="flex items-center gap-1.5">
                     <span className="font-mono text-ctp-text truncate flex-1" title={m.path}>
-                      {m.path.replace(/^\/home\/[^/]+/, '~')}
+                      {prettyPath(m.path)}
                       {m.path === session.cwd && <span className="text-ctp-overlay"> (project)</span>}
                     </span>
                     <button

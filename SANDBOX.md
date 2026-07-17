@@ -69,8 +69,15 @@ interface SandboxConfig { enabled: boolean; mounts: SandboxMount[] }
 - **Two flavors**, `rw` (full) and `ro` (read-only), and **overlaps are allowed**:
   emit mounts sorted **shallowest-path-first** so a `rw` pocket nested inside a `ro`
   tree layers correctly regardless of input order (bwrap applies binds in order).
-- **Default writable mount = the session's own `cwd`** (rw). Sessions may not be a
-  git repo, so we do NOT use the repo root. You add more mounts (rw or ro) as needed.
+- **cwd is optional.** A new session *seeds* its own `cwd` as a `rw` mount (the
+  convenient default; we do NOT use the repo root — sessions may not be a git repo),
+  but you can downgrade it to `ro` or remove it entirely. The only *enforced* data
+  mounts are the two `.claude` dirs below; everything else, cwd included, is yours to
+  set. You add more mounts (rw or ro) as needed.
+- **Obligatory data mounts = the two `.claude` dirs** (both `rw`): the global config
+  dir (`~/.claude`, where creds + memory live) and the project-local `<cwd>/.claude`.
+  These are always present, so Claude keeps its config and memory even when cwd is
+  read-only or removed.
 - **On by default** per session; toggleable. Subsessions inherit the parent's config.
 
 ### Runtime baseline (always present; not "your data" — just what makes claude run)
@@ -92,9 +99,14 @@ Validated on Ubuntu 24.04 (bwrap 0.9.0):
 --ro-bind <which claude> <same>                          # ~/.local/bin/claude launcher
 --ro-bind <dirname (readlink -f claude)> <same>          # …/versions/<v> (the ELF)
 --ro-bind <node root> <same>                             # …/node/vX (from readlink -f node)
-# global claude config/creds/history — READ-WRITE (claude writes here at runtime):
---bind <CLAUDE_CONFIG_DIR or $HOME/.claude> <same>
-# user mounts (default: cwd rw), shallowest-first; then:
+# OBLIGATORY data mounts — READ-WRITE (claude writes config + memory at runtime):
+--bind <CLAUDE_CONFIG_DIR or $HOME/.claude> <same>       # global config/creds/history/memory
+--bind <cwd>/.claude <same>                              # project-local .claude (if present)
+# user mounts (a new session seeds cwd rw; you may set it ro or drop it), shallowest-first.
+# If NOTHING binds cwd's lineage (cwd dropped AND no local .claude), ro-bind an empty
+# dir onto cwd so --chdir resolves, the project stays invisible, AND writes to cwd fail
+# hard (EROFS) rather than silently vanishing into a writable tmpfs (as a plain --dir):
+--ro-bind <hostTmp>/.claudette-sandbox-empty <cwd>     # only when cwd is otherwise unreachable
 --chdir <cwd> --setenv HOME <home>
 # Relocate .claude.json INTO the mounted config dir (see below):
 --setenv CLAUDE_CONFIG_DIR <configDir>
@@ -128,9 +140,14 @@ found" warning. Consequence: sandboxed sessions share `<configDir>/.claude.json`
 `~/.claude.json`. Acceptable — the heavy state (creds, history, projects) is the
 shared dir; `.claude.json` is mostly trust/onboarding/prefs.
 
-**Known tradeoff:** `~/.claude` holds *every* project's transcripts plus
-`.credentials.json`, so a sandboxed session can still *read* them (write-confinement
-holds; read-secrecy does not). Future tightening: a per-session `CLAUDE_CONFIG_DIR`
+**Known tradeoff — the sandbox is a WORKSPACE firewall, not a secrets boundary.**
+`~/.claude` is always mounted **rw** (claude can't boot otherwise), and it holds *every*
+project's transcripts + memory plus `.credentials.json`. So even a maximally-locked
+session — cwd removed, only `.claude` left — can still **read your Claude credentials and
+every project's history**. Tightening cwd to `ro`/removed shrinks what of the *current
+project* is exposed; it does **nothing** to the global mount. Don't read "only .claude"
+as "isolated from my secrets." Write-confinement holds (writes outside the mounts fail);
+read-secrecy of `~/.claude` does not. Future tightening: a per-session `CLAUDE_CONFIG_DIR`
 seeded with only credentials. Documented, deferred.
 
 ---
