@@ -356,6 +356,32 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const items = itemsFromEvent(e)
       if (items.length) dispatch({ type: 'APPEND', sessionId: id, items })
     })
+    // Connect-time catch-up for a session already in progress: rebuild its
+    // transcript from the buffered events (same replay path as /resume), restore the
+    // slash catalog + MetaBar + rate-limit chips, and surface any still-pending
+    // permission so THIS device (e.g. the phone) can answer it. LOAD replaces rather
+    // than appends, so a reconnect is idempotent.
+    const offSnapshot = api.on.snapshot((id, evs, pending) => {
+      dispatch({ type: 'LOAD', sessionId: id, items: evs.flatMap((e) => itemsFromEvent(e, true)) })
+      const meta = metaFromReplay(evs)
+      if (Object.keys(meta).length) dispatch({ type: 'SET_META', sessionId: id, meta })
+      for (const e of evs) {
+        if (e.type === 'system' && (e as { subtype?: string }).subtype === 'init') {
+          const cmds = (e as { slash_commands?: unknown }).slash_commands
+          if (Array.isArray(cmds)) dispatch({ type: 'SET_SLASH', sessionId: id, commands: cmds.map(String) })
+        } else if (e.type === 'rate_limit_event') {
+          const info = (e as { rate_limit_info?: RateLimitInfo }).rate_limit_info
+          if (info) {
+            const percentUsed = typeof info.percentUsed === 'number' ? info.percentUsed
+              : typeof info.utilization === 'number' ? info.utilization * 100
+              : undefined
+            dispatch({ type: 'SET_LIMIT', sessionId: id, limitType: info.rateLimitType ?? 'limit', info: { ...info, percentUsed } })
+          }
+        }
+      }
+      if (pending) dispatch({ type: 'SET_PENDING', sessionId: id, req: pending })
+      else dispatch({ type: 'CLEAR_PENDING', sessionId: id })
+    })
     const offPerm = api.on.permission((id, req) => {
       dispatch({ type: 'SET_PENDING', sessionId: id, req })
     })
@@ -375,7 +401,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const offState = api.on.stateChange((id, s) => {
       if (s === 'idle' && stateRef.current.pending[id]) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
     })
-    return () => { offEvent(); offPerm(); offUserTurn(); offPermResolved(); offState() }
+    return () => { offEvent(); offSnapshot(); offPerm(); offUserTurn(); offPermResolved(); offState() }
   }, [])
 
   const sendTurn = useCallback((sessionId: string, text: string) => {

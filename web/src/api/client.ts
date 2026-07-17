@@ -49,6 +49,8 @@ function channel<A extends unknown[]>() {
 }
 
 const events = channel<[string, ClaudeEvent]>()
+// [id, buffered events, pending permission] — the connect-time per-session catch-up.
+const snapshots = channel<[string, ClaudeEvent[], PermissionRequest | undefined]>()
 const permissions = channel<[string, PermissionRequest]>()
 const userTurns = channel<[string, string, string | undefined]>()   // [id, text, turnId]
 const permsResolved = channel<[string, string]>()                   // [id, requestId]
@@ -78,6 +80,7 @@ function send(msg: WsClientMessage): void {
 function dispatch(msg: WsServerMessage): void {
   switch (msg.type) {
     case 'session:list': lists.emit(msg.sessions); break
+    case 'session:snapshot': snapshots.emit(msg.id, msg.events, msg.pending); break
     case 'session:event': events.emit(msg.id, msg.event); break
     case 'session:permission': permissions.emit(msg.id, msg.request); break
     case 'session:userTurn': userTurns.emit(msg.id, msg.text, msg.turnId); break
@@ -162,6 +165,7 @@ export const api = {
   // Streaming subscriptions (namespaced by session id, except list/connected).
   on: {
     event: (fn: Fn<[string, ClaudeEvent]>) => events.on(fn),
+    snapshot: (fn: Fn<[string, ClaudeEvent[], PermissionRequest | undefined]>) => snapshots.on(fn),
     permission: (fn: Fn<[string, PermissionRequest]>) => permissions.on(fn),
     // A user turn mirrored from the server (any device); turnId de-dupes the sender's echo.
     userTurn: (fn: Fn<[string, string, string | undefined]>) => userTurns.on(fn),

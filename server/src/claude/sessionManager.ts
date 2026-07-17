@@ -48,6 +48,11 @@ interface Session extends SessionInfo {
 // + show output) rather than silently removing the session.
 const STARTUP_GRACE_MS = 4000
 const TAIL_MAX = 2000
+// Cap the per-session in-memory transcript buffer (raw stream-json events kept for
+// the connect-time snapshot). Bounds memory on very long sessions; the CLI's own
+// .jsonl holds the complete history for /resume, so this only limits the live
+// catch-up a freshly-connected device gets.
+const TRANSCRIPT_CAP = 4000
 
 // Optional hooks the app injects (kept out of SessionManager's core so it stays
 // transport-only). `mcpConfig` returns the --mcp-config string for a session
@@ -58,8 +63,32 @@ export interface SessionManagerOpts {
 
 export class SessionManager extends EventEmitter {
   private sessions = new Map<string, Session>()
+  // Per-session transcript (raw stream-json events) + the current unanswered
+  // permission prompt, so a client connecting mid-session can be handed a snapshot
+  // (see session:snapshot / snapshot getters below). Kept separate from Session so
+  // they never leak into persistence or toInfo().
+  private transcripts = new Map<string, ClaudeEvent[]>()
+  private pendingPerms = new Map<string, PermissionRequest>()
 
   constructor(private readonly opts: SessionManagerOpts = {}) { super() }
+
+  // Append an event to a session's transcript buffer, capped at TRANSCRIPT_CAP
+  // (oldest dropped). The live UI shows user PROMPTS via the userTurn mirror, not the
+  // event stream, and sendUserTurn records them here itself — so drop the CLI's
+  // string-content user echo to avoid a double prompt on replay. Tool-result user
+  // events (array content) are real transcript material and are kept.
+  private buffer(id: string, e: ClaudeEvent): void {
+    if (e.type === 'user' && typeof (e as { message?: { content?: unknown } }).message?.content === 'string') return
+    const buf = this.transcripts.get(id) ?? []
+    buf.push(e)
+    if (buf.length > TRANSCRIPT_CAP) buf.splice(0, buf.length - TRANSCRIPT_CAP)
+    this.transcripts.set(id, buf)
+  }
+
+  // Connect-time snapshot inputs (see session:snapshot): the buffered transcript
+  // and any still-unanswered permission prompt for a session.
+  transcriptOf(id: string): ClaudeEvent[] { return this.transcripts.get(id) ?? [] }
+  pendingPermissionOf(id: string): PermissionRequest | undefined { return this.pendingPerms.get(id) }
 
   create(
     name: string,
@@ -162,6 +191,7 @@ export class SessionManager extends EventEmitter {
       // banner; the exit handler recovers by relaunching fresh.
       if (e.type === 'result' && !session.sawInit) return
       this.emit('event', id, e)
+      this.buffer(id, e)   // keep for the connect-time snapshot (late-joining devices)
     })
     engine.on('ready', (sid: string) => {
       // claude may hand back a different id (e.g. on resume mismatch); trust it.
@@ -169,9 +199,19 @@ export class SessionManager extends EventEmitter {
       session.claudeSessionId = sid
       this.emit('ready', id, sid)
     })
-    engine.on('permission', (req: PermissionRequest) => this.emit('permission', id, req))
-    engine.on('permissionResolved', (requestId: string) => this.emit('permissionResolved', id, requestId))
-    engine.on('state', (state: 'idle' | 'running' | 'waiting') => this.setState(id, state))
+    engine.on('permission', (req: PermissionRequest) => {
+      this.pendingPerms.set(id, req)   // remember it so a late-joining device gets it too
+      this.emit('permission', id, req)
+    })
+    engine.on('permissionResolved', (requestId: string) => {
+      const p = this.pendingPerms.get(id)
+      if (p?.requestId === requestId) this.pendingPerms.delete(id)   // matched prompt answered
+      this.emit('permissionResolved', id, requestId)
+    })
+    engine.on('state', (state: 'idle' | 'running' | 'waiting') => {
+      if (state === 'idle') this.pendingPerms.delete(id)   // no prompt outlives an idle turn
+      this.setState(id, state)
+    })
     engine.on('exit', (code: number | null) => {
       // A resumeInto() kill: relaunch straight into the chosen conversation
       // rather than treating the exit as a crash/close.
@@ -259,6 +299,8 @@ export class SessionManager extends EventEmitter {
     session.claudeSessionId = claudeSessionId
     session.resume = true
     session.resumeFallbackTried = false
+    this.transcripts.delete(id)          // rebinding to another conversation → drop old buffer
+    this.pendingPerms.delete(id)
     if (session.engine) {
       session.replacing = true
       session.engine.kill()
@@ -276,6 +318,8 @@ export class SessionManager extends EventEmitter {
     if (!session) return
     session.claudeSessionId = crypto.randomUUID()
     session.resume = false
+    this.transcripts.delete(id)          // fresh conversation → drop the old snapshot buffer
+    this.pendingPerms.delete(id)
     if (session.engine) {
       session.replacing = true
       session.engine.kill()
@@ -295,6 +339,13 @@ export class SessionManager extends EventEmitter {
     // notebook "working target" pin) resets and re-binds to the user's current view,
     // AND so every client mirrors the message (text/turnId), not just the sender.
     this.emit('userTurn', id, text, turnId)
+    // Record the prompt in the snapshot buffer so a late-joining device sees the
+    // question, not just the answer (the live stream carries no renderable prompt —
+    // buffer() drops the CLI's string echo, so this is the single source).
+    const buf = this.transcripts.get(id) ?? []
+    buf.push({ type: 'user', message: { content: text } } as unknown as ClaudeEvent)
+    if (buf.length > TRANSCRIPT_CAP) buf.splice(0, buf.length - TRANSCRIPT_CAP)
+    this.transcripts.set(id, buf)
     session.engine.sendUserTurn(text)
   }
 
@@ -489,6 +540,8 @@ export class SessionManager extends EventEmitter {
     const s = this.sessions.get(id)
     if (s?.sandboxApplyTimer) clearTimeout(s.sandboxApplyTimer)
     this.sessions.delete(id)
+    this.transcripts.delete(id)   // free the snapshot buffers with the session
+    this.pendingPerms.delete(id)
     this.emit('changed')   // set shrank → re-persist
   }
 }

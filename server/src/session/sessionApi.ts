@@ -38,6 +38,19 @@ export function bridgeSessionEvents(sessions: SessionManager, hub: WsHub): void 
     hub.broadcast({ type: 'session:exit', id, failed, error }))
 }
 
+// Send a freshly-connected socket the per-session catch-up it needs to render an
+// in-progress session: the buffered transcript so far + any still-unanswered
+// permission prompt. Called once per connect, AFTER session:list. Without this a
+// device joining mid-session sees a blank stream and can't answer a pending prompt.
+export function sendSessionSnapshots(sessions: SessionManager, hub: WsHub, ws: import('ws').WebSocket): void {
+  for (const s of sessions.list()) {
+    const events = sessions.transcriptOf(s.id)
+    const pending = sessions.pendingPermissionOf(s.id)
+    if (events.length === 0 && !pending) continue
+    hub.send(ws, { type: 'session:snapshot', id: s.id, events, pending })
+  }
+}
+
 // Register the HTTP lifecycle routes on the Fastify app.
 export function registerSessionRoutes(app: FastifyInstance, sessions: SessionManager): void {
   app.post<{ Body: CreateSessionRequest }>('/api/session/create', async (req): Promise<CreateSessionResponse> => {

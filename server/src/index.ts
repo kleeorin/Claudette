@@ -8,7 +8,7 @@ import type { WsClientMessage, HealthResponse } from '@claudette/shared'
 import { SessionManager } from './claude/sessionManager'
 import { sandboxAvailable } from './claude/sandbox'
 import { WsHub } from './ws/hub'
-import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage } from './session/sessionApi'
+import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage, sendSessionSnapshots } from './session/sessionApi'
 import { loadState, saveState } from './session/sessionPersistence'
 import { NotebookDocManager } from './notebook/notebookDocManager'
 import { bridgeNotebookEvents, registerNotebookRoutes, handleNotebookClientMessage } from './notebook/notebookApi'
@@ -188,9 +188,12 @@ const wss = new WebSocketServer({ noServer: true })
 
 wss.on('connection', (ws: WebSocket) => {
   hub.add(ws)
-  // Connect-time snapshot so a fresh tab renders the current session list.
+  // Connect-time snapshot so a fresh tab renders the current session list, then a
+  // per-session catch-up (transcript-so-far + any pending permission) so a device
+  // joining an in-progress session isn't left with a blank stream / stuck prompt.
   hub.send(ws, { type: 'hello', version: VERSION })
   hub.send(ws, { type: 'session:list', sessions: sessions.list() })
+  sendSessionSnapshots(sessions, hub, ws)
   ws.on('message', (data) => {
     let msg: WsClientMessage
     try {
