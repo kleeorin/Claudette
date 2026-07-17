@@ -1,19 +1,16 @@
-import type { NbOutput } from '@claudette/shared'
+import { nbText as asText, type NbOutput } from '@claudette/shared'
 
 // Renders one nbformat output dict. Unlike ClaudeMaster's Output (which consumed a
 // normalized union), Claudette stores outputs nbformat-native, so we read
 // `output_type` and collapse the line-array `text`/`data` values here.
 
-// nbformat stores multi-line strings as arrays of lines; collapse to a string.
-function asText(v: unknown): string {
-  if (Array.isArray(v)) return v.join('')
-  if (typeof v === 'string') return v
-  return ''
-}
 function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '')
 }
 
+// Richest-first: prefer HTML/image/svg over plain text; fall back to any text-ish
+// bundle (latex/markdown/json) so an output is never rendered blank just because it
+// lacks a `text/plain` alternative.
 function MimeContent({ data }: { data: Record<string, unknown> }) {
   const html = asText(data['text/html'])
   if (html) {
@@ -21,14 +18,27 @@ function MimeContent({ data }: { data: Record<string, unknown> }) {
     // readability (the global reset strips th/td padding + borders).
     return <div className="text-sm nb-html" dangerouslySetInnerHTML={{ __html: html }} />
   }
-  const png = data['image/png']
-  if (typeof png === 'string') {
-    return <img src={`data:image/png;base64,${png}`} className="max-w-full" alt="" />
+  // Bitmap images (base64-encoded in the mime bundle).
+  for (const mime of ['image/png', 'image/jpeg', 'image/gif'] as const) {
+    const b64 = data[mime]
+    if (typeof b64 === 'string') return <img src={`data:${mime};base64,${b64}`} className="max-w-full" alt="" />
   }
   const svg = asText(data['image/svg+xml'])
   if (svg) return <div dangerouslySetInnerHTML={{ __html: svg }} />
   const plain = asText(data['text/plain'])
   if (plain) return <pre className="text-xs text-ctp-text whitespace-pre-wrap font-mono">{plain}</pre>
+  // Text-ish fallbacks with no text/plain alternative (LaTeX from Math/SymPy,
+  // markdown, JSON/vendor bundles like Plotly) — show the source instead of nothing.
+  const latex = asText(data['text/latex'])
+  if (latex) return <pre className="text-xs text-ctp-text whitespace-pre-wrap font-mono">{latex}</pre>
+  const md = asText(data['text/markdown'])
+  if (md) return <pre className="text-xs text-ctp-text whitespace-pre-wrap font-mono">{md}</pre>
+  const jsonKey = Object.keys(data).find((k) => k === 'application/json' || k.startsWith('application/'))
+  if (jsonKey) {
+    const v = data[jsonKey]
+    const text = typeof v === 'string' ? v : JSON.stringify(v, null, 2)
+    return <pre className="text-xs text-ctp-overlay whitespace-pre-wrap font-mono">{text}</pre>
+  }
   return null
 }
 

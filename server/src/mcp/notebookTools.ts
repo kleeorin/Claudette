@@ -1,8 +1,10 @@
-import { extname } from 'path'
+import { extname, resolve } from 'path'
+import { nbText as asText } from '@claudette/shared'
 import type { NbCell, NbCellType, NbOutput, NotebookDoc, NotebookOp } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
 import type { KernelManager } from '../jupyter/kernelManager'
 import type { ActivePaneRegistry } from './activePaneRegistry'
+import type { TurnNotebookRegistry } from './turnNotebookRegistry'
 import type { AppControlMcpServer, McpToolResult } from './appControlServer'
 
 // AppControl notebook tools. The KEY ClaudeMaster fix: handlers mutate the
@@ -16,16 +18,27 @@ import type { AppControlMcpServer, McpToolResult } from './appControlServer'
 // currently viewing — the one the user is looking at — read from the per-session
 // ActivePaneRegistry (published by the web client on tab/session switch). This is
 // what makes "add a cell here" unambiguous when several notebooks are open. An
-// explicit `path` is honored, but GUARDED: if the user is viewing a *different*
+// explicit `path` is honored, but GUARDED: if the turn is anchored to a *different*
 // notebook, the tool refuses (a stale path from earlier context is the main
 // targeting mistake); Claude can call `open_notebook` to bring the intended one
 // into focus first. `read_active_pane` lets Claude ask what the user is viewing.
+//
+// PER-TURN PIN (TurnNotebookRegistry): active-pane steering re-reads the live pane
+// on every call, which redirects a multi-cell task if the user switches tabs mid-
+// task. So the FIRST notebook a turn resolves is PINNED and reused by every later
+// path-unset call that turn — the task stays on its notebook even if the user
+// navigates away or closes it. open_notebook/create_notebook re-pin (Claude's
+// explicit choice); the pin resets at the next user turn (SessionManager 'userTurn').
 
 export function registerNotebookTools(
   mcp: AppControlMcpServer,
   docs: NotebookDocManager,
   kernels: KernelManager,
   panes: ActivePaneRegistry,
+  // Per-turn "working notebook" pin: the first notebook a turn resolves sticks for
+  // the rest of that turn (see TurnNotebookRegistry), so mid-task tab switches by
+  // the user don't redirect Claude's cells to the wrong notebook.
+  turns: TurnNotebookRegistry,
   // Steer the calling session's UI to focus a notebook (open_notebook). The doc is
   // already open server-side; this only moves the user's focus onto it.
   onFocus: (sessionId: string, doc: NotebookDoc) => void,
@@ -49,22 +62,40 @@ export function registerNotebookTools(
     }
   }
 
-  // Decide which notebook a path-optional tool targets: an explicit `path` (guarded
-  // against the user viewing a different notebook), else the calling session's
-  // active pane. Returns the resolved path (a string) or a Claude-facing error.
+  // Decide which notebook a path-optional tool targets, and pin it for the turn:
+  //   • explicit `path` — honored, but GUARDED against the notebook the turn is
+  //     already anchored to (the pin once established, else the user's active pane):
+  //     a mismatch is almost always a stale path, so refuse.
+  //   • no `path` — the pinned working notebook if the turn has established one
+  //     (stick to it even if the user has since switched tabs or closed it), else
+  //     the calling session's active pane (which then becomes the pin).
+  // Returns the resolved path (a string) or a Claude-facing error.
   function resolveNotebook(sessionId: string, args: Record<string, unknown>): string | McpToolResult {
     const explicit = args.path != null ? String(args.path) : ''
+    const pinned = turns.get(sessionId)
     if (explicit) {
       if (extname(explicit).toLowerCase() !== '.ipynb') return { error: `${explicit} is not a .ipynb notebook.` }
+      // What this turn is "about": the pinned working notebook once one exists, else
+      // whatever the user is viewing. Normalize BOTH sides before comparing so a
+      // non-canonical-but-equivalent `explicit` (relative, `..`, redundant `.`)
+      // pointing at the very same notebook doesn't trip the guard.
       const active = panes.get(sessionId)
-      if (active && active.isNotebook && active.path !== explicit) {
-        return { error: `Refusing to edit ${explicit}: the user is currently viewing a different notebook (${active.path}), which is almost certainly the one they mean. Omit \`path\` to target the notebook they're looking at. Only edit ${explicit} if the user explicitly named that file this turn — and if so, call open_notebook(${explicit}) first so the change is visible, then retry.` }
+      const anchor = pinned ?? (active && active.isNotebook ? active.path : undefined)
+      if (anchor && resolve(anchor) !== resolve(explicit)) {
+        return { error: pinned
+          ? `Refusing to edit ${explicit}: this turn is already working in ${pinned}, which is almost certainly the intended notebook. Omit \`path\` to keep targeting it. Only switch to ${explicit} if the user explicitly named that file this turn — and if so, call open_notebook(${explicit}) first so it's visible and becomes the working notebook, then retry.`
+          : `Refusing to edit ${explicit}: the user is currently viewing a different notebook (${anchor}), which is almost certainly the one they mean. Omit \`path\` to target the notebook they're looking at. Only edit ${explicit} if the user explicitly named that file this turn — and if so, call open_notebook(${explicit}) first so the change is visible, then retry.` }
       }
+      if (!pinned) turns.set(sessionId, explicit)   // first target of the turn → pin it
       return explicit
     }
+    // Established working notebook wins over the live pane — the whole point of the
+    // pin: a mid-task tab switch (or closing the notebook) must not move the target.
+    if (pinned) return pinned
     const p = panes.get(sessionId)
     if (!p) return { error: 'No notebook is open in the active pane, and no `path` was given. Ask the user to open a notebook (or open_notebook one), or pass an absolute `path`.' }
     if (!p.isNotebook) return { error: `The active pane is a text file (${p.path}), not a notebook. Ask the user to open a notebook, or pass an absolute .ipynb \`path\`.` }
+    turns.set(sessionId, p.path)   // first target of the turn → pin it
     return p.path
   }
 
@@ -91,6 +122,16 @@ export function registerNotebookTools(
       return { error: `index ${index} out of range (notebook has ${doc.cells.length} cells: 0..${doc.cells.length - 1})` }
     }
     return doc.cells[i].id
+  }
+
+  // Validate a positional index used for insert/move (0..max) — rejects NaN / negative
+  // / non-integer instead of letting applyOp silently clamp it to 0.
+  function boundedIndex(n: unknown, max: number, label: string): number | McpToolResult {
+    const i = Number(n)
+    if (!Number.isInteger(i) || i < 0 || i > max) {
+      return { error: `${label} ${n} out of range (must be an integer 0..${max})` }
+    }
+    return i
   }
 
   // Apply a mutation op then persist; map an op failure to an MCP error.
@@ -120,6 +161,9 @@ export function registerNotebookTools(
       const doc = await openByPath(String(args.path ?? ''))
       if (isErr(doc)) return doc
       onFocus(sid, doc)
+      // Claude explicitly chose this notebook to work on → make it the turn's pinned
+      // working notebook (overriding any earlier pin), so path-unset tools follow it.
+      turns.set(sid, doc.path)
       return { text: `Opened and focused ${doc.path} in the current session.` }
     },
   })
@@ -162,7 +206,8 @@ export function registerNotebookTools(
     inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' }, type: { type: 'string' }, source: { type: 'string' } }, required: ['index'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
-      return applyAndSave(doc, { op: 'insertCell', notebookId: doc.notebookId, index: Number(args.index), cellType: cellType(args.type), source: strOrUndef(args.source) })
+      const index = boundedIndex(args.index, doc.cells.length, 'index'); if (typeof index !== 'number') return index
+      return applyAndSave(doc, { op: 'insertCell', notebookId: doc.notebookId, index, cellType: cellType(args.type), source: strOrUndef(args.source) })
     },
   })
 
@@ -184,7 +229,8 @@ export function registerNotebookTools(
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.from); if (typeof id !== 'string') return id
-      return applyAndSave(doc, { op: 'moveCell', notebookId: doc.notebookId, cellId: id, toIndex: Number(args.to) })
+      const to = boundedIndex(args.to, doc.cells.length - 1, 'to'); if (typeof to !== 'number') return to
+      return applyAndSave(doc, { op: 'moveCell', notebookId: doc.notebookId, cellId: id, toIndex: to })
     },
   })
 
@@ -203,12 +249,18 @@ export function registerNotebookTools(
     name: 'create_notebook',
     description: "Create a new, empty .ipynb at an absolute `path` (fails if it already exists). Populate it with the cell tools, then run cells with run_cell / run_all. To also bring it into the user's view, open_notebook it.",
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Absolute path ending in .ipynb' } }, required: ['path'] },
-    handler: async (_sid, args) => {
+    handler: async (sid, args) => {
       const path = String(args.path ?? '')
       if (!path) return { error: 'path is required' }
       if (extname(path).toLowerCase() !== '.ipynb') return { error: 'path must end in .ipynb' }
-      try { await docs.createPath(path); return { text: `created ${path}` } }
-      catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
+      try {
+        await docs.createPath(path)
+        // Claude just made this notebook to populate it → pin it as the turn's working
+        // notebook so the following path-unset cell tools land here, not in whatever
+        // the user happens to be viewing.
+        turns.set(sid, path)
+        return { text: `created ${path}` }
+      } catch (e) { return { error: e instanceof Error ? e.message : String(e) } }
     },
   })
 
@@ -271,7 +323,4 @@ function summarizeOutput(o: NbOutput): unknown {
     case 'error': return { kind: 'error', ename: o.ename, evalue: o.evalue }
     default: return { kind: String(o.output_type) }
   }
-}
-function asText(v: unknown): string {
-  return Array.isArray(v) ? v.join('') : typeof v === 'string' ? v : ''
 }

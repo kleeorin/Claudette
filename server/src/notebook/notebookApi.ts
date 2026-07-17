@@ -11,29 +11,38 @@ import type { KernelManager } from '../jupyter/kernelManager'
 export function bridgeNotebookEvents(
   notebooks: NotebookDocManager, kernels: KernelManager, hub: WsHub,
 ): void {
-  notebooks.on('update', (doc: NotebookDoc) =>
-    hub.broadcast({ type: 'notebook:update', doc }))
+  notebooks.on('update', (doc: NotebookDoc) => {
+    // A notebook mid-deferred-close (tab already gone, finishing a background run) must
+    // not broadcast — else its output re-adds the closed tab on the client.
+    if (notebooks.isClosing(doc.notebookId)) return
+    hub.broadcast({ type: 'notebook:update', doc })
+  })
   notebooks.on('opFocus', (notebookId: string, cellId: string, reveal: boolean) =>
     hub.broadcast({ type: 'notebook:focus', notebookId, cellId, reveal }))
   notebooks.on('locks', (notebookId: string, locks: CellLock[]) =>
     hub.broadcast({ type: 'notebook:locks', notebookId, locks }))
   kernels.on('status', (notebookId: string, status: KernelStatus) =>
     hub.broadcast({ type: 'notebook:kernel', notebookId, status }))
+  kernels.on('running', (notebookId: string, cellIds: string[]) =>
+    hub.broadcast({ type: 'notebook:running', notebookId, cellIds }))
 }
 
 export function registerNotebookRoutes(app: FastifyInstance, notebooks: NotebookDocManager, kernels: KernelManager): void {
-  app.post<{ Body: { path: string } }>('/api/notebook/open', async (req, reply) => {
+  app.post<{ Body: { path: string; sessionId?: string } }>('/api/notebook/open', async (req, reply) => {
     try {
       const doc = await notebooks.openPath(req.body.path)
+      if (req.body.sessionId) kernels.setOwner(doc.notebookId, req.body.sessionId)
+      kernels.resync(doc.notebookId)   // reconnect a still-running kernel on reopen
       return { doc }
     } catch (e) {
       return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })
     }
   })
 
-  app.post<{ Body: { path: string } }>('/api/notebook/create', async (req, reply) => {
+  app.post<{ Body: { path: string; sessionId?: string } }>('/api/notebook/create', async (req, reply) => {
     try {
       const doc = await notebooks.createPath(req.body.path)
+      if (req.body.sessionId) kernels.setOwner(doc.notebookId, req.body.sessionId)
       return { doc }
     } catch (e) {
       return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })
@@ -47,6 +56,17 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
     } catch (e) {
       return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })
     }
+  })
+
+  // Close a notebook tab: unregister the server-owned doc (stops the file watcher) so
+  // the "closed" tab doesn't reappear on the next update — but LEAVE the kernel
+  // running. Kernels persist until explicitly shut down or Claudette exits; reopening
+  // the notebook reconnects to the live kernel (open → kernels.resync).
+  app.post<{ Body: { notebookId: string; save?: boolean } }>('/api/notebook/close', async (req) => {
+    // `save` = the user's choice from the close prompt. Defer if a cell is still
+    // running (its output is captured + saved when it finishes).
+    notebooks.requestClose(req.body.notebookId, kernels.isRunning(req.body.notebookId), req.body.save ?? false)
+    return { ok: true }
   })
 
   // Conflict resolution: disk changed under unsaved edits (doc.conflict). The UI
@@ -82,6 +102,12 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   })
   app.post<{ Body: { notebookId: string } }>('/api/notebook/kernel/interrupt', async (req) => {
     await kernels.interrupt(req.body.notebookId)
+    return { ok: true }
+  })
+  // Explicitly kill the kernel (the notebook stays open with no kernel; a later run
+  // starts a fresh one). This is the deliberate "kill it" the user asks for.
+  app.post<{ Body: { notebookId: string } }>('/api/notebook/kernel/shutdown', async (req) => {
+    kernels.shutdown(req.body.notebookId)
     return { ok: true }
   })
   app.post<{ Body: { notebookId: string; name: string } }>('/api/notebook/kernel/setSpec', async (req, reply) => {

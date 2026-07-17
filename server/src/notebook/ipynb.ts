@@ -8,6 +8,7 @@
 //      client (P1.9) produces the same nbformat output dicts, so there is no lossy
 //      round-trip.
 import { randomUUID } from 'crypto'
+import { nbText } from '@claudette/shared'
 import type { NbCell, NbCellType, NbOutput } from '@claudette/shared'
 
 export interface NotebookMeta {
@@ -16,14 +17,7 @@ export interface NotebookMeta {
   nbformat_minor: number
 }
 
-// nbformat stores multi-line strings as arrays of lines; collapse to a string.
-function srcToString(source: unknown): string {
-  if (Array.isArray(source)) return source.join('')
-  if (typeof source === 'string') return source
-  return ''
-}
-
-// Inverse: split into nbformat's line array (each line keeps its trailing "\n"
+// Split a string into nbformat's line array (each line keeps its trailing "\n"
 // except the last). An empty string serializes to [].
 function splitLines(s: string): string[] {
   if (s === '') return []
@@ -45,15 +39,26 @@ export function parseNotebook(text: string): { cells: NbCell[]; meta: NotebookMe
   try { nb = JSON.parse(text) as Record<string, unknown> } catch { nb = {} }
 
   const rawCells = Array.isArray(nb.cells) ? nb.cells : []
+  const seenIds = new Set<string>()
   const cells: NbCell[] = rawCells.map((raw) => {
     const c = raw as Record<string, unknown>
     const cellType = cellTypeOf(c.cell_type)
+    // Preserve a disk-provided 4.5 id; mint one when absent (older 4.0–4.4 files) OR
+    // when it collides with an already-seen id — duplicate ids would make cellId
+    // addressing resolve to the wrong cell (silent wrong-cell edit/delete/move).
+    const diskId = typeof c.id === 'string' && c.id ? c.id : ''
+    const id = diskId && !seenIds.has(diskId) ? diskId : randomUUID()
+    seenIds.add(id)
     const cell: NbCell = {
-      // Preserve a disk-provided 4.5 id; mint one when absent (older 4.0–4.4 files).
-      id: typeof c.id === 'string' && c.id ? c.id : randomUUID(),
+      id,
       cellType,
-      source: srcToString(c.source),
+      source: nbText(c.source),
       metadata: c.metadata && typeof c.metadata === 'object' ? (c.metadata as Record<string, unknown>) : {},
+    }
+    // Markdown/raw cells may carry an `attachments` dict (inline images); keep it so
+    // an edit-then-save round-trips losslessly.
+    if (cellType !== 'code' && c.attachments && typeof c.attachments === 'object') {
+      cell.attachments = c.attachments as Record<string, unknown>
     }
     if (cellType === 'code') {
       // Outputs kept verbatim (already nbformat output dicts); execution_count as-is.
@@ -88,6 +93,8 @@ export function serializeNotebook(cells: NbCell[], meta: NotebookMeta): string {
       if (c.cellType === 'code') {
         out.execution_count = c.executionCount ?? null
         out.outputs = c.outputs ?? []   // already nbformat output dicts
+      } else if (c.attachments) {
+        out.attachments = c.attachments  // preserve inline-image attachments
       }
       return out
     }),

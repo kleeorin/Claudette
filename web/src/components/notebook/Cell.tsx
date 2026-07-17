@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { EditorView, keymap, lineNumbers } from '@codemirror/view'
-import { EditorState, type Extension } from '@codemirror/state'
-import { defaultKeymap, indentWithTab } from '@codemirror/commands'
+import { EditorState, Transaction, type Extension } from '@codemirror/state'
+import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { python } from '@codemirror/lang-python'
 import { markdown } from '@codemirror/lang-markdown'
 import type { NbCell } from '@claudette/shared'
@@ -31,7 +31,9 @@ interface Props {
   onToggleType: () => void
   onRemove: () => void
   onDuplicate: () => void
+  onSplit: () => void         // split this cell into two at the editor's cursor
   onReorder: (fromIndex: number) => void
+  onMenu: (x: number, y: number) => void   // open the cell context menu at (x, y)
   // Register this cell's editor so the notebook find bar can highlight + scroll to
   // matches inside it (null on unmount).
   registerView: (id: string, view: EditorView | null) => void
@@ -54,7 +56,7 @@ interface Props {
 const COMMIT_DEBOUNCE_MS = 500
 
 export function Cell(props: Props) {
-  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, onSelect, onMoveUp, onMoveDown, onToggleType, onRemove, onDuplicate, onReorder, onTogglePin, onBeginEdit, onToggleCollapse } = props
+  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, onSelect, onMoveUp, onMoveDown, onToggleType, onRemove, onDuplicate, onSplit, onReorder, onTogglePin, onBeginEdit, onToggleCollapse, onMenu } = props
   const editorRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const cbRef = useRef(props)
@@ -72,7 +74,14 @@ export function Cell(props: Props) {
   const [outputCollapsed, setOutputCollapsed] = useState(false)
   const outputs = cell.outputs ?? []
 
-  const commit = (code: string) => cbRef.current.onCodeChange(code)
+  // Only send an editCell when the buffer actually differs from the server's current
+  // source. A blur (click away, Ctrl+click another cell) flushes unconditionally, and
+  // the server clears a cell's outputs on every editCell — so committing an unchanged
+  // buffer would wipe the output for no reason. Guarding here keeps output intact.
+  const commit = (code: string) => {
+    if (code === cbRef.current.cell.source) return
+    cbRef.current.onCodeChange(code)
+  }
   const scheduleCommit = (code: string) => {
     if (commitTimer.current) clearTimeout(commitTimer.current)
     commitTimer.current = setTimeout(() => commit(code), COMMIT_DEBOUNCE_MS)
@@ -103,7 +112,11 @@ export function Cell(props: Props) {
           editorTheme,
           editorHighlight,
           cellSearch,
-          keymap.of([...runKeys, indentWithTab, ...defaultKeymap]),
+          // Per-cell undo/redo. Without this state field CodeMirror's Mod-z is a
+          // no-op and the keypress falls through to the browser's flaky native
+          // contentEditable undo — which only restores part of the buffer.
+          history(),
+          keymap.of([...runKeys, indentWithTab, ...historyKeymap, ...defaultKeymap]),
           EditorView.updateListener.of((u) => {
             if (u.docChanged) scheduleCommit(u.state.doc.toString())
           }),
@@ -132,7 +145,12 @@ export function Cell(props: Props) {
     const view = viewRef.current
     if (!view || focusedRef.current) return
     if (view.state.doc.toString() === cell.source) return
-    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: cell.source } })
+    // Keep external edits (Claude, reload, undo echoes) OUT of this editor's local
+    // undo history, so an in-cell Ctrl+Z rewinds only what the user typed here.
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: cell.source },
+      annotations: Transaction.addToHistory.of(false),
+    })
   }, [cell.source])
 
   const label = isCode ? `[${running ? '*' : (cell.executionCount ?? ' ')}]:` : isMarkdown ? 'md' : 'raw'
@@ -145,9 +163,10 @@ export function Cell(props: Props) {
 
   return (
     <div
-      className={`group flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50' : ''}`}
+      className={`group flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50 bg-ctp-accent/[0.06]' : ''}`}
       onMouseDown={onSelect}
       onFocus={onSelect}
+      onContextMenu={(e) => { e.preventDefault(); onMenu(e.clientX, e.clientY) }}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
       onDrop={(e) => {
         const from = Number(e.dataTransfer.getData('application/x-cell-index'))
@@ -226,11 +245,18 @@ export function Cell(props: Props) {
 
       {/* Per-cell actions — appear on hover */}
       <div className="w-5 shrink-0 self-start mt-1.5 flex flex-col items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-ctp-overlay">
+        <button
+          onClick={(e) => { e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); onMenu(r.right, r.bottom + 2) }}
+          title="More actions (copy, cut, paste…) · or right-click the cell"
+          aria-label="Cell actions"
+          className="text-[11px] leading-none px-0.5 py-0.5 rounded hover:bg-ctp-surface0 hover:text-ctp-text"
+        >⋯</button>
         <CellBtn onClick={onTogglePin} title={pinned ? 'Unpin (allow Claude to edit)' : 'Pin (lock for Claude)'} active={pinned}>{pinned ? '🔒' : '🔓'}</CellBtn>
         <CellBtn onClick={onMoveUp} title="Move up">↑</CellBtn>
         <CellBtn onClick={onMoveDown} title="Move down">↓</CellBtn>
         <CellBtn onClick={onToggleType} title={isCode ? 'Convert to markdown' : 'Convert to code'}>{isCode ? 'M' : '{}'}</CellBtn>
         <CellBtn onClick={onDuplicate} title="Duplicate cell">⧉</CellBtn>
+        {showEditor && <CellBtn onClick={onSplit} title="Split cell at cursor">✂</CellBtn>}
         <CellBtn onClick={onRemove} title="Delete cell" danger>✕</CellBtn>
       </div>
     </div>

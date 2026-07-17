@@ -25,12 +25,15 @@ type Origin = 'human' | 'claude'
 
 const IDLE_LOCK_MS = 30_000  // a focus/dirty lock auto-releases after this idle window
 const MAX_HISTORY = 50       // undo/redo depth per notebook (snapshots of the cells array)
+const MAX_OUTPUTS = 1000     // per-cell output cap — a runaway loop can't grow it unbounded
+const MAX_STREAM_CHARS = 200_000  // cap on a single coalesced stdout/stderr block
 
 interface OpenNotebook {
   doc: NotebookDoc
   meta: NotebookMeta                     // nbformat/nbformat_minor (doc.metadata mirrors meta.metadata)
   baseline: string                       // last text we read from / wrote to disk (echo-filtering)
   watcher?: FSWatcher
+  watchDebounce?: NodeJS.Timeout         // pending disk-change debounce (cancelled on close)
   locks: Map<string, CellLock>           // cellId → lock (human-held)
   lockTimers: Map<string, NodeJS.Timeout>
   writing: boolean                       // a persist is in flight (suppress our own watch echo)
@@ -39,8 +42,15 @@ interface OpenNotebook {
 }
 
 export class NotebookDocManager extends EventEmitter {
-  private open = new Map<string, OpenNotebook>()   // notebookId → state
-  private byPath = new Map<string, string>()       // abs path → notebookId
+  private open = new Map<string, OpenNotebook>()   // notebookId → state (currently open)
+  private byPath = new Map<string, string>()       // abs path → notebookId (currently open)
+  // Stable notebookId per path for the SESSION — survives close, so reopening a path
+  // gets the same id and its still-running kernel (keyed by notebookId) reconnects.
+  private idByPath = new Map<string, string>()
+  // Notebooks closed while a cell was still running — the doc is kept live so the
+  // run's output keeps landing, then saved + unregistered once the kernel goes idle
+  // (onKernelIdle). Their `update` broadcasts are suppressed (the tab is gone).
+  private pendingClose = new Set<string>()
 
   // --- open / create -------------------------------------------------------
 
@@ -49,8 +59,10 @@ export class NotebookDocManager extends EventEmitter {
   async openPath(path: string): Promise<NotebookDoc> {
     const abs = resolve(path)
     const existingId = this.byPath.get(abs)
-    if (existingId) return this.open.get(existingId)!.doc
-
+    if (existingId) {
+      this.pendingClose.delete(existingId)   // reopened before its deferred close fired
+      return this.open.get(existingId)!.doc
+    }
     const text = await readFile(abs, 'utf8')
     return this.register(abs, text)
   }
@@ -66,7 +78,9 @@ export class NotebookDocManager extends EventEmitter {
 
   private register(abs: string, text: string): NotebookDoc {
     const { cells, meta } = parseNotebook(text)
-    const notebookId = randomUUID()
+    // Reuse the path's stable id (so a reopen rebinds to its running kernel), else mint.
+    const notebookId = this.idByPath.get(abs) ?? randomUUID()
+    this.idByPath.set(abs, notebookId)
     const doc: NotebookDoc = {
       notebookId,
       path: abs,
@@ -100,9 +114,48 @@ export class NotebookDocManager extends EventEmitter {
     const nb = this.open.get(notebookId)
     if (!nb) return
     nb.watcher?.close()
+    if (nb.watchDebounce) clearTimeout(nb.watchDebounce)   // cancel a pending disk-change fire
     for (const t of nb.lockTimers.values()) clearTimeout(t)
     this.open.delete(notebookId)
     this.byPath.delete(nb.doc.path)
+  }
+
+  // Close a notebook tab. If a cell is still running, DEFER the actual close: keep the
+  // doc live so the run's output keeps landing, then save + unregister once idle
+  // (onKernelIdle). An idle notebook closes immediately (unsaved edits discarded, as
+  // before — nothing is mid-flight to lose). The kernel keeps running either way.
+  requestClose(notebookId: string, isRunning: boolean, save: boolean): void {
+    // Running → defer regardless; finalizeClose persists the run's output (and any
+    // unsaved edits) when it finishes. Idle → save-then-close, or discard-then-close.
+    if (isRunning) { this.pendingClose.add(notebookId); return }
+    if (save) { this.pendingClose.add(notebookId); void this.finalizeClose(notebookId) }  // save's emit stays suppressed
+    else this.close(notebookId)
+  }
+
+  // Is this notebook mid-deferred-close? Its `update` broadcasts are suppressed (the
+  // tab is already gone) so a background run doesn't resurrect it on the client.
+  isClosing(notebookId: string): boolean { return this.pendingClose.has(notebookId) }
+
+  // The kernel manager calls this when a notebook's runs finish. If the tab was closed
+  // mid-run, persist the captured output to disk, then unregister the doc.
+  onKernelIdle(notebookId: string): void {
+    if (this.pendingClose.has(notebookId)) void this.finalizeClose(notebookId)
+  }
+
+  private async finalizeClose(notebookId: string): Promise<void> {
+    // Save (persists the run's output) BEFORE dropping pendingClose, so save's own
+    // `update` emit is still suppressed by the broadcast filter — the tab is gone.
+    if (this.get(notebookId)?.dirty) { try { await this.save(notebookId) } catch { /* best effort */ } }
+    this.close(notebookId)
+    this.pendingClose.delete(notebookId)
+  }
+
+  // Reopening (or Claude re-focusing) a notebook mid-deferred-close cancels the close
+  // and re-broadcasts the live doc so the reopened tab picks it up.
+  cancelClose(notebookId: string): void {
+    if (!this.pendingClose.delete(notebookId)) return
+    const nb = this.open.get(notebookId)
+    if (nb) this.emit('update', nb.doc)
   }
 
   // --- ops -----------------------------------------------------------------
@@ -169,6 +222,13 @@ export class NotebookDocManager extends EventEmitter {
         const i = idx(op.cellId)
         if (i < 0) return notFound(op.cellId)
         doc.cells.splice(i, 1)
+        // Drop any lock the deleted cell held (else a sticky 'pin' lingers forever on
+        // a cellId that no longer exists) and re-broadcast the pruned lock set.
+        if (nb.locks.has(op.cellId)) {
+          this.clearLockTimer(nb, op.cellId)
+          nb.locks.delete(op.cellId)
+          this.emitLocks(nb)
+        }
         if (doc.cells.length === 0) doc.cells.push(emptyCodeCell())
         // Land focus on the cell that slid into the deleted slot (else the last one).
         focusId = doc.cells[Math.min(i, doc.cells.length - 1)]?.id
@@ -186,10 +246,71 @@ export class NotebookDocManager extends EventEmitter {
         const i = idx(op.cellId)
         if (i < 0) return notFound(op.cellId)
         const c = doc.cells[i]
-        doc.cells[i] = op.cellType === 'code'
-          ? { ...c, cellType: 'code', outputs: [], executionCount: null }
-          : { id: c.id, cellType: op.cellType, source: c.source, metadata: c.metadata }
+        // No-op when the type is unchanged — otherwise a redundant convert-to-code
+        // would wipe the cell's outputs/executionCount for nothing.
+        if (c.cellType !== op.cellType) {
+          doc.cells[i] = op.cellType === 'code'
+            ? { ...c, cellType: 'code', outputs: [], executionCount: null }
+            : { id: c.id, cellType: op.cellType, source: c.source, metadata: c.metadata }
+        }
         focusId = op.cellId
+        break
+      }
+      case 'deleteCells': {
+        const ids = new Set(op.cellIds)
+        const positions = op.cellIds.map(idx).filter((i) => i >= 0)
+        if (positions.length === 0) return notFound(op.cellIds[0] ?? '(none)')
+        const firstIdx = Math.min(...positions)
+        doc.cells = doc.cells.filter((c) => !ids.has(c.id))
+        this.dropLocks(nb, ids)
+        if (doc.cells.length === 0) doc.cells.push(emptyCodeCell())
+        // Land on the cell that slid into the first deleted slot (else the last one).
+        focusId = doc.cells[Math.min(firstIdx, doc.cells.length - 1)]?.id
+        break
+      }
+      case 'insertCells': {
+        if (op.cells.length === 0) return { ok: false, error: 'insertCells: no cells given' }
+        const at = clamp(op.index, 0, doc.cells.length)
+        const made = op.cells.map((c) => makeCell(c.cellType, c.source))
+        doc.cells.splice(at, 0, ...made)
+        focusId = made[0].id
+        break
+      }
+      case 'moveCells': {
+        const moveSet = new Set(op.cellIds.filter((id) => idx(id) >= 0))
+        if (moveSet.size === 0) return notFound(op.cellIds[0] ?? '(none)')
+        const moving = doc.cells.filter((c) => moveSet.has(c.id))   // preserve doc order
+        const rest = doc.cells.filter((c) => !moveSet.has(c.id))
+        const at = clamp(op.toIndex, 0, rest.length)
+        rest.splice(at, 0, ...moving)
+        doc.cells = rest
+        focusId = moving[0].id
+        break
+      }
+      case 'splitCell': {
+        const i = idx(op.cellId)
+        if (i < 0) return notFound(op.cellId)
+        const c = doc.cells[i]
+        const off = clamp(op.offset, 0, c.source.length)
+        // Head keeps the cell's id (and thus its place); tail becomes a new cell. A
+        // split invalidates outputs, so clear them on the (now-shorter) head.
+        doc.cells[i] = { ...c, source: c.source.slice(0, off), outputs: [], executionCount: null }
+        const tail = makeCell(c.cellType, c.source.slice(off))
+        doc.cells.splice(i + 1, 0, tail)
+        focusId = tail.id
+        break
+      }
+      case 'mergeCells': {
+        // Merge in DOCUMENT order regardless of the order ids were passed in.
+        const inOrder = doc.cells.filter((c) => op.cellIds.includes(c.id))
+        if (inOrder.length < 2) return { ok: false, error: 'mergeCells needs at least two existing cells', code: 'not_found' }
+        const first = inOrder[0]
+        const merged = inOrder.map((c) => c.source).join('\n')
+        const drop = new Set(inOrder.slice(1).map((c) => c.id))
+        doc.cells[idx(first.id)] = { ...first, source: merged, outputs: [], executionCount: null }
+        doc.cells = doc.cells.filter((c) => !drop.has(c.id))
+        this.dropLocks(nb, drop)
+        focusId = first.id
         break
       }
     }
@@ -319,21 +440,39 @@ export class NotebookDocManager extends EventEmitter {
     this.mutateCell(notebookId, cellId, (c) => { c.outputs = []; c.executionCount = null })
   }
   appendCellOutput(notebookId: string, cellId: string, output: NbOutput): void {
-    this.mutateCell(notebookId, cellId, (c) => { (c.outputs ??= []).push(output) })
+    this.mutateCell(notebookId, cellId, (c) => {
+      const outs = (c.outputs ??= [])
+      // Coalesce consecutive stream chunks of the same stream (stdout/stderr) into one
+      // output — what real Jupyter frontends do — so a tight print loop appends to one
+      // block (capped) instead of spawning an output per line.
+      const last = outs[outs.length - 1] as (NbOutput & { name?: string; text?: string }) | undefined
+      const cur = output as NbOutput & { name?: string; text?: string }
+      if (cur.output_type === 'stream' && last?.output_type === 'stream' && last.name === cur.name) {
+        last.text = capChars(String(last.text ?? '') + String(cur.text ?? ''), MAX_STREAM_CHARS)
+        return
+      }
+      if (cur.output_type === 'stream') cur.text = capChars(String(cur.text ?? ''), MAX_STREAM_CHARS)
+      outs.push(output)
+      // Hard cap the output count so a runaway non-stream loop (e.g. display() in a
+      // loop) can't grow the array without bound — keep the most recent.
+      if (outs.length > MAX_OUTPUTS) outs.splice(0, outs.length - MAX_OUTPUTS)
+    })
   }
   setCellExecutionCount(notebookId: string, cellId: string, n: number | null): void {
     this.mutateCell(notebookId, cellId, (c) => { c.executionCount = n })
   }
 
-  // Output changes mutate in place and broadcast, but do NOT bump `version`
-  // (that's for edit-op optimistic concurrency) nor mark `dirty` — outputs are
-  // regenerable and streaming them would spam saves. The user saves to persist them.
+  // Output changes mutate in place and broadcast. They don't bump `version` (that's
+  // for edit-op optimistic concurrency), but they DO mark `dirty` — fresh run outputs
+  // are unsaved state, so a concurrent external disk change must surface as a conflict
+  // (via onDiskChange's dirty guard) instead of silently discarding them on reload.
   private mutateCell(notebookId: string, cellId: string, fn: (c: NbCell) => void): void {
     const nb = this.open.get(notebookId)
     if (!nb) return
     const c = nb.doc.cells.find((x) => x.id === cellId)
     if (!c) return
     fn(c)
+    nb.doc.dirty = true
     this.emit('update', nb.doc)
   }
 
@@ -367,6 +506,18 @@ export class NotebookDocManager extends EventEmitter {
     const t = nb.lockTimers.get(cellId)
     if (t) { clearTimeout(t); nb.lockTimers.delete(cellId) }
   }
+  // Drop any locks held on the given (about-to-be-removed) cells, then re-broadcast
+  // the pruned set — else a sticky lock lingers on a cellId that no longer exists.
+  private dropLocks(nb: OpenNotebook, cellIds: Set<string>): void {
+    let changed = false
+    for (const id of cellIds) {
+      if (!nb.locks.has(id)) continue
+      this.clearLockTimer(nb, id)
+      nb.locks.delete(id)
+      changed = true
+    }
+    if (changed) this.emitLocks(nb)
+  }
   private emitLocks(nb: OpenNotebook): void {
     this.emit('locks', nb.doc.notebookId, [...nb.locks.values()])
   }
@@ -376,14 +527,14 @@ export class NotebookDocManager extends EventEmitter {
   private startWatch(nb: OpenNotebook): void {
     const dir = dirname(nb.doc.path)
     const base = basename(nb.doc.path)
-    let debounce: NodeJS.Timeout | undefined
     try {
       // Watch the directory (survives the temp+rename swap better than watching
-      // the file inode) and filter by basename.
+      // the file inode) and filter by basename. The debounce handle lives on `nb`
+      // so close() can cancel a fire that would otherwise mutate a closed doc.
       nb.watcher = watch(dir, (_event, filename) => {
         if (filename && filename.toString() !== base) return
-        clearTimeout(debounce)
-        debounce = setTimeout(() => { void this.onDiskChange(nb) }, 50)
+        clearTimeout(nb.watchDebounce)
+        nb.watchDebounce = setTimeout(() => { void this.onDiskChange(nb) }, 50)
       })
     } catch {
       // best-effort; a missing dir just means no external-change detection
@@ -391,6 +542,7 @@ export class NotebookDocManager extends EventEmitter {
   }
 
   private async onDiskChange(nb: OpenNotebook): Promise<void> {
+    if (!this.open.has(nb.doc.notebookId)) return       // closed after the watch fired
     if (nb.writing) return                              // our own write, ignore
     let text: string
     try { text = await readFile(nb.doc.path, 'utf8') } catch { return }
@@ -403,6 +555,12 @@ export class NotebookDocManager extends EventEmitter {
       return
     }
     // Clean reload: reparse from disk, keep the same notebookId (view stays bound).
+    this.applyDiskText(nb, text)
+  }
+
+  // Reparse `text` from disk into the doc, keeping the same notebookId so the view
+  // stays bound; bumps version, resets undo history, and broadcasts the update.
+  private applyDiskText(nb: OpenNotebook, text: string): void {
     const { cells, meta } = parseNotebook(text)
     nb.doc.cells = cells
     nb.meta = meta
@@ -410,6 +568,14 @@ export class NotebookDocManager extends EventEmitter {
     nb.baseline = text
     nb.doc.version++
     this.resetHistory(nb)
+    // The reparsed cells may have different ids (a file without 4.5 ids re-mints
+    // them), so any held lock now points at a gone cell — prune the orphans.
+    const live = new Set(cells.map((c) => c.id))
+    let pruned = false
+    for (const cellId of [...nb.locks.keys()]) {
+      if (!live.has(cellId)) { this.clearLockTimer(nb, cellId); nb.locks.delete(cellId); pruned = true }
+    }
+    if (pruned) this.emitLocks(nb)
     this.emit('update', nb.doc)
   }
 
@@ -418,16 +584,9 @@ export class NotebookDocManager extends EventEmitter {
     const nb = this.open.get(notebookId)
     if (!nb) return
     const text = await readFile(nb.doc.path, 'utf8')
-    const { cells, meta } = parseNotebook(text)
-    nb.doc.cells = cells
-    nb.meta = meta
-    nb.doc.metadata = meta.metadata
-    nb.baseline = text
     nb.doc.dirty = false
     nb.doc.conflict = false
-    nb.doc.version++
-    this.resetHistory(nb)
-    this.emit('update', nb.doc)
+    this.applyDiskText(nb, text)
   }
 
   // Resolve a conflict by overwriting disk with our version.
@@ -475,6 +634,13 @@ function firstChangedCellId(a: NbCell[], b: NbCell[]): string | undefined {
   return b[0]?.id
 }
 function clamp(n: number, lo: number, hi: number): number { return Math.max(lo, Math.min(hi, n)) }
+// Bound a stream block's length, keeping the head and tail (the interesting ends) with
+// an elision marker — a runaway loop stays legible instead of ballooning memory.
+function capChars(s: string, max: number): string {
+  if (s.length <= max) return s
+  const keep = Math.floor(max / 2)
+  return `${s.slice(0, keep)}\n… [output truncated: ${s.length - max} more chars] …\n${s.slice(s.length - keep)}`
+}
 function notFound(cellId: string): NotebookOpResult {
   return { ok: false, error: `no such cell: ${cellId}`, code: 'not_found' }
 }

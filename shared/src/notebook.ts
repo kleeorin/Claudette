@@ -5,6 +5,15 @@
 
 export type NbCellType = 'code' | 'markdown' | 'raw'
 
+// nbformat stores multi-line strings as arrays of lines; collapse to one string.
+// Used for both cell `source` and output `text`/`text/plain` values, which the
+// format allows to be either a string or a string[].
+export function nbText(v: unknown): string {
+  if (Array.isArray(v)) return v.join('')
+  if (typeof v === 'string') return v
+  return ''
+}
+
 // Kernel lifecycle as surfaced to the UI (mirrors Jupyter's execution_state plus
 // our starting/dead bookends). 'none' = no kernel started yet (or shut down) — the
 // default before the first run, so the UI shows "No kernel" instead of a bogus idle.
@@ -31,6 +40,9 @@ export interface NbCell {
   outputs?: NbOutput[]       // code cells only
   executionCount?: number | null
   metadata?: Record<string, unknown>  // preserved verbatim so cells round-trip losslessly
+  // nbformat `attachments` (embedded images referenced as `attachment:…`), on
+  // markdown/raw cells. Kept so an edit-then-save doesn't strip inline images.
+  attachments?: Record<string, unknown>
 }
 
 export interface NotebookDoc {
@@ -57,6 +69,19 @@ export type NotebookOp =
   | { op: 'setCellType'; notebookId: string; cellId: string; cellType: NbCellType }
   | { op: 'runCell'; notebookId: string; cellId: string }
   | { op: 'runAll'; notebookId: string }
+  // --- multi-cell / structural ops (atomic: one undo step each) ---------------
+  // Delete several cells at once. Bulk-delete over a multi-selection.
+  | { op: 'deleteCells'; notebookId: string; cellIds: string[] }
+  // Insert a run of new cells at `index` (0-based). Used for multi-cell paste.
+  | { op: 'insertCells'; notebookId: string; index: number; cells: { cellType: NbCellType; source: string }[] }
+  // Move a set of cells (kept in document order) so they sit at `toIndex` within the
+  // remaining cells. Powers move-to-top/bottom and reordering a multi-selection.
+  | { op: 'moveCells'; notebookId: string; cellIds: string[]; toIndex: number }
+  // Split one cell at character `offset` into two adjacent cells (same type).
+  | { op: 'splitCell'; notebookId: string; cellId: string; offset: number }
+  // Merge the listed cells (joined in document order by newlines) into the earliest,
+  // keeping that cell's type; the rest are removed.
+  | { op: 'mergeCells'; notebookId: string; cellIds: string[] }
 
 export type NotebookOpResult =
   | { ok: true; version: number }

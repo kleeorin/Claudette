@@ -73,8 +73,10 @@ export class KernelClient {
     switch (header.msg_type) {
       case 'status': {
         const state = content.execution_state as KernelStatus
-        // Skip the momentary 'busy' our own heartbeat causes.
-        if (state === 'busy' && parentId && parentId === this.hbMsgId) break
+        // Skip BOTH the momentary 'busy' AND the paired 'idle' our own heartbeat
+        // (kernel_info_request) causes — letting the idle through would flip the
+        // kernel to idle mid-run and clear the running cell while it's still going.
+        if (parentId && parentId === this.hbMsgId) break
         this.onStatusChange?.(state)
         break
       }
@@ -199,7 +201,22 @@ export class KernelClient {
   // ---- REST actions ------------------------------------------------------
 
   interrupt(): Promise<void> { return this.post('interrupt') }
-  restart(): Promise<void> { return this.post('restart') }
+  restart(): Promise<void> {
+    // A restart kills the current kernel process, so any in-flight execute never
+    // gets its execute_reply — resolve those `pending` runs now (count = null, no
+    // error output) so their promises settle and the running state clears, instead
+    // of leaking the entry and stranding the cell as "running" forever.
+    this.abortPending()
+    return this.post('restart')
+  }
+
+  // Resolve every in-flight execution as ended-without-a-reply, WITHOUT appending an
+  // error output (unlike failPending, which surfaces a connection error). Used when
+  // we deliberately end the runs — e.g. a restart.
+  private abortPending() {
+    for (const { onDone } of this.pending.values()) onDone(null)
+    this.pending.clear()
+  }
   private post(action: string): Promise<void> {
     return fetch(`${this.baseUrl}/api/kernels/${this.kernelId}/${action}`, {
       method: 'POST', headers: { Authorization: `token ${this.token}` },

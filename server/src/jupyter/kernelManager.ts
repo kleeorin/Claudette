@@ -12,6 +12,9 @@ import { KernelClient, type KernelStatus } from './kernelClient'
 export class KernelManager extends EventEmitter {
   private clients = new Map<string, KernelClient>()   // notebookId → client
   private status = new Map<string, KernelStatus>()
+  private running = new Map<string, Set<string>>()    // notebookId → cellIds currently executing/queued
+  private executing = new Set<string>()               // `${notebookId}:${cellId}` actually mid-execution
+  private owner = new Map<string, string>()           // notebookId → owning sessionId (kills with the session)
   private specByNotebook = new Map<string, string>()  // notebookId → chosen kernelspec name
   // The default kernelspec for notebooks that haven't chosen one. Seeded from
   // CLAUDETTE_DEFAULT_KERNEL (set it to e.g. 'python-autovenv' to make the auto-venv
@@ -35,7 +38,35 @@ export class KernelManager extends EventEmitter {
   private setStatus(notebookId: string, status: KernelStatus): void {
     this.status.set(notebookId, status)
     this.emit('status', notebookId, status)
+    // A dead kernel will never finish its runs — drop the running markers so the UI
+    // spinners don't spin forever.
+    if (status === 'dead') this.clearRunning(notebookId)
   }
+
+  // The authoritative per-cell running set (emitted as 'running' → `notebook:running`).
+  // Marking a cell running/not-running is the ONLY driver of the UI spinner, so it must
+  // cover every terminal path (done, error, deleted mid-run, kernel dead/restart).
+  private setRunning(notebookId: string, cellIds: string[], on: boolean): void {
+    const set = this.running.get(notebookId) ?? new Set<string>()
+    let changed = false
+    for (const id of cellIds) {
+      if (on ? !set.has(id) : set.has(id)) { on ? set.add(id) : set.delete(id); changed = true }
+    }
+    if (!changed) return
+    this.running.set(notebookId, set)
+    this.emit('running', notebookId, [...set])
+    if (set.size === 0) this.docs.onKernelIdle(notebookId)   // finalize a deferred close
+  }
+  private clearRunning(notebookId: string): void {
+    const set = this.running.get(notebookId)
+    if (!set || set.size === 0) return
+    set.clear()
+    this.emit('running', notebookId, [])
+    this.docs.onKernelIdle(notebookId)
+  }
+
+  // Is any cell of this notebook currently executing/queued?
+  isRunning(notebookId: string): boolean { return (this.running.get(notebookId)?.size ?? 0) > 0 }
 
   private async info(): Promise<JupyterInfo> {
     const info = await this.jupyter.start()
@@ -113,24 +144,63 @@ export class KernelManager extends EventEmitter {
     const cell = doc?.cells.find((c) => c.id === cellId)
     if (!doc || !cell) throw new Error(`no such cell: ${cellId}`)
     if (cell.cellType !== 'code') return   // only code cells execute
-    const client = await this.ensureKernel(notebookId)
-    this.docs.clearCellOutputs(notebookId, cellId)
-    await new Promise<void>((resolve) => {
-      client.execute(
-        cell.source,
-        (o) => this.docs.appendCellOutput(notebookId, cellId, o),
-        (count) => { this.docs.setCellExecutionCount(notebookId, cellId, count); resolve() },
-      )
-    })
+    // Ignore a re-run of a cell that's already executing — otherwise the second run
+    // clears the first's partial output while the first keeps appending, interleaving
+    // two runs' output in the same cell.
+    const execKey = `${notebookId}:${cellId}`
+    if (this.executing.has(execKey)) return
+    this.executing.add(execKey)
+    this.setRunning(notebookId, [cellId], true)
+    try {
+      let client: KernelClient
+      try {
+        client = await this.ensureKernel(notebookId)
+      } catch (e) {
+        // Kernel couldn't start (e.g. Jupyter not installed) — surface it as the
+        // cell's error output rather than a swallowed rejection + stuck spinner.
+        this.docs.clearCellOutputs(notebookId, cellId)
+        this.docs.appendCellOutput(notebookId, cellId, {
+          output_type: 'error', ename: 'KernelStartError',
+          evalue: e instanceof Error ? e.message : String(e), traceback: [],
+        })
+        return
+      }
+      this.docs.clearCellOutputs(notebookId, cellId)
+      await new Promise<void>((resolve) => {
+        client.execute(
+          cell.source,
+          (o) => this.docs.appendCellOutput(notebookId, cellId, o),
+          (count) => { this.docs.setCellExecutionCount(notebookId, cellId, count); resolve() },
+        )
+      })
+    } finally {
+      this.executing.delete(execKey)
+      this.setRunning(notebookId, [cellId], false)
+    }
   }
 
   // Run every code cell top-to-bottom, in order, stopping nothing on error (matches
-  // a plain run-all; the error output lands on the offending cell).
+  // a plain run-all; the error output lands on the offending cell). All target cells
+  // are marked running up front (so queued cells show `[*]` like classic Jupyter) and
+  // each clears as it finishes; a cell deleted mid-run is skipped, not fatal.
   async runAll(notebookId: string): Promise<void> {
     const doc = this.docs.get(notebookId)
     if (!doc) throw new Error(`no such open notebook: ${notebookId}`)
-    for (const cell of doc.cells.filter((c) => c.cellType === 'code')) {
-      await this.runCell(notebookId, cell.id)
+    const ids = doc.cells.filter((c) => c.cellType === 'code').map((c) => c.id)
+    this.setRunning(notebookId, ids, true)
+    try {
+      for (const id of ids) {
+        // The cell may have been deleted since we snapshotted; skip it gracefully so
+        // one gone cell doesn't abort the rest of the run.
+        if (!this.docs.get(notebookId)?.cells.some((c) => c.id === id)) {
+          this.setRunning(notebookId, [id], false)
+          continue
+        }
+        try { await this.runCell(notebookId, id) }
+        catch { this.setRunning(notebookId, [id], false) }
+      }
+    } finally {
+      this.setRunning(notebookId, ids, false)   // clear any stragglers
     }
   }
 
@@ -140,18 +210,49 @@ export class KernelManager extends EventEmitter {
   restart(notebookId: string): Promise<void> {
     const client = this.clients.get(notebookId)
     if (!client) return Promise.resolve()
+    this.clearRunning(notebookId)            // in-flight runs won't finish on the old kernel
     this.setStatus(notebookId, 'starting')   // reflect the restart immediately; idle arrives via the socket
     return client.restart()
   }
 
   shutdown(notebookId: string): void {
+    this.owner.delete(notebookId)   // explicit kill severs session ownership
     const client = this.clients.get(notebookId)
     if (!client) return
     void client.shutdown()
     client.dispose()
     this.clients.delete(notebookId)
+    this.clearRunning(notebookId)
     this.docs.bindKernel(notebookId, undefined)
     this.setStatus(notebookId, 'none')   // no kernel now — clears the bogus 'idle'
+  }
+
+  // Record which session a notebook was opened in — closing that session kills its
+  // kernel (see shutdownForSession). Last opener wins.
+  setOwner(notebookId: string, sessionId: string): void {
+    this.owner.set(notebookId, sessionId)
+  }
+
+  // Kill the kernels for every notebook opened in a now-closed session.
+  shutdownForSession(sessionId: string): void {
+    for (const [notebookId, sid] of [...this.owner]) {
+      if (sid !== sessionId) continue
+      this.shutdown(notebookId)
+      this.owner.delete(notebookId)
+    }
+  }
+
+  // Re-broadcast a notebook's live kernel state. Kernels OUTLIVE the doc (closing a
+  // tab doesn't kill the kernel), so when a notebook is REOPENED its fresh doc/view
+  // must pick the existing kernel back up — its binding, status, and running cells.
+  resync(notebookId: string): void {
+    const client = this.clients.get(notebookId)
+    if (!client) return
+    this.docs.setKernelName(notebookId, this.specName(notebookId))
+    this.docs.bindKernel(notebookId, client.kernelId)
+    this.emit('status', notebookId, this.status.get(notebookId) ?? 'idle')
+    const running = this.running.get(notebookId)
+    this.emit('running', notebookId, running ? [...running] : [])
   }
 
   destroy(): void {
