@@ -50,6 +50,8 @@ function channel<A extends unknown[]>() {
 
 const events = channel<[string, ClaudeEvent]>()
 const permissions = channel<[string, PermissionRequest]>()
+const userTurns = channel<[string, string, string | undefined]>()   // [id, text, turnId]
+const permsResolved = channel<[string, string]>()                   // [id, requestId]
 const states = channel<[string, SessionState]>()
 const readies = channel<[string, string]>()
 const exits = channel<[string, boolean, string]>()
@@ -78,6 +80,8 @@ function dispatch(msg: WsServerMessage): void {
     case 'session:list': lists.emit(msg.sessions); break
     case 'session:event': events.emit(msg.id, msg.event); break
     case 'session:permission': permissions.emit(msg.id, msg.request); break
+    case 'session:userTurn': userTurns.emit(msg.id, msg.text, msg.turnId); break
+    case 'session:permissionResolved': permsResolved.emit(msg.id, msg.requestId); break
     case 'session:state': states.emit(msg.id, msg.state); break
     case 'session:ready': readies.emit(msg.id, msg.claudeSessionId); break
     case 'session:exit': exits.emit(msg.id, msg.failed, msg.error); break
@@ -159,6 +163,10 @@ export const api = {
   on: {
     event: (fn: Fn<[string, ClaudeEvent]>) => events.on(fn),
     permission: (fn: Fn<[string, PermissionRequest]>) => permissions.on(fn),
+    // A user turn mirrored from the server (any device); turnId de-dupes the sender's echo.
+    userTurn: (fn: Fn<[string, string, string | undefined]>) => userTurns.on(fn),
+    // A pending permission prompt was resolved — clear it on every client.
+    permissionResolved: (fn: Fn<[string, string]>) => permsResolved.on(fn),
     stateChange: (fn: Fn<[string, SessionState]>) => states.on(fn),
     ready: (fn: Fn<[string, string]>) => readies.on(fn),
     exit: (fn: Fn<[string, boolean, string]>) => exits.on(fn),
@@ -178,7 +186,7 @@ export const api = {
   },
   // Turn I/O over WS.
   session: {
-    sendTurn: (id: string, text: string) => send({ type: 'session:send', id, text }),
+    sendTurn: (id: string, text: string, turnId?: string) => send({ type: 'session:send', id, text, turnId }),
     interrupt: (id: string) => send({ type: 'session:interrupt', id }),
     respondPermission: (id: string, requestId: string, decision: PermissionDecision) =>
       send({ type: 'session:permission', id, requestId, decision }),

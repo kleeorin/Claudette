@@ -16,7 +16,7 @@ import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, Kerne
 export type WsClientMessage =
   | { type: 'ping' }
   // Native turn I/O for a session (lifecycle create/list/destroy/… is HTTP).
-  | { type: 'session:send'; id: string; text: string }
+  | { type: 'session:send'; id: string; text: string; turnId?: string }
   | { type: 'session:interrupt'; id: string }
   | { type: 'session:permission'; id: string; requestId: string; decision: PermissionDecision }
   // What a session is currently viewing (its active content tab), published on tab/
@@ -46,6 +46,13 @@ export type WsServerMessage =
   // Per-session streaming events (namespaced by session id).
   | { type: 'session:event'; id: string; event: ClaudeEvent }
   | { type: 'session:permission'; id: string; request: PermissionRequest }
+  // A user turn, broadcast to EVERY client so all mirror it (not just the sender's
+  // optimistic echo). turnId lets the sender de-dupe its own optimistic message.
+  | { type: 'session:userTurn'; id: string; text: string; turnId?: string }
+  // A pending permission prompt was resolved (answered, auto-denied, or the session
+  // ended) — every client clears that prompt, so a non-answering device (e.g. the
+  // phone) isn't left stuck on a dead prompt.
+  | { type: 'session:permissionResolved'; id: string; requestId: string }
   | { type: 'session:state'; id: string; state: SessionState }
   | { type: 'session:ready'; id: string; claudeSessionId: string }
   | { type: 'session:exit'; id: string; failed: boolean; error: string }

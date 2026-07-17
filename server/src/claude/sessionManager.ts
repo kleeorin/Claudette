@@ -170,6 +170,7 @@ export class SessionManager extends EventEmitter {
       this.emit('ready', id, sid)
     })
     engine.on('permission', (req: PermissionRequest) => this.emit('permission', id, req))
+    engine.on('permissionResolved', (requestId: string) => this.emit('permissionResolved', id, requestId))
     engine.on('state', (state: 'idle' | 'running' | 'waiting') => this.setState(id, state))
     engine.on('exit', (code: number | null) => {
       // A resumeInto() kill: relaunch straight into the chosen conversation
@@ -287,12 +288,13 @@ export class SessionManager extends EventEmitter {
 
   // --- turn I/O (replaces keystroke sendInput) -------------------------------
 
-  sendUserTurn(id: string, text: string): void {
+  sendUserTurn(id: string, text: string, turnId?: string): void {
     const session = this.sessions.get(id)
     if (!session?.engine) return
     // A new user message = a new turn: notify listeners so per-turn state (e.g. the
-    // notebook "working target" pin) resets and re-binds to the user's current view.
-    this.emit('userTurn', id)
+    // notebook "working target" pin) resets and re-binds to the user's current view,
+    // AND so every client mirrors the message (text/turnId), not just the sender.
+    this.emit('userTurn', id, text, turnId)
     session.engine.sendUserTurn(text)
   }
 

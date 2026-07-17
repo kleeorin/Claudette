@@ -24,6 +24,12 @@ export function bridgeSessionEvents(sessions: SessionManager, hub: WsHub): void 
     hub.broadcast({ type: 'session:event', id, event }))
   sessions.on('permission', (id: string, request: PermissionRequest) =>
     hub.broadcast({ type: 'session:permission', id, request }))
+  // Mirror user turns + permission resolutions to EVERY client so all devices stay
+  // in sync (not just whoever typed / answered) — see the ws.ts message docs.
+  sessions.on('userTurn', (id: string, text: string, turnId?: string) =>
+    hub.broadcast({ type: 'session:userTurn', id, text, turnId }))
+  sessions.on('permissionResolved', (id: string, requestId: string) =>
+    hub.broadcast({ type: 'session:permissionResolved', id, requestId }))
   sessions.on('stateChange', (id: string, state: SessionState) =>
     hub.broadcast({ type: 'session:state', id, state }))
   sessions.on('ready', (id: string, claudeSessionId: string) =>
@@ -125,7 +131,7 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
 export function handleSessionClientMessage(sessions: SessionManager, msg: WsClientMessage): boolean {
   switch (msg.type) {
     case 'session:send':
-      sessions.sendUserTurn(msg.id, msg.text)
+      sessions.sendUserTurn(msg.id, msg.text, msg.turnId)
       return true
     case 'session:interrupt':
       sessions.interrupt(msg.id)

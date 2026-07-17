@@ -103,6 +103,7 @@ type PendingPermission = { request: PermissionRequest; resolve: (d: PermissionDe
 export interface ClaudeEngineEvents {
   event: (e: ClaudeEvent) => void            // any parsed stream-json event, for the transcript
   permission: (req: PermissionRequest) => void
+  permissionResolved: (requestId: string) => void   // a pending prompt was answered → clear it everywhere
   state: (state: 'idle' | 'running' | 'waiting') => void
   ready: (sessionId: string) => void         // fired on the init event
   exit: (code: number | null) => void
@@ -154,8 +155,12 @@ export class ClaudeEngine extends EventEmitter {
       if (terminated) return
       terminated = true
       this.child = null
-      // Fail any in-flight permission prompts so the client doesn't hang.
-      for (const { resolve } of this.pending.values()) resolve({ behavior: 'deny', message: 'session ended' })
+      // Fail any in-flight permission prompts so the client doesn't hang, and tell
+      // every client to clear them (a non-answering device would otherwise be stuck).
+      for (const [requestId, { resolve }] of this.pending) {
+        resolve({ behavior: 'deny', message: 'session ended' })
+        this.emit('permissionResolved', requestId)
+      }
       this.pending.clear()
       // Settle any in-flight control requests we sent (e.g. set_permission_mode).
       for (const settle of this.pendingControl.values()) settle({ ok: false, error: 'session ended' })
@@ -214,6 +219,7 @@ export class ClaudeEngine extends EventEmitter {
     if (!p) return
     this.pending.delete(requestId)
     p.resolve(decision)
+    this.emit('permissionResolved', requestId)   // tell every client to clear the prompt
     // Back to running if the turn is still going; the next result flips to idle.
     if (this._turnActive) this.setState('running')
   }

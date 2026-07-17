@@ -359,19 +359,35 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const offPerm = api.on.permission((id, req) => {
       dispatch({ type: 'SET_PENDING', sessionId: id, req })
     })
+    // A user turn from ANY device — mirror it here, unless it's this client's own
+    // optimistic echo (already appended in sendTurn under this turnId).
+    const offUserTurn = api.on.userTurn((id, text, turnId) => {
+      if (turnId && stateRef.current.transcripts[id]?.some((it) => it.id === turnId)) return
+      dispatch({ type: 'APPEND', sessionId: id, items: [{ kind: 'user', id: turnId ?? nextId(), text }] })
+    })
+    // A permission prompt was resolved (answered on any device / auto-denied). Clear
+    // it here so a non-answering client isn't stuck on a dead prompt. Match on
+    // requestId so a NEWER prompt that arrived meanwhile isn't cleared by mistake.
+    const offPermResolved = api.on.permissionResolved((id, requestId) => {
+      if (stateRef.current.pending[id]?.requestId === requestId) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
+    })
     // A finished/interrupted turn clears any stale prompt defensively.
     const offState = api.on.stateChange((id, s) => {
       if (s === 'idle' && stateRef.current.pending[id]) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
     })
-    return () => { offEvent(); offPerm(); offState() }
+    return () => { offEvent(); offPerm(); offUserTurn(); offPermResolved(); offState() }
   }, [])
 
   const sendTurn = useCallback((sessionId: string, text: string) => {
     const t = text.trim()
     if (!t) return
-    // Optimistic local echo (we don't pass --replay-user-messages, so no dup).
-    dispatch({ type: 'APPEND', sessionId, items: [{ kind: 'user', id: nextId(), text: t }] })
-    api.session.sendTurn(sessionId, t)
+    // Optimistic local echo under a globally-unique turnId. The server broadcasts the
+    // turn to EVERY client (session:userTurn) so all devices mirror it; we de-dupe our
+    // own echo by that id (a per-client counter would collide across devices). Not
+    // crypto.randomUUID — the VPN origin is plain http (non-secure context).
+    const turnId = `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+    dispatch({ type: 'APPEND', sessionId, items: [{ kind: 'user', id: turnId, text: t }] })
+    api.session.sendTurn(sessionId, t, turnId)
   }, [])
 
   const interrupt = useCallback((sessionId: string) => {
