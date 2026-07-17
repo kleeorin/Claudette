@@ -9,6 +9,8 @@ import type {
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
   ActivePane, KernelSpecsResponse, SandboxConfig,
+  AgentInfo, ListAgentsResponse,
+  EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
 } from '@claudette/shared'
 
 // The single place the SPA talks to the server — replaces ClaudeMaster's Electron
@@ -25,8 +27,12 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+async function get<T>(path: string): Promise<T> {
+  return (await fetch(path)).json()
+}
+
 export async function getHealth(): Promise<HealthResponse> {
-  return (await fetch('/api/health')).json()
+  return get<HealthResponse>('/api/health')
 }
 
 // --- WebSocket hub (client side) ---------------------------------------------
@@ -53,6 +59,7 @@ const nbUpdates = channel<[NotebookDoc]>()
 const nbFocuses = channel<[string, string, boolean]>()   // [notebookId, cellId, reveal]
 const nbLocks = channel<[string, CellLock[]]>()
 const nbKernels = channel<[string, KernelStatus]>()
+const nbRunning = channel<[string, string[]]>()          // [notebookId, running cellIds]
 const paneOutputs = channel<[string, string]>()
 const paneExits = channel<[string]>()
 const focusPanes = channel<[string, string, string]>()   // [sessionId, notebookId, path]
@@ -78,6 +85,7 @@ function dispatch(msg: WsServerMessage): void {
     case 'notebook:focus': nbFocuses.emit(msg.notebookId, msg.cellId, msg.reveal); break
     case 'notebook:locks': nbLocks.emit(msg.notebookId, msg.locks); break
     case 'notebook:kernel': nbKernels.emit(msg.notebookId, msg.status); break
+    case 'notebook:running': nbRunning.emit(msg.notebookId, msg.cellIds); break
     case 'pane:output': paneOutputs.emit(msg.id, msg.data); break
     case 'pane:exit': paneExits.emit(msg.id); break
     case 'session:focusPane': focusPanes.emit(msg.id, msg.notebookId, msg.path); break
@@ -161,6 +169,8 @@ export const api = {
     notebookFocus: (fn: Fn<[string, string, boolean]>) => nbFocuses.on(fn),
     notebookLocks: (fn: Fn<[string, CellLock[]]>) => nbLocks.on(fn),
     notebookKernel: (fn: Fn<[string, KernelStatus]>) => nbKernels.on(fn),
+    // The authoritative set of running/queued cells for a notebook (server-owned).
+    notebookRunning: (fn: Fn<[string, string[]]>) => nbRunning.on(fn),
     paneOutput: (fn: Fn<[string, string]>) => paneOutputs.on(fn),
     paneExit: (fn: Fn<[string]>) => paneExits.on(fn),
     // Claude asked (via open_notebook) to focus a notebook in a given session.
@@ -181,34 +191,39 @@ export const api = {
   http: {
     createSession: (req: CreateSessionRequest) => post<CreateSessionResponse>('/api/session/create', req),
     listSessions: async (): Promise<SessionInfo[]> =>
-      (await (await fetch('/api/session/list')).json() as ListSessionsResponse).sessions,
+      (await get<ListSessionsResponse>('/api/session/list')).sessions,
     destroySession: (id: string) => post<OkResponse>('/api/session/destroy', { id }),
     relaunch: (id: string) => post<OkResponse>('/api/session/relaunch', { id }),
     relaunchApply: (id: string) => post<OkResponse>('/api/session/relaunchApply', { id }),
     setMode: (id: string, mode: PermissionMode) => post<SetModeResult>('/api/session/setMode', { id, mode } as SetModeRequest),
+    setAgent: (id: string, agentId: string) => post<OkResponse>('/api/session/setAgent', { id, agentId }),
+    rename: (id: string, name: string) => post<OkResponse>('/api/session/rename', { id, name }),
+    listAgents: async (): Promise<AgentInfo[]> => (await get<ListAgentsResponse>('/api/agents')).agents,
     setSandbox: (id: string, sandbox: SandboxConfig) => post<OkResponse>('/api/session/setSandbox', { id, sandbox }),
     restartFresh: (id: string) => post<OkResponse>('/api/session/restartFresh', { id }),
     resumeInto: (id: string, claudeSessionId: string) => post<OkResponse>('/api/session/resumeInto', { id, claudeSessionId }),
     listConversations: async (cwd: string): Promise<ConversationMeta[]> =>
-      (await (await fetch(`/api/session/conversations?cwd=${encodeURIComponent(cwd)}`)).json() as ConversationsResponse).conversations,
+      (await get<ConversationsResponse>(`/api/session/conversations?cwd=${encodeURIComponent(cwd)}`)).conversations,
     readConversation: async (cwd: string, id: string): Promise<ClaudeEvent[]> =>
-      (await (await fetch(`/api/session/conversation?cwd=${encodeURIComponent(cwd)}&id=${encodeURIComponent(id)}`)).json() as ConversationResponse).events,
+      (await get<ConversationResponse>(`/api/session/conversation?cwd=${encodeURIComponent(cwd)}&id=${encodeURIComponent(id)}`)).events,
   },
   // Notebook: HTTP for open/create/save/conflict; ops + locks over WS. The doc is
   // server-owned — these send intents; the authoritative state comes back via
   // `on.notebookUpdate`.
   notebook: {
-    open: (path: string) => post<{ doc?: NotebookDoc; error?: string }>('/api/notebook/open', { path }),
-    create: (path: string) => post<{ doc?: NotebookDoc; error?: string }>('/api/notebook/create', { path }),
+    open: (path: string, sessionId?: string) => post<{ doc?: NotebookDoc; error?: string }>('/api/notebook/open', { path, sessionId }),
+    create: (path: string, sessionId?: string) => post<{ doc?: NotebookDoc; error?: string }>('/api/notebook/create', { path, sessionId }),
+    close: (notebookId: string, save = false) => post<OkResponse>('/api/notebook/close', { notebookId, save }),
     save: (notebookId: string) => post<OkResponse>('/api/notebook/save', { notebookId }),
     reload: (notebookId: string) => post<OkResponse>('/api/notebook/reload', { notebookId }),
     keepMine: (notebookId: string) => post<OkResponse>('/api/notebook/keepMine', { notebookId }),
     undo: (notebookId: string) => post<OkResponse>('/api/notebook/undo', { notebookId }),
     redo: (notebookId: string) => post<OkResponse>('/api/notebook/redo', { notebookId }),
     clearOutputs: (notebookId: string) => post<OkResponse>('/api/notebook/clearOutputs', { notebookId }),
-    kernelSpecs: async (): Promise<KernelSpecsResponse> => (await fetch('/api/notebook/kernelspecs')).json(),
+    kernelSpecs: () => get<KernelSpecsResponse>('/api/notebook/kernelspecs'),
     kernelRestart: (notebookId: string) => post<OkResponse>('/api/notebook/kernel/restart', { notebookId }),
     kernelInterrupt: (notebookId: string) => post<OkResponse>('/api/notebook/kernel/interrupt', { notebookId }),
+    kernelShutdown: (notebookId: string) => post<OkResponse>('/api/notebook/kernel/shutdown', { notebookId }),
     kernelSetSpec: (notebookId: string, name: string) => post<OkResponse>('/api/notebook/kernel/setSpec', { notebookId, name }),
     op: (op: NotebookOp) => send({ type: 'notebook:op', op }),
     claim: (notebookId: string, cellId: string, reason: LockReason) =>
@@ -218,27 +233,42 @@ export const api = {
   },
   // Filesystem browse (read-only) for the file/folder picker. `path` omitted ⇒ home.
   fs: {
-    list: async (path?: string): Promise<FsListResponse> =>
-      (await fetch(`/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ''}`)).json(),
-    read: async (path: string): Promise<FilePreview> =>
-      (await fetch(`/api/fs/read?path=${encodeURIComponent(path)}`)).json(),
+    list: (path?: string): Promise<FsListResponse> =>
+      get<FsListResponse>(`/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ''}`),
+    read: (path: string): Promise<FilePreview> =>
+      get<FilePreview>(`/api/fs/read?path=${encodeURIComponent(path)}`),
     write: (path: string, text: string) => post<WriteResult>('/api/fs/write', { path, text }),
     createFile: (path: string) => post<WriteResult>('/api/fs/createFile', { path }),
     mkdir: (path: string) => post<WriteResult>('/api/fs/mkdir', { path }),
+    rename: (from: string, to: string) => post<WriteResult>('/api/fs/rename', { from, to }),
+    copy: (from: string, to: string) => post<WriteResult>('/api/fs/copy', { from, to }),
+    remove: (path: string) => post<WriteResult>('/api/fs/delete', { path }),
+    // A same-origin URL the browser can navigate to; the auth cookie rides along.
+    downloadUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}`,
+  },
+  // Permission Control Center: read the merged picture over GET (cwd + agent in the
+  // query); add/remove a rule over POST. Per-session mode uses http.setMode.
+  perms: {
+    get: async (cwd: string, agentId?: string): Promise<EffectivePermissions> =>
+      (await get<PermissionsResponse>(`/api/session/permissions?cwd=${encodeURIComponent(cwd)}${agentId ? `&agentId=${encodeURIComponent(agentId)}` : ''}`)).permissions,
+    addRule: (cwd: string, scope: PermissionScope, action: PermissionAction, value: string) =>
+      post<WriteResult>('/api/session/perms/addRule', { cwd, scope, action, value }),
+    removeRule: (cwd: string, scope: PermissionScope, action: PermissionAction, value: string) =>
+      post<WriteResult>('/api/session/perms/removeRule', { cwd, scope, action, value }),
   },
   // Git panel: reads over GET (cwd + params in the query), mutations over POST.
   // Every call carries the session's cwd — git runs there.
   git: {
-    status: async (cwd: string): Promise<GitStatus> =>
-      (await fetch(`/api/git/status?cwd=${encodeURIComponent(cwd)}`)).json(),
-    diff: async (cwd: string, file: string, staged: boolean, untracked: boolean): Promise<GitDiff> =>
-      (await fetch(`/api/git/diff?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}&staged=${staged ? 1 : 0}&untracked=${untracked ? 1 : 0}`)).json(),
-    log: async (cwd: string, limit = 100): Promise<GitLog> =>
-      (await fetch(`/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=${limit}`)).json(),
-    show: async (cwd: string, hash: string): Promise<GitDiff> =>
-      (await fetch(`/api/git/show?cwd=${encodeURIComponent(cwd)}&hash=${encodeURIComponent(hash)}`)).json(),
-    branches: async (cwd: string): Promise<GitBranches> =>
-      (await fetch(`/api/git/branches?cwd=${encodeURIComponent(cwd)}`)).json(),
+    status: (cwd: string): Promise<GitStatus> =>
+      get<GitStatus>(`/api/git/status?cwd=${encodeURIComponent(cwd)}`),
+    diff: (cwd: string, file: string, staged: boolean, untracked: boolean): Promise<GitDiff> =>
+      get<GitDiff>(`/api/git/diff?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}&staged=${staged ? 1 : 0}&untracked=${untracked ? 1 : 0}`),
+    log: (cwd: string, limit = 100): Promise<GitLog> =>
+      get<GitLog>(`/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=${limit}`),
+    show: (cwd: string, hash: string): Promise<GitDiff> =>
+      get<GitDiff>(`/api/git/show?cwd=${encodeURIComponent(cwd)}&hash=${encodeURIComponent(hash)}`),
+    branches: (cwd: string): Promise<GitBranches> =>
+      get<GitBranches>(`/api/git/branches?cwd=${encodeURIComponent(cwd)}`),
     stage: (cwd: string, file: string) => post<GitResult>('/api/git/stage', { cwd, file }),
     unstage: (cwd: string, file: string) => post<GitResult>('/api/git/unstage', { cwd, file }),
     stageAll: (cwd: string) => post<GitResult>('/api/git/stageAll', { cwd }),
@@ -249,6 +279,9 @@ export const api = {
     checkoutBranch: (cwd: string, name: string) => post<GitResult>('/api/git/checkoutBranch', { cwd, name }),
     deleteBranch: (cwd: string, name: string, force: boolean) => post<GitResult>('/api/git/deleteBranch', { cwd, name, force }),
     mergeBranch: (cwd: string, name: string) => post<GitResult>('/api/git/mergeBranch', { cwd, name }),
+    fetch: (cwd: string) => post<GitResult>('/api/git/fetch', { cwd }),
+    pull: (cwd: string) => post<GitResult>('/api/git/pull', { cwd }),
+    push: (cwd: string, setUpstream = false) => post<GitResult>('/api/git/push', { cwd, setUpstream }),
   },
   // Terminal pane: create/destroy over HTTP; input/resize over WS; output/exit via on.*.
   pane: {

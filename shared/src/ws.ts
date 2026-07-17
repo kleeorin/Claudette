@@ -1,6 +1,7 @@
 import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
   SessionInfo, SessionState, SetModeResult, ConversationMeta, ActivePane, SandboxConfig,
+  AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult,
 } from './types'
 import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
 
@@ -59,6 +60,11 @@ export type WsServerMessage =
   | { type: 'notebook:focus'; notebookId: string; cellId: string; reveal: boolean }
   | { type: 'notebook:locks'; notebookId: string; locks: CellLock[] }
   | { type: 'notebook:kernel'; notebookId: string; status: KernelStatus }
+  // The set of cells currently executing (or queued) for a notebook — server-owned
+  // and authoritative, so the per-cell running spinner reflects reality instead of a
+  // single global busy→idle edge (which fires early, leaks on heartbeats, or never
+  // fires on a dead/restarted kernel). Replaces the client's optimistic set.
+  | { type: 'notebook:running'; notebookId: string; cellIds: string[] }
   // Steer a session's UI to focus a notebook tab — emitted when Claude calls the
   // app-control `open_notebook` tool so the notebook it's about to work on becomes
   // the one the user is looking at (in that same session). The doc itself arrives
@@ -109,6 +115,22 @@ export type { SetModeResult }
 // Re-export the session id request under intent-revealing aliases for routes.
 export type DestroySessionRequest = SessionIdRequest
 export type RelaunchSessionRequest = SessionIdRequest
+
+// POST /api/session/setAgent { id, agentId } — change the session's role. Applied by
+// a resume-preserving relaunch (new charter/tools/model take effect on the fresh engine).
+export interface SetAgentRequest { id: string; agentId: string }
+// POST /api/session/rename { id, name } — set the session's display name.
+export interface RenameSessionRequest { id: string; name: string }
+// GET /api/agents → the selectable roles (id/name/description).
+export interface ListAgentsResponse { agents: AgentInfo[] }
+
+// GET /api/session/permissions?cwd=…&agentId=…  → the merged permission picture
+// read from Claude's own settings files (Permission Control Center).
+export interface PermissionsResponse { permissions: EffectivePermissions }
+// POST /api/session/perms/addRule | /api/session/perms/removeRule → WriteResult.
+// Add/remove one allow/deny/ask rule in a chosen scope's settings file.
+export interface EditRuleRequest { cwd: string; scope: PermissionScope; action: PermissionAction; value: string }
+export type { WriteResult }
 
 // POST /api/session/restartFresh { id }  — the native /clear (fresh conversation)
 export type RestartFreshRequest = SessionIdRequest

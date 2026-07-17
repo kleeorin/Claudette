@@ -22,6 +22,15 @@ export interface SandboxConfig {
   mounts: SandboxMount[]
 }
 
+// A selectable session role (agent): its id, display name, and a one-line summary.
+// The full charter/tool-scope lives server-side (claude/agents.ts); the client only
+// needs these three to render the role picker + a sidebar badge.
+export interface AgentInfo {
+  id: string
+  name: string
+  description: string
+}
+
 export interface SessionInfo {
   id: string
   name: string
@@ -237,7 +246,7 @@ export interface GitFileStatus {
 }
 
 export type GitStatus =
-  | { repo: true; branch: string; ahead: number; behind: number; files: GitFileStatus[] }
+  | { repo: true; branch: string; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[] }
   | { repo: false }                    // dir isn't inside a git work tree
   | { repo: 'error'; error: string }
 
