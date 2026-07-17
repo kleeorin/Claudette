@@ -17,6 +17,7 @@ import { JupyterProxy } from './jupyter/jupyterProxy'
 import { AppControlMcpServer } from './mcp/appControlServer'
 import { registerNotebookTools } from './mcp/notebookTools'
 import { ActivePaneRegistry } from './mcp/activePaneRegistry'
+import { TurnNotebookRegistry } from './mcp/turnNotebookRegistry'
 import { PaneManager } from './pane/paneManager'
 import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from './pane/paneApi'
 import { registerFsRoutes } from './fs/fsApi'
@@ -47,6 +48,10 @@ app.addHook('preHandler', makeAuthHook(auth))
 // user is viewing, and `open_notebook` broadcasts a focus message through the hub.
 const hub = new WsHub()
 const activePanes = new ActivePaneRegistry()
+// Per-turn "working notebook" pin: once Claude establishes which notebook a turn is
+// about, path-unset tools stick to it even if the user navigates away (see
+// TurnNotebookRegistry). Reset per turn via the 'userTurn' event below.
+const turnNotebooks = new TurnNotebookRegistry()
 
 // Core services.
 const notebooks = new NotebookDocManager()
@@ -59,9 +64,14 @@ kernels.onJupyterStart = (info) => jupyterProxy.setTarget(info)
 // AppControl MCP server: notebook tools that mutate the doc directly. Its
 // per-session --mcp-config is injected into each Claude launch via the hook below.
 const mcp = new AppControlMcpServer()
-registerNotebookTools(mcp, notebooks, kernels, activePanes, (sessionId, doc) =>
-  hub.broadcast({ type: 'session:focusPane', id: sessionId, notebookId: doc.notebookId, path: doc.path }))
+registerNotebookTools(mcp, notebooks, kernels, activePanes, turnNotebooks, (sessionId, doc) => {
+  kernels.setOwner(doc.notebookId, sessionId)   // Claude opened it in this session → dies with it
+  notebooks.cancelClose(doc.notebookId)         // re-focusing a mid-close notebook keeps it open
+  hub.broadcast({ type: 'session:focusPane', id: sessionId, notebookId: doc.notebookId, path: doc.path })
+})
 const sessions = new SessionManager({ mcpConfig: (sid) => mcp.configFor(sid) })
+// Closing a session kills the kernels of notebooks opened in it.
+sessions.on('destroyed', (id: string) => kernels.shutdownForSession(id))
 
 const panes = new PaneManager()
 bridgeSessionEvents(sessions, hub)
@@ -70,8 +80,13 @@ bridgePaneEvents(panes, hub)
 
 // Session persistence (P1.19): debounce-save the set whenever it changes so a
 // server restart restores it (each --resume'd into its saved conversation).
+let shuttingDown = false
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 function persistSessions(): void {
+  // Never persist while shutting down: shutdown() kills every engine, whose exit
+  // handlers cleanup() the sessions and emit 'changed' — saving that empty set
+  // would wipe the on-disk state we need to restore next boot.
+  if (shuttingDown) return
   if (saveTimer) clearTimeout(saveTimer)
   saveTimer = setTimeout(() => { void saveState(sessions.saved()) }, 400)
 }
@@ -83,17 +98,25 @@ sessions.on('ready', persistSessions)     // claudeSessionId finalized
 sessions.on('changed', () => hub.broadcast({ type: 'session:list', sessions: sessions.list() }))
 // When a session goes away, drop its active-pane record and its MCP url tokens
 // (the latter was never released before — a small unbounded-map leak).
-sessions.on('exit', (id: string) => { activePanes.release(id); mcp.release(id) })
+sessions.on('exit', (id: string) => { activePanes.release(id); turnNotebooks.release(id); mcp.release(id) })
+// New user turn → drop the per-turn notebook pin so the turn's first tool call
+// re-binds to whatever the user is viewing now (see TurnNotebookRegistry).
+sessions.on('userTurn', (id: string) => turnNotebooks.clear(id))
 
 // Reap all Claude engines when the server goes down so bwrap/claude children don't
 // orphan and linger. Covers Ctrl-C (SIGINT), `kill`/`tsx watch` restarts (SIGTERM),
 // and terminal close (SIGHUP). SIGTERM each engine's process group, then SIGKILL any
 // survivor just before exit — no reliance on --die-with-parent.
-let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
+  // Flush the live set NOW, then block further saves: shutdown() kills every engine,
+  // whose exit handlers cleanup() the sessions and emit 'changed' — persisting that
+  // empty set would clobber the state we restore next boot. Snapshot before killing.
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+  void saveState(sessions.saved())
   sessions.shutdown()
+  kernels.destroy()   // kill the Jupyter server (and with it every notebook kernel)
   setTimeout(() => { sessions.killHard(); process.exit(0) }, 800)
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, shutdown)

@@ -51,12 +51,15 @@ function remarkWikiLinks() {
 // Links are intentionally inert (this is a desktop app, not a browser): we show
 // the URL on hover but don't navigate away from the SPA.
 const components: Components = {
-  h1: ({ node, ...p }) => <h1 className="text-base font-semibold mt-3 mb-1.5" {...p} />,
-  h2: ({ node, ...p }) => <h2 className="text-[15px] font-semibold mt-3 mb-1.5" {...p} />,
-  h3: ({ node, ...p }) => <h3 className="text-sm font-semibold mt-2 mb-1" {...p} />,
+  // A clearly descending scale so heading levels are distinguishable at a glance:
+  // h1–h4 step down in size; h5–h6 switch to small-caps (muted) once sizes get too
+  // small to separate reliably.
+  h1: ({ node, ...p }) => <h1 className="text-xl font-bold mt-4 mb-2" {...p} />,
+  h2: ({ node, ...p }) => <h2 className="text-lg font-semibold mt-3.5 mb-1.5" {...p} />,
+  h3: ({ node, ...p }) => <h3 className="text-base font-semibold mt-3 mb-1.5" {...p} />,
   h4: ({ node, ...p }) => <h4 className="text-sm font-semibold mt-2 mb-1" {...p} />,
   h5: ({ node, ...p }) => <h5 className="text-xs font-semibold mt-2 mb-1 uppercase tracking-wide text-ctp-subtext" {...p} />,
-  h6: ({ node, ...p }) => <h6 className="text-xs font-semibold mt-2 mb-1 uppercase tracking-wide text-ctp-overlay" {...p} />,
+  h6: ({ node, ...p }) => <h6 className="text-[11px] font-semibold mt-2 mb-1 uppercase tracking-wide text-ctp-overlay" {...p} />,
   p: ({ node, ...p }) => <p className="my-1.5 leading-relaxed" {...p} />,
   ul: ({ node, ...p }) => <ul className="list-disc pl-5 my-1.5 space-y-0.5" {...p} />,
   ol: ({ node, ...p }) => <ol className="list-decimal pl-5 my-1.5 space-y-0.5" {...p} />,

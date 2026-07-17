@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { basename } from './paths'
 
 // Turn a tool's raw JSON input into something a human can read at a glance —
 // used by the permission prompt ("what am I allowing?") and the tool-call rows.
@@ -8,7 +9,7 @@ import type { ReactNode } from 'react'
 // A short verb-phrase headline, e.g. "Run a command", "Write cfg.py".
 export function toolHeadline(name: string, input: Record<string, unknown>): string {
   const f = (k: string) => (typeof input?.[k] === 'string' ? (input[k] as string) : undefined)
-  const base = (p?: string) => (p ? p.split('/').pop() || p : '')
+  const base = (p?: string) => (p ? basename(p) : '')
   switch (name) {
     case 'Bash': return 'Run a shell command'
     case 'Write': return `Write ${base(f('file_path'))}`
@@ -31,7 +32,7 @@ export function toolHeadline(name: string, input: Record<string, unknown>): stri
 // `Bash(npm test)`). Returns undefined when there's nothing worth showing.
 export function toolArg(name: string, input: Record<string, unknown>): string | undefined {
   const f = (k: string) => (typeof input?.[k] === 'string' ? (input[k] as string) : undefined)
-  const base = (p?: string) => (p ? p.split('/').pop() || p : undefined)
+  const base = (p?: string) => (p ? basename(p) : undefined)
   const oneLine = (s?: string) => s?.replace(/\s+/g, ' ').trim()
   switch (name) {
     case 'Bash': return oneLine(f('command'))
@@ -209,5 +210,5 @@ function rangeHint(o: Record<string, unknown>): string {
   return parts.length ? `(${parts.join(', ')})` : ''
 }
 
-function truncate(s: string, n: number): string { return s.length > n ? s.slice(0, n) + '…' : s }
+export function truncate(s: string, n: number): string { return s.length > n ? s.slice(0, n) + '…' : s }
 function safeJson(v: unknown): string { try { return JSON.stringify(v) } catch { return String(v) } }

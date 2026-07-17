@@ -8,12 +8,14 @@ import { NotebookView } from './components/NotebookView'
 import { TerminalView } from './components/TerminalView'
 import { GitPanelView } from './components/GitPanelView'
 import { FileManager } from './components/FileManager'
+import { PermissionsPanel } from './components/PermissionsPanel'
 import { FileEditorView } from './components/FileEditorView'
 import { FileBrowser } from './components/FileBrowser'
 import { AuthGate } from './components/AuthGate'
 import { api } from './api/client'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
-import type { SessionInfo, ActivePane } from '@claudette/shared'
+import { basename, prettyPath } from './lib/paths'
+import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
 // file editors open as CONTENT tabs beside it (a companion split); Files and Git
@@ -50,15 +52,18 @@ function Shell() {
 
   // Content panes per session — switching sessions swaps the whole tab set + focus.
   const [bySession, setBySession] = useState<Record<string, Pane>>({})
-  // Live refs for callbacks that must see the current session / notebook store
-  // without re-subscribing (the WS focus handler below runs with `[]` deps).
-  const activeIdRef = useRef(activeId); activeIdRef.current = activeId
-  const notebooksRef = useRef(notebooks); notebooksRef.current = notebooks
+
+  // Pending "save before closing?" prompt for a dirty / still-running notebook tab.
+  const [closeNb, setCloseNb] = useState<{ id: string; name: string; dirty: boolean; running: boolean } | null>(null)
 
   // Docks.
-  const [dock, setDock] = useState<'files' | 'git' | null>(null)
+  const [dock, setDock] = useState<'files' | 'git' | 'permissions' | null>(null)
   const [termOpen, setTermOpen] = useState(false)
-  const [termMounted, setTermMounted] = useState(false)
+  // Multiple terminals share the bottom dock (tabbed). Each captures its cwd at
+  // creation. `+` adds one, per-tab `×` closes it; closing the last closes the dock.
+  const [terms, setTerms] = useState<{ id: string; cwd: string }[]>([])
+  const [activeTerm, setActiveTerm] = useState<string | null>(null)
+  const termSeq = useRef(0)
 
   // Companion orientation for the content split (phones default to stacked).
   const [layout, setLayout] = useState<'side' | 'stack'>(
@@ -110,10 +115,18 @@ function Shell() {
   const selectTab = (t: Content) => {
     if (!activeId) return
     setPane(activeId, (p) => ({ ...p, active: t }))
-    if (t.kind === 'notebook') notebooks.setActive(t.id)
   }
   const closeTab = (t: Content) => {
-    if (t.kind === 'notebook') { notebooks.close(t.id); return }  // the effect prunes it from all panes
+    if (t.kind === 'notebook') {
+      const doc = notebooks.open.find((d) => d.notebookId === t.id)
+      const dirty = doc?.dirty ?? false
+      const running = notebooks.isBusy(t.id)
+      // Clean + idle → close straight away; otherwise ask before losing work. (The
+      // store.close → effect prunes the tab from all panes.)
+      if (!dirty && !running) notebooks.close(t.id)
+      else setCloseNb({ id: t.id, name: doc ? basename(doc.path) : 'notebook', dirty, running })
+      return
+    }
     if (!activeId) return
     setPane(activeId, (p) => {
       const tabs = p.tabs.filter((x) => !(x.kind === 'file' && x.path === t.path))
@@ -156,12 +169,6 @@ function Shell() {
     }
   }, [openIds, activeId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // On session switch, mirror the session's active notebook into the store.
-  useEffect(() => {
-    const a = activeId ? bySession[activeId]?.active : null
-    if (a?.kind === 'notebook') notebooks.setActive(a.id)
-  }, [activeId]) // eslint-disable-line react-hooks/exhaustive-deps
-
   // Publish each session's active pane (the file it's viewing, or null for the
   // Claude tab) to the server, so the app-control notebook tools target what the
   // user is looking at. Diff against the last publish so we only send on change; a
@@ -197,20 +204,35 @@ function Shell() {
           ? p.tabs : [...p.tabs, nb]
         return { ...prev, [sid]: { tabs, active: nb } }
       })
-      if (sid === activeIdRef.current) notebooksRef.current.setActive(notebookId)
     })
   }, [])
 
-  const toggleTerm = () => { if (!termOpen) setTermMounted(true); setTermOpen((v) => !v) }
-  const toggleDock = (which: 'files' | 'git') => setDock((d) => (d === which ? null : which))
+  const addTerm = (cwd: string) => {
+    const id = `t${++termSeq.current}`
+    setTerms((ts) => [...ts, { id, cwd }])
+    setActiveTerm(id)
+  }
+  const closeTerm = (id: string) => {
+    const rest = terms.filter((t) => t.id !== id)   // unmounting its TerminalView tears the pty down
+    setTerms(rest)
+    if (activeTerm === id) setActiveTerm(rest[rest.length - 1]?.id ?? null)
+    if (rest.length === 0) setTermOpen(false)        // last one → dock closes (as before first open)
+  }
+  // Toggle the dock: opening with no terminals yet spawns the first one.
+  const toggleTerm = () => {
+    if (termOpen) { setTermOpen(false); return }
+    setTermOpen(true)
+    if (terms.length === 0) addTerm(termCwd)
+  }
+  const toggleDock = (which: 'files' | 'git' | 'permissions') => setDock((d) => (d === which ? null : which))
 
   // Tab strip for the CURRENT session's pane, enriched with live doc metadata.
   const tabs: Tab[] = pane.tabs.map((t) => {
     if (t.kind === 'notebook') {
       const d = notebooks.open.find((o) => o.notebookId === t.id)
-      return { key: `nb:${t.id}`, kind: 'notebook', id: t.id, label: d ? (d.path.split('/').pop() ?? d.path) : 'notebook', path: d?.path ?? '', dirty: d?.dirty ?? false }
+      return { key: `nb:${t.id}`, kind: 'notebook', id: t.id, label: d ? basename(d.path) : 'notebook', path: d?.path ?? '', dirty: d?.dirty ?? false }
     }
-    return { key: `f:${t.path}`, kind: 'file', id: '', label: t.path.split('/').pop() ?? t.path, path: t.path, dirty: false }
+    return { key: `f:${t.path}`, kind: 'file', id: '', label: basename(t.path), path: t.path, dirty: false }
   })
 
   const contentNode = active?.kind === 'notebook'
@@ -239,25 +261,29 @@ function Shell() {
           <span className="text-sm font-medium text-ctp-text truncate">{activeSession?.name ?? 'Claudette'}</span>
         </div>
 
-        <div className="flex-1 min-h-0 flex">
-          {/* Main column: tabs + (Claude | content) + terminal dock. */}
-          <div className="flex-1 min-w-0 flex flex-col">
-            <MainTabs
-              tabs={tabs}
-              active={active}
-              onSelectChat={selectChat}
-              onSelectTab={(t) => selectTab(t.kind === 'notebook' ? { kind: 'notebook', id: t.id } : { kind: 'file', path: t.path })}
-              onCloseTab={(t) => closeTab(t.kind === 'notebook' ? { kind: 'notebook', id: t.id } : { kind: 'file', path: t.path })}
-              layout={layout}
-              onSetLayout={setLayout}
-              showLayout={active !== null}
-              dock={dock}
-              onToggleDock={toggleDock}
-              termOpen={termOpen}
-              onToggleTerm={toggleTerm}
-              notif={notif}
-            />
+        {/* Content tabs + a PINNED toolbar (Files/Git/Terminal/sound/bell). This bar
+            spans the FULL width ABOVE the main-column|dock row, so the toolbar stays
+            fixed in the top-right corner — opening the right dock slides in below this
+            bar and never nudges the toggles. */}
+        <MainTabs
+          tabs={tabs}
+          active={active}
+          onSelectChat={selectChat}
+          onSelectTab={(t) => selectTab(t.kind === 'notebook' ? { kind: 'notebook', id: t.id } : { kind: 'file', path: t.path })}
+          onCloseTab={(t) => closeTab(t.kind === 'notebook' ? { kind: 'notebook', id: t.id } : { kind: 'file', path: t.path })}
+          layout={layout}
+          onSetLayout={setLayout}
+          showLayout={active !== null}
+          dock={dock}
+          onToggleDock={toggleDock}
+          termOpen={termOpen}
+          onToggleTerm={toggleTerm}
+          notif={notif}
+        />
 
+        <div className="flex-1 min-h-0 flex">
+          {/* Main column: (Claude | content) + terminal dock. */}
+          <div className="flex-1 min-w-0 flex flex-col">
             {/* Upper region: Claude, plus content beside it when a tab is active. */}
             <div ref={splitRef} className={`flex-1 min-h-0 relative flex ${active && layout === 'side' ? 'flex-row' : 'flex-col'}`}>
               {active && (
@@ -285,25 +311,51 @@ function Shell() {
               </div>
             </div>
 
-            {/* Bottom dock: Terminal (spans the main column). Mounted once opened. */}
-            {termMounted && termOpen && (
+            {/* Bottom dock: tabbed terminals (span the main column). Terminals stay
+                mounted while the dock is hidden so scrollback survives; closing the
+                last tab closes the dock. */}
+            {terms.length > 0 && termOpen && (
               <div
                 {...dividerProps({ axis: 'y', get: () => termH, set: setTermH, sign: -1, min: 120, max: () => 700 })}
                 title="Drag to resize"
                 className="shrink-0 h-1 cursor-row-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
               />
             )}
-            {termMounted && (
+            {terms.length > 0 && (
               <div className={termOpen ? 'shrink-0 flex flex-col border-t border-ctp-surface0' : 'hidden'} style={termOpen ? { height: termH } : undefined}>
-                <div className="h-7 shrink-0 flex items-center gap-2 px-3 bg-ctp-mantle border-b border-ctp-surface0">
-                  <span className="text-[11px] font-medium text-ctp-subtext">Terminal</span>
-                  <span className="text-[10px] text-ctp-overlay font-mono truncate">{prettyPath(termCwd)}</span>
-                  <button onClick={toggleTerm} title="Hide terminal" className="ml-auto text-ctp-overlay hover:text-ctp-text p-0.5">
+                {/* Tab strip: one tab per terminal (× to close), + to add, hide on the right. */}
+                <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
+                  {terms.map((t, i) => (
+                    <div
+                      key={t.id}
+                      onClick={() => setActiveTerm(t.id)}
+                      title={t.cwd}
+                      className={`group flex items-center gap-1.5 pl-2 pr-1 shrink-0 cursor-pointer text-[11px] border-b-2 ${activeTerm === t.id ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-subtext hover:text-ctp-text'}`}
+                    >
+                      <span className="text-ctp-overlay">❯</span>
+                      <span>Terminal {i + 1}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); closeTerm(t.id) }}
+                        title="Close terminal"
+                        className="opacity-0 group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red p-0.5 rounded leading-none"
+                      >
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                      </button>
+                    </div>
+                  ))}
+                  <button onClick={() => addTerm(termCwd)} title="New terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text px-1.5 text-sm leading-none">+</button>
+                  <span className="ml-auto self-center text-[10px] text-ctp-overlay font-mono truncate max-w-[45%]">{prettyPath(terms.find((t) => t.id === activeTerm)?.cwd ?? termCwd)}</span>
+                  <button onClick={() => setTermOpen(false)} title="Hide terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text p-0.5">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                   </button>
                 </div>
-                <div className="flex-1 min-h-0">
-                  <TerminalView key={termCwd} cwd={termCwd} visible={termOpen} />
+                {/* Bodies: all mounted, only the active one visible (scrollback preserved). */}
+                <div className="flex-1 min-h-0 relative">
+                  {terms.map((t) => (
+                    <div key={t.id} className={activeTerm === t.id ? 'absolute inset-0' : 'hidden'}>
+                      <TerminalView cwd={t.cwd} visible={termOpen && activeTerm === t.id} />
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
@@ -323,19 +375,84 @@ function Shell() {
                 <FileManager
                   key={termCwd}
                   initialPath={termCwd}
-                  onOpenNotebook={(p) => void notebooks.openPath(p)}
+                  onOpenNotebook={(p) => void notebooks.openPath(p, activeId ?? undefined).then((id) => {
+                    // Focus the notebook's tab — including when it was already open,
+                    // where the newly-seen effect above wouldn't fire.
+                    if (id && activeId) setPane(activeId, (pane) => ({
+                      tabs: pane.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? pane.tabs : [...pane.tabs, { kind: 'notebook', id }],
+                      active: { kind: 'notebook', id },
+                    }))
+                  })}
                   onOpenFile={openFile}
-                  onNewNotebook={notebooks.createPath}
+                  onNewNotebook={(p) => notebooks.createPath(p, activeId ?? undefined)}
                   onClose={() => setDock(null)}
                 />
-              ) : (
+              ) : dock === 'git' ? (
                 <GitPanelView key={termCwd} cwd={termCwd} onClose={() => setDock(null)} />
+              ) : activeSession ? (
+                <PermissionsPanel key={activeSession.id} session={activeSession} onClose={() => setDock(null)} />
+              ) : (
+                <div className="h-full flex items-center justify-center p-4 text-center text-xs text-ctp-overlay">
+                  No session selected.
+                </div>
               )}
             </div>
           )}
         </div>
       </div>
+
+      {closeNb && (
+        <CloseNotebookDialog
+          target={closeNb}
+          onChoose={(action) => {
+            if (action !== 'cancel') notebooks.close(closeNb.id, action === 'save')
+            setCloseNb(null)
+          }}
+        />
+      )}
     </div>
+  )
+}
+
+// Confirm before closing a notebook tab that has unsaved work or a running cell.
+// Dirty + idle → Save / Don't Save / Cancel. Running → Close (finish + save in the
+// background) / Cancel — the kernel keeps going and its output is saved when done.
+function CloseNotebookDialog({ target, onChoose }: {
+  target: { id: string; name: string; dirty: boolean; running: boolean }
+  onChoose: (action: 'save' | 'discard' | 'cancel') => void
+}) {
+  const { name, dirty, running } = target
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onChoose('cancel') }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onChoose])
+  const btn = 'text-xs px-3 py-1.5 rounded-md transition'
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={() => onChoose('cancel')}>
+      <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="text-sm font-semibold text-ctp-text mb-1 truncate">
+          {running ? `“${name}” is still running` : `Save changes to “${name}”?`}
+        </div>
+        <div className="text-xs text-ctp-subtext mb-4">
+          {running
+            ? <>The kernel keeps running in the background; its output{dirty ? ' and your unsaved changes' : ''} will be saved when it finishes.</>
+            : <>Your unsaved changes will be lost if you don’t save.</>}
+        </div>
+        <div className="flex justify-end gap-2">
+          <button onClick={() => onChoose('cancel')} className={`${btn} text-ctp-subtext hover:bg-ctp-surface0`}>Cancel</button>
+          {running ? (
+            <button onClick={() => onChoose('save')} className={`${btn} bg-ctp-accent text-ctp-base font-medium hover:brightness-110`}>Close</button>
+          ) : (
+            <>
+              <button onClick={() => onChoose('discard')} className={`${btn} text-ctp-red hover:bg-ctp-surface0`}>Don’t Save</button>
+              <button onClick={() => onChoose('save')} className={`${btn} bg-ctp-accent text-ctp-base font-medium hover:brightness-110`}>Save</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -350,7 +467,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
   onSelectTab: (t: Tab) => void
   onCloseTab: (t: Tab) => void
   layout: 'side' | 'stack'; onSetLayout: (l: 'side' | 'stack') => void; showLayout: boolean
-  dock: 'files' | 'git' | null; onToggleDock: (w: 'files' | 'git') => void
+  dock: 'files' | 'git' | 'permissions' | null; onToggleDock: (w: 'files' | 'git' | 'permissions') => void
   termOpen: boolean; onToggleTerm: () => void
   notif: NotificationsApi
 }) {
@@ -365,35 +482,44 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
     `px-2.5 h-6 rounded text-[11px] transition-colors ${on ? 'bg-ctp-surface1 text-ctp-text' : 'text-ctp-overlay hover:text-ctp-subtext hover:bg-ctp-surface0'}`
 
   return (
-    <div className="shrink-0 h-8 flex items-stretch gap-0 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
-      <button className={tab(active === null)} onClick={onSelectChat}>Chat</button>
-      {tabs.map((t) => (
-        <span key={t.key} className={tab(isOn(t))}>
-          <span className="shrink-0">{t.kind === 'notebook' ? '📓' : '📄'}</span>
-          <button onClick={() => onSelectTab(t)} className="truncate max-w-[150px]" title={t.path}>
-            {t.label}{t.dirty && <span className="text-ctp-yellow"> ●</span>}
+    <div className="shrink-0 h-8 flex items-stretch gap-0 px-2 bg-ctp-mantle border-b border-ctp-surface0">
+      {/* Tabs scroll in their OWN region so growing/overflowing tabs never push the
+          toolbar. */}
+      <div className="flex items-stretch min-w-0 flex-1 overflow-x-auto">
+        <button className={tab(active === null)} onClick={onSelectChat}>Chat</button>
+        {/* Where Claude sits relative to open content — a SINGLE toggle that lives
+            next to the Chat tab (so it reads as "Claude's position"), flipping
+            beside ⇄ under. Only meaningful once a content tab is open. */}
+        {showLayout && (
+          <button
+            onClick={() => onSetLayout(layout === 'side' ? 'stack' : 'side')}
+            title={layout === 'side' ? 'Claude is beside — click to put it under' : 'Claude is under — click to put it beside'}
+            aria-label="Toggle where Claude sits"
+            className="self-center shrink-0 mx-1 w-6 h-6 flex items-center justify-center rounded text-ctp-overlay hover:text-ctp-subtext hover:bg-ctp-surface0 transition-colors"
+          >
+            {layout === 'side'
+              ? <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="1.5" y="2.5" width="4.5" height="9" rx="1" /><rect x="8" y="2.5" width="4.5" height="9" rx="1" /></svg>
+              : <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="2.5" y="1.5" width="9" height="4.5" rx="1" /><rect x="2.5" y="8" width="9" height="4.5" rx="1" /></svg>}
           </button>
-          <button onClick={() => onCloseTab(t)} className="text-ctp-overlay hover:text-ctp-red" title="Close">✕</button>
-        </span>
-      ))}
-      <div className="flex-1" />
+        )}
+        {tabs.map((t) => (
+          <span key={t.key} className={tab(isOn(t))}>
+            <span className="shrink-0">{t.kind === 'notebook' ? '📓' : '📄'}</span>
+            <button onClick={() => onSelectTab(t)} className="truncate max-w-[150px]" title={t.path}>
+              {t.label}{t.dirty && <span className="text-ctp-yellow"> ●</span>}
+            </button>
+            <button onClick={() => onCloseTab(t)} className="text-ctp-overlay hover:text-ctp-red" title="Close">✕</button>
+          </span>
+        ))}
+      </div>
 
-      {/* Companion orientation (only meaningful when a content tab is open). */}
-      {showLayout && (
-        <div className="flex items-center gap-0.5 rounded-md bg-ctp-surface0/40 p-0.5 mr-1 self-center" title="Where Claude sits">
-          <button className={`w-7 h-6 flex items-center justify-center rounded ${layout === 'side' ? 'bg-ctp-surface1 text-ctp-text' : 'text-ctp-overlay hover:text-ctp-subtext'}`} onClick={() => onSetLayout('side')} title="Claude beside">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="1.5" y="2.5" width="4.5" height="9" rx="1" /><rect x="8" y="2.5" width="4.5" height="9" rx="1" /></svg>
-          </button>
-          <button className={`w-7 h-6 flex items-center justify-center rounded ${layout === 'stack' ? 'bg-ctp-surface1 text-ctp-text' : 'text-ctp-overlay hover:text-ctp-subtext'}`} onClick={() => onSetLayout('stack')} title="Claude under">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="2.5" y="1.5" width="9" height="4.5" rx="1" /><rect x="2.5" y="8" width="9" height="4.5" rx="1" /></svg>
-          </button>
-        </div>
-      )}
-
-      {/* Dock toggles. */}
-      <div className="flex items-center gap-1 self-center">
+      {/* Pinned toolbar: sits outside the scroll region and stays put. The companion
+          control appears at its LEFT edge, so the dock toggles keep a fixed offset
+          from the right edge and don't shift when a pane opens. */}
+      <div className="shrink-0 flex items-center gap-1 self-center pl-2">
         <button className={toggle(dock === 'files')} onClick={() => onToggleDock('files')} title="Files browser">Files</button>
         <button className={toggle(dock === 'git')} onClick={() => onToggleDock('git')} title="Git panel">Git</button>
+        <button className={toggle(dock === 'permissions')} onClick={() => onToggleDock('permissions')} title="Permissions — what this session's Claude can do">Permissions</button>
         <button className={toggle(termOpen)} onClick={onToggleTerm} title="Terminal">Terminal</button>
         <SoundToggle notif={notif} />
         <NotifyBell notif={notif} />
@@ -525,12 +651,14 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
   )
 }
 
-// Centered modal for creating a session — name + working directory + optional model.
+// Centered modal for creating a session — name + working directory + role + model.
 function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreated?: () => void }) {
-  const { create } = useSessions()
+  const { create, agents, sandboxAvailable } = useSessions()
   const [name, setName] = useState('')
   const [cwd, setCwd] = useState(DEFAULT_CWD)
+  const [agentId, setAgentId] = useState('general')
   const [model, setModel] = useState('')
+  const [sb, setSb] = useState<SbState>(defaultSb())
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [browsing, setBrowsing] = useState(false)
@@ -548,7 +676,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
     if (!cwd.trim()) { setErr('Working directory is required.'); return }
     setBusy(true); setErr(null)
     try {
-      await create(name.trim() || cwd.trim().split('/').pop() || 'session', cwd.trim(), { model: model.trim() || undefined })
+      await create(name.trim() || basename(cwd.trim()) || 'session', cwd.trim(), { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, cwd.trim()) })
       ;(onCreated ?? onClose)()
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Failed to create session.')
@@ -575,8 +703,14 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
               <button type="button" onClick={() => setBrowsing(true)} className="text-xs px-3 rounded-md text-ctp-subtext hover:bg-ctp-surface0 border border-ctp-surface1 transition-colors whitespace-nowrap" title="Browse for a folder">Browse…</button>
             </div>
           </Field>
+          <Field label="Role">
+            <RolePicker agents={agents} value={agentId} onChange={setAgentId} />
+          </Field>
           <Field label="Model" hint="optional">
             <input value={model} onChange={(e) => setModel(e.target.value)} onKeyDown={onEnter} placeholder="account default (e.g. sonnet, opus, haiku)" className="modal-input font-mono text-[12px]" />
+          </Field>
+          <Field label="Sandbox">
+            <SandboxFields value={sb} onChange={setSb} cwd={cwd.trim() || DEFAULT_CWD} available={sandboxAvailable} />
           </Field>
           {err && <div className="text-[11px] text-ctp-red">{err}</div>}
         </div>
@@ -607,22 +741,329 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   )
 }
 
-function SessionRow({ session, active, attention, onSelect, onClose }: { session: SessionInfo; active: boolean; attention: boolean; onSelect: () => void; onClose: () => void }) {
+// Role selector — a styled native <select> over the available agents, with the
+// chosen role's one-line description shown beneath it. Falls back to a lone General
+// option before /api/agents resolves.
+function RolePicker({ agents, value, onChange }: { agents: AgentInfo[]; value: string; onChange: (id: string) => void }) {
+  const list = agents.length ? agents : [{ id: 'general', name: 'General', description: '' }]
+  const desc = list.find((a) => a.id === value)?.description
   return (
-    <div onClick={onSelect} className={`group relative rounded-md px-2.5 py-2 cursor-pointer flex items-center gap-2.5 transition-colors ${active ? 'bg-ctp-surface0' : 'hover:bg-ctp-surface0/50'}`}>
+    <div className="space-y-1">
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="modal-input cursor-pointer">
+        {list.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+      </select>
+      {desc && <div className="text-[10px] text-ctp-overlay leading-snug">{desc}</div>}
+    </div>
+  )
+}
+
+// The creation dialogs edit the sandbox as three fields — enabled, how the project
+// folder (cwd) is mounted (rw / ro / not at all), and a list of extra folders — rather
+// than a raw mount array, so cwd stays tied to the (possibly-edited) cwd field.
+type SbState = { enabled: boolean; projectMode: 'rw' | 'ro' | 'none'; extra: SandboxMount[] }
+const defaultSb = (): SbState => ({ enabled: true, projectMode: 'rw', extra: [] })
+// Seed the fields from an existing config relative to a cwd (subsession → parent's).
+function sbFromConfig(cfg: SandboxConfig | undefined, cwd: string): SbState {
+  if (!cfg) return defaultSb()
+  const cwdMount = cfg.mounts.find((m) => m.path === cwd)
+  return { enabled: cfg.enabled, projectMode: cwdMount?.mode ?? 'none', extra: cfg.mounts.filter((m) => m.path !== cwd) }
+}
+// Build the SandboxConfig to submit (cwd folded back in per projectMode).
+function sbToConfig(sb: SbState, cwd: string): SandboxConfig {
+  const mounts: SandboxMount[] = [
+    ...(sb.projectMode !== 'none' ? [{ path: cwd, mode: sb.projectMode } as SandboxMount] : []),
+    ...sb.extra,
+  ]
+  return { enabled: sb.enabled, mounts }
+}
+
+// Sandbox editor for the creation dialogs — enable toggle, project-folder access
+// (rw/ro/none), and add/remove extra folders (each rw/ro) via the folder picker. The
+// two .claude dirs are always mounted rw server-side, noted here.
+function SandboxFields({ value, onChange, cwd, available }: { value: SbState; onChange: (v: SbState) => void; cwd: string; available: boolean }) {
+  const [picking, setPicking] = useState(false)
+  if (!available) {
+    return <div className="text-[11px] text-ctp-overlay leading-snug">This host can’t sandbox (bubblewrap/user-namespaces). Sessions run <b>unconfined</b>.</div>
+  }
+  const set = (patch: Partial<SbState>) => onChange({ ...value, ...patch })
+  const modeBtn = (on: boolean) => `px-1.5 py-0.5 rounded text-[10px] font-mono ${on ? 'bg-ctp-accent/20 text-ctp-accent' : 'text-ctp-overlay hover:bg-ctp-surface0'}`
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-2 text-[11px] text-ctp-subtext cursor-pointer select-none">
+        <input type="checkbox" checked={value.enabled} onChange={(e) => set({ enabled: e.target.checked })} className="accent-ctp-accent" />
+        Confine this session (bubblewrap sandbox)
+      </label>
+      {value.enabled && (
+        <>
+          <div className="flex items-center gap-2 text-[11px]">
+            <span className="text-ctp-overlay shrink-0">Project</span>
+            <span className="font-mono text-ctp-subtext truncate flex-1" title={cwd}>{prettyPath(cwd)}</span>
+            <div className="flex gap-0.5 shrink-0">
+              {(['rw', 'ro', 'none'] as const).map((m) => (
+                <button key={m} type="button" onClick={() => set({ projectMode: m })} className={modeBtn(value.projectMode === m)} title={m === 'rw' ? 'Read-write' : m === 'ro' ? 'Read-only' : 'Not mounted (project invisible)'}>{m}</button>
+              ))}
+            </div>
+          </div>
+          {value.extra.map((m, i) => (
+            <div key={i} className="flex items-center gap-1.5 text-[11px]">
+              <span className="font-mono text-ctp-subtext truncate flex-1" title={m.path}>{prettyPath(m.path)}</span>
+              <button type="button" onClick={() => set({ extra: value.extra.map((x, k) => k === i ? { ...x, mode: x.mode === 'rw' ? 'ro' : 'rw' } : x) })} className={`px-1.5 rounded text-[10px] font-mono ${m.mode === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface0 text-ctp-subtext'}`} title={m.mode === 'rw' ? 'Writable — click for read-only' : 'Read-only — click for writable'}>{m.mode}</button>
+              <button type="button" onClick={() => set({ extra: value.extra.filter((_, k) => k !== i) })} className="text-ctp-overlay hover:text-ctp-red px-0.5" title="Remove">×</button>
+            </div>
+          ))}
+          <button type="button" onClick={() => setPicking(true)} className="w-full rounded border border-dashed border-ctp-surface2 text-[11px] text-ctp-subtext hover:text-ctp-text hover:border-ctp-overlay py-1">+ Add a folder…</button>
+          <div className="text-[10px] text-ctp-overlay leading-snug"><span className="font-mono">~/.claude</span> + the project’s <span className="font-mono">.claude</span> are always mounted rw.</div>
+        </>
+      )}
+      {picking && (
+        <FileBrowser
+          mode="folder"
+          initialPath={cwd}
+          onClose={() => setPicking(false)}
+          onPick={(p) => { setPicking(false); if (p !== cwd && !value.extra.some((m) => m.path === p)) set({ extra: [...value.extra, { path: p, mode: 'ro' }] }) }}
+        />
+      )}
+    </div>
+  )
+}
+
+function SessionRow({ session, active, attention, onSelect, onClose }: { session: SessionInfo; active: boolean; attention: boolean; onSelect: () => void; onClose: () => void }) {
+  const { sessions, agents, setAgent, rename } = useSessions()
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  const [subOpen, setSubOpen] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [renameVal, setRenameVal] = useState(session.name)
+  const [info, setInfo] = useState(false)
+  // Guards the Enter→blur double-fire and a cancel-on-Escape from saving twice/at all.
+  const renameDone = useRef(false)
+
+  const isSub = !!session.parentId
+  const roleId = session.agentId ?? 'general'
+  const roleName = agents.find((a) => a.id === roleId)?.name ?? roleId
+  const roleBadge = roleId !== 'general' ? roleName : null
+
+  const openMenu = (e: React.MouseEvent) => {
+    e.stopPropagation(); e.preventDefault()
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    setMenu({ x: r.right, y: r.bottom + 2 })
+  }
+  const beginRename = () => { renameDone.current = false; setRenameVal(session.name); setRenaming(true) }
+  const submitRename = () => {
+    if (renameDone.current) return
+    renameDone.current = true
+    setRenaming(false)
+    const n = renameVal.trim()
+    if (n && n !== session.name) void rename(session.id, n)
+  }
+  const cancelRename = () => { renameDone.current = true; setRenaming(false) }
+
+  return (
+    <div onClick={onSelect} className={`group relative rounded-md pr-1 py-2 cursor-pointer flex items-center gap-2.5 transition-colors ${isSub ? 'pl-5' : 'pl-2.5'} ${active ? 'bg-ctp-surface0' : 'hover:bg-ctp-surface0/50'}`}>
       {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-ctp-accent" />}
+      {isSub && <span className="absolute left-2 text-ctp-overlay text-[11px] leading-none" title="Subsession">↳</span>}
       {/* A finished/errored background session gets a red attention light until viewed. */}
       {attention
         ? <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-ctp-red shadow-[0_0_8px_2px] shadow-ctp-red/60 animate-pulse" title="Finished — needs your attention" />
         : <StateDot state={session.state} />}
       <div className="min-w-0 flex-1">
-        <div className={`truncate text-sm ${attention ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`}>{session.name}</div>
-        <div className="truncate text-[10px] text-ctp-overlay font-mono">{prettyPath(session.cwd)}</div>
+        {renaming ? (
+          <input
+            autoFocus
+            value={renameVal}
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => setRenameVal(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitRename() } else if (e.key === 'Escape') { e.preventDefault(); cancelRename() } }}
+            onBlur={submitRename}
+            className="w-full bg-ctp-base border border-ctp-surface1 rounded px-1.5 py-0.5 text-sm text-ctp-text outline-none focus:border-ctp-accent/60"
+          />
+        ) : (
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className={`truncate text-sm ${attention ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
+            {roleBadge && <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide px-1 py-0.5 rounded bg-ctp-accent/15 text-ctp-accent" title={`Role: ${roleBadge}`}>{roleBadge}</span>}
+          </div>
+        )}
       </div>
-      {/* Live status word — hidden while hovering so it doesn't fight the ✕. */}
+      {/* Live status word — hidden while hovering so it doesn't fight the actions. */}
       <span className="md:group-hover:hidden">{attention ? <span className="text-[10px] text-ctp-red">done</span> : <StateLabel state={session.state} />}</span>
-      <button onClick={(e) => { e.stopPropagation(); onClose() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red text-xs transition-opacity px-1.5 py-1" title="Close session">✕</button>
+      <button onClick={openMenu} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text text-sm leading-none transition-opacity px-1 py-1" title="Session actions" aria-label="Session actions">⋯</button>
+      <button onClick={(e) => { e.stopPropagation(); onClose() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red text-xs transition-opacity px-1 py-1" title="Close session">✕</button>
+
+      {menu && (
+        <SessionMenu
+          x={menu.x} y={menu.y} session={session} agents={agents}
+          onClose={() => setMenu(null)}
+          onSubsession={() => setSubOpen(true)}
+          onInfo={() => setInfo(true)}
+          onRename={beginRename}
+          onPickRole={(id) => { if (id !== roleId) void setAgent(session.id, id) }}
+        />
+      )}
+      {info && (
+        <SessionInfoDialog
+          session={session}
+          roleName={roleName}
+          parentName={session.parentId ? (sessions.find((s) => s.id === session.parentId)?.name ?? '—') : null}
+          onClose={() => setInfo(false)}
+        />
+      )}
+      {subOpen && <SubsessionDialog parent={session} onClose={() => setSubOpen(false)} />}
     </div>
+  )
+}
+
+// Create a subsession under `parent`: shares the parent's cwd/root, with its own name,
+// role, and sandbox (seeded from the parent's, fully editable — you choose whether the
+// child inherits or diverges).
+function SubsessionDialog({ parent, onClose }: { parent: SessionInfo; onClose: () => void }) {
+  const { spawnSubsession, agents, sandboxAvailable } = useSessions()
+  const [name, setName] = useState(`${parent.name} · sub`)
+  const [agentId, setAgentId] = useState('general')
+  const [sb, setSb] = useState<SbState>(() => sbFromConfig(parent.sandbox, parent.cwd))
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const submit = async () => {
+    if (busy) return
+    setBusy(true); setErr(null)
+    try {
+      const id = await spawnSubsession(parent.id, { name: name.trim() || undefined, agentId, sandbox: sbToConfig(sb, parent.cwd) })
+      if (!id) throw new Error('Could not create the subsession.')
+      onClose()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Failed to create subsession.')
+      setBusy(false)
+    }
+  }
+  const onEnter = (e: React.KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }
+
+  return createPortal(
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+      <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
+          <Mark className="w-4 h-4 text-ctp-accent" />
+          <span className="text-sm font-semibold text-ctp-text shrink-0">New subsession</span>
+          <span className="text-[11px] text-ctp-overlay truncate">under {parent.name}</span>
+          <button onClick={onClose} className="ml-auto text-ctp-overlay hover:text-ctp-text text-sm">✕</button>
+        </div>
+        <div className="p-5 space-y-3.5">
+          <Field label="Name" hint="optional">
+            <input autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={onEnter} className="modal-input" />
+          </Field>
+          <Field label="Working directory" hint="shared with parent">
+            <input value={parent.cwd} readOnly className="modal-input font-mono text-[12px] opacity-70 cursor-not-allowed" />
+          </Field>
+          <Field label="Role">
+            <RolePicker agents={agents} value={agentId} onChange={setAgentId} />
+          </Field>
+          <Field label="Sandbox" hint="seeded from parent">
+            <SandboxFields value={sb} onChange={setSb} cwd={parent.cwd} available={sandboxAvailable} />
+          </Field>
+          {err && <div className="text-[11px] text-ctp-red">{err}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-5 py-3.5 border-t border-ctp-surface0">
+          <button onClick={onClose} className="text-xs px-3.5 py-1.5 rounded-md text-ctp-subtext hover:bg-ctp-surface0 transition-colors">Cancel</button>
+          <button onClick={submit} disabled={busy} className="text-xs font-medium px-4 py-1.5 rounded-md bg-ctp-accent text-ctp-base hover:brightness-110 active:brightness-95 disabled:opacity-40 transition">
+            {busy ? 'Starting…' : 'Create subsession'}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+// Per-session actions menu (portal to body so the sidebar's scroll never clips it).
+// Two views: the main actions, and a "change role" submenu listing the agents.
+function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onRename, onPickRole }: {
+  x: number; y: number; session: SessionInfo; agents: AgentInfo[]
+  onClose: () => void; onSubsession: () => void; onInfo: () => void; onRename: () => void; onPickRole: (id: string) => void
+}) {
+  const [view, setView] = useState<'main' | 'roles'>('main')
+  useEffect(() => {
+    const close = () => onClose()
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('click', close)
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
+  }, [onClose])
+  const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
+  const left = Math.min(x, window.innerWidth - 200)
+  const top = Math.min(y, window.innerHeight - 220)
+  const curRole = session.agentId ?? 'general'
+  const list = agents.length ? agents : [{ id: 'general', name: 'General', description: '' }]
+  return createPortal(
+    <div style={{ left, top }} onClick={(e) => e.stopPropagation()} className="fixed z-[60] w-48 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs">
+      {view === 'main' ? (
+        <>
+          <button className={item} onClick={() => { onClose(); onSubsession() }}>➕ Create subsession</button>
+          <button className={item} onClick={() => { onClose(); onInfo() }}>ⓘ Session info</button>
+          <button className={item} onClick={() => setView('roles')}>🎭 Change role<span className="ml-auto text-ctp-overlay">›</span></button>
+          <button className={item} onClick={() => { onClose(); onRename() }}>✎ Rename</button>
+        </>
+      ) : (
+        <>
+          <button className="w-full text-left px-3 py-1 text-[10px] uppercase tracking-wide text-ctp-overlay hover:text-ctp-text flex items-center gap-1" onClick={() => setView('main')}>‹ Change role</button>
+          {list.map((a) => (
+            <button key={a.id} className={item} onClick={() => { onClose(); onPickRole(a.id) }} title={a.description}>
+              <span className="flex-1 truncate">{a.name}</span>
+              {a.id === curRole && <span className="text-ctp-accent">✓</span>}
+            </button>
+          ))}
+        </>
+      )}
+    </div>,
+    document.body,
+  )
+}
+
+// Read-only detail panel for a session (modal). Surfaces the fields that aren't
+// otherwise visible: role, model, dirs, parent, permission mode, sandbox, id.
+function SessionInfoDialog({ session, roleName, parentName, onClose }: {
+  session: SessionInfo; roleName: string; parentName: string | null; onClose: () => void
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const sandbox = session.sandbox?.enabled
+    ? (session.sandboxed ? 'on' : 'requested — host can’t confine')
+    : 'off'
+  const rows: [string, React.ReactNode][] = [
+    ['Role', roleName],
+    ['Model', session.model || 'account default'],
+    ['State', session.state],
+    ['Permission', session.permissionMode ?? 'default'],
+    ...(parentName ? [['Parent', parentName] as [string, React.ReactNode]] : []),
+    ['Working dir', <span className="font-mono break-all">{session.cwd}</span>],
+    ['Root dir', <span className="font-mono break-all">{session.rootDir}</span>],
+    ['Sandbox', sandbox],
+    ['Session id', <span className="font-mono break-all text-ctp-overlay">{session.id}</span>],
+  ]
+  return createPortal(
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+      <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
+          <span className="text-sm font-semibold text-ctp-text truncate">{session.name}</span>
+          <button onClick={onClose} className="ml-auto text-ctp-overlay hover:text-ctp-text text-sm">✕</button>
+        </div>
+        <div className="p-5 grid gap-2">
+          {rows.map(([k, v]) => (
+            <div key={k} className="grid grid-cols-[92px_1fr] gap-3 text-xs items-baseline">
+              <span className="text-ctp-overlay">{k}</span>
+              <span className="text-ctp-text min-w-0">{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -643,9 +1084,4 @@ function StateLabel({ state }: { state: string }) {
   if (state === 'waiting') return <span className="text-[10px] text-ctp-yellow shrink-0 animate-pulse">needs you</span>
   if (state === 'exited') return <span className="text-[10px] text-ctp-red shrink-0">exited</span>
   return null
-}
-
-// Shorten a home path to `~/…` for the sidebar.
-function prettyPath(p: string): string {
-  return p.replace(/^\/home\/[^/]+/, '~')
 }
