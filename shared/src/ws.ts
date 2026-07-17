@@ -84,6 +84,9 @@ export interface HealthResponse {
   // Functional probe, not "binary exists" — see SANDBOX.md. Drives the UI's
   // "enable sandbox" affordance and the "unavailable" messaging.
   sandboxAvailable: boolean
+  // The server user's home directory — the sensible default cwd for new sessions,
+  // terminals, and the folder picker (the client can't read the server's $HOME).
+  homeDir: string
 }
 
 // POST /api/session/create

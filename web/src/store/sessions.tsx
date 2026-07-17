@@ -28,6 +28,9 @@ interface ContextValue {
   // Whether THIS host can actually confine sessions (bwrap present + userns ok).
   // false ⇒ the sandbox controls explain it's unavailable + how to enable it.
   sandboxAvailable: boolean
+  // The server user's home directory — the default cwd for new sessions, terminals,
+  // and the folder picker. Empty until the health probe resolves (app startup).
+  homeDir: string
   // Update a session's bwrap sandbox config (enable/disable, mounts). Applies on the
   // next launch; the caller relaunches to bring it into force.
   setSandbox: (id: string, sandbox: SandboxConfig) => Promise<void>
@@ -56,6 +59,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // Background sessions that finished / errored while unviewed — cleared on view.
   const [attention, setAttention] = useState<Set<string>>(new Set())
   const [sandboxAvailable, setSandboxAvailable] = useState(false)
+  const [homeDir, setHomeDir] = useState('')
   const [agents, setAgents] = useState<AgentInfo[]>([])
   const prevStateRef = useRef<Map<string, SessionState>>(new Map())
   const flagAttention = (id: string) => setAttention((a) => a.has(id) ? a : new Set(a).add(id))
@@ -151,7 +155,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   }, [patch])
 
   // Learn once whether this host can sandbox (drives the sandbox controls' messaging).
-  useEffect(() => { getHealth().then((h) => setSandboxAvailable(!!h.sandboxAvailable)).catch(() => {}) }, [])
+  useEffect(() => { getHealth().then((h) => { setSandboxAvailable(!!h.sandboxAvailable); if (h.homeDir) setHomeDir(h.homeDir) }).catch(() => {}) }, [])
 
   // Fetch the selectable roles once (drives the role pickers + sidebar badge).
   useEffect(() => { api.http.listAgents().then(setAgents).catch(() => {}) }, [])
@@ -176,7 +180,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, setSandbox, isFresh, markBusy, attention }}>
+    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, isFresh, markBusy, attention }}>
       {children}
     </SessionsContext.Provider>
   )

@@ -11,6 +11,7 @@ import { FileManager } from './components/FileManager'
 import { PermissionsPanel } from './components/PermissionsPanel'
 import { FileEditorView } from './components/FileEditorView'
 import { FileBrowser } from './components/FileBrowser'
+import { ConfirmDialog } from './components/ConfirmDialog'
 import { AuthGate } from './components/AuthGate'
 import { api } from './api/client'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
@@ -43,7 +44,7 @@ type Pane = { tabs: Content[]; active: Content | null }
 const EMPTY_PANE: Pane = { tabs: [], active: null }
 
 function Shell() {
-  const { sessions, activeId, setActive } = useSessions()
+  const { sessions, activeId, setActive, homeDir } = useSessions()
   const notebooks = useNotebooks()
   const [drawer, setDrawer] = useState(false)
 
@@ -96,7 +97,7 @@ function Shell() {
   const dividerProps = (cfg: Parameters<typeof onDown>[0]) => ({ onPointerDown: onDown(cfg), onPointerMove: onMove, onPointerUp: onUp })
 
   const activeSession = sessions.find((s) => s.id === activeId)
-  const termCwd = activeSession?.cwd ?? DEFAULT_CWD
+  const termCwd = activeSession?.cwd || homeDir
 
   // --- content tab management (per session) ----------------------------------
   const pane = (activeId ? bySession[activeId] : null) ?? EMPTY_PANE
@@ -590,8 +591,6 @@ function Mark({ className = '' }: { className?: string }) {
   )
 }
 
-const DEFAULT_CWD = '/home/kleeorin/Work/Projects/Claudette'
-
 function Empty() {
   return (
     <div className="flex-1 h-full flex flex-col items-center justify-center gap-3 text-center px-6">
@@ -607,6 +606,7 @@ function Empty() {
 function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void; width: number }) {
   const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
   const [showNew, setShowNew] = useState(false)
+  const [confirmClose, setConfirmClose] = useState<SessionInfo | null>(null)
   const pick = (id: string) => { setActive(id); onClose() }
 
   return (
@@ -635,7 +635,7 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
         <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
           {sessions.length === 0 && <div className="px-2 py-2 text-xs text-ctp-overlay">No sessions yet.</div>}
           {sessions.map((s) => (
-            <SessionRow key={s.id} session={s} active={s.id === activeId} attention={attention.has(s.id)} onSelect={() => pick(s.id)} onClose={() => void destroy(s.id)} />
+            <SessionRow key={s.id} session={s} active={s.id === activeId} attention={attention.has(s.id)} onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)} />
           ))}
         </div>
 
@@ -646,6 +646,16 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
         </div>
 
         {showNew && <NewSessionDialog onClose={() => setShowNew(false)} onCreated={() => { setShowNew(false); onClose() }} />}
+        {confirmClose && (
+          <ConfirmDialog
+            danger
+            title="Close this session?"
+            body={<>Closing <b>{confirmClose.name || 'this session'}</b> ends its Claude engine and kills any kernels or terminals it owns. The conversation history is kept and can be resumed.</>}
+            confirmLabel="Close session"
+            onConfirm={() => { const id = confirmClose.id; setConfirmClose(null); void destroy(id) }}
+            onCancel={() => setConfirmClose(null)}
+          />
+        )}
       </aside>
     </>
   )
@@ -653,9 +663,12 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
 
 // Centered modal for creating a session — name + working directory + role + model.
 function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreated?: () => void }) {
-  const { create, agents, sandboxAvailable } = useSessions()
+  const { create, agents, sandboxAvailable, homeDir } = useSessions()
   const [name, setName] = useState('')
-  const [cwd, setCwd] = useState(DEFAULT_CWD)
+  const [cwd, setCwd] = useState(homeDir)
+  // homeDir may resolve after this dialog mounts (health probe is async); adopt it as
+  // the default the moment it arrives, unless the user has already typed a path.
+  useEffect(() => { setCwd((c) => c || homeDir) }, [homeDir])
   const [agentId, setAgentId] = useState('general')
   const [model, setModel] = useState('')
   const [sb, setSb] = useState<SbState>(defaultSb())
@@ -710,7 +723,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
             <input value={model} onChange={(e) => setModel(e.target.value)} onKeyDown={onEnter} placeholder="account default (e.g. sonnet, opus, haiku)" className="modal-input font-mono text-[12px]" />
           </Field>
           <Field label="Sandbox">
-            <SandboxFields value={sb} onChange={setSb} cwd={cwd.trim() || DEFAULT_CWD} available={sandboxAvailable} />
+            <SandboxFields value={sb} onChange={setSb} cwd={cwd.trim() || homeDir} available={sandboxAvailable} />
           </Field>
           {err && <div className="text-[11px] text-ctp-red">{err}</div>}
         </div>
@@ -722,7 +735,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
         </div>
       </div>
       {browsing && (
-        <FileBrowser mode="folder" initialPath={cwd.trim() || DEFAULT_CWD} onPick={(path) => { setCwd(path); setBrowsing(false) }} onClose={() => setBrowsing(false)} />
+        <FileBrowser mode="folder" initialPath={cwd.trim() || homeDir} onPick={(path) => { setCwd(path); setBrowsing(false) }} onClose={() => setBrowsing(false)} />
       )}
     </div>,
     document.body,

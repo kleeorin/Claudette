@@ -2,6 +2,7 @@ import Fastify from 'fastify'
 import fastifyStatic from '@fastify/static'
 import { WebSocketServer, WebSocket } from 'ws'
 import { existsSync } from 'fs'
+import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import type { WsClientMessage, HealthResponse } from '@claudette/shared'
 import { SessionManager } from './claude/sessionManager'
@@ -126,6 +127,7 @@ app.get('/api/health', async (): Promise<HealthResponse> => ({
   version: VERSION,
   ts: Date.now(),
   sandboxAvailable: sandboxAvailable(),
+  homeDir: homedir(),
 }))
 
 // Token bootstrap: open the app once as `…/api/auth?token=<secret>` (or the SPA
