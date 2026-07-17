@@ -23,6 +23,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# Use nvm's Node no matter which terminal launched us (see the helper for why).
+# shellcheck source=scripts/use-nvm-node.sh
+. "$ROOT/scripts/use-nvm-node.sh"
+
 HOST="127.0.0.1"                 # app binds loopback; tailscale serve fronts it
 PORT="${PORT:-4319}"
 TOKEN_FILE="$ROOT/.claudette-token"

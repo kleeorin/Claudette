@@ -11,6 +11,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# Use nvm's Node no matter which terminal launched us (see the helper for why).
+# shellcheck source=scripts/use-nvm-node.sh
+. "$ROOT/scripts/use-nvm-node.sh"
+
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-4319}"
 WEB_PORT="${WEB_PORT:-5273}"
