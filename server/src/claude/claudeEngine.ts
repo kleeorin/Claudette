@@ -96,6 +96,7 @@ interface EngineSpawn {
   args: string[]           // claudeArgs(...) locally, or ssh args wrapping it
   cwd: string              // process cwd (local dir, or homedir for ssh)
   env: Record<string, string>
+  permissionMode?: PermissionMode  // Claudette's own view of the mode (drives bypass auto-allow)
 }
 
 type PendingPermission = { request: PermissionRequest; resolve: (d: PermissionDecision) => void }
@@ -119,9 +120,15 @@ export class ClaudeEngine extends EventEmitter {
   private nextControlId = 1
   private _state: 'idle' | 'running' | 'waiting' = 'idle'
   private _turnActive = false
+  // Claudette's authoritative view of the permission mode. Because we run with
+  // --permission-prompt-tool stdio, the CLI routes every tool decision to us, so
+  // "allow all" (bypassPermissions) must be honoured HERE — see handlePermission.
+  // Tracked separately from the CLI's flag so a live switch takes effect instantly.
+  private mode?: PermissionMode
 
   constructor(private readonly spawnCfg: EngineSpawn) {
     super()
+    this.mode = spawnCfg.permissionMode
   }
 
   get state(): 'idle' | 'running' | 'waiting' { return this._state }
@@ -198,6 +205,10 @@ export class ClaudeEngine extends EventEmitter {
   // context) so the caller can fall back to "applies on restart". Resolves
   // ok:false immediately if the process is gone or never answers.
   setPermissionMode(mode: PermissionMode): Promise<{ ok: true } | { ok: false; error: string }> {
+    // Adopt the mode for OUR own decisions immediately (optimistic), so bypass
+    // auto-allow takes effect at once — even if the CLI's live switch below is
+    // declined or the turn is mid-flight. A relaunch would re-seed it from spawnCfg.
+    this.mode = mode
     if (!this.child) return Promise.resolve({ ok: false, error: 'session not running' })
     const requestId = `set-mode-${this.controlId()}`
     return new Promise((resolve) => {
@@ -332,6 +343,19 @@ export class ClaudeEngine extends EventEmitter {
       this.write({
         type: 'control_response',
         response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message: notebookDeny } },
+      })
+      return
+    }
+    // "Allow all" (bypassPermissions): auto-approve every tool without prompting.
+    // We hold the prompt tool (--permission-prompt-tool stdio), so the CLI defers
+    // the decision to us regardless of its own --permission-mode; honouring bypass
+    // here is what actually makes "allow all" take effect (and instantly on a live
+    // switch, since setPermissionMode updates this.mode). The notebook deny above
+    // still wins — .ipynb edits stay funnelled through the app tools.
+    if (this.mode === 'bypassPermissions') {
+      this.write({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: requestId, response: { behavior: 'allow', updatedInput: req.input } },
       })
       return
     }

@@ -172,6 +172,7 @@ export class SessionManager extends EventEmitter {
       args: spawn.args,
       cwd: runCwd,
       env: process.env as Record<string, string>,
+      permissionMode: session.permissionMode,   // so "allow all" auto-approves without the CLI's cooperation
     })
 
     session.engine = engine
