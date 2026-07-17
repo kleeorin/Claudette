@@ -4,8 +4,12 @@ import type {
   CreateSessionRequest, CreateSessionResponse, ListSessionsResponse,
   SessionIdRequest, OkResponse, SetModeRequest, SetModeResult,
   ResumeIntoRequest, ConversationsResponse, ConversationResponse, SandboxConfig,
+  SetAgentRequest, RenameSessionRequest, ListAgentsResponse,
+  PermissionsResponse, EditRuleRequest, WriteResult,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
+import { listAgents } from '../claude/agents'
+import { getEffective, addRule, removeRule } from '../claude/permissions'
 import { listConversations, readConversation } from '../claude/conversations'
 import { WsHub } from '../ws/hub'
 
@@ -68,6 +72,31 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
 
   app.post<{ Body: SetModeRequest }>('/api/session/setMode', async (req): Promise<SetModeResult> =>
     sessions.setPermissionMode(req.body.id, req.body.mode))
+
+  // Change a session's role — relaunches (resume-preserving) to apply the new charter.
+  app.post<{ Body: SetAgentRequest }>('/api/session/setAgent', async (req): Promise<OkResponse> => ({
+    ok: sessions.setAgent(req.body.id, req.body.agentId),
+  }))
+
+  // Rename a session (display name only).
+  app.post<{ Body: RenameSessionRequest }>('/api/session/rename', async (req): Promise<OkResponse> => ({
+    ok: sessions.rename(req.body.id, req.body.name),
+  }))
+
+  // The selectable roles for the New Session dialog / role picker.
+  app.get('/api/agents', async (): Promise<ListAgentsResponse> => ({ agents: listAgents() }))
+
+  // Permission Control Center — a GUI over Claude's own settings files (keyed by the
+  // session cwd + its agent role). Read the merged picture; add/remove a rule at a
+  // chosen scope. Per-session mode still goes through /api/session/setMode.
+  app.get<{ Querystring: { cwd: string; agentId?: string } }>(
+    '/api/session/permissions', async (req): Promise<PermissionsResponse> => ({
+      permissions: await getEffective(req.query.cwd, req.query.agentId),
+    }))
+  app.post<{ Body: EditRuleRequest }>('/api/session/perms/addRule', async (req): Promise<WriteResult> =>
+    addRule(req.body.cwd, req.body.scope, req.body.action, req.body.value))
+  app.post<{ Body: EditRuleRequest }>('/api/session/perms/removeRule', async (req): Promise<WriteResult> =>
+    removeRule(req.body.cwd, req.body.scope, req.body.action, req.body.value))
 
   // /clear — restart the session on a brand-new conversation (fresh --session-id).
   app.post<{ Body: SessionIdRequest }>('/api/session/restartFresh', async (req): Promise<OkResponse> => {

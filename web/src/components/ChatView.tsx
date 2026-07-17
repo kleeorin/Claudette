@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode, SessionInfo } from '@claudette/shared'
 import { useChat, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
-import { ToolDetail, toolHeadline, toolArg } from '../lib/toolFormat'
+import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
+import { prettyPath } from '../lib/paths'
 import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
 import { SandboxControl } from './SandboxControl'
+import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { useMentionComplete } from '../hooks/useMentionComplete'
 import { api } from '../api/client'
 
@@ -40,6 +42,18 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // The turns you've sent this session, oldest→newest. `histPtr` counts steps back
   // (0 = the live draft); `stashRef` holds the in-progress draft while browsing.
   const sentHistory = useMemo(() => items.filter((it) => it.kind === 'user').map((it) => it.text), [items])
+  // The rendered transcript, memoized on `items` so composer keystrokes (which
+  // re-render ChatView via `draft`) don't re-filter and re-build the whole list.
+  const rendered = useMemo(() => {
+    // Drop signature-only "thinking" blocks (no readable text) so they leave
+    // neither an empty toggle nor a phantom spacing gap.
+    const shown = items.filter((it) => it.kind !== 'thinking' || it.streaming || it.text.trim())
+    return shown.map((it, i) => (
+      <div key={it.id} className={gapClass(it, shown[i - 1])}>
+        <Item item={it} />
+      </div>
+    ))
+  }, [items])
   const [histPtr, setHistPtr] = useState(0)
   const stashRef = useRef('')
   const caretToEnd = () => requestAnimationFrame(() => { const ta = taRef.current; if (ta) ta.selectionStart = ta.selectionEnd = ta.value.length })
@@ -170,15 +184,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
               Send a message to start the conversation.
             </div>
           )}
-          {items
-            // Drop signature-only "thinking" blocks (no readable text) so they
-            // leave neither an empty toggle nor a phantom spacing gap.
-            .filter((it) => it.kind !== 'thinking' || it.streaming || it.text.trim())
-            .map((it, i, shown) => (
-              <div key={it.id} className={gapClass(it, shown[i - 1])}>
-                <Item item={it} />
-              </div>
-            ))}
+          {rendered}
 
           {pending && (
             <div className="mt-4">
@@ -242,7 +248,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
           {mention.active && (
             <div className="absolute bottom-full left-6 mb-2 w-80 rounded-lg border border-ctp-surface1 bg-ctp-mantle shadow-pop overflow-hidden z-10">
               <div className="px-3 py-1 text-[10px] text-ctp-overlay font-mono truncate border-b border-ctp-surface0/70">
-                {mention.dir.replace(/^\/home\/[^/]+/, '~')}
+                {prettyPath(mention.dir)}
               </div>
               {mention.items.map((it, i) => (
                 <button
@@ -348,7 +354,10 @@ function gapClass(it: TranscriptItem, prev?: TranscriptItem): string {
   }
 }
 
-function Item({ item }: { item: TranscriptItem }) {
+// Memoized: the reducer preserves object identity for every settled item, so a
+// streaming token (which only replaces the one growing item) re-renders that item
+// alone instead of the whole transcript.
+const Item = memo(function Item({ item }: { item: TranscriptItem }) {
   switch (item.kind) {
     case 'user':
       return (
@@ -393,7 +402,7 @@ function Item({ item }: { item: TranscriptItem }) {
     case 'notice':
       return <div className="text-[11px] text-ctp-red/80 whitespace-pre-wrap font-mono">{item.text}</div>
   }
-}
+})
 
 // Compact, collapsed-by-default tool call — a dim one-liner (`⏺ Read(client.ts)`)
 // that expands to the full ToolDetail on click. Keeps tool chatter subordinate to
@@ -435,7 +444,7 @@ function ResultRow({ content, isError }: { content: string; isError: boolean }) 
     <div className="ml-4 animate-fade-in">
       <button onClick={() => setOpen((v) => !v)} className={`flex items-baseline gap-1.5 text-left text-[11.5px] ${color} hover:text-ctp-subtext w-full`}>
         <span className="text-ctp-surface2 shrink-0">⎿</span>
-        <span className="truncate font-mono">{truncateLine(summary, 100)}</span>
+        <span className="truncate font-mono">{truncate(summary, 100)}</span>
         {extra && <span className="text-ctp-surface2 shrink-0">{extra}</span>}
       </button>
       {open && (
@@ -446,8 +455,6 @@ function ResultRow({ content, isError }: { content: string; isError: boolean }) 
     </div>
   )
 }
-
-function truncateLine(s: string, n: number): string { return s.length > n ? s.slice(0, n) + '…' : s }
 
 function Collapsible({ label, body, tone }: { label: string; body: string; tone: 'overlay' | 'subtext' | 'red' }) {
   const [open, setOpen] = useState(false)
@@ -503,7 +510,7 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
       {/* Session identity — hidden on mobile (the top bar already shows the name). */}
       <div className="hidden md:flex min-w-0 items-baseline gap-2">
         {title && <span className="text-sm font-medium text-ctp-text truncate max-w-[16rem]">{title}</span>}
-        {cwd && <span className="text-[11px] text-ctp-overlay font-mono truncate max-w-[20rem]">{cwd.replace(/^\/home\/[^/]+/, '~')}</span>}
+        {cwd && <span className="text-[11px] text-ctp-overlay font-mono truncate max-w-[20rem]">{prettyPath(cwd)}</span>}
       </div>
 
       <div className="md:ml-auto flex items-center flex-wrap gap-x-3 gap-y-1 text-[10px] text-ctp-overlay">
@@ -531,13 +538,15 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
 
 // Live permission-mode switch (P1.4). Applies over the control protocol when the
 // session is running (instant), else on the next launch — the returned status says
-// which, shown briefly so the user knows it took.
+// which, shown briefly so the user knows it took. "allow all" (bypassPermissions)
+// is guarded behind a confirm, matching the Permissions panel.
 const MODE_LABEL: Record<PermissionMode, string> = {
-  default: 'prompt', acceptEdits: 'auto-edit', plan: 'plan', bypassPermissions: 'bypass',
+  default: 'prompt', acceptEdits: 'auto-edit', plan: 'plan', bypassPermissions: 'allow all',
 }
 function ModeSelect({ mode, onSetMode }: { mode: PermissionMode; onSetMode: (m: PermissionMode) => Promise<{ applied: string; reason?: string }> | void }) {
   const [hint, setHint] = useState<string | null>(null)
-  const change = async (m: PermissionMode) => {
+  const [confirmBypass, setConfirmBypass] = useState(false)
+  const apply = async (m: PermissionMode) => {
     const r = await onSetMode(m)
     if (r && 'applied' in r) {
       const msg = r.applied === 'live' ? 'applied' : r.applied === 'relaunched' ? 'relaunching…' : 'applies on next run'
@@ -545,18 +554,32 @@ function ModeSelect({ mode, onSetMode }: { mode: PermissionMode; onSetMode: (m: 
       setTimeout(() => setHint(null), 2500)
     }
   }
+  // Picking "allow all" opens the confirm instead of applying; the controlled
+  // <select> keeps showing the current mode until it's confirmed (cancel = no-op).
+  const change = (m: PermissionMode) => {
+    if (m === mode) return
+    if (m === 'bypassPermissions') { setConfirmBypass(true); return }
+    void apply(m)
+  }
   return (
     <span className="flex items-center gap-1" title="Permission mode — how Claude's tool use is gated">
       <select
         value={mode}
-        onChange={(e) => void change(e.target.value as PermissionMode)}
-        className="bg-ctp-surface0 text-ctp-subtext rounded px-1 py-0.5 outline-none hover:text-ctp-text cursor-pointer"
+        onChange={(e) => change(e.target.value as PermissionMode)}
+        className={`bg-ctp-surface0 rounded px-1 py-0.5 outline-none hover:text-ctp-text cursor-pointer ${
+          mode === 'bypassPermissions' ? 'text-ctp-red' : 'text-ctp-subtext'}`}
       >
         {(Object.keys(MODE_LABEL) as PermissionMode[]).map((m) => (
           <option key={m} value={m}>{MODE_LABEL[m]}</option>
         ))}
       </select>
       {hint && <span className="text-ctp-overlay">{hint}</span>}
+      {confirmBypass && (
+        <BypassConfirmDialog
+          onConfirm={() => { setConfirmBypass(false); void apply('bypassPermissions') }}
+          onCancel={() => setConfirmBypass(false)}
+        />
+      )}
     </span>
   )
 }

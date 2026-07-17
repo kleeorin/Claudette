@@ -25,7 +25,6 @@ export interface RateLimitInfo {
   status?: string
   resetsAt?: number
   rateLimitType?: string
-  overageStatus?: string
   isUsingOverage?: boolean
   // The CLI's rate_limit_event reports usage as `utilization` (a 0–1 fraction on
   // the anthropic-ratelimit-unified-*-utilization header); we normalize it into

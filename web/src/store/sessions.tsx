@@ -1,7 +1,7 @@
 import {
   createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode,
 } from 'react'
-import type { SessionInfo, SessionState, PermissionMode, SetModeResult, SandboxConfig } from '@claudette/shared'
+import type { SessionInfo, SessionState, PermissionMode, SetModeResult, SandboxConfig, AgentInfo } from '@claudette/shared'
 import { api, getHealth } from '../api/client'
 
 // Minimal Phase-1 session store: mirrors the server's session set (via the WS
@@ -14,7 +14,15 @@ interface ContextValue {
   activeId: string | null
   setActive: (id: string | null) => void
   connected: boolean
-  create: (name: string, cwd: string, opts?: { model?: string }) => Promise<string>
+  create: (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig }) => Promise<string>
+  // Spawn a child session under `parentId` (shares the parent's cwd/rootDir, carries
+  // parentId so the server appends the report-to-parent instruction). Own role + sandbox.
+  spawnSubsession: (parentId: string, opts?: { name?: string; agentId?: string; sandbox?: SandboxConfig }) => Promise<string | null>
+  // Change a session's role (relaunches, resume-preserving) / rename it in place.
+  setAgent: (id: string, agentId: string) => Promise<void>
+  rename: (id: string, name: string) => Promise<void>
+  // The selectable roles (fetched once); empty until loaded. `general` always exists.
+  agents: AgentInfo[]
   destroy: (id: string) => Promise<void>
   setMode: (id: string, mode: PermissionMode) => Promise<SetModeResult>
   // Whether THIS host can actually confine sessions (bwrap present + userns ok).
@@ -48,6 +56,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // Background sessions that finished / errored while unviewed — cleared on view.
   const [attention, setAttention] = useState<Set<string>>(new Set())
   const [sandboxAvailable, setSandboxAvailable] = useState(false)
+  const [agents, setAgents] = useState<AgentInfo[]>([])
   const prevStateRef = useRef<Map<string, SessionState>>(new Map())
   const flagAttention = (id: string) => setAttention((a) => a.has(id) ? a : new Set(a).add(id))
 
@@ -93,15 +102,38 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     return () => { offList(); offState(); offReady(); offExit(); offConn() }
   }, [patch])
 
-  const create = useCallback(async (name: string, cwd: string, opts?: { model?: string }): Promise<string> => {
-    const { id } = await api.http.createSession({ name, cwd, model: opts?.model })
+  const create = useCallback(async (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig }): Promise<string> => {
+    const rootDir = opts?.rootDir ?? cwd
+    const { id } = await api.http.createSession({ name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox })
     freshRef.current.add(id)   // a user-created session stays fresh (no auto-resume)
     // Optimistically add + select; the next list/state event reconciles.
     setSessions((prev) => prev.some((s) => s.id === id) ? prev
-      : [...prev, { id, name, cwd, rootDir: cwd, model: opts?.model, state: 'idle' }])
+      : [...prev, { id, name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox, state: 'idle' }])
     setActiveId(id)
     return id
   }, [])
+
+  // A subsession shares its parent's working directory + root, carries parentId, and
+  // gets its own role. Name defaults to "<parent> · sub".
+  const spawnSubsession = useCallback(async (parentId: string, opts?: { name?: string; agentId?: string; sandbox?: SandboxConfig }): Promise<string | null> => {
+    const parent = sessions.find((s) => s.id === parentId)
+    if (!parent) return null
+    return create(opts?.name?.trim() || `${parent.name} · sub`, parent.cwd, {
+      parentId, rootDir: parent.rootDir, agentId: opts?.agentId, sandbox: opts?.sandbox,
+    })
+  }, [sessions, create])
+
+  const setAgent = useCallback(async (id: string, agentId: string): Promise<void> => {
+    patch(id, { agentId })   // optimistic; the server's session:list broadcast reconciles
+    await api.http.setAgent(id, agentId)
+  }, [patch])
+
+  const rename = useCallback(async (id: string, name: string): Promise<void> => {
+    const trimmed = name.trim()
+    if (!trimmed) return
+    patch(id, { name: trimmed })
+    await api.http.rename(id, trimmed)
+  }, [patch])
 
   const destroy = useCallback(async (id: string): Promise<void> => {
     await api.http.destroySession(id)
@@ -120,6 +152,9 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
 
   // Learn once whether this host can sandbox (drives the sandbox controls' messaging).
   useEffect(() => { getHealth().then((h) => setSandboxAvailable(!!h.sandboxAvailable)).catch(() => {}) }, [])
+
+  // Fetch the selectable roles once (drives the role pickers + sidebar badge).
+  useEffect(() => { api.http.listAgents().then(setAgents).catch(() => {}) }, [])
 
   const setSandbox = useCallback(async (id: string, sandbox: SandboxConfig): Promise<void> => {
     patch(id, { sandbox })   // optimistic; the server's session:list broadcast reconciles `sandboxed`
@@ -141,7 +176,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, destroy, setMode, sandboxAvailable, setSandbox, isFresh, markBusy, attention }}>
+    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, setSandbox, isFresh, markBusy, attention }}>
       {children}
     </SessionsContext.Provider>
   )
