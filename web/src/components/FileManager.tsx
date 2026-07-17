@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api } from '../api/client'
+import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
 import type { DirEntry } from '@claudette/shared'
+
+// A file/dir copied or cut in the browser — module-level so it survives a re-render
+// and a folder change, letting you paste it into a different directory (like the OS
+// file manager). `cut` moves on paste; `copy` duplicates.
+let fileClipboard: { path: string; name: string; mode: 'copy' | 'cut' } | null = null
+
+// Insert " copy" before the extension for Duplicate / a paste into the same folder.
+function withCopySuffix(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? `${name.slice(0, dot)} copy${name.slice(dot)}` : `${name} copy`
+}
 
 // Narrow Files dock (right side): a navigable directory tree with New notebook /
 // file / folder actions. Clicking a directory navigates; a .ipynb opens as a
@@ -14,26 +27,6 @@ interface Props {
   onClose: () => void
 }
 
-const joinPath = (dir: string, name: string) => (dir === '/' ? `/${name}` : `${dir}/${name}`)
-const isNotebook = (name: string) => name.endsWith('.ipynb')
-
-function crumbs(dir: string): Array<{ label: string; path: string }> {
-  const parts = dir.split('/').filter(Boolean)
-  const out = [{ label: '/', path: '/' }]
-  let acc = ''
-  for (const p of parts) { acc += `/${p}`; out.push({ label: p, path: acc }) }
-  return out
-}
-
-function fmtSize(n: number): string {
-  if (!n) return ''
-  const u = ['B', 'KB', 'MB', 'GB']
-  let i = 0
-  let v = n
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
-  return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)}${u[i]}`
-}
-
 type Creating = 'notebook' | 'file' | 'folder' | null
 
 export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNotebook, onClose }: Props) {
@@ -45,6 +38,14 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   const [creating, setCreating] = useState<Creating>(null)
   const [newName, setNewName] = useState('')
   const [createErr, setCreateErr] = useState<string | null>(null)
+  // File-op UI state: right-click menu, inline rename, delete confirm, op errors,
+  // and a tick that forces re-render when the module-level clipboard changes.
+  const [menu, setMenu] = useState<{ e: DirEntry; x: number; y: number } | null>(null)
+  const [renaming, setRenaming] = useState<string | null>(null)   // entry name being renamed
+  const [renameVal, setRenameVal] = useState('')
+  const [confirmDel, setConfirmDel] = useState<DirEntry | null>(null)
+  const [opErr, setOpErr] = useState<string | null>(null)
+  const [clipTick, setClipTick] = useState(0)
 
   const load = useCallback(async (path?: string) => {
     setLoading(true); setErr(null)
@@ -55,11 +56,63 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   }, [])
 
   useEffect(() => { void load(initialPath) }, [initialPath, load])
+  // Close the context menu on any outside click or Escape.
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(null)
+    const onKey = (ev: KeyboardEvent) => { if (ev.key === 'Escape') setMenu(null) }
+    window.addEventListener('click', close)
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
+  }, [menu])
 
+  // --- file operations -------------------------------------------------------
+  const run = async (p: Promise<{ ok: true } | { ok: false; error: string }>) => {
+    const r = await p
+    if (!r.ok) { setOpErr(r.error); return false }
+    setOpErr(null); await load(dir); return true
+  }
+  const beginRename = (e: DirEntry) => { setRenaming(e.name); setRenameVal(e.name); setMenu(null) }
+  const submitRename = async () => {
+    // Clear `renaming` up front so the Enter→blur double-fire can't rename twice.
+    const from = renaming
+    const n = renameVal.trim()
+    setRenaming(null)
+    if (!from || !n || n === from) return
+    await run(api.fs.rename(joinPath(dir, from), joinPath(dir, n)))
+  }
+  const copyEntry = (e: DirEntry) => { fileClipboard = { path: joinPath(dir, e.name), name: e.name, mode: 'copy' }; setClipTick((t) => t + 1); setMenu(null) }
+  const cutEntry = (e: DirEntry) => { fileClipboard = { path: joinPath(dir, e.name), name: e.name, mode: 'cut' }; setClipTick((t) => t + 1); setMenu(null) }
+  // Paste the clipboard into `targetDir` (defaults to the current folder; a right-
+  // click on a folder pastes INTO it). A same-folder copy lands as "name copy".
+  const paste = async (targetDir: string) => {
+    if (!fileClipboard) return
+    setMenu(null)
+    const src = fileClipboard.path
+    const collide = joinPath(targetDir, fileClipboard.name) === src && fileClipboard.mode === 'copy'
+    const dest = joinPath(targetDir, collide ? withCopySuffix(fileClipboard.name) : fileClipboard.name)
+    const ok = await run(fileClipboard.mode === 'copy' ? api.fs.copy(src, dest) : api.fs.rename(src, dest))
+    if (ok && fileClipboard.mode === 'cut') { fileClipboard = null; setClipTick((t) => t + 1) }
+  }
+  const duplicateEntry = async (e: DirEntry) => { setMenu(null); await run(api.fs.copy(joinPath(dir, e.name), joinPath(dir, withCopySuffix(e.name)))) }
+  const doDelete = async () => { const e = confirmDel; if (!e) return; setConfirmDel(null); await run(api.fs.remove(joinPath(dir, e.name))) }
+  const download = (e: DirEntry) => {
+    setMenu(null)
+    const a = document.createElement('a')
+    a.href = api.fs.downloadUrl(joinPath(dir, e.name))
+    a.download = e.name
+    document.body.appendChild(a); a.click(); a.remove()
+  }
+
+  // Folders navigate on a single click; files open on double-click (the usual
+  // desktop convention — a single click would open things by accident).
   const clickEntry = (e: DirEntry) => {
+    if (e.isDir) void load(joinPath(dir, e.name))
+  }
+  const openEntry = (e: DirEntry) => {
+    if (e.isDir) return
     const full = joinPath(dir, e.name)
-    if (e.isDir) void load(full)
-    else if (isNotebook(e.name)) onOpenNotebook(full)
+    if (isNotebookPath(e.name)) onOpenNotebook(full)
     else onOpenFile(full)
   }
 
@@ -122,7 +175,16 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
           <button className={actBtn} onClick={() => beginCreate('notebook')} title="New notebook here">+ Notebook</button>
           <button className={actBtn} onClick={() => beginCreate('file')} title="New file here">+ File</button>
           <button className={actBtn} onClick={() => beginCreate('folder')} title="New folder here">+ Folder</button>
+          {fileClipboard && (
+            <button
+              className={actBtn}
+              onClick={() => void paste(dir)}
+              title={`Paste "${fileClipboard.name}" here (${fileClipboard.mode})`}
+              data-cliptick={clipTick}
+            >📋 Paste</button>
+          )}
         </div>
+        {opErr && <div className="text-[10px] text-ctp-red mt-1 break-words">{opErr}</div>}
         {creating && (
           <div className="mt-1.5">
             <input
@@ -146,18 +208,109 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
         {loading && <div className="px-3 py-2 text-[12px] text-ctp-overlay">Loading…</div>}
         {err && <div className="px-3 py-2 text-[12px] text-ctp-red break-words">{err}</div>}
         {!loading && !err && visible.length === 0 && <div className="px-3 py-2 text-[12px] text-ctp-overlay">Empty folder.</div>}
-        {!loading && !err && visible.map((e) => (
+        {!loading && !err && visible.map((e) => renaming === e.name ? (
+          <div key={e.name} className="flex items-center gap-2 px-3 py-1">
+            <span className="shrink-0 w-4 text-center">{e.isDir ? '📁' : isNotebookPath(e.name) ? '📓' : '📄'}</span>
+            <input
+              autoFocus
+              value={renameVal}
+              onChange={(ev) => setRenameVal(ev.target.value)}
+              onKeyDown={(ev) => {
+                if (ev.key === 'Enter') { ev.preventDefault(); void submitRename() }
+                else if (ev.key === 'Escape') { setRenaming(null); setOpErr(null) }
+              }}
+              onBlur={() => void submitRename()}
+              className="modal-input font-mono text-[12px] flex-1"
+            />
+          </div>
+        ) : (
           <button
             key={e.name}
             onClick={() => clickEntry(e)}
-            className="w-full flex items-center gap-2 px-3 py-1 text-left text-[13px] hover:bg-ctp-surface0/50 text-ctp-subtext transition-colors"
+            onDoubleClick={() => openEntry(e)}
+            onContextMenu={(ev) => { ev.preventDefault(); setMenu({ e, x: ev.clientX, y: ev.clientY }) }}
+            title={e.isDir ? 'Open folder' : 'Double-click to open · right-click for actions'}
+            className="group w-full flex items-center gap-2 px-3 py-1 text-left text-[13px] hover:bg-ctp-surface0/50 text-ctp-subtext transition-colors"
           >
-            <span className="shrink-0 w-4 text-center">{e.isDir ? '📁' : isNotebook(e.name) ? '📓' : '📄'}</span>
+            <span className="shrink-0 w-4 text-center">{e.isDir ? '📁' : isNotebookPath(e.name) ? '📓' : '📄'}</span>
             <span className="truncate font-mono flex-1">{e.name}</span>
-            {e.isDir ? <span className="text-ctp-surface2 text-xs">›</span> : <span className="text-ctp-surface2 text-[10px] tabular-nums">{fmtSize(e.size)}</span>}
+            <span
+              role="button"
+              tabIndex={-1}
+              onClick={(ev) => { ev.preventDefault(); ev.stopPropagation(); setMenu({ e, x: ev.clientX, y: ev.clientY }) }}
+              title="Actions"
+              className="shrink-0 opacity-0 group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text px-1 leading-none"
+            >⋯</span>
+            {e.isDir && <span className="text-ctp-surface2 text-xs">›</span>}
           </button>
         ))}
       </div>
+
+      {menu && <RowMenu
+        entry={menu.e} x={menu.x} y={menu.y} hasClipboard={!!fileClipboard}
+        onOpen={() => { setMenu(null); menu.e.isDir ? void load(joinPath(dir, menu.e.name)) : openEntry(menu.e) }}
+        onDownload={() => download(menu.e)}
+        onRename={() => beginRename(menu.e)}
+        onDuplicate={() => void duplicateEntry(menu.e)}
+        onCopy={() => copyEntry(menu.e)}
+        onCut={() => cutEntry(menu.e)}
+        onPaste={() => void paste(menu.e.isDir ? joinPath(dir, menu.e.name) : dir)}
+        onDelete={() => { setConfirmDel(menu.e); setMenu(null) }}
+      />}
+      {confirmDel && <ConfirmDelete entry={confirmDel} onCancel={() => setConfirmDel(null)} onConfirm={() => void doDelete()} />}
     </div>
+  )
+}
+
+// Right-click actions menu for a file/dir, positioned at the cursor (portal to body
+// so it's never clipped by the dock's overflow). Closes on outside click (wired in
+// FileManager). A directory can't be downloaded.
+function RowMenu({ entry, x, y, hasClipboard, onOpen, onDownload, onRename, onDuplicate, onCopy, onCut, onPaste, onDelete }: {
+  entry: DirEntry; x: number; y: number; hasClipboard: boolean
+  onOpen: () => void; onDownload: () => void; onRename: () => void; onDuplicate: () => void
+  onCopy: () => void; onCut: () => void; onPaste: () => void; onDelete: () => void
+}) {
+  const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
+  // Keep the menu on-screen: nudge left/up near the viewport edges.
+  const left = Math.min(x, window.innerWidth - 180)
+  const top = Math.min(y, window.innerHeight - 260)
+  return createPortal(
+    <div
+      style={{ left, top }}
+      onClick={(e) => e.stopPropagation()}
+      className="fixed z-[60] w-44 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs"
+    >
+      <button className={item} onClick={onOpen}>{entry.isDir ? 'Open folder' : 'Open'}</button>
+      {!entry.isDir && <button className={item} onClick={onDownload}>⬇ Download</button>}
+      <div className="my-1 border-t border-ctp-surface0" />
+      <button className={item} onClick={onRename}>Rename…</button>
+      <button className={item} onClick={onDuplicate}>Duplicate</button>
+      <button className={item} onClick={onCopy}>Copy</button>
+      <button className={item} onClick={onCut}>Cut</button>
+      {hasClipboard && <button className={item} onClick={onPaste}>Paste into…{entry.isDir ? ` ${entry.name}` : ''}</button>}
+      <div className="my-1 border-t border-ctp-surface0" />
+      <button className={`${item} text-ctp-red hover:bg-ctp-red/15`} onClick={onDelete}>Delete…</button>
+    </div>,
+    document.body,
+  )
+}
+
+// Small confirm dialog for a delete (recursive for folders). Modal, centered.
+function ConfirmDelete({ entry, onCancel, onConfirm }: { entry: DirEntry; onCancel: () => void; onConfirm: () => void }) {
+  return createPortal(
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>
+      <div className="w-[360px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="text-sm font-semibold text-ctp-text mb-1.5">Delete {entry.isDir ? 'folder' : 'file'}?</div>
+        <div className="text-xs text-ctp-subtext break-words mb-4">
+          <span className="font-mono text-ctp-text">{entry.name}</span>
+          {entry.isDir ? ' and everything inside it will be permanently deleted.' : ' will be permanently deleted.'} This can’t be undone.
+        </div>
+        <div className="flex justify-end gap-2">
+          <button onClick={onCancel} className="text-xs px-3.5 py-1.5 rounded-md text-ctp-subtext hover:bg-ctp-surface0 transition-colors">Cancel</button>
+          <button onClick={onConfirm} className="text-xs font-medium px-4 py-1.5 rounded-md bg-ctp-red text-ctp-base hover:brightness-110 active:brightness-95 transition">Delete</button>
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }

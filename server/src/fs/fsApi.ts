@@ -1,4 +1,5 @@
-import { readdir, stat, readFile, writeFile, mkdir } from 'fs/promises'
+import { readdir, stat, readFile, writeFile, mkdir, rename, cp, rm } from 'fs/promises'
+import { createReadStream } from 'fs'
 import { resolve, dirname, isAbsolute, basename, extname } from 'path'
 import { homedir } from 'os'
 import type { FastifyInstance } from 'fastify'
@@ -8,6 +9,11 @@ import type { DirEntry, FsListResponse, FilePreview, WriteResult } from '@claude
 // against $HOME.
 function toAbs(raw: string): string {
   return isAbsolute(raw) ? resolve(raw) : resolve(homedir(), raw)
+}
+
+// Does a path exist? Used to refuse move/copy that would clobber a destination.
+async function exists(p: string): Promise<boolean> {
+  try { await stat(p); return true } catch { return false }
 }
 
 // Filesystem browse endpoint backing the file/folder picker. Single-user, local
@@ -122,5 +128,66 @@ export function registerFsRoutes(app: FastifyInstance): void {
     if (!path?.trim()) return { ok: false, error: 'path is required' }
     try { await mkdir(toAbs(path), { recursive: true }); return { ok: true } }
     catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+  })
+
+  // --- move / copy / delete — back the file-browser context actions. -----------
+
+  // Rename or move a file/dir. Atomic within a filesystem; across devices Node's
+  // rename throws EXDEV, so fall back to a recursive copy-then-remove. Refuses to
+  // clobber an existing destination (rename/move should never silently overwrite).
+  app.post<{ Body: { from?: string; to?: string } }>('/api/fs/rename', async (req): Promise<WriteResult> => {
+    const { from, to } = req.body
+    if (!from?.trim() || !to?.trim()) return { ok: false, error: 'from and to are required' }
+    const src = toAbs(from), dst = toAbs(to)
+    if (src === dst) return { ok: true }
+    try {
+      if (await exists(dst)) return { ok: false, error: `already exists: ${basename(dst)}` }
+      try { await rename(src, dst) }
+      catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EXDEV') { await cp(src, dst, { recursive: true }); await rm(src, { recursive: true }) }
+        else throw e
+      }
+      return { ok: true }
+    } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+  })
+
+  // Copy a file or directory (recursive). Refuses to overwrite an existing target.
+  app.post<{ Body: { from?: string; to?: string } }>('/api/fs/copy', async (req): Promise<WriteResult> => {
+    const { from, to } = req.body
+    if (!from?.trim() || !to?.trim()) return { ok: false, error: 'from and to are required' }
+    const src = toAbs(from), dst = toAbs(to)
+    try {
+      if (await exists(dst)) return { ok: false, error: `already exists: ${basename(dst)}` }
+      await cp(src, dst, { recursive: true, errorOnExist: true, force: false })
+      return { ok: true }
+    } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+  })
+
+  // Delete a file or directory (recursive). Guards the obvious catastrophes ('/'
+  // and $HOME); everything else is fair game on this single-user local tool.
+  app.post<{ Body: { path?: string } }>('/api/fs/delete', async (req): Promise<WriteResult> => {
+    const raw = req.body.path
+    if (!raw?.trim()) return { ok: false, error: 'path is required' }
+    const abs = toAbs(raw)
+    if (abs === '/' || abs === homedir()) return { ok: false, error: 'refusing to delete this directory' }
+    try { await rm(abs, { recursive: true, force: false }); return { ok: true } }
+    catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+  })
+
+  // Stream a file to the browser as a download (Content-Disposition: attachment).
+  // Same-origin GET → the auth cookie rides along, so a plain <a href> works.
+  app.get<{ Querystring: { path?: string } }>('/api/fs/download', async (req, reply) => {
+    const raw = req.query.path?.trim()
+    if (!raw) { reply.code(400); return { error: 'path is required' } }
+    const abs = toAbs(raw)
+    try {
+      const s = await stat(abs)
+      if (s.isDirectory()) { reply.code(400); return { error: 'cannot download a directory' } }
+      const safe = basename(abs).replace(/["\\\r\n]/g, '_')
+      reply.header('Content-Disposition', `attachment; filename="${safe}"`)
+      reply.header('Content-Type', 'application/octet-stream')
+      reply.header('Content-Length', s.size)
+      return reply.send(createReadStream(abs))
+    } catch (e) { reply.code(404); return { error: e instanceof Error ? e.message : String(e) } }
   })
 }

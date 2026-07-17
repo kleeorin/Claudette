@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
+import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
 import type { DirEntry } from '@claudette/shared'
 
 // A navigable file/folder picker, used in two modes:
@@ -14,17 +15,6 @@ interface Props {
   onPick: (path: string, create?: boolean) => void
   onClose: () => void
   error?: string | null   // an open/create failure from the caller, shown in the footer
-}
-
-const joinPath = (dir: string, name: string) => (dir === '/' ? `/${name}` : `${dir}/${name}`)
-
-// Cumulative breadcrumb segments for an absolute POSIX dir.
-function crumbs(dir: string): Array<{ label: string; path: string }> {
-  const parts = dir.split('/').filter(Boolean)
-  const out = [{ label: '/', path: '/' }]
-  let acc = ''
-  for (const p of parts) { acc += `/${p}`; out.push({ label: p, path: acc }) }
-  return out
 }
 
 export function FileBrowser({ mode, initialPath, onPick, onClose, error }: Props) {
@@ -55,7 +45,7 @@ export function FileBrowser({ mode, initialPath, onPick, onClose, error }: Props
     .filter((e) => showHidden || !e.name.startsWith('.'))
     .filter((e) => mode === 'notebook' || e.isDir)  // folder mode: dirs only
 
-  const isNotebook = (e: DirEntry) => !e.isDir && e.name.endsWith('.ipynb')
+  const isNotebook = (e: DirEntry) => !e.isDir && isNotebookPath(e.name)
 
   const clickEntry = (e: DirEntry) => {
     if (e.isDir) { setSelected(null); void load(joinPath(dir, e.name)) }
