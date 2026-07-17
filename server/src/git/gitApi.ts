@@ -104,4 +104,23 @@ export function registerGitRoutes(app: FastifyInstance): void {
     if (!needCwd(cwd) || !name) return { ok: false, error: 'cwd and name are required' }
     return git.mergeBranch(cwd, name)
   })
+
+  // --- remote (reach the network; can be slow) ---
+  app.post<{ Body: { cwd?: string } }>('/api/git/fetch', async (req): Promise<GitResult> => {
+    const { cwd } = req.body
+    if (!needCwd(cwd)) return { ok: false, error: 'cwd is required' }
+    return git.fetch(cwd)
+  })
+
+  app.post<{ Body: { cwd?: string } }>('/api/git/pull', async (req): Promise<GitResult> => {
+    const { cwd } = req.body
+    if (!needCwd(cwd)) return { ok: false, error: 'cwd is required' }
+    return git.pull(cwd)
+  })
+
+  app.post<{ Body: { cwd?: string; setUpstream?: boolean } }>('/api/git/push', async (req): Promise<GitResult> => {
+    const { cwd, setUpstream } = req.body
+    if (!needCwd(cwd)) return { ok: false, error: 'cwd is required' }
+    return git.push(cwd, !!setUpstream)
+  })
 }

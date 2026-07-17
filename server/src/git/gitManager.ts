@@ -35,9 +35,10 @@ const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(er
 // Parse `git status --porcelain=v1 -b -z`. Records are NUL-terminated; the first
 // is the branch header, and rename/copy entries are followed by their source
 // path as a separate record.
-function parseStatus(out: string): { branch: string; ahead: number; behind: number; files: GitFileStatus[] } {
+function parseStatus(out: string): { branch: string; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[] } {
   const recs = out.split('\0')
   let branch = ''
+  let upstream: string | null = null
   let ahead = 0
   let behind = 0
   const files: GitFileStatus[] = []
@@ -51,7 +52,14 @@ function parseStatus(out: string): { branch: string; ahead: number; behind: numb
       // "branch...upstream [ahead N, behind M]" or "No commits yet on branch"
       const noCommits = header.match(/No commits yet on (.+)/)
       if (noCommits) { branch = noCommits[1].trim(); continue }
-      branch = header.split('...')[0].split(' ')[0]
+      const dots = header.indexOf('...')
+      if (dots >= 0) {
+        branch = header.slice(0, dots).trim()
+        // rest is "upstream [ahead N, behind M]"; the upstream ref is up to the space.
+        upstream = header.slice(dots + 3).split(' ')[0].trim() || null
+      } else {
+        branch = header.split(' ')[0]
+      }
       ahead = Number(header.match(/ahead (\d+)/)?.[1] ?? 0)
       behind = Number(header.match(/behind (\d+)/)?.[1] ?? 0)
       continue
@@ -76,7 +84,7 @@ function parseStatus(out: string): { branch: string; ahead: number; behind: numb
       untracked,
     })
   }
-  return { branch, ahead, behind, files }
+  return { branch, upstream, ahead, behind, files }
 }
 
 export async function status(dir: string): Promise<GitStatus> {
@@ -208,4 +216,31 @@ export async function deleteBranch(dir: string, name: string, force: boolean): P
 export async function mergeBranch(dir: string, name: string): Promise<GitResult> {
   try { await git(dir, ['merge', '--no-edit', name]); return { ok: true } }
   catch (err) { return { ok: false, error: errMsg(err) } }
+}
+
+// --- Remote ------------------------------------------------------------------
+// These reach the network, so they can be slow or hang on auth prompts. We rely
+// on git's own credential handling (helpers/SSH agent); anything interactive
+// fails fast because there's no TTY, surfacing as ok:false with git's message.
+
+// Fetch remote refs without touching the working tree — updates ahead/behind.
+export async function fetch(dir: string): Promise<GitResult> {
+  try { await git(dir, ['fetch']); return { ok: true } }
+  catch (err) { return { ok: false, error: errMsg(err) } }
+}
+
+// Pull with fast-forward-only by default so we never spawn a merge editor; a
+// divergent history surfaces as ok:false and the user resolves it in the terminal.
+export async function pull(dir: string): Promise<GitResult> {
+  try { await git(dir, ['pull', '--ff-only']); return { ok: true } }
+  catch (err) { return { ok: false, error: errMsg(err) } }
+}
+
+// Push the current branch. `setUpstream` publishes an unpushed branch
+// (`push -u origin HEAD`) so it gains a tracking ref; otherwise a plain push.
+export async function push(dir: string, setUpstream: boolean): Promise<GitResult> {
+  try {
+    await git(dir, setUpstream ? ['push', '-u', 'origin', 'HEAD'] : ['push'])
+    return { ok: true }
+  } catch (err) { return { ok: false, error: errMsg(err) } }
 }

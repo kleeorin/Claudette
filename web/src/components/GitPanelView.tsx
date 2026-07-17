@@ -226,10 +226,27 @@ export function GitPanelView({ cwd, onClose }: Props) {
     }
   }, [cwd, loadBranches, refresh])
 
+  // --- Remote ------------------------------------------------------------------
+
+  const doFetch = useCallback(async () => {
+    await run(() => api.git.fetch(cwd))
+  }, [run, cwd])
+
+  // Pull can land new commits, so refresh the log if it's showing.
+  const doPull = useCallback(async () => {
+    await run(() => api.git.pull(cwd))
+    if (modeRef.current === 'log') loadLog()
+  }, [run, cwd, loadLog])
+
+  // setUpstream publishes a branch that has no tracking ref yet (push -u origin).
+  const doPush = useCallback(async (setUpstream: boolean) => {
+    await run(() => api.git.push(cwd, setUpstream))
+  }, [run, cwd])
+
   if (status && status.repo === false) {
     return (
       <Shell>
-        <Header branch="" ahead={0} behind={0} onRefresh={() => { refresh() }} onClose={onClose} disabled />
+        <Header onRefresh={() => { refresh() }} onClose={onClose} disabled />
         <div className="flex-1 flex items-center justify-center p-4 text-center text-xs text-ctp-overlay">
           Not a git repository.
         </div>
@@ -239,7 +256,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
   if (status && status.repo === 'error') {
     return (
       <Shell>
-        <Header branch="" ahead={0} behind={0} onRefresh={() => { refresh() }} onClose={onClose} disabled />
+        <Header onRefresh={() => { refresh() }} onClose={onClose} disabled />
         <div className="flex-1 flex items-center justify-center p-4 text-center text-xs text-ctp-red">
           {status.error}
         </div>
@@ -248,6 +265,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
   }
 
   const branch = status && status.repo === true ? status.branch : ''
+  const upstream = status && status.repo === true ? status.upstream : null
   const ahead = status && status.repo === true ? status.ahead : 0
   const behind = status && status.repo === true ? status.behind : 0
 
@@ -323,12 +341,38 @@ export function GitPanelView({ cwd, onClose }: Props) {
             </>
           )}
         </div>
-        {(ahead > 0 || behind > 0) && (
-          <span className="text-[10px] text-ctp-overlay tabular-nums">
-            {ahead > 0 && `↑${ahead}`} {behind > 0 && `↓${behind}`}
-          </span>
+        {/* Remote: pull ↓, push/publish ↑, fetch. Counts come from status. */}
+        {branch && (
+          <div className="flex items-center gap-0.5 shrink-0">
+            <button
+              onClick={() => void doPull()}
+              disabled={busy || !upstream}
+              title={upstream ? (behind > 0 ? `Pull ${behind} commit(s) from ${upstream}` : `Pull from ${upstream}`) : 'No upstream to pull from'}
+              className={`flex items-center gap-0.5 px-1 text-[10px] leading-none tabular-nums disabled:opacity-40 ${behind > 0 ? 'text-ctp-blue' : 'text-ctp-overlay hover:text-ctp-text'}`}
+            >
+              ↓{behind > 0 ? behind : ''}
+            </button>
+            <button
+              onClick={() => void doPush(!upstream)}
+              disabled={busy}
+              title={upstream ? (ahead > 0 ? `Push ${ahead} commit(s) to ${upstream}` : `Push to ${upstream}`) : 'Publish branch (push -u origin)'}
+              className={`flex items-center gap-0.5 px-1 text-[10px] leading-none tabular-nums disabled:opacity-40 ${ahead > 0 || !upstream ? 'text-ctp-green' : 'text-ctp-overlay hover:text-ctp-text'}`}
+            >
+              ↑{upstream ? (ahead > 0 ? ahead : '') : '·'}
+            </button>
+            <button
+              onClick={() => void doFetch()}
+              disabled={busy}
+              title="Fetch from remote"
+              className="text-ctp-overlay hover:text-ctp-text disabled:opacity-40 leading-none p-0.5"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v4h-4" />
+              </svg>
+            </button>
+          </div>
         )}
-        <button onClick={() => { refresh(); loadLog() }} title="Refresh" className="text-ctp-overlay hover:text-ctp-text text-xs leading-none">⟳</button>
+        <button onClick={() => { refresh(); loadLog() }} title="Refresh (local status)" className="text-ctp-overlay hover:text-ctp-text text-xs leading-none">⟳</button>
         <button onClick={onClose} title="Close (back to Chat)" className="text-ctp-overlay hover:text-ctp-text p-1">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M18 6 6 18M6 6l12 12" />
@@ -462,7 +506,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
 // A minimal header used only for the not-a-repo / error states (the main render
 // inlines its own richer header with the branch menu).
 function Header({ onRefresh, onClose, disabled }: {
-  branch: string; ahead: number; behind: number; onRefresh: () => void; onClose: () => void; disabled?: boolean
+  onRefresh: () => void; onClose: () => void; disabled?: boolean
 }) {
   return (
     <div className="h-9 shrink-0 flex items-center gap-2 px-3 bg-ctp-mantle border-b border-ctp-surface0">
