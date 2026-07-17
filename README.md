@@ -53,26 +53,76 @@ runs `npm install` for you on first run and whenever the lockfile changes.
 > `launch.sh` only warns. But chat needs `claude` and notebook execution needs
 > Jupyter, so install both for the full experience.
 
-### Exposing it beyond localhost (phone / another device)
+### Exposing it beyond localhost (phone / another device / VPN)
 
-By default the server binds loopback and needs no token. To reach it from another
-device you must set an access token, or the server refuses to start:
+By default the server binds loopback (`127.0.0.1`) and needs no token — from the
+**same machine**, the firewall is irrelevant and any port works. To reach it from
+**another device** you bind a non-loopback address, and the server then **requires
+an access token** (it refuses to start without one — fail-closed by design, because
+Claudette runs shell commands and drives Claude, unlike a plain file server).
+
+**Always use `--build` for remote access** — it serves the UI and the API from a
+*single* origin, so there's only **one** port to reach. (Plain `./launch.sh` is dev
+mode with *two* ports; see [Dev vs build](#dev-vs-build-mode) below.)
+
+#### The access token
+
+You **make the token up** — it's a shared secret you invent, used in two places that
+must match: the `CLAUDETTE_TOKEN=` you launch with, and the `?token=` in the URL you
+open. Generate a strong one:
 
 ```bash
-CLAUDETTE_TOKEN=$(openssl rand -hex 24) HOST=0.0.0.0 ./launch.sh --build
-# front it with HTTPS, e.g. `tailscale serve --bg 4319`, then open
-# https://<your-host>/?token=<that token>  once to authenticate the device.
+openssl rand -hex 24        # copy the output; use it as your token
 ```
+
+You put it in the URL **once per device** — the first `?token=…` visit sets an
+httpOnly cookie, and that device stays logged in afterward. **Reuse the same token**
+across restarts so you don't have to re-authenticate; only change it if it leaks.
+
+#### Reachable over a VPN / a known-open port (the common case)
+
+If your VPN reaches the machine's IP and a port (say `8916`) is open there, this is
+all you need — the direct analogue of `python -m http.server 8916`, plus auth:
+
+```bash
+CLAUDETTE_TOKEN=<your-secret> HOST=0.0.0.0 PORT=8916 ./launch.sh --build
+# then open, once:  http://<machine-ip>:8916/?token=<your-secret>
+```
+
+- `HOST=0.0.0.0` — listen on all interfaces (incl. the VPN one), not just loopback.
+- `PORT=8916` — any open port **≥ 1024** (ports below 1024 need root to bind).
+- No firewall changes needed if the port is already reachable over the VPN.
+
+#### Locked-down firewall (no inbound ports) → Tailscale
+
+If you **can't open any inbound port**, use `./rc_launch.sh` — it fronts the app with
+`tailscale serve` over HTTPS (real cert) on your private tailnet. Tailscale traverses
+NAT/firewalls with no inbound port open, and persists a token to `.claudette-token`
+so your phone PWA stays logged in. Needs Tailscale installed + `tailscale up`.
 
 ## Run
 
 ```bash
-./launch.sh        # dev (hot-reload): server :4319, web :5273
+./launch.sh          # dev (hot-reload): server :4319, web :5273
 ./launch.sh --build  # production: build the web bundle, serve it from the server on :4319
 # or: npm run dev
 ```
 
-Server runs on `127.0.0.1:4319`, web on `127.0.0.1:5273` (proxies `/api` + `/ws`
-to the server). Open http://127.0.0.1:5273 — the page shows the server health + a
-WS ping, confirming the end-to-end wiring. Override ports with
-`PORT=… WEB_PORT=… ./launch.sh`.
+Override ports with `PORT=… WEB_PORT=… ./launch.sh`.
+
+### Dev vs build mode
+
+The two modes differ in how the UI is served — which is also why dev has *two* ports
+and build has *one*:
+
+| Mode | Command | Ports | You open | Use it for |
+|---|---|---|---|---|
+| **Dev** | `./launch.sh` | server `:4319` + Vite `:5273` | **5273** | editing Claudette's code (hot-reload) |
+| **Build** | `./launch.sh --build` | server `:4319` only | **4319** | just *using* Claudette; remote access |
+
+- **Dev mode** runs a separate **Vite** dev server (`:5273`) that serves the React UI
+  with hot-module-reload and **proxies** `/api` + `/ws` to the Node server (`:4319`).
+  The extra port exists purely for live-reloading while developing. Open **5273**.
+- **Build mode** compiles the UI to static files (`web/dist/`) and the Node server
+  serves **both the UI and the API from one origin** (`:4319`). No Vite, no proxy,
+  one port. This is the way to run it for real, and what remote access should use.
