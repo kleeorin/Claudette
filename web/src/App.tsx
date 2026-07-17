@@ -9,6 +9,7 @@ import { TerminalView } from './components/TerminalView'
 import { GitPanelView } from './components/GitPanelView'
 import { FileManager } from './components/FileManager'
 import { PermissionsPanel } from './components/PermissionsPanel'
+import { SandboxPanel } from './components/SandboxPanel'
 import { FileEditorView } from './components/FileEditorView'
 import { FileBrowser } from './components/FileBrowser'
 import { ConfirmDialog } from './components/ConfirmDialog'
@@ -58,7 +59,7 @@ function Shell() {
   const [closeNb, setCloseNb] = useState<{ id: string; name: string; dirty: boolean; running: boolean } | null>(null)
 
   // Docks.
-  const [dock, setDock] = useState<'files' | 'git' | 'permissions' | null>(null)
+  const [dock, setDock] = useState<'files' | 'git' | 'permissions' | 'sandbox' | null>(null)
   const [termOpen, setTermOpen] = useState(false)
   // Multiple terminals share the bottom dock (tabbed). Each captures its cwd at
   // creation. `+` adds one, per-tab `×` closes it; closing the last closes the dock.
@@ -225,7 +226,7 @@ function Shell() {
     setTermOpen(true)
     if (terms.length === 0) addTerm(termCwd)
   }
-  const toggleDock = (which: 'files' | 'git' | 'permissions') => setDock((d) => (d === which ? null : which))
+  const toggleDock = (which: 'files' | 'git' | 'permissions' | 'sandbox') => setDock((d) => (d === which ? null : which))
 
   // Tab strip for the CURRENT session's pane, enriched with live doc metadata.
   const tabs: Tab[] = pane.tabs.map((t) => {
@@ -390,12 +391,14 @@ function Shell() {
                 />
               ) : dock === 'git' ? (
                 <GitPanelView key={termCwd} cwd={termCwd} onClose={() => setDock(null)} />
-              ) : activeSession ? (
-                <PermissionsPanel key={activeSession.id} session={activeSession} onClose={() => setDock(null)} />
-              ) : (
+              ) : !activeSession ? (
                 <div className="h-full flex items-center justify-center p-4 text-center text-xs text-ctp-overlay">
                   No session selected.
                 </div>
+              ) : dock === 'sandbox' ? (
+                <SandboxPanel key={activeSession.id} session={activeSession} onClose={() => setDock(null)} />
+              ) : (
+                <PermissionsPanel key={activeSession.id} session={activeSession} onClose={() => setDock(null)} />
               )}
             </div>
           )}
@@ -468,7 +471,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
   onSelectTab: (t: Tab) => void
   onCloseTab: (t: Tab) => void
   layout: 'side' | 'stack'; onSetLayout: (l: 'side' | 'stack') => void; showLayout: boolean
-  dock: 'files' | 'git' | 'permissions' | null; onToggleDock: (w: 'files' | 'git' | 'permissions') => void
+  dock: 'files' | 'git' | 'permissions' | 'sandbox' | null; onToggleDock: (w: 'files' | 'git' | 'permissions' | 'sandbox') => void
   termOpen: boolean; onToggleTerm: () => void
   notif: NotificationsApi
 }) {
@@ -521,6 +524,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         <button className={toggle(dock === 'files')} onClick={() => onToggleDock('files')} title="Files browser">Files</button>
         <button className={toggle(dock === 'git')} onClick={() => onToggleDock('git')} title="Git panel">Git</button>
         <button className={toggle(dock === 'permissions')} onClick={() => onToggleDock('permissions')} title="Permissions — what this session's Claude can do">Permissions</button>
+        <button className={toggle(dock === 'sandbox')} onClick={() => onToggleDock('sandbox')} title="Sandbox — filesystem confinement + mounts for this session">Sandbox</button>
         <button className={toggle(termOpen)} onClick={onToggleTerm} title="Terminal">Terminal</button>
         <SoundToggle notif={notif} />
         <NotifyBell notif={notif} />
