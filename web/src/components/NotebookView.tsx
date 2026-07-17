@@ -73,6 +73,10 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
 
   // Toolbar/overlay UI state.
   const [kernelMenu, setKernelMenu] = useState(false)
+  const kernelBtnRef = useRef<HTMLButtonElement>(null)
+  // Viewport-anchored position for the kernel menu, which renders in a portal to escape
+  // the toolbar's overflow clipping (see openKernelMenu).
+  const [kernelMenuPos, setKernelMenuPos] = useState<{ left: number; top: number } | null>(null)
   const [specs, setSpecs] = useState<KernelSpec[] | null>(null)
   // Jupyter's default kernelspec name, so the header can name the kernel that WILL
   // launch before one is running (kernelName is only set once a kernel starts).
@@ -407,6 +411,11 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   useEffect(() => { loadSpecs() }, [loadSpecs])
 
   const openKernelMenu = () => {
+    // Anchor the menu to the button in VIEWPORT coords and render it through a portal
+    // (below) — the toolbar is `overflow-x-auto`, which clips any absolutely-positioned
+    // child, so an in-flow dropdown here is invisible/unclickable.
+    const r = kernelBtnRef.current?.getBoundingClientRect()
+    if (r) setKernelMenuPos({ left: r.left, top: r.bottom + 4 })
     setKernelMenu(true)
     if (!specs) loadSpecs()   // retry if the initial load failed or hasn't finished
   }
@@ -488,16 +497,18 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       <div className="h-9 shrink-0 flex items-center gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
         {/* Kernel: status dot + picker + restart/interrupt */}
         <div className="relative shrink-0 flex items-center">
-          <button onClick={openKernelMenu} title="Choose kernel" className="flex items-center gap-1.5 px-1.5 h-6 rounded hover:bg-ctp-surface0 transition-colors">
+          <button ref={kernelBtnRef} onClick={openKernelMenu} title="Choose kernel" className="flex items-center gap-1.5 px-1.5 h-6 rounded hover:bg-ctp-surface0 transition-colors">
             <span className={`w-2 h-2 rounded-full ${STATUS_DOT[kernel]}`} />
             <span className="text-xs text-ctp-text max-w-[110px] truncate">{kernelLabel}</span>
             <span className="text-[10px] text-ctp-overlay">{STATUS_LABEL[kernel]}</span>
             <span className="text-[9px] text-ctp-overlay">▾</span>
           </button>
-          {kernelMenu && (
+          {kernelMenu && createPortal(
             <>
               <div className="fixed inset-0 z-40" onClick={() => setKernelMenu(false)} />
-              <div className="absolute top-7 left-0 z-50 w-52 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs">
+              <div
+                style={{ position: 'fixed', left: kernelMenuPos?.left ?? 0, top: kernelMenuPos?.top ?? 0 }}
+                className="z-50 w-52 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs">
                 <div className="px-2.5 py-1 text-[10px] uppercase tracking-wide text-ctp-overlay">Kernel</div>
                 {specs === null && !specsError && <div className="px-2.5 py-1 text-ctp-overlay">Loading…</div>}
                 {specsError && (
@@ -521,7 +532,8 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
                 <button onClick={() => { nb.shutdownKernel(notebookId); setKernelMenu(false) }} disabled={kernel === 'none'}
                   className="w-full text-left px-2.5 py-1.5 hover:bg-ctp-surface0 disabled:opacity-40 text-ctp-red">⊗ Shut down kernel</button>
               </div>
-            </>
+            </>,
+            document.body,
           )}
         </div>
         {/* Quick interrupt when busy (no menu needed). */}
