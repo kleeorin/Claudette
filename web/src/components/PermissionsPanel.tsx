@@ -5,6 +5,7 @@ import type {
 import { api } from '../api/client'
 import { useSessions } from '../store/sessions'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
+import { NoPermsConfirmDialog } from './NoPermsConfirmDialog'
 
 // Permission Control Center — a GUI over Claude's OWN settings files (see the server
 // permissions.ts). Lives in the right dock beside Files / Git. Shows the effective
@@ -49,6 +50,7 @@ export function PermissionsPanel({ session, onClose }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [modeHint, setModeHint] = useState<string | null>(null)
   const [confirmBypass, setConfirmBypass] = useState(false)
+  const [confirmNoPerms, setConfirmNoPerms] = useState(false)
 
   // Add-rule form.
   const [addAction, setAddAction] = useState<PermissionAction>('allow')
@@ -122,6 +124,23 @@ export function PermissionsPanel({ session, onClose }: Props) {
 
   const ruleCount = perms?.rules.length ?? 0
 
+  // "No permissions" profile: the strict inverse of "Allow all". It's active when the
+  // mode is Prompt AND no allow rule is in effect, so every tool needs explicit
+  // approval. Applying it strips every allow rule (across scopes) and drops to default.
+  const allowRules = useMemo(() => (perms?.rules ?? []).filter((r) => r.action === 'allow'), [perms])
+  const noPermsActive = mode === 'default' && allowRules.length === 0
+  const applyNoPerms = useCallback(async () => {
+    setBusy(true); setError(null)
+    try {
+      for (const r of allowRules) {
+        const res = await api.perms.removeRule(cwd, r.scope, 'allow', r.value)
+        if (!res.ok) { setError(res.error); break }
+      }
+      if (mode !== 'default') await applyMode('default')
+      await refresh()
+    } finally { setBusy(false) }
+  }, [allowRules, cwd, mode, applyMode, refresh])
+
   return (
     <Shell>
       {/* Header */}
@@ -171,10 +190,30 @@ export function PermissionsPanel({ session, onClose }: Props) {
               )
             })}
           </div>
+          {/* "No permissions": the strict inverse of Allow all — strip every allow rule
+              so nothing runs without explicit approval. Confirm-gated (it's destructive). */}
+          <button
+            onClick={() => setConfirmNoPerms(true)}
+            title="Remove every allow rule and require explicit approval for every tool"
+            className={`mt-1.5 w-full px-2 py-1.5 rounded text-[11px] text-left border transition-colors ${
+              noPermsActive
+                ? 'border-ctp-blue bg-ctp-blue/15 text-ctp-blue'
+                : 'border-ctp-surface0 text-ctp-subtext hover:border-ctp-blue/60 hover:text-ctp-blue'
+            }`}
+          >
+            <span className="font-medium">No permissions</span>
+            <span className="ml-1.5 text-ctp-overlay">· strip allow rules; approve every tool</span>
+          </button>
           {mode === 'bypassPermissions' && (
             <div className="mt-1.5 flex items-center gap-1.5 text-[10px] text-ctp-red">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-ctp-red" />
               Allow-all is ON — Claude runs every tool without asking.
+            </div>
+          )}
+          {noPermsActive && (
+            <div className="mt-1.5 flex items-center gap-1.5 text-[10px] text-ctp-blue">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-ctp-blue" />
+              No allow rules — every tool needs explicit approval.
             </div>
           )}
           {modeHint && <div className="mt-1 text-[10px] text-ctp-overlay">{modeHint}</div>}
@@ -288,6 +327,13 @@ export function PermissionsPanel({ session, onClose }: Props) {
         <BypassConfirmDialog
           onConfirm={() => { setConfirmBypass(false); void applyMode('bypassPermissions') }}
           onCancel={() => setConfirmBypass(false)}
+        />
+      )}
+      {confirmNoPerms && (
+        <NoPermsConfirmDialog
+          count={allowRules.length}
+          onConfirm={() => { setConfirmNoPerms(false); void applyNoPerms() }}
+          onCancel={() => setConfirmNoPerms(false)}
         />
       )}
     </Shell>
