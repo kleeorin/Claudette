@@ -15,10 +15,44 @@ function stripAnsi(s: string): string {
 // execute in the app's authenticated origin (full fs/pane/git API) — and a
 // sandboxed kernel's HTML would escape confinement through the operator's
 // browser. Sanitize before injecting: DOMPurify strips scripts/event handlers/
-// unsafe URLs while keeping benign markup (tables, styles) so pandas/plotly
-// output still renders. DOMPurify's default profile covers HTML, SVG and MathML.
+// unsafe URLs while keeping benign markup (tables) so pandas output still renders.
+//
+// The default profile stops script execution, but still permits markup that makes
+// the operator's browser issue EXTERNAL requests — `<img src=http://…>`, `<style>`
+// / inline `url()` / `@import`, `<link rel=stylesheet>`. From kernel output those
+// are a tracking / data-exfil / tailnet-SSRF channel from the authenticated origin.
+// The hook below neutralizes them: resource URLs must be inline `data:` (so base64
+// images still render), remote CSS is dropped, and anchors get noopener/noreferrer.
+const isDataUri = (v: string): boolean => /^\s*data:/i.test(v)
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+  const el = node as Element
+  if (typeof el.getAttribute !== 'function') return
+  const tag = el.tagName?.toUpperCase()
+  // Resource-loading URL attributes: allow only inline data: URIs; drop anything remote.
+  for (const attr of ['src', 'srcset', 'poster', 'background']) {
+    const v = el.getAttribute(attr)
+    if (v && !isDataUri(v)) el.removeAttribute(attr)
+  }
+  // SVG resource refs (<image>/<use> href / xlink:href). Keep in-document fragment
+  // refs (#id) and data: URIs; drop remote. Anchors (<a href>) are handled below.
+  for (const attr of ['href', 'xlink:href']) {
+    const v = el.getAttribute(attr)
+    if (v && tag !== 'A' && !isDataUri(v) && !v.trimStart().startsWith('#')) el.removeAttribute(attr)
+  }
+  // Inline CSS that fetches remotely (url()/@import).
+  const style = el.getAttribute('style')
+  if (style && /url\s*\(|@import/i.test(style)) el.removeAttribute('style')
+  // Keep anchor navigation, but block opener/referrer leakage.
+  if (tag === 'A' && el.getAttribute('href')) {
+    el.setAttribute('rel', 'noopener noreferrer')
+    el.setAttribute('target', '_blank')
+  }
+})
+
 function sanitizeHtml(html: string): string {
-  return DOMPurify.sanitize(html)
+  // FORBID <style>/<link>/<base> outright — external CSS + inline stylesheets are the
+  // remaining request channel the per-attribute hook can't fully cover.
+  return DOMPurify.sanitize(html, { FORBID_TAGS: ['style', 'link', 'base'], ADD_ATTR: ['target'] })
 }
 
 // Richest-first: prefer HTML/image/svg over plain text; fall back to any text-ish
