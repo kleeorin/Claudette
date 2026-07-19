@@ -295,6 +295,15 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
     }
   } else if (e.type === 'user') {
     const content = (e as { message?: { content?: unknown } }).message?.content
+    // A <task-notification> is a background agent's completion signal. Synthesize the
+    // terminal tool_result its Task tool_use is still waiting on, so collectAgents can
+    // settle the tray card to done/failed. Handled before the branches below because
+    // the notification can arrive as either string or block content.
+    const notif = parseTaskNotification(userContentText(content))
+    if (notif) {
+      out.push({ kind: 'tool_result', id: nextId(), toolUseId: notif.toolUseId, isError: notif.isError, content: notif.summary })
+      return out
+    }
     if (typeof content === 'string') {
       // A resumed conversation records your prompts as string-content user turns;
       // surface them as user bubbles (replay only — live turns are echoed locally).
@@ -427,6 +436,41 @@ function metaFromReplay(events: ClaudeEvent[]): Partial<SessionMeta> {
 // subagent regardless of which name this CLI emits.
 export const isSubagentTool = (name: string): boolean => name === 'Task' || name === 'Agent'
 
+// A background/async subagent launch returns an IMMEDIATE tool_result that only
+// acknowledges the launch ("Async agent launched successfully…") — it is NOT the
+// agent's output, which arrives much later as a <task-notification>. Treat this ack
+// as "launched, still running", never as the terminal result — otherwise the tray
+// card flips to done the instant the agent starts.
+const ASYNC_LAUNCH_ACK = /Async agent launched successfully/i
+function isAsyncLaunchAck(content: string): boolean {
+  return ASYNC_LAUNCH_ACK.test(content)
+}
+
+// Flatten a user message's content (string, or an array of blocks) to plain text.
+function userContentText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => { const o = b as { type?: string; text?: unknown }; return o?.type === 'text' && typeof o.text === 'string' ? o.text : '' })
+      .join('\n')
+  }
+  return ''
+}
+
+// The harness injects a <task-notification> (delivered as a plain user turn) when a
+// background agent stops — the real lifecycle signal, replacing the launch ack. Parse
+// the Task tool-use-id it settles and whether it failed. It isn't written to the CLI's
+// jsonl, so it only reaches us on the live stream / connect snapshot, never a resume.
+interface TaskNotification { toolUseId: string; isError: boolean; summary: string }
+function parseTaskNotification(text: string): TaskNotification | null {
+  if (!text.includes('<task-notification>')) return null
+  const toolUseId = /<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/.exec(text)?.[1]
+  if (!toolUseId) return null
+  const status = (/<status>\s*([^<]+?)\s*<\/status>/.exec(text)?.[1] ?? '').toLowerCase()
+  const summary = /<summary>\s*([^<]*?)\s*<\/summary>/.exec(text)?.[1]?.trim()
+  return { toolUseId, isError: status === 'failed' || status === 'error', summary: summary || `Agent ${status || 'finished'}` }
+}
+
 // One subagent, assembled from a transcript: its `Task` call + its own nested
 // activity (steps) + its final result. Drives the Agents tray — the Task no longer
 // renders inline in the conversation.
@@ -437,16 +481,23 @@ export interface AgentView {
   description: string
   prompt?: string
   steps: TranscriptItem[]                                   // the agent's own calls/results
-  result?: Extract<TranscriptItem, { kind: 'tool_result' }> // final output (present ⇒ finished)
+  launched: boolean                                         // a background agent whose launch was acked (runs detached from the parent turn)
+  result?: Extract<TranscriptItem, { kind: 'tool_result' }> // final output (present ⇒ finished); excludes the async-launch ack
 }
 
 // Pull every subagent out of a transcript. Groups each subagent's calls/results
 // (parentId === the Task's toolId) under its Task, and pairs the Task's result.
 export function collectAgents(items: TranscriptItem[]): AgentView[] {
   const resultByTool = new Map<string, Extract<TranscriptItem, { kind: 'tool_result' }>>()
+  const launchedTools = new Set<string>()
   const childrenByParent = new Map<string, TranscriptItem[]>()
   for (const it of items) {
-    if (it.kind === 'tool_result') resultByTool.set(it.toolUseId, it)
+    if (it.kind === 'tool_result') {
+      // The async-launch ack marks a background agent as launched, not finished; the
+      // real result (later notification / a foreground agent's output) is the terminal one.
+      if (isAsyncLaunchAck(it.content)) launchedTools.add(it.toolUseId)
+      else resultByTool.set(it.toolUseId, it)
+    }
     const pid = (it.kind === 'tool_use' || it.kind === 'tool_result' || it.kind === 'text' || it.kind === 'thinking') ? it.parentId : undefined
     if (pid) { const a = childrenByParent.get(pid) ?? []; a.push(it); childrenByParent.set(pid, a) }
   }
@@ -460,18 +511,30 @@ export function collectAgents(items: TranscriptItem[]): AgentView[] {
       description: input.description || 'Subagent task',
       prompt: input.prompt,
       steps: it.toolId ? childrenByParent.get(it.toolId) ?? [] : [],
+      launched: it.toolId ? launchedTools.has(it.toolId) : false,
       result: it.toolId ? resultByTool.get(it.toolId) : undefined,
     })
   }
   return agents
 }
 
-// How many Tasks are still in flight (no result yet). Drives the sidebar dot + the
-// MetaBar chip; callers gate on the session actually running.
-export function countRunningAgents(items: TranscriptItem[]): number {
-  const done = new Set<string>()
-  for (const it of items) if (it.kind === 'tool_result') done.add(it.toolUseId)
-  return items.reduce((n, it) => n + (it.kind === 'tool_use' && isSubagentTool(it.name) && it.toolId != null && !done.has(it.toolId) ? 1 : 0), 0)
+// How many subagents are still in flight. A BACKGROUND agent (launch acked, no
+// terminal result yet) runs detached, so it counts regardless of the parent turn. A
+// FOREGROUND agent (no ack, no result) is only in flight while the parent turn is
+// active — gating on `turnActive` keeps an interrupted Task from latching on forever.
+// Drives the sidebar dot + the MetaBar chip.
+export function countRunningAgents(items: TranscriptItem[], turnActive: boolean): number {
+  const finished = new Set<string>()   // has a terminal (non-ack) result
+  const launched = new Set<string>()   // background agent, launch acked
+  for (const it of items) {
+    if (it.kind !== 'tool_result') continue
+    if (isAsyncLaunchAck(it.content)) launched.add(it.toolUseId)
+    else finished.add(it.toolUseId)
+  }
+  return items.reduce((n, it) => {
+    if (it.kind !== 'tool_use' || !isSubagentTool(it.name) || it.toolId == null || finished.has(it.toolId)) return n
+    return n + (launched.has(it.toolId) || turnActive ? 1 : 0)
+  }, 0)
 }
 
 interface ContextValue {

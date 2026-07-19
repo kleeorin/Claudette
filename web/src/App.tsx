@@ -716,7 +716,7 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
           {sessions.map((s) => (
             <SessionRow
               key={s.id} session={s} active={s.id === activeId} attention={attention.has(s.id)}
-              runningAgents={s.state === 'running' ? countRunningAgents(transcriptFor(s.id)) : 0}
+              runningAgents={countRunningAgents(transcriptFor(s.id), s.state === 'running')}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
             />
           ))}

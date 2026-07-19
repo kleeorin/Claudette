@@ -53,7 +53,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // the turn is active, so an interrupted (never-completed) Task doesn't latch on.
   // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
   const agents = useMemo(() => collectAgents(items), [items])
-  const agentsRunning = running ? countRunningAgents(items) : 0
+  const agentsRunning = countRunningAgents(items, running)
   // Dismissed agent cards (view-only). Agents are derived from the immutable
   // transcript each render, so there's nothing to delete — we filter by a stable
   // key instead. The set persists while this session's ChatView is mounted, so a
@@ -606,11 +606,13 @@ function AgentsTray({ agents, running, onDismiss, onDismissFinished }: {
 // ticker keeps it glanceable; expand for the full activity + result.
 function AgentCard({ agent, running, onDismiss }: { agent: AgentView; running: boolean; onDismiss: () => void }) {
   const [open, setOpen] = useState(false)
-  const { type, description: desc, prompt, steps, result } = agent
+  const { type, description: desc, prompt, steps, result, launched } = agent
   const calls = steps.filter((s): s is Extract<TranscriptItem, { kind: 'tool_use' }> => s.kind === 'tool_use')
   const done = !!result
   const failed = result?.isError === true
-  const active = !done && running
+  // A background agent (launched, no result yet) runs detached from the parent turn,
+  // so it stays "running" even after the turn goes idle; a foreground agent tracks the turn.
+  const active = !done && (launched || running)
   const status = failed ? { label: 'failed', text: 'text-ctp-red', dot: 'bg-ctp-red' }
     : done ? { label: 'done', text: 'text-ctp-green', dot: 'bg-ctp-green' }
     : active ? { label: 'running', text: 'text-ctp-mauve', dot: 'bg-ctp-mauve animate-pulse' }
