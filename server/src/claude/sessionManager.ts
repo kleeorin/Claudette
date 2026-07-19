@@ -106,11 +106,14 @@ export class SessionManager extends EventEmitter {
     model?: string,
     permissionMode?: PermissionMode,
     sandbox?: SandboxConfig,
+    // Only an auth-gated HTTP caller (the operator) or boot-restore may pass a
+    // sandbox with enabled:false; an untrusted/in-process caller can't lower it.
+    trusted = false,
   ): string {
     const id = crypto.randomUUID()
     const session: Session = {
       id, name, cwd, rootDir, parentId, agentId, model, permissionMode,
-      sandbox: normalizeSandbox(sandbox, cwd),
+      sandbox: normalizeSandbox(sandbox, cwd, trusted),
       state: 'idle', engine: null, startedAt: 0, resume,
       claudeSessionId: claudeSessionId ?? crypto.randomUUID(),
       stderrTail: '',
@@ -470,10 +473,10 @@ export class SessionManager extends EventEmitter {
 
   // Change a session's sandbox config. Applies on the next launch (relaunch/restart);
   // we don't hot-swap a running engine. Persisted so a restart keeps it.
-  setSandbox(id: string, sandbox: SandboxConfig): boolean {
+  setSandbox(id: string, sandbox: SandboxConfig, trusted = false): boolean {
     const session = this.sessions.get(id)
     if (!session) return false
-    session.sandbox = normalizeSandbox(sandbox, session.cwd)
+    session.sandbox = normalizeSandbox(sandbox, session.cwd, trusted)
     this.emit('changed')
     this.scheduleSandboxApply(id)   // apply now if idle, else when the turn ends
     return true
@@ -530,6 +533,7 @@ export class SessionManager extends EventEmitter {
         s.name, s.cwd, s.rootDir, parentId,
         /* resume */ !!s.claudeSessionId, s.claudeSessionId,
         s.agentId, s.model, s.permissionMode, s.sandbox,
+        /* trusted */ true,   // a persisted config was already operator-approved
       )
       ids.push(id)
     }
@@ -563,16 +567,20 @@ export class SessionManager extends EventEmitter {
 // wrapSandbox, and claude's working dir stays valid via its --chdir handling there.
 // Whether the sandbox is actually in force is decided at launch (host capability) and
 // reported via `sandboxed`.
-export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string): SandboxConfig {
+export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string, trusted = false): SandboxConfig {
   const cfg: SandboxConfig = !sandbox
     ? { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
     : { enabled: sandbox.enabled, mounts: sandbox.mounts }
-  // Confinement must NOT be lowerable by a request. A sandboxed session that reaches
-  // the loopback control API (SANDBOX.md "Control-plane escape") could otherwise ask
-  // for enabled:false and get an unconfined session. Force it on unless the OPERATOR
-  // opted in at launch (a capability an in-box caller cannot grant itself).
-  if (!cfg.enabled && !unsandboxedAllowed()) {
-    console.warn('[sandbox] ignoring sandbox.enabled=false — set CLAUDETTE_ALLOW_UNSANDBOXED=1 to permit unconfined sessions')
+  // Confinement must NOT be lowerable by an UNTRUSTED request. A sandboxed session
+  // that reaches the loopback control API (SANDBOX.md "Control-plane escape") could
+  // otherwise ask for enabled:false and get an unconfined session — but it can't
+  // authenticate: wrapSandbox never leaks CLAUDETTE_TOKEN into the box, so an in-box
+  // caller has no token. `trusted` is set only by the auth-gated HTTP handlers (the
+  // operator's own browser) and by boot restore of a previously-approved config.
+  // Everything else stays forced-on unless the operator opted in at launch
+  // (CLAUDETTE_ALLOW_UNSANDBOXED=1), a capability an in-box caller can't grant itself.
+  if (!cfg.enabled && !trusted && !unsandboxedAllowed()) {
+    console.warn('[sandbox] ignoring untrusted sandbox.enabled=false — set CLAUDETTE_ALLOW_UNSANDBOXED=1 to permit unconfined sessions')
     return { enabled: true, mounts: cfg.mounts }
   }
   return cfg

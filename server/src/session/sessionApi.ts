@@ -58,6 +58,7 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     const id = sessions.create(
       b.name, b.cwd, b.rootDir, b.parentId, b.resume,
       b.claudeSessionId, b.agentId, b.model, b.permissionMode, b.sandbox,
+      /* trusted */ true,   // this route is auth-gated → the operator, may disable the sandbox
     )
     return { id }
   })
@@ -66,7 +67,7 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
   // on the next launch — relaunch/restartFresh to bring it into force.
   app.post<{ Body: SessionIdRequest & { sandbox: SandboxConfig } }>(
     '/api/session/setSandbox', async (req): Promise<OkResponse> => ({
-      ok: sessions.setSandbox(req.body.id, req.body.sandbox),
+      ok: sessions.setSandbox(req.body.id, req.body.sandbox, /* trusted */ true),
     }))
 
   app.get('/api/session/list', async (): Promise<ListSessionsResponse> => ({
