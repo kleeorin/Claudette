@@ -45,8 +45,8 @@ export function bridgeSessionEvents(sessions: SessionManager, hub: WsHub): void 
 export function sendSessionSnapshots(sessions: SessionManager, hub: WsHub, ws: import('ws').WebSocket): void {
   for (const s of sessions.list()) {
     const events = sessions.transcriptOf(s.id)
-    const pending = sessions.pendingPermissionOf(s.id)
-    if (events.length === 0 && !pending) continue
+    const pending = sessions.pendingPermissionsOf(s.id)
+    if (events.length === 0 && pending.length === 0) continue
     hub.send(ws, { type: 'session:snapshot', id: s.id, events, pending })
   }
 }

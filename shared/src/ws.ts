@@ -43,12 +43,14 @@ export type WsServerMessage =
   | { type: 'pong'; ts: number }
   // A snapshot of all sessions, sent on connect so a fresh tab renders the list.
   | { type: 'session:list'; sessions: SessionInfo[] }
-  // Per-session connect-time snapshot: the buffered transcript so far + any
-  // still-unanswered permission prompt. Sent to a freshly-connected socket so a
+  // Per-session connect-time snapshot: the buffered transcript so far + ALL
+  // still-unanswered permission prompts (the CLI can have several outstanding at once
+  // when an assistant message fires multiple tool_uses). Sent to a freshly-connected
+  // socket so a
   // device joining an in-progress session (e.g. the phone) sees the conversation
   // AND can answer a pending "allow" prompt, instead of a blank stream. Events are
   // replayed like a resumed conversation; `pending` is set only if one awaits.
-  | { type: 'session:snapshot'; id: string; events: ClaudeEvent[]; pending?: PermissionRequest }
+  | { type: 'session:snapshot'; id: string; events: ClaudeEvent[]; pending?: PermissionRequest[] }
   // Per-session streaming events (namespaced by session id).
   | { type: 'session:event'; id: string; event: ClaudeEvent }
   | { type: 'session:permission'; id: string; request: PermissionRequest }

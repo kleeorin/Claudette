@@ -42,7 +42,9 @@ export interface SessionMeta {
 
 interface State {
   transcripts: Record<string, TranscriptItem[]>
-  pending: Record<string, PermissionRequest | undefined>
+  // A QUEUE of unanswered permission prompts per session (the CLI can have several
+  // outstanding at once from parallel tool_uses). The UI answers them one at a time.
+  pending: Record<string, PermissionRequest[]>
   slash: Record<string, string[]>
   open: Record<string, Record<number, string>>
   meta: Record<string, SessionMeta>
@@ -54,12 +56,24 @@ type Action =
   | { type: 'STREAM_START'; sessionId: string; index: number; kind: 'text' | 'thinking' }
   | { type: 'STREAM_DELTA'; sessionId: string; index: number; text: string }
   | { type: 'STREAM_STOP'; sessionId: string; index: number }
-  | { type: 'SET_PENDING'; sessionId: string; req: PermissionRequest }
-  | { type: 'CLEAR_PENDING'; sessionId: string }
+  // A completed (live) assistant message. Reconciles its text/thinking blocks against
+  // what was streamed: a block the client streamed is finalized in place; a block it
+  // never saw stream (e.g. a device that joined mid-turn) is materialized fresh — so
+  // text isn't lost for a late/second client. tool_use blocks are appended as before.
+  | { type: 'ASSISTANT'; sessionId: string; blocks: AssistantBlock[] }
+  | { type: 'MSG_START'; sessionId: string }   // a new assistant message → reset the per-message block map
+  | { type: 'ADD_PENDING'; sessionId: string; req: PermissionRequest }        // one new prompt (dedup by requestId)
+  | { type: 'SET_PENDING'; sessionId: string; reqs: PermissionRequest[] }     // replace the whole queue (snapshot)
+  | { type: 'REMOVE_PENDING'; sessionId: string; requestId: string }          // one prompt answered/resolved
+  | { type: 'CLEAR_PENDING'; sessionId: string }                              // drop the whole queue
   | { type: 'SET_SLASH'; sessionId: string; commands: string[] }
   | { type: 'SET_META'; sessionId: string; meta: Partial<SessionMeta> }
   | { type: 'SET_LIMIT'; sessionId: string; limitType: string; info: RateLimitInfo }
   | { type: 'CLEAR'; sessionId: string }
+
+// One content block of a completed assistant message; `index` matches the stream
+// event's block index so we can pair it with the item built from that block's deltas.
+interface AssistantBlock { index: number; kind: 'text' | 'thinking' | 'tool_use'; text?: string; name?: string; input?: unknown; toolId?: string }
 
 let seq = 0
 const nextId = () => `i${++seq}`
@@ -97,19 +111,60 @@ function reducer(state: State, action: Action): State {
       }
     }
     case 'STREAM_STOP': {
-      const openS = { ...(state.open[action.sessionId] ?? {}) }
-      const id = openS[action.index]
-      delete openS[action.index]
+      // Keep the index→id mapping in `open` (don't delete it): the completed ASSISTANT
+      // event still needs it to pair this block with its streamed item and finalize
+      // the authoritative text. `open` for the message is cleared when ASSISTANT lands.
+      const id = state.open[action.sessionId]?.[action.index]
       const prev = state.transcripts[action.sessionId] ?? []
       return {
         ...state,
-        open: { ...state.open, [action.sessionId]: openS },
         transcripts: {
           ...state.transcripts,
           [action.sessionId]: prev.map((it) =>
             it.id === id && (it.kind === 'text' || it.kind === 'thinking') ? { ...it, streaming: false } : it),
         },
       }
+    }
+    case 'ASSISTANT': {
+      const sid = action.sessionId
+      const openMap = state.open[sid] ?? {}   // index → item id for this message's blocks
+      const nextOpen = { ...openMap }
+      let list = state.transcripts[sid] ?? []
+      const append: TranscriptItem[] = []
+      for (const b of action.blocks) {
+        if (b.kind === 'tool_use') {
+          append.push({ kind: 'tool_use', id: nextId(), name: b.name ?? '', input: b.input, toolId: b.toolId })
+          continue
+        }
+        const knownId = openMap[b.index]
+        if (knownId) {
+          // We already have this block's item (streamed here, or materialized from an
+          // earlier partial assistant snapshot). Finalize it IN PLACE with the
+          // authoritative text — so a repeated/cumulative assistant event for the same
+          // message re-settles the same item instead of appending a duplicate.
+          list = list.map((it) => it.id === knownId && (it.kind === 'text' || it.kind === 'thinking')
+            ? { ...it, text: b.text ?? it.text, streaming: false } : it)
+        } else if (b.text) {
+          // No item for this block yet (a device that joined mid-turn never streamed it).
+          // Materialize it AND register its id under this block index, so a later
+          // cumulative snapshot of the SAME message finalizes it in place rather than
+          // materializing a second copy. `open` is reset per message on `message_start`.
+          const newId = nextId()
+          append.push({ kind: b.kind, id: newId, text: b.text })
+          nextOpen[b.index] = newId
+        }
+      }
+      return {
+        ...state,
+        open: { ...state.open, [sid]: nextOpen },
+        transcripts: { ...state.transcripts, [sid]: append.length ? [...list, ...append] : list },
+      }
+    }
+    case 'MSG_START': {
+      // A new assistant message starts here: reset the per-message index→item map so
+      // its blocks (numbered from 0 again) can't collide with the previous message's.
+      const open = { ...state.open }; delete open[action.sessionId]
+      return { ...state, open }
     }
     case 'SET_META':
       return { ...state, meta: { ...state.meta, [action.sessionId]: { ...(state.meta[action.sessionId] ?? {}), ...action.meta } } }
@@ -120,8 +175,18 @@ function reducer(state: State, action: Action): State {
         meta: { ...state.meta, [action.sessionId]: { ...m, limits: { ...(m.limits ?? {}), [action.limitType]: action.info } } },
       }
     }
+    case 'ADD_PENDING': {
+      const cur = state.pending[action.sessionId] ?? []
+      if (cur.some((r) => r.requestId === action.req.requestId)) return state   // dedup (echo/replay)
+      return { ...state, pending: { ...state.pending, [action.sessionId]: [...cur, action.req] } }
+    }
     case 'SET_PENDING':
-      return { ...state, pending: { ...state.pending, [action.sessionId]: action.req } }
+      return { ...state, pending: { ...state.pending, [action.sessionId]: action.reqs } }
+    case 'REMOVE_PENDING': {
+      const cur = state.pending[action.sessionId]
+      if (!cur?.length) return state
+      return { ...state, pending: { ...state.pending, [action.sessionId]: cur.filter((r) => r.requestId !== action.requestId) } }
+    }
     case 'CLEAR_PENDING': {
       const pending = { ...state.pending }
       delete pending[action.sessionId]
@@ -165,6 +230,20 @@ function resultErrorText(e: ClaudeEvent): string {
   if (/error_during_execution/i.test(s)) return 'Claude hit an internal error partway through this turn (error_during_execution). This is usually transient — send the message again.'
   if (/error_max_output|max.?tokens/i.test(s)) return 'Stopped: hit the maximum output length for one turn.'
   return /^[a-z0-9_]+$/i.test(s) ? `The turn ended with an error (${s}).` : s
+}
+
+// Parse a completed assistant event's content into ordered blocks (with their index)
+// for the ASSISTANT reducer to reconcile against streamed items.
+function parseAssistantBlocks(e: ClaudeEvent): AssistantBlock[] {
+  const content = (e as { message?: { content?: unknown[] } }).message?.content ?? []
+  const blocks: AssistantBlock[] = []
+  content.forEach((raw, index) => {
+    const b = raw as Record<string, unknown>
+    if (b.type === 'tool_use') blocks.push({ index, kind: 'tool_use', name: String(b.name), input: b.input, toolId: typeof b.id === 'string' ? b.id : undefined })
+    else if (b.type === 'text' && typeof b.text === 'string' && b.text) blocks.push({ index, kind: 'text', text: b.text })
+    else if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking) blocks.push({ index, kind: 'thinking', text: b.thinking })
+  })
+  return blocks
 }
 
 // Turn one raw stream-json event into transcript items.
@@ -214,6 +293,9 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
 // Translate one wrapped Anthropic streaming event into stream actions.
 function handleStreamEvent(dispatch: (a: Action) => void, sessionId: string, ev?: Record<string, unknown>): void {
   if (!ev) return
+  // Start of a new assistant message: reset the block-index map so this message's
+  // blocks (numbered from 0) don't pair with the previous message's streamed items.
+  if (ev.type === 'message_start') { dispatch({ type: 'MSG_START', sessionId }); return }
   const index = ev.index as number
   if (ev.type === 'content_block_start') {
     const bt = (ev.content_block as { type?: string })?.type
@@ -347,6 +429,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       if (e.type === 'assistant') {
         const cm = contextFromAssistant(e)
         if (cm) dispatch({ type: 'SET_META', sessionId: id, meta: cm })
+        dispatch({ type: 'ASSISTANT', sessionId: id, blocks: parseAssistantBlocks(e) })
+        return
       }
       // Turn end: cumulative cost + context-window size (keyed to the session model).
       if (e.type === 'result') {
@@ -379,11 +463,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           }
         }
       }
-      if (pending) dispatch({ type: 'SET_PENDING', sessionId: id, req: pending })
-      else dispatch({ type: 'CLEAR_PENDING', sessionId: id })
+      dispatch({ type: 'SET_PENDING', sessionId: id, reqs: pending ?? [] })
     })
     const offPerm = api.on.permission((id, req) => {
-      dispatch({ type: 'SET_PENDING', sessionId: id, req })
+      dispatch({ type: 'ADD_PENDING', sessionId: id, req })
     })
     // A user turn from ANY device — mirror it here, unless it's this client's own
     // optimistic echo (already appended in sendTurn under this turnId).
@@ -395,11 +478,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     // it here so a non-answering client isn't stuck on a dead prompt. Match on
     // requestId so a NEWER prompt that arrived meanwhile isn't cleared by mistake.
     const offPermResolved = api.on.permissionResolved((id, requestId) => {
-      if (stateRef.current.pending[id]?.requestId === requestId) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
+      dispatch({ type: 'REMOVE_PENDING', sessionId: id, requestId })   // drop just this one; others stay
     })
-    // A finished/interrupted turn clears any stale prompt defensively.
+    // A finished/interrupted turn clears any stale prompts defensively.
     const offState = api.on.stateChange((id, s) => {
-      if (s === 'idle' && stateRef.current.pending[id]) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
+      if (s === 'idle' && stateRef.current.pending[id]?.length) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
     })
     return () => { offEvent(); offSnapshot(); offPerm(); offUserTurn(); offPermResolved(); offState() }
   }, [])
@@ -422,7 +505,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const respond = useCallback((sessionId: string, requestId: string, decision: PermissionDecision) => {
     api.session.respondPermission(sessionId, requestId, decision)
-    dispatch({ type: 'CLEAR_PENDING', sessionId })
+    dispatch({ type: 'REMOVE_PENDING', sessionId, requestId })   // reveal the next queued prompt, if any
   }, [])
 
   // Replace a session's transcript with a resumed conversation's history.
@@ -440,7 +523,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const transcriptFor = useCallback((sessionId: string) => state.transcripts[sessionId] ?? [], [state.transcripts])
-  const pendingFor = useCallback((sessionId: string) => state.pending[sessionId], [state.pending])
+  // The prompt to show now = head of the session's queue (answering it reveals the
+  // next). Kept as a single-value API so callers render one card at a time.
+  const pendingFor = useCallback((sessionId: string) => state.pending[sessionId]?.[0], [state.pending])
   const slashCommandsFor = useCallback((sessionId: string) => state.slash[sessionId] ?? [], [state.slash])
   const metaFor = useCallback((sessionId: string) => state.meta[sessionId] ?? {}, [state.meta])
 

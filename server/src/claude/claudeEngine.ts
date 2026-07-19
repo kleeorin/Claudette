@@ -231,8 +231,11 @@ export class ClaudeEngine extends EventEmitter {
     this.pending.delete(requestId)
     p.resolve(decision)
     this.emit('permissionResolved', requestId)   // tell every client to clear the prompt
-    // Back to running if the turn is still going; the next result flips to idle.
-    if (this._turnActive) this.setState('running')
+    // Stay 'waiting' while OTHER prompts are still outstanding (parallel tool_uses) —
+    // flipping to 'running' with a prompt still pending is what made the session look
+    // like it was "working" when it actually needed the user. Only resume once the
+    // last prompt is answered; the next result flips to idle.
+    if (this._turnActive) this.setState(this.pending.size > 0 ? 'waiting' : 'running')
   }
 
   // Graceful stop: SIGTERM the whole process group, then SIGKILL it if it hasn't

@@ -68,7 +68,12 @@ export class SessionManager extends EventEmitter {
   // (see session:snapshot / snapshot getters below). Kept separate from Session so
   // they never leak into persistence or toInfo().
   private transcripts = new Map<string, ClaudeEvent[]>()
-  private pendingPerms = new Map<string, PermissionRequest>()
+  // sessionId → (requestId → request). A session can have MORE THAN ONE unanswered
+  // prompt at once: when an assistant message contains several tool_uses the CLI
+  // fires their can_use_tool requests in parallel. Keying by requestId (not a single
+  // slot) is what stops a second prompt from shadowing the first — the shadowed one
+  // used to stay blocked forever, so the session looked like it hung "working".
+  private pendingPerms = new Map<string, Map<string, PermissionRequest>>()
 
   constructor(private readonly opts: SessionManagerOpts = {}) { super() }
 
@@ -88,7 +93,7 @@ export class SessionManager extends EventEmitter {
   // Connect-time snapshot inputs (see session:snapshot): the buffered transcript
   // and any still-unanswered permission prompt for a session.
   transcriptOf(id: string): ClaudeEvent[] { return this.transcripts.get(id) ?? [] }
-  pendingPermissionOf(id: string): PermissionRequest | undefined { return this.pendingPerms.get(id) }
+  pendingPermissionsOf(id: string): PermissionRequest[] { return [...(this.pendingPerms.get(id)?.values() ?? [])] }
 
   create(
     name: string,
@@ -201,12 +206,15 @@ export class SessionManager extends EventEmitter {
       this.emit('ready', id, sid)
     })
     engine.on('permission', (req: PermissionRequest) => {
-      this.pendingPerms.set(id, req)   // remember it so a late-joining device gets it too
+      // Track EVERY outstanding prompt by requestId (parallel tool_uses ⇒ several at
+      // once) so a late-joining device gets them all and none gets shadowed.
+      const m = this.pendingPerms.get(id) ?? new Map<string, PermissionRequest>()
+      m.set(req.requestId, req)
+      this.pendingPerms.set(id, m)
       this.emit('permission', id, req)
     })
     engine.on('permissionResolved', (requestId: string) => {
-      const p = this.pendingPerms.get(id)
-      if (p?.requestId === requestId) this.pendingPerms.delete(id)   // matched prompt answered
+      this.pendingPerms.get(id)?.delete(requestId)   // drop just the answered prompt
       this.emit('permissionResolved', id, requestId)
     })
     engine.on('state', (state: 'idle' | 'running' | 'waiting') => {
