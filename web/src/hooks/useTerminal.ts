@@ -51,7 +51,7 @@ export interface TerminalAPI {
 export function useTerminal(
   containerRef: React.RefObject<HTMLDivElement | null>,
   api: TerminalAPI,
-): { fit: () => void; focus: () => void } {
+): { fit: () => void; focus: () => void; getSize: () => { cols: number; rows: number } | null } {
   const fitRef = useRef<FitAddon | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const apiRef = useRef(api)
@@ -91,5 +91,9 @@ export function useTerminal(
 
   const fit = useCallback(() => fitRef.current?.fit(), [])
   const focus = useCallback(() => termRef.current?.focus(), [])
-  return { fit, focus }
+  const getSize = useCallback(() => {
+    const t = termRef.current
+    return t ? { cols: t.cols, rows: t.rows } : null
+  }, [])
+  return { fit, focus, getSize }
 }

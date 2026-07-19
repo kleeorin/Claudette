@@ -44,6 +44,12 @@ type Content = { kind: 'notebook'; id: string } | { kind: 'file'; path: string }
 type Pane = { tabs: Content[]; active: Content | null }
 const EMPTY_PANE: Pane = { tabs: [], active: null }
 
+// A session's terminal dock: its open/closed state, its tabbed terminals, and which
+// tab is focused. Tracked PER SESSION (keyed by session id) so terminals follow the
+// session you switch to.
+type TermPane = { open: boolean; terms: { id: string; cwd: string }[]; active: string | null }
+const EMPTY_TERM: TermPane = { open: false, terms: [], active: null }
+
 function Shell() {
   const { sessions, activeId, setActive, homeDir } = useSessions()
   const notebooks = useNotebooks()
@@ -60,11 +66,12 @@ function Shell() {
 
   // Docks.
   const [dock, setDock] = useState<'files' | 'git' | 'permissions' | 'sandbox' | null>(null)
-  const [termOpen, setTermOpen] = useState(false)
-  // Multiple terminals share the bottom dock (tabbed). Each captures its cwd at
-  // creation. `+` adds one, per-tab `×` closes it; closing the last closes the dock.
-  const [terms, setTerms] = useState<{ id: string; cwd: string }[]>([])
-  const [activeTerm, setActiveTerm] = useState<string | null>(null)
+  // Terminals are PER SESSION — each session owns its own tabbed set of terminals
+  // and its own dock open/closed state, so switching sessions swaps the whole
+  // terminal dock (and every session's ptys keep running in the background). Each
+  // terminal captures its cwd at creation. Terminal ids are globally unique (via the
+  // shared `termSeq`) so every session's terminals can be mounted at once.
+  const [termsBySession, setTermsBySession] = useState<Record<string, TermPane>>({})
   const termSeq = useRef(0)
 
   // Companion orientation for the content split (phones default to stacked).
@@ -105,6 +112,18 @@ function Shell() {
   const active = pane.active
   const setPane = (sid: string, fn: (p: Pane) => Pane) =>
     setBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_PANE) }))
+
+  // --- terminals (per session) -----------------------------------------------
+  // The active session's terminal dock, plus a flat list of EVERY session's
+  // terminals so they can all stay mounted (ptys survive session switches).
+  const termPane = (activeId ? termsBySession[activeId] : null) ?? EMPTY_TERM
+  const termOpen = termPane.open
+  const terms = termPane.terms
+  const activeTerm = termPane.active
+  const allTerms = Object.entries(termsBySession).flatMap(([sid, st]) => st.terms.map((t) => ({ ...t, sid })))
+  const dockShown = termOpen && terms.length > 0   // the active session's dock is visible
+  const setTermPane = (sid: string, fn: (p: TermPane) => TermPane) =>
+    setTermsBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_TERM) }))
 
   const openFile = (path: string) => {
     if (!activeId) return
@@ -210,23 +229,46 @@ function Shell() {
   }, [])
 
   const addTerm = (cwd: string) => {
-    const id = `t${++termSeq.current}`
-    setTerms((ts) => [...ts, { id, cwd }])
-    setActiveTerm(id)
+    if (!activeId) return
+    const id = `t${++termSeq.current}`   // globally unique across sessions
+    setTermPane(activeId, (p) => ({ open: true, terms: [...p.terms, { id, cwd }], active: id }))
   }
   const closeTerm = (id: string) => {
-    const rest = terms.filter((t) => t.id !== id)   // unmounting its TerminalView tears the pty down
-    setTerms(rest)
-    if (activeTerm === id) setActiveTerm(rest[rest.length - 1]?.id ?? null)
-    if (rest.length === 0) setTermOpen(false)        // last one → dock closes (as before first open)
+    if (!activeId) return
+    setTermPane(activeId, (p) => {
+      const rest = p.terms.filter((t) => t.id !== id)   // unmounting its TerminalView tears the pty down
+      return {
+        open: rest.length > 0 ? p.open : false,         // last one → dock closes (as before first open)
+        terms: rest,
+        active: p.active === id ? (rest[rest.length - 1]?.id ?? null) : p.active,
+      }
+    })
   }
-  // Toggle the dock: opening with no terminals yet spawns the first one.
+  const selectTerm = (id: string) => { if (activeId) setTermPane(activeId, (p) => ({ ...p, active: id })) }
+  const hideTerm = () => { if (activeId) setTermPane(activeId, (p) => ({ ...p, open: false })) }
+  // Toggle the active session's dock: opening with no terminals yet spawns the first.
   const toggleTerm = () => {
-    if (termOpen) { setTermOpen(false); return }
-    setTermOpen(true)
+    if (!activeId) return
+    if (termOpen) { hideTerm(); return }
     if (terms.length === 0) addTerm(termCwd)
+    else setTermPane(activeId, (p) => ({ ...p, open: true }))
   }
   const toggleDock = (which: 'files' | 'git' | 'permissions' | 'sandbox') => setDock((d) => (d === which ? null : which))
+
+  // When a session goes away, drop its terminal dock — unmounting those
+  // TerminalViews tears down the ptys the session owned.
+  useEffect(() => {
+    const ids = new Set(sessions.map((s) => s.id))
+    setTermsBySession((prev) => {
+      let changed = false
+      const next: Record<string, TermPane> = {}
+      for (const [sid, st] of Object.entries(prev)) {
+        if (ids.has(sid)) next[sid] = st
+        else changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [sessions])
 
   // Tab strip for the CURRENT session's pane, enriched with live doc metadata.
   const tabs: Tab[] = pane.tabs.map((t) => {
@@ -313,24 +355,25 @@ function Shell() {
               </div>
             </div>
 
-            {/* Bottom dock: tabbed terminals (span the main column). Terminals stay
-                mounted while the dock is hidden so scrollback survives; closing the
-                last tab closes the dock. */}
-            {terms.length > 0 && termOpen && (
+            {/* Bottom dock: tabbed terminals for the ACTIVE session (span the main
+                column). Every session's terminals stay mounted (see the bodies
+                below) so ptys + scrollback survive session switches; the tab strip
+                and sizing only apply to the active session's dock. */}
+            {dockShown && (
               <div
                 {...dividerProps({ axis: 'y', get: () => termH, set: setTermH, sign: -1, min: 120, max: () => 700 })}
                 title="Drag to resize"
                 className="shrink-0 h-1 cursor-row-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
               />
             )}
-            {terms.length > 0 && (
-              <div className={termOpen ? 'shrink-0 flex flex-col border-t border-ctp-surface0' : 'hidden'} style={termOpen ? { height: termH } : undefined}>
-                {/* Tab strip: one tab per terminal (× to close), + to add, hide on the right. */}
+            {allTerms.length > 0 && (
+              <div className={dockShown ? 'shrink-0 flex flex-col border-t border-ctp-surface0' : 'hidden'} style={dockShown ? { height: termH } : undefined}>
+                {/* Tab strip: one tab per terminal in the ACTIVE session (× to close), + to add, hide on the right. */}
                 <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
                   {terms.map((t, i) => (
                     <div
                       key={t.id}
-                      onClick={() => setActiveTerm(t.id)}
+                      onClick={() => selectTerm(t.id)}
                       title={t.cwd}
                       className={`group flex items-center gap-1.5 pl-2 pr-1 shrink-0 cursor-pointer text-[11px] border-b-2 ${activeTerm === t.id ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-subtext hover:text-ctp-text'}`}
                     >
@@ -347,17 +390,22 @@ function Shell() {
                   ))}
                   <button onClick={() => addTerm(termCwd)} title="New terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text px-1.5 text-sm leading-none">+</button>
                   <span className="ml-auto self-center text-[10px] text-ctp-overlay font-mono truncate max-w-[45%]">{prettyPath(terms.find((t) => t.id === activeTerm)?.cwd ?? termCwd)}</span>
-                  <button onClick={() => setTermOpen(false)} title="Hide terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text p-0.5">
+                  <button onClick={hideTerm} title="Hide terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text p-0.5">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                   </button>
                 </div>
-                {/* Bodies: all mounted, only the active one visible (scrollback preserved). */}
+                {/* Bodies: EVERY session's terminals stay mounted here (this container
+                    persists across session switches, so ptys + scrollback survive);
+                    only the active session's active terminal is shown. */}
                 <div className="flex-1 min-h-0 relative">
-                  {terms.map((t) => (
-                    <div key={t.id} className={activeTerm === t.id ? 'absolute inset-0' : 'hidden'}>
-                      <TerminalView cwd={t.cwd} visible={termOpen && activeTerm === t.id} />
-                    </div>
-                  ))}
+                  {allTerms.map((t) => {
+                    const show = t.sid === activeId && dockShown && activeTerm === t.id
+                    return (
+                      <div key={t.id} className={show ? 'absolute inset-0' : 'hidden'}>
+                        <TerminalView cwd={t.cwd} visible={show} sessionId={t.sid} />
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )}

@@ -6,7 +6,7 @@ import { useTerminal, type TerminalAPI } from '../hooks/useTerminal'
 // xterm to it (output over WS, input/resize back over WS), and tears the pty down
 // on unmount. The parent (App) keeps this mounted once opened so the shell + its
 // scrollback survive tab switches.
-export function TerminalView({ cwd, visible }: { cwd: string; visible: boolean }) {
+export function TerminalView({ cwd, visible, sessionId }: { cwd: string; visible: boolean; sessionId?: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const paneIdRef = useRef<string | null>(null)
   const [exited, setExited] = useState(false)
@@ -19,7 +19,7 @@ export function TerminalView({ cwd, visible }: { cwd: string; visible: boolean }
     subscribeOutput: (cb) => api.on.paneOutput((id, data) => { if (id === paneIdRef.current) cb(data) }),
   }).current
 
-  const { fit, focus } = useTerminal(containerRef, termApi)
+  const { fit, focus, getSize } = useTerminal(containerRef, termApi)
 
   // Kept mounted-but-hidden across tab switches (so scrollback survives); a hidden
   // container fits to 0, so re-fit + focus whenever we become visible again.
@@ -31,12 +31,23 @@ export function TerminalView({ cwd, visible }: { cwd: string; visible: boolean }
     let disposed = false
     let paneId: string | null = null
     const offExit = api.on.paneExit((id) => { if (id === paneIdRef.current) setExited(true) })
-    void api.pane.create(cwd).then(({ id }) => {
+    // Fit BEFORE creating the pty so it spawns at the terminal's real size — the
+    // shell then draws its very first prompt at the right width, so typed chars
+    // don't overwrite the prompt and history recall doesn't shift a line. (fitRef is
+    // set by useTerminal's effect, which runs before this one.) Re-send the size once
+    // more after create as a backstop for any layout that settled in between.
+    fit()
+    const initial = getSize()
+    void api.pane.create(cwd, initial?.cols, initial?.rows, sessionId).then(({ id }) => {
       if (disposed) { void api.pane.destroy(id); return }
       paneId = id
       paneIdRef.current = id
-      // Re-fit now that the pty exists so its size matches the viewport.
-      requestAnimationFrame(() => { fit(); focus() })
+      requestAnimationFrame(() => {
+        fit()
+        focus()
+        const size = getSize()
+        if (size) api.pane.resize(id, size.cols, size.rows)
+      })
     })
     return () => {
       disposed = true
