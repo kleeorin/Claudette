@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode, SessionInfo } from '@claudette/shared'
 import { useChat, collectAgents, countRunningAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
@@ -17,6 +17,11 @@ import type { UsageWindow } from '@claudette/shared'
 // Resets on a full page reload (module re-eval), which is exactly when we DO want
 // to resume again. Module-level so it survives ChatView remounts.
 const autoResumed = new Set<string>()
+
+// Dismissed agent-tray cards, keyed by session id, kept OUTSIDE the component so it
+// survives ChatView unmounting on a session switch (App keys ChatView by session id).
+// A cleared card therefore stays cleared when you return to the session.
+const dismissedBySession = new Map<string, Set<string>>()
 
 // Native chat frontend for a Claude session — ported from ClaudeMaster. Renders
 // the structured transcript, streams tokens, and surfaces permission /
@@ -56,13 +61,17 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const agentsRunning = countRunningAgents(items, running)
   // Dismissed agent cards (view-only). Agents are derived from the immutable
   // transcript each render, so there's nothing to delete — we filter by a stable
-  // key instead. The set persists while this session's ChatView is mounted, so a
-  // dismissed card stays hidden even if the agent later emits more transcript items.
-  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set())
+  // key instead. App keys ChatView by session id, so switching sessions unmounts
+  // this component; persist the set per-session in a module map (see below) so a
+  // card you cleared stays cleared when you come back.
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => dismissedBySession.get(sessionId) ?? new Set())
+  const updateDismissed = useCallback((fn: (prev: ReadonlySet<string>) => Set<string>) => {
+    setDismissed((prev) => { const next = fn(prev); dismissedBySession.set(sessionId, next); return next })
+  }, [sessionId])
   const visibleAgents = useMemo(() => agents.filter((a) => !dismissed.has(agentKey(a))), [agents, dismissed])
-  const dismissAgent = (a: AgentView) => setDismissed((prev) => new Set(prev).add(agentKey(a)))
+  const dismissAgent = (a: AgentView) => updateDismissed((prev) => new Set(prev).add(agentKey(a)))
   const dismissFinished = () =>
-    setDismissed((prev) => {
+    updateDismissed((prev) => {
       const next = new Set(prev)
       for (const a of agents) if (a.result) next.add(agentKey(a))
       return next
