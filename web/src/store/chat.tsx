@@ -14,8 +14,8 @@ import { api } from '../api/client'
 // text/thinking layered on via stream_event deltas.
 export type TranscriptItem =
   | { kind: 'user'; id: string; text: string }
-  | { kind: 'text'; id: string; text: string; streaming?: boolean }
-  | { kind: 'thinking'; id: string; text: string; streaming?: boolean }
+  | { kind: 'text'; id: string; text: string; streaming?: boolean; parentId?: string }
+  | { kind: 'thinking'; id: string; text: string; streaming?: boolean; parentId?: string }
   // `toolId` = the anthropic tool_use block id (`toolu_…`); pairs a call with its
   // tool_result and, for a `Task`, links its subagent's activity. `parentId` =
   // `parent_tool_use_id`: set on a SUBAGENT's own calls/results, matching the parent
@@ -287,8 +287,11 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
     const content = (e as { message?: { content?: unknown[] } }).message?.content ?? []
     for (const b of content as Array<Record<string, unknown>>) {
       if (b.type === 'tool_use') out.push({ kind: 'tool_use', id: nextId(), name: String(b.name), input: b.input, toolId: typeof b.id === 'string' ? b.id : undefined, parentId })
-      else if (fromReplay && b.type === 'text' && b.text) out.push({ kind: 'text', id: nextId(), text: String(b.text) })
-      else if (fromReplay && b.type === 'thinking' && b.thinking) out.push({ kind: 'thinking', id: nextId(), text: String(b.thinking) })
+      // A SUBAGENT's text/thinking (parentId set) is always captured — it's the agent's
+      // chain of thought, shown in its tray card. The MAIN agent's live text/thinking
+      // arrives via the stream path (reconciled by ASSISTANT), so here it's replay-only.
+      else if ((fromReplay || parentId) && b.type === 'text' && b.text) out.push({ kind: 'text', id: nextId(), text: String(b.text), parentId })
+      else if ((fromReplay || parentId) && b.type === 'thinking' && b.thinking) out.push({ kind: 'thinking', id: nextId(), text: String(b.thinking), parentId })
     }
   } else if (e.type === 'user') {
     const content = (e as { message?: { content?: unknown } }).message?.content
@@ -444,7 +447,7 @@ export function collectAgents(items: TranscriptItem[]): AgentView[] {
   const childrenByParent = new Map<string, TranscriptItem[]>()
   for (const it of items) {
     if (it.kind === 'tool_result') resultByTool.set(it.toolUseId, it)
-    const pid = (it.kind === 'tool_use' || it.kind === 'tool_result') ? it.parentId : undefined
+    const pid = (it.kind === 'tool_use' || it.kind === 'tool_result' || it.kind === 'text' || it.kind === 'thinking') ? it.parentId : undefined
     if (pid) { const a = childrenByParent.get(pid) ?? []; a.push(it); childrenByParent.set(pid, a) }
   }
   const agents: AgentView[] = []

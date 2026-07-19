@@ -34,7 +34,13 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const meta = metaFor(sessionId)
   const [draft, setDraft] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  // Whether the viewport is parked at the bottom. We only auto-scroll to new
+  // content while this holds, so scrolling up to read stays undisturbed. It's a
+  // ref (read inside the scroll effect) mirrored to state only for the button.
+  const pinnedRef = useRef(true)
+  const [showJump, setShowJump] = useState(false)
   const running = state === 'running' || state === 'waiting'
   // `@`-mention path autocomplete (interactive citation picker), anchored at cwd.
   const mention = useMentionComplete({ draft, setDraft, taRef, cwd: session?.cwd ?? '' })
@@ -48,6 +54,19 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
   const agents = useMemo(() => collectAgents(items), [items])
   const agentsRunning = running ? countRunningAgents(items) : 0
+  // Dismissed agent cards (view-only). Agents are derived from the immutable
+  // transcript each render, so there's nothing to delete — we filter by a stable
+  // key instead. The set persists while this session's ChatView is mounted, so a
+  // dismissed card stays hidden even if the agent later emits more transcript items.
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set())
+  const visibleAgents = useMemo(() => agents.filter((a) => !dismissed.has(agentKey(a))), [agents, dismissed])
+  const dismissAgent = (a: AgentView) => setDismissed((prev) => new Set(prev).add(agentKey(a)))
+  const dismissFinished = () =>
+    setDismissed((prev) => {
+      const next = new Set(prev)
+      for (const a of agents) if (a.result) next.add(agentKey(a))
+      return next
+    })
   // The rendered transcript, memoized on `items` so composer keystrokes (which
   // re-render ChatView via `draft`) don't re-filter and re-build the whole list.
   const rendered = useMemo(() => {
@@ -59,7 +78,9 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       // Drop signature-only "thinking" blocks (no readable body → empty toggle/gap).
       if (it.kind === 'thinking' && !it.streaming && !it.text.trim()) return false
       if (it.kind === 'tool_use' && isSubagentTool(it.name)) return false                     // → tray
-      if ((it.kind === 'tool_use' || it.kind === 'tool_result') && it.parentId) return false   // subagent activity → tray
+      // A subagent's own activity — tool calls/results AND its text/thinking (chain of
+      // thought) — is tagged with parentId and belongs in the tray, not inline.
+      if ((it.kind === 'tool_use' || it.kind === 'tool_result' || it.kind === 'text' || it.kind === 'thinking') && it.parentId) return false
       if (it.kind === 'tool_result' && taskToolIds.has(it.toolUseId)) return false             // Task result → tray
       return true
     })
@@ -103,9 +124,27 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const thinking = last && last.kind === 'thinking' && last.streaming ? last.text.trim() : ''
   const thinkTail = thinking.length > 180 ? '…' + thinking.slice(-180) : thinking
 
-  // Keep the newest content in view while this session is the one on screen.
+  // Track how close the viewport is to the bottom. Within the threshold we're
+  // "pinned" and new content follows; scroll up and we release, so reading above
+  // is never yanked down. Updates a ref (for the effect) and state (for the button).
+  const onScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    pinnedRef.current = pinned
+    setShowJump((prev) => (prev === !pinned ? prev : !pinned))
+  }
+
+  const jumpToLatest = () => {
+    pinnedRef.current = true
+    setShowJump(false)
+    bottomRef.current?.scrollIntoView({ block: 'end' })
+  }
+
+  // Keep the newest content in view while this session is on screen — but only
+  // when the reader is already parked at the bottom. Scrolled up? Stay put.
   useEffect(() => {
-    if (isActive) bottomRef.current?.scrollIntoView({ block: 'end' })
+    if (isActive && pinnedRef.current) bottomRef.current?.scrollIntoView({ block: 'end' })
   }, [items.length, pending, isActive])
 
   // Auto-resume on load: a RESTORED session (not one just created) with an empty
@@ -193,7 +232,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
           ⚠ Claude exited{session.exitError ? ` — ${session.exitError}` : ''}
         </div>
       )}
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-5 sm:py-6 text-[13px]">
           {items.length === 0 && (
             <div className="text-ctp-overlay text-sm select-none pt-16 text-center">
@@ -241,10 +280,26 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
         </div>
       </div>
 
-      {agents.length > 0 && <AgentsTray agents={agents} running={running} />}
+      {visibleAgents.length > 0 && (
+        <AgentsTray
+          agents={visibleAgents}
+          running={running}
+          onDismiss={dismissAgent}
+          onDismissFinished={dismissFinished}
+        />
+      )}
 
       <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
         <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3 relative">
+          {showJump && (
+            <button
+              onClick={jumpToLatest}
+              title="Jump to latest"
+              className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-10 flex items-center gap-1 rounded-full border border-ctp-surface1 bg-ctp-mantle px-3 py-1 text-[11px] text-ctp-subtext shadow-pop hover:text-ctp-text hover:border-ctp-surface2 transition-colors animate-fade-in"
+            >
+              ↓ Jump to latest
+            </button>
+          )}
           {suggestions.length > 0 && (
             <div className="absolute bottom-full left-6 mb-2 w-64 rounded-lg border border-ctp-surface1 bg-ctp-mantle shadow-pop overflow-hidden z-10">
               {suggestions.map((c) => {
@@ -490,29 +545,54 @@ function Collapsible({ label, body, tone }: { label: string; body: string; tone:
   )
 }
 
+// Stable identity for a tray card across transcript rebuilds: the anthropic tool
+// id when we have it (survives collectAgents re-runs), else the local item id.
+function agentKey(a: AgentView): string {
+  return a.toolId ?? a.id
+}
+
 // The pinned Agents tray: a docked strip between the transcript and the composer that
 // collects every subagent for this session (out of the conversation flow, so it's easy
 // to find and never scrolls away). Collapsible; header shows total + live count.
-function AgentsTray({ agents, running }: { agents: AgentView[]; running: boolean }) {
+function AgentsTray({ agents, running, onDismiss, onDismissFinished }: {
+  agents: AgentView[]
+  running: boolean
+  onDismiss: (a: AgentView) => void
+  onDismissFinished: () => void
+}) {
   const [open, setOpen] = useState(true)
   const active = agents.filter((a) => !a.result).length
+  const finished = agents.length - active
   return (
     <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-mantle/60">
       <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-2">
-        <button onClick={() => setOpen((v) => !v)} className="flex items-center gap-2 w-full text-[11px] text-ctp-subtext">
-          <span className="text-ctp-mauve" aria-hidden>◈</span>
-          <span className="font-medium">Agents</span>
-          <span className="text-ctp-overlay">{agents.length}</span>
-          {active > 0 && (
-            <span className="flex items-center gap-1 text-ctp-mauve">
-              <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />{active} running
-            </span>
+        <div className="flex items-center gap-2 w-full text-[11px] text-ctp-subtext">
+          <button onClick={() => setOpen((v) => !v)} className="flex items-center gap-2 min-w-0 flex-1 text-left">
+            <span className="text-ctp-mauve" aria-hidden>◈</span>
+            <span className="font-medium">Agents</span>
+            <span className="text-ctp-overlay">{agents.length}</span>
+            {active > 0 && (
+              <span className="flex items-center gap-1 text-ctp-mauve">
+                <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />{active} running
+              </span>
+            )}
+          </button>
+          {finished > 0 && (
+            <button
+              onClick={onDismissFinished}
+              title="Dismiss all finished agents"
+              className="shrink-0 text-ctp-overlay hover:text-ctp-text transition-colors"
+            >
+              Clear finished
+            </button>
           )}
-          <span className="ml-auto text-ctp-surface2">{open ? '▾' : '▸'}</span>
-        </button>
+          <button onClick={() => setOpen((v) => !v)} className="shrink-0 text-ctp-surface2" title={open ? 'Collapse' : 'Expand'}>
+            {open ? '▾' : '▸'}
+          </button>
+        </div>
         {open && (
           <div className="mt-1.5 space-y-1.5 max-h-64 overflow-y-auto">
-            {agents.map((a) => <AgentCard key={a.id} agent={a} running={running} />)}
+            {agents.map((a) => <AgentCard key={a.id} agent={a} running={running} onDismiss={() => onDismiss(a)} />)}
           </div>
         )}
       </div>
@@ -524,7 +604,7 @@ function AgentsTray({ agents, running }: { agents: AgentView[]; running: boolean
 // EXISTENCE (type + task), STATUS (running / done / failed, live), and PROGRESS (its
 // own tool calls, nested). Collapsed by default — a one-line "N steps · last action"
 // ticker keeps it glanceable; expand for the full activity + result.
-function AgentCard({ agent, running }: { agent: AgentView; running: boolean }) {
+function AgentCard({ agent, running, onDismiss }: { agent: AgentView; running: boolean; onDismiss: () => void }) {
   const [open, setOpen] = useState(false)
   const { type, description: desc, prompt, steps, result } = agent
   const calls = steps.filter((s): s is Extract<TranscriptItem, { kind: 'tool_use' }> => s.kind === 'tool_use')
@@ -540,15 +620,24 @@ function AgentCard({ agent, running }: { agent: AgentView; running: boolean }) {
   const border = active ? 'border-ctp-mauve/50' : failed ? 'border-ctp-red/40' : 'border-ctp-surface1'
   return (
     <div className={`animate-fade-in rounded-lg border ${border} bg-ctp-surface0/30 overflow-hidden`}>
-      <button onClick={() => setOpen((v) => !v)} className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-ctp-surface0/50">
-        <span className="shrink-0 text-ctp-mauve" aria-hidden>◈</span>
-        <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-ctp-mauve/15 text-ctp-mauve">{type}</span>
-        <span className="min-w-0 truncate text-[13px] font-medium text-ctp-text">{desc}</span>
-        <span className={`ml-auto shrink-0 flex items-center gap-1 text-[10px] ${status.text}`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />{status.label}
-        </span>
-        <span className="shrink-0 text-ctp-surface2 text-[10px]">{open ? '▾' : '▸'}</span>
-      </button>
+      <div className="flex items-center gap-2 px-2.5 py-1.5 hover:bg-ctp-surface0/50">
+        <button onClick={() => setOpen((v) => !v)} className="flex-1 min-w-0 flex items-center gap-2 text-left">
+          <span className="shrink-0 text-ctp-mauve" aria-hidden>◈</span>
+          <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-ctp-mauve/15 text-ctp-mauve">{type}</span>
+          <span className="min-w-0 truncate text-[13px] font-medium text-ctp-text">{desc}</span>
+          <span className={`ml-auto shrink-0 flex items-center gap-1 text-[10px] ${status.text}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />{status.label}
+          </span>
+          <span className="shrink-0 text-ctp-surface2 text-[10px]">{open ? '▾' : '▸'}</span>
+        </button>
+        <button
+          onClick={onDismiss}
+          title={active ? 'Dismiss card (the agent keeps running)' : 'Dismiss'}
+          className="shrink-0 text-ctp-overlay hover:text-ctp-red px-0.5 leading-none"
+        >
+          ×
+        </button>
+      </div>
 
       {/* Collapsed ticker: step count + the agent's most recent action. */}
       {!open && (calls.length > 0 || active) && (
@@ -567,7 +656,10 @@ function AgentCard({ agent, running }: { agent: AgentView; running: boolean }) {
               <div className="text-[10px] uppercase tracking-wide text-ctp-overlay">Activity</div>
               {steps.map((s) => s.kind === 'tool_use'
                 ? <ToolRow key={s.id} name={s.name} input={s.input} />
-                : s.kind === 'tool_result' ? <ResultRow key={s.id} content={s.content} isError={s.isError} /> : null)}
+                : s.kind === 'tool_result' ? <ResultRow key={s.id} content={s.content} isError={s.isError} />
+                : s.kind === 'thinking' ? <Collapsible key={s.id} label="Thinking" tone="overlay" body={s.text} />
+                : s.kind === 'text' ? <div key={s.id} className="text-xs text-ctp-subtext"><Markdown text={s.text} /></div>
+                : null)}
             </div>
           )}
           {result && (
