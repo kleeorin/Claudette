@@ -10,6 +10,7 @@ import { SandboxControl } from './SandboxControl'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { useMentionComplete } from '../hooks/useMentionComplete'
 import { api } from '../api/client'
+import type { UsageWindow } from '@claudette/shared'
 
 // Sessions already auto-resumed this app load — so revisiting a session (or a
 // /clear that empties the transcript) doesn't re-pull the old conversation.
@@ -585,7 +586,9 @@ function AgentCard({ agent, running }: { agent: AgentView; running: boolean }) {
 
 // Compact token count: 210_234 → "210k". Sub-1k values shown as-is.
 function fmtTokens(n: number): string {
-  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`   // Opus' 1M window as "1.0M", not "1000k"
+  if (n >= 1000) return `${Math.round(n / 1000)}k`
+  return String(n)
 }
 
 // The CLI's weekly window comes in several flavors: seven_day, seven_day_opus,
@@ -600,6 +603,37 @@ function limitLabel(type?: string): string {
 // Session window first, then any weekly window, then anything unrecognized.
 const limitRank = (t?: string) => (t === 'five_hour' ? 0 : isWeekly(t) ? 1 : 9)
 
+// Re-render on an interval so time-based UI (rate-limit chip expiry) updates without
+// new events. Pass null to disable the timer (no re-renders) when there's nothing to
+// age out.
+function useNow(intervalMs: number | null): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (intervalMs == null) return
+    const t = setInterval(() => setNow(Date.now()), intervalMs)
+    return () => clearInterval(t)
+  }, [intervalMs])
+  return now
+}
+
+// Poll the plan-quota usage endpoint (session/weekly %). The CLI stream no longer
+// carries a usage fraction, so this HTTP poll is the source for the rate-limit chips.
+// Account-global (not per-session), so one interval suffices; refetch on mount, every
+// 60s, and when the tab regains focus. Empty ⇒ no OAuth token / endpoint unreachable.
+function useUsage(): UsageWindow[] {
+  const [windows, setWindows] = useState<UsageWindow[]>([])
+  useEffect(() => {
+    let alive = true
+    const load = () => { api.http.usage().then((u) => { if (alive) setWindows(u.windows) }).catch(() => {}) }
+    load()
+    const iv = setInterval(load, 60_000)
+    const onVis = () => { if (!document.hidden) load() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => { alive = false; clearInterval(iv); document.removeEventListener('visibilitychange', onVis) }
+  }, [])
+  return windows
+}
+
 // Always-visible status bar: session title + cwd, then model, real context usage
 // (tokens + %), cost, and a chip per rate-limit window (session / weekly).
 function MetaBar({ meta, session, title, cwd, mode, onSetMode, agentsRunning }: {
@@ -610,11 +644,33 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode, agentsRunning }: 
   const tokens = meta.contextTokens
   const win = meta.contextWindow
   const pct = win && tokens != null ? Math.min(100, Math.round((tokens / win) * 100)) : undefined
+  // Against Opus' 1M window a few-k-token session rounds to 0% — show "<1%" (and keep a
+  // 1px sliver of bar) so a working meter doesn't read as broken/empty.
+  const pctLabel = pct == null ? undefined : pct === 0 && (tokens ?? 0) > 0 ? '<1%' : `${pct}%`
+  const barPct = pct == null ? 0 : Math.max(pct, (tokens ?? 0) > 0 ? 1 : 0)
   const barColor = pct == null ? 'bg-ctp-accent' : pct >= 92 ? 'bg-ctp-red' : pct >= 80 ? 'bg-ctp-yellow' : 'bg-ctp-accent'
-  // The 5-hour ("Session") window always shows. The Weekly window is usually just
-  // noise, so only surface it once it's genuinely worth attention: > 85% used.
-  const limits = (meta.limits ? Object.values(meta.limits) : [])
+  // Tick while any chip has a reset time, so an expired window self-clears below even
+  // when the session is idle (the CLI only reports usage near a limit — there's no
+  // "0%" event to clear it, so without this a stale chip would linger until the next
+  // turn or reconnect).
+  const hasResetable = !!meta.limits && Object.values(meta.limits).some((rl) => rl.resetsAt)
+  const now = useNow(hasResetable ? 30_000 : null)
+  // Quota chips. PREFER the polled `/api/usage` endpoint — it carries a continuous
+  // session + weekly % (the stream no longer does). Map each window onto the RateChip's
+  // shape (five_hour/seven_day). Only when the endpoint is unavailable (no OAuth token /
+  // offline) fall back to the stream's rate_limit_event chips: Session always, Weekly
+  // once it's worth attention (>85%), dropping windows whose reset time has passed.
+  const usage = useUsage()
+  const usageChips: RateLimitInfo[] = usage.map((w) => ({
+    rateLimitType: w.group === 'session' ? 'five_hour' : 'seven_day',
+    percentUsed: w.percent,
+    resetsAt: w.resetsAt,
+    status: w.severity && w.severity !== 'normal' ? w.severity : 'allowed',
+  }))
+  const streamChips = (meta.limits ? Object.values(meta.limits) : [])
+    .filter((rl) => !(rl.resetsAt && rl.resetsAt * 1000 <= now))
     .filter((rl) => !isWeekly(rl.rateLimitType) || (rl.percentUsed ?? 0) > 85)
+  const limits = (usageChips.length ? usageChips : streamChips)
     .sort((a, b) => limitRank(a.rateLimitType) - limitRank(b.rateLimitType))
 
   return (
@@ -635,10 +691,10 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode, agentsRunning }: 
         <span className="flex items-center gap-1.5" title="Context window used (input + cached tokens) vs the model's limit">
           <span className="text-ctp-overlay">ctx</span>
           <span className="inline-block w-16 h-1.5 rounded-full bg-ctp-surface0 overflow-hidden align-middle">
-            {pct !== undefined && <span className={`block h-full rounded-full ${barColor}`} style={{ width: `${pct}%` }} />}
+            {pct !== undefined && <span className={`block h-full rounded-full ${barColor}`} style={{ width: `${barPct}%` }} />}
           </span>
           {tokens != null && win
-            ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pct}%)</span>
+            ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pctLabel})</span>
             : <span className="text-ctp-surface2">—</span>}
         </span>
 

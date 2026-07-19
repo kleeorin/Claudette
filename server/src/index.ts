@@ -23,6 +23,7 @@ import { PaneManager } from './pane/paneManager'
 import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from './pane/paneApi'
 import { registerFsRoutes } from './fs/fsApi'
 import { registerGitRoutes } from './git/gitApi'
+import { registerUsageRoutes } from './usage/usageApi'
 import { resolveAuth, makeAuthHook, isAuthed, authCookie, tokenFilePath } from './auth'
 
 // Claudette app server. Single-user by design (PLAN §1). Binds loopback by
@@ -160,6 +161,7 @@ registerNotebookRoutes(app, notebooks, kernels)
 registerPaneRoutes(app, panes)
 registerFsRoutes(app)
 registerGitRoutes(app)
+registerUsageRoutes(app)
 
 // Reverse-proxy the browser's Jupyter REST/asset requests through our origin, with
 // the token injected server-side (auth-gated in makeAuthHook). hijack() hands the

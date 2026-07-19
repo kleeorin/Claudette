@@ -30,9 +30,10 @@ export interface RateLimitInfo {
   resetsAt?: number
   rateLimitType?: string
   isUsingOverage?: boolean
-  // The CLI's rate_limit_event reports usage as `utilization` (a 0–1 fraction on
-  // the anthropic-ratelimit-unified-*-utilization header); we normalize it into
-  // `percentUsed` (0–100) at ingestion. `percentUsed` is kept for the display path.
+  // NOTE: current CLIs (≥2.1) no longer put a usage fraction in `rate_limit_event` —
+  // the info is just {status, resetsAt, rateLimitType}. `utilization` (a 0–1 fraction,
+  // older CLIs) is still normalized into `percentUsed` (0–100) when present, so the
+  // chip shows a % on a CLI that provides one; otherwise it shows status + reset time.
   utilization?: number
   percentUsed?: number
 }
@@ -73,6 +74,7 @@ type Action =
   | { type: 'SET_SLASH'; sessionId: string; commands: string[] }
   | { type: 'SET_META'; sessionId: string; meta: Partial<SessionMeta> }
   | { type: 'SET_LIMIT'; sessionId: string; limitType: string; info: RateLimitInfo }
+  | { type: 'CLEAR_LIMITS'; sessionId: string }
   | { type: 'CLEAR'; sessionId: string }
 
 // One content block of a completed assistant message; `index` matches the stream
@@ -179,6 +181,12 @@ function reducer(state: State, action: Action): State {
         meta: { ...state.meta, [action.sessionId]: { ...m, limits: { ...(m.limits ?? {}), [action.limitType]: action.info } } },
       }
     }
+    case 'CLEAR_LIMITS': {
+      const m = state.meta[action.sessionId]
+      if (!m?.limits) return state
+      const next = { ...m }; delete next.limits
+      return { ...state, meta: { ...state.meta, [action.sessionId]: next } }
+    }
     case 'ADD_PENDING': {
       const cur = state.pending[action.sessionId] ?? []
       if (cur.some((r) => r.requestId === action.req.requestId)) return state   // dedup (echo/replay)
@@ -209,6 +217,25 @@ function reducer(state: State, action: Action): State {
     default:
       return state
   }
+}
+
+// Fold a `rate_limit_event` into meta. Current CLIs name the window (`rateLimitType`,
+// e.g. "five_hour") and give its status + reset time, but NO usage fraction — so the
+// chip shows status + reset (no %). Older CLIs sent `utilization` (0–1) which we still
+// normalize to `percentUsed` (0–100) when present. A truly bare `allowed` event (no
+// window at all) means we've recovered: clear stale warning/overage chips, so an old
+// "overage 101%" value doesn't latch on the chip forever (there's no "0%" update).
+function applyRateLimit(dispatch: (a: Action) => void, sessionId: string, e: { rate_limit_info?: RateLimitInfo }): void {
+  const info = e.rate_limit_info
+  if (!info) return
+  if (!info.rateLimitType && (info.status ?? 'allowed') === 'allowed') {
+    dispatch({ type: 'CLEAR_LIMITS', sessionId })
+    return
+  }
+  const percentUsed = typeof info.percentUsed === 'number' ? info.percentUsed
+    : typeof info.utilization === 'number' ? info.utilization * 100
+    : undefined
+  dispatch({ type: 'SET_LIMIT', sessionId, limitType: info.rateLimitType ?? 'limit', info: { ...info, percentUsed } })
 }
 
 // Normalize a tool_result's `content` (string | block array) to display text.
@@ -326,12 +353,14 @@ interface ModelUsage { contextWindow?: number; inputTokens?: number }
 // divide the fill by the wrong model's window and report a nonsense percentage.
 function pickWindow(mu: Record<string, ModelUsage>, knownModel?: string): number | undefined {
   if (knownModel && typeof mu[knownModel]?.contextWindow === 'number') return mu[knownModel].contextWindow
-  // No known model yet (e.g. before init on replay): fall back to the model that
-  // processed the most input — the one carrying the real conversation context.
+  // No known model yet (e.g. before init on replay): the main conversation model is the
+  // one with the LARGEST context window (helper models like haiku carry a smaller 200k
+  // window). Picking by inputTokens misfires under prompt caching — the main model's
+  // fresh input_tokens can be ~0 while its real context sits in cache_read.
   let best: ModelUsage | undefined
   for (const v of Object.values(mu)) {
     if (typeof v?.contextWindow !== 'number') continue
-    if (!best || (v.inputTokens ?? 0) > (best.inputTokens ?? 0)) best = v
+    if (!best || v.contextWindow > (best.contextWindow ?? 0)) best = v
   }
   return best?.contextWindow
 }
@@ -485,13 +514,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       // event carries usage as `utilization` (0–1); normalize to `percentUsed` so
       // the chip shows "how much is used", not just when the window resets.
       if (e.type === 'rate_limit_event') {
-        const info = (e as { rate_limit_info?: RateLimitInfo }).rate_limit_info
-        if (info) {
-          const percentUsed = typeof info.percentUsed === 'number' ? info.percentUsed
-            : typeof info.utilization === 'number' ? info.utilization * 100
-            : undefined
-          dispatch({ type: 'SET_LIMIT', sessionId: id, limitType: info.rateLimitType ?? 'limit', info: { ...info, percentUsed } })
-        }
+        applyRateLimit(dispatch, id, e as { rate_limit_info?: RateLimitInfo })
         return
       }
       if (e.type === 'assistant') {
@@ -532,13 +555,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           const cmds = (e as { slash_commands?: unknown }).slash_commands
           if (Array.isArray(cmds)) dispatch({ type: 'SET_SLASH', sessionId: id, commands: cmds.map(String) })
         } else if (e.type === 'rate_limit_event') {
-          const info = (e as { rate_limit_info?: RateLimitInfo }).rate_limit_info
-          if (info) {
-            const percentUsed = typeof info.percentUsed === 'number' ? info.percentUsed
-              : typeof info.utilization === 'number' ? info.utilization * 100
-              : undefined
-            dispatch({ type: 'SET_LIMIT', sessionId: id, limitType: info.rateLimitType ?? 'limit', info: { ...info, percentUsed } })
-          }
+          applyRateLimit(dispatch, id, e as { rate_limit_info?: RateLimitInfo })
         }
       }
       dispatch({ type: 'SET_PENDING', sessionId: id, reqs: pending ?? [] })

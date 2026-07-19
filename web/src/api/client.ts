@@ -11,6 +11,7 @@ import type {
   ActivePane, KernelSpecsResponse, SandboxConfig,
   AgentInfo, ListAgentsResponse,
   EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
+  UsageResponse,
 } from '@claudette/shared'
 
 // The single place the SPA talks to the server — replaces ClaudeMaster's Electron
@@ -218,6 +219,8 @@ export const api = {
       (await get<ConversationsResponse>(`/api/session/conversations?cwd=${encodeURIComponent(cwd)}`)).conversations,
     readConversation: async (cwd: string, id: string): Promise<ClaudeEvent[]> =>
       (await get<ConversationResponse>(`/api/session/conversation?cwd=${encodeURIComponent(cwd)}&id=${encodeURIComponent(id)}`)).events,
+    // Plan-quota usage (session/weekly %), polled — see useUsage. Account-global.
+    usage: (): Promise<UsageResponse> => get<UsageResponse>('/api/usage'),
   },
   // Notebook: HTTP for open/create/save/conflict; ops + locks over WS. The doc is
   // server-owned — these send intents; the authoritative state comes back via

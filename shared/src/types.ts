@@ -266,3 +266,17 @@ export type GitLog = { ok: true; commits: GitCommit[] } | { ok: false; error: st
 export type GitBranches =
   | { ok: true; current: string; branches: string[] }  // `current` is '' when detached
   | { ok: false; error: string }
+
+// Plan-quota usage (the account's rate-limit windows), read from the same
+// `/api/oauth/usage` endpoint the CLI's own `/usage` command uses — the stream no
+// longer carries a usage fraction, so this is polled over HTTP. Account-global (not
+// per-session). `resetsAt` is epoch SECONDS (matches the rate-limit chip's rendering).
+export interface UsageWindow {
+  kind: string          // e.g. 'session', 'weekly_all'
+  group: string         // 'session' | 'weekly'
+  label: string         // display label ('Session' | 'Weekly')
+  percent: number       // 0–100 utilization
+  resetsAt?: number     // epoch seconds
+  severity?: string     // 'normal' | 'warning' | …
+}
+export interface UsageResponse { windows: UsageWindow[]; fetchedAt: number }
