@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode, SessionInfo } from '@claudette/shared'
-import { useChat, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
+import { useChat, collectAgents, countRunningAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
 import { prettyPath } from '../lib/paths'
@@ -42,12 +42,26 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // The turns you've sent this session, oldest→newest. `histPtr` counts steps back
   // (0 = the live draft); `stashRef` holds the in-progress draft while browsing.
   const sentHistory = useMemo(() => items.filter((it) => it.kind === 'user').map((it) => it.text), [items])
+  // Live subagent count = Task tool_uses with no matching tool_result yet. Only while
+  // the turn is active, so an interrupted (never-completed) Task doesn't latch on.
+  // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
+  const agents = useMemo(() => collectAgents(items), [items])
+  const agentsRunning = running ? countRunningAgents(items) : 0
   // The rendered transcript, memoized on `items` so composer keystrokes (which
   // re-render ChatView via `draft`) don't re-filter and re-build the whole list.
   const rendered = useMemo(() => {
-    // Drop signature-only "thinking" blocks (no readable text) so they leave
-    // neither an empty toggle nor a phantom spacing gap.
-    const shown = items.filter((it) => it.kind !== 'thinking' || it.streaming || it.text.trim())
+    // Everything about a subagent (its `Task` call, its own nested activity, and its
+    // result) is pulled OUT of the conversation and shown in the Agents tray instead.
+    const taskToolIds = new Set<string>()
+    for (const it of items) if (it.kind === 'tool_use' && isSubagentTool(it.name) && it.toolId) taskToolIds.add(it.toolId)
+    const shown = items.filter((it) => {
+      // Drop signature-only "thinking" blocks (no readable body → empty toggle/gap).
+      if (it.kind === 'thinking' && !it.streaming && !it.text.trim()) return false
+      if (it.kind === 'tool_use' && isSubagentTool(it.name)) return false                     // → tray
+      if ((it.kind === 'tool_use' || it.kind === 'tool_result') && it.parentId) return false   // subagent activity → tray
+      if (it.kind === 'tool_result' && taskToolIds.has(it.toolUseId)) return false             // Task result → tray
+      return true
+    })
     return shown.map((it, i) => (
       <div key={it.id} className={gapClass(it, shown[i - 1])}>
         <Item item={it} />
@@ -171,6 +185,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
         cwd={session.cwd}
         mode={session.permissionMode ?? 'default'}
         onSetMode={(m) => setMode(sessionId, m)}
+        agentsRunning={agentsRunning}
       />
       {state === 'exited' && (
         <div className="shrink-0 px-4 py-2 bg-ctp-red/10 border-b border-ctp-red/30 text-[11px] text-ctp-red whitespace-pre-wrap">
@@ -224,6 +239,8 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
           <div ref={bottomRef} />
         </div>
       </div>
+
+      {agents.length > 0 && <AgentsTray agents={agents} running={running} />}
 
       <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
         <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3 relative">
@@ -472,6 +489,100 @@ function Collapsible({ label, body, tone }: { label: string; body: string; tone:
   )
 }
 
+// The pinned Agents tray: a docked strip between the transcript and the composer that
+// collects every subagent for this session (out of the conversation flow, so it's easy
+// to find and never scrolls away). Collapsible; header shows total + live count.
+function AgentsTray({ agents, running }: { agents: AgentView[]; running: boolean }) {
+  const [open, setOpen] = useState(true)
+  const active = agents.filter((a) => !a.result).length
+  return (
+    <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-mantle/60">
+      <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-2">
+        <button onClick={() => setOpen((v) => !v)} className="flex items-center gap-2 w-full text-[11px] text-ctp-subtext">
+          <span className="text-ctp-mauve" aria-hidden>◈</span>
+          <span className="font-medium">Agents</span>
+          <span className="text-ctp-overlay">{agents.length}</span>
+          {active > 0 && (
+            <span className="flex items-center gap-1 text-ctp-mauve">
+              <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />{active} running
+            </span>
+          )}
+          <span className="ml-auto text-ctp-surface2">{open ? '▾' : '▸'}</span>
+        </button>
+        {open && (
+          <div className="mt-1.5 space-y-1.5 max-h-64 overflow-y-auto">
+            {agents.map((a) => <AgentCard key={a.id} agent={a} running={running} />)}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// A subagent, rendered as a first-class card in the tray: it shows the agent's
+// EXISTENCE (type + task), STATUS (running / done / failed, live), and PROGRESS (its
+// own tool calls, nested). Collapsed by default — a one-line "N steps · last action"
+// ticker keeps it glanceable; expand for the full activity + result.
+function AgentCard({ agent, running }: { agent: AgentView; running: boolean }) {
+  const [open, setOpen] = useState(false)
+  const { type, description: desc, prompt, steps, result } = agent
+  const calls = steps.filter((s): s is Extract<TranscriptItem, { kind: 'tool_use' }> => s.kind === 'tool_use')
+  const done = !!result
+  const failed = result?.isError === true
+  const active = !done && running
+  const status = failed ? { label: 'failed', text: 'text-ctp-red', dot: 'bg-ctp-red' }
+    : done ? { label: 'done', text: 'text-ctp-green', dot: 'bg-ctp-green' }
+    : active ? { label: 'running', text: 'text-ctp-mauve', dot: 'bg-ctp-mauve animate-pulse' }
+    : { label: 'stopped', text: 'text-ctp-overlay', dot: 'bg-ctp-overlay' }
+  const last = calls[calls.length - 1]
+  const lastArg = last ? toolArg(last.name, (last.input ?? {}) as Record<string, unknown>) : ''
+  const border = active ? 'border-ctp-mauve/50' : failed ? 'border-ctp-red/40' : 'border-ctp-surface1'
+  return (
+    <div className={`animate-fade-in rounded-lg border ${border} bg-ctp-surface0/30 overflow-hidden`}>
+      <button onClick={() => setOpen((v) => !v)} className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-ctp-surface0/50">
+        <span className="shrink-0 text-ctp-mauve" aria-hidden>◈</span>
+        <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-ctp-mauve/15 text-ctp-mauve">{type}</span>
+        <span className="min-w-0 truncate text-[13px] font-medium text-ctp-text">{desc}</span>
+        <span className={`ml-auto shrink-0 flex items-center gap-1 text-[10px] ${status.text}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />{status.label}
+        </span>
+        <span className="shrink-0 text-ctp-surface2 text-[10px]">{open ? '▾' : '▸'}</span>
+      </button>
+
+      {/* Collapsed ticker: step count + the agent's most recent action. */}
+      {!open && (calls.length > 0 || active) && (
+        <div className="px-2.5 pb-1.5 -mt-0.5 text-[10px] text-ctp-overlay truncate">
+          {calls.length} step{calls.length === 1 ? '' : 's'}
+          {last && <span className="text-ctp-subtext"> · {last.name}{lastArg ? ` ${lastArg}` : ''}</span>}
+          {active && !last && <span className="text-ctp-mauve"> · starting…</span>}
+        </div>
+      )}
+
+      {open && (
+        <div className="px-2.5 pb-2 pt-1.5 space-y-2 border-t border-ctp-surface0">
+          {prompt && <Collapsible label="Task prompt" tone="overlay" body={prompt} />}
+          {steps.length > 0 && (
+            <div className="space-y-0.5">
+              <div className="text-[10px] uppercase tracking-wide text-ctp-overlay">Activity</div>
+              {steps.map((s) => s.kind === 'tool_use'
+                ? <ToolRow key={s.id} name={s.name} input={s.input} />
+                : s.kind === 'tool_result' ? <ResultRow key={s.id} content={s.content} isError={s.isError} /> : null)}
+            </div>
+          )}
+          {result && (
+            <div className="space-y-0.5">
+              <div className={`text-[10px] uppercase tracking-wide ${failed ? 'text-ctp-red/80' : 'text-ctp-overlay'}`}>{failed ? 'Error' : 'Result'}</div>
+              <div className={`text-xs max-h-72 overflow-y-auto ${failed ? 'text-ctp-red' : 'text-ctp-subtext'}`}>
+                <Markdown text={result.content} />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Compact token count: 210_234 → "210k". Sub-1k values shown as-is.
 function fmtTokens(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
@@ -491,9 +602,10 @@ const limitRank = (t?: string) => (t === 'five_hour' ? 0 : isWeekly(t) ? 1 : 9)
 
 // Always-visible status bar: session title + cwd, then model, real context usage
 // (tokens + %), cost, and a chip per rate-limit window (session / weekly).
-function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
+function MetaBar({ meta, session, title, cwd, mode, onSetMode, agentsRunning }: {
   meta: SessionMeta; session: SessionInfo; title?: string; cwd?: string
   mode: PermissionMode; onSetMode: (mode: PermissionMode) => void
+  agentsRunning: number
 }) {
   const tokens = meta.contextTokens
   const win = meta.contextWindow
@@ -529,6 +641,13 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
             ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pct}%)</span>
             : <span className="text-ctp-surface2">—</span>}
         </span>
+
+        {agentsRunning > 0 && (
+          <span className="flex items-center gap-1 text-ctp-mauve" title={`${agentsRunning} subagent${agentsRunning > 1 ? 's' : ''} running`}>
+            <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />
+            {agentsRunning} agent{agentsRunning > 1 ? 's' : ''} running
+          </span>
+        )}
 
         {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} />)}
       </div>

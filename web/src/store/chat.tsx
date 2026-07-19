@@ -16,8 +16,12 @@ export type TranscriptItem =
   | { kind: 'user'; id: string; text: string }
   | { kind: 'text'; id: string; text: string; streaming?: boolean }
   | { kind: 'thinking'; id: string; text: string; streaming?: boolean }
-  | { kind: 'tool_use'; id: string; name: string; input: unknown }
-  | { kind: 'tool_result'; id: string; toolUseId: string; isError: boolean; content: string }
+  // `toolId` = the anthropic tool_use block id (`toolu_…`); pairs a call with its
+  // tool_result and, for a `Task`, links its subagent's activity. `parentId` =
+  // `parent_tool_use_id`: set on a SUBAGENT's own calls/results, matching the parent
+  // Task's `toolId` — lets the UI nest an agent's work under its card.
+  | { kind: 'tool_use'; id: string; name: string; input: unknown; toolId?: string; parentId?: string }
+  | { kind: 'tool_result'; id: string; toolUseId: string; isError: boolean; content: string; parentId?: string }
   | { kind: 'result'; id: string; isError: boolean; costUsd?: number; durationMs?: number; errorText?: string }
   | { kind: 'notice'; id: string; text: string }
 
@@ -249,10 +253,13 @@ function parseAssistantBlocks(e: ClaudeEvent): AssistantBlock[] {
 // Turn one raw stream-json event into transcript items.
 function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
   const out: TranscriptItem[] = []
+  // On a subagent's own events this is the parent Task's tool id — tag its items so
+  // the UI can nest them under that agent's card.
+  const parentId = (() => { const p = (e as { parent_tool_use_id?: unknown }).parent_tool_use_id; return typeof p === 'string' && p ? p : undefined })()
   if (e.type === 'assistant') {
     const content = (e as { message?: { content?: unknown[] } }).message?.content ?? []
     for (const b of content as Array<Record<string, unknown>>) {
-      if (b.type === 'tool_use') out.push({ kind: 'tool_use', id: nextId(), name: String(b.name), input: b.input })
+      if (b.type === 'tool_use') out.push({ kind: 'tool_use', id: nextId(), name: String(b.name), input: b.input, toolId: typeof b.id === 'string' ? b.id : undefined, parentId })
       else if (fromReplay && b.type === 'text' && b.text) out.push({ kind: 'text', id: nextId(), text: String(b.text) })
       else if (fromReplay && b.type === 'thinking' && b.thinking) out.push({ kind: 'thinking', id: nextId(), text: String(b.thinking) })
     }
@@ -267,7 +274,7 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
         if (b.type === 'tool_result') {
           out.push({
             kind: 'tool_result', id: nextId(),
-            toolUseId: String(b.tool_use_id), isError: b.is_error === true, content: resultText(b.content),
+            toolUseId: String(b.tool_use_id), isError: b.is_error === true, content: resultText(b.content), parentId,
           })
         } else if (fromReplay && b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
           out.push({ kind: 'user', id: nextId(), text: b.text })
@@ -344,6 +351,16 @@ function metaFromResult(e: ClaudeEvent, knownModel?: string): Partial<SessionMet
   return meta
 }
 
+// A subagent (Task) message is nested under a Task tool_use: it carries
+// `parent_tool_use_id` on the live stream (or `isSidechain` on replayed transcript
+// events). Its model/usage belong to the SUBagent, not the session — folding its
+// context into the meter is what made the ctx bar jump to the agent's window. Gate
+// every meta-from-assistant update on this so the meter stays the session's own.
+function isSubagentEvent(e: ClaudeEvent): boolean {
+  const o = e as { parent_tool_use_id?: unknown; isSidechain?: unknown }
+  return (o.parent_tool_use_id != null && o.parent_tool_use_id !== '') || o.isSidechain === true
+}
+
 // Context fill = tokens processed as context on the LATEST assistant call.
 function contextFromAssistant(e: ClaudeEvent): Partial<SessionMeta> | null {
   const u = (e as { message?: { usage?: Record<string, number> } }).message?.usage
@@ -361,7 +378,7 @@ function metaFromReplay(events: ClaudeEvent[]): Partial<SessionMeta> {
     if (e.type === 'system' && (e as { subtype?: string }).subtype === 'init') {
       const m = (e as { model?: unknown }).model
       if (typeof m === 'string') meta.model = m
-    } else if (e.type === 'assistant') {
+    } else if (e.type === 'assistant' && !isSubagentEvent(e)) {
       const am = (e as { message?: { model?: unknown } }).message?.model
       if (typeof am === 'string') meta.model = am
       const cm = contextFromAssistant(e)
@@ -371,6 +388,58 @@ function metaFromReplay(events: ClaudeEvent[]): Partial<SessionMeta> {
     }
   }
   return meta
+}
+
+// The tool the model calls to spawn a subagent. Named `Task` on some CLIs and
+// `Agent` on others (FleetView) — match both so the Agents tray recognizes a
+// subagent regardless of which name this CLI emits.
+export const isSubagentTool = (name: string): boolean => name === 'Task' || name === 'Agent'
+
+// One subagent, assembled from a transcript: its `Task` call + its own nested
+// activity (steps) + its final result. Drives the Agents tray — the Task no longer
+// renders inline in the conversation.
+export interface AgentView {
+  id: string          // the Task item's local id (stable React key)
+  toolId?: string     // the anthropic tool id (pairs result + child activity)
+  type: string        // subagent_type
+  description: string
+  prompt?: string
+  steps: TranscriptItem[]                                   // the agent's own calls/results
+  result?: Extract<TranscriptItem, { kind: 'tool_result' }> // final output (present ⇒ finished)
+}
+
+// Pull every subagent out of a transcript. Groups each subagent's calls/results
+// (parentId === the Task's toolId) under its Task, and pairs the Task's result.
+export function collectAgents(items: TranscriptItem[]): AgentView[] {
+  const resultByTool = new Map<string, Extract<TranscriptItem, { kind: 'tool_result' }>>()
+  const childrenByParent = new Map<string, TranscriptItem[]>()
+  for (const it of items) {
+    if (it.kind === 'tool_result') resultByTool.set(it.toolUseId, it)
+    const pid = (it.kind === 'tool_use' || it.kind === 'tool_result') ? it.parentId : undefined
+    if (pid) { const a = childrenByParent.get(pid) ?? []; a.push(it); childrenByParent.set(pid, a) }
+  }
+  const agents: AgentView[] = []
+  for (const it of items) {
+    if (it.kind !== 'tool_use' || !isSubagentTool(it.name)) continue
+    const input = (it.input ?? {}) as { description?: string; prompt?: string; subagent_type?: string }
+    agents.push({
+      id: it.id, toolId: it.toolId,
+      type: input.subagent_type || 'agent',
+      description: input.description || 'Subagent task',
+      prompt: input.prompt,
+      steps: it.toolId ? childrenByParent.get(it.toolId) ?? [] : [],
+      result: it.toolId ? resultByTool.get(it.toolId) : undefined,
+    })
+  }
+  return agents
+}
+
+// How many Tasks are still in flight (no result yet). Drives the sidebar dot + the
+// MetaBar chip; callers gate on the session actually running.
+export function countRunningAgents(items: TranscriptItem[]): number {
+  const done = new Set<string>()
+  for (const it of items) if (it.kind === 'tool_result') done.add(it.toolUseId)
+  return items.reduce((n, it) => n + (it.kind === 'tool_use' && isSubagentTool(it.name) && it.toolId != null && !done.has(it.toolId) ? 1 : 0), 0)
 }
 
 interface ContextValue {
@@ -425,8 +494,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
         return
       }
-      // Each assistant message reports the context size of that model call.
       if (e.type === 'assistant') {
+        if (isSubagentEvent(e)) {
+          // Subagent (Task) message: its context is its own (don't touch the session
+          // meter); surface its tool calls as before (text stays replay-only).
+          const items = itemsFromEvent(e)
+          if (items.length) dispatch({ type: 'APPEND', sessionId: id, items })
+          return
+        }
+        // Main agent: fold context into the session meter, then reconcile the message's
+        // text/thinking/tool_use — this materializes text even for a client that didn't
+        // stream the turn from its start (the phone-joins-mid-turn case).
         const cm = contextFromAssistant(e)
         if (cm) dispatch({ type: 'SET_META', sessionId: id, meta: cm })
         dispatch({ type: 'ASSISTANT', sessionId: id, blocks: parseAssistantBlocks(e) })
