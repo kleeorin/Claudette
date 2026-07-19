@@ -8,6 +8,7 @@ import { NotebookView } from './components/NotebookView'
 import { TerminalView } from './components/TerminalView'
 import { GitPanelView } from './components/GitPanelView'
 import { FileManager } from './components/FileManager'
+import { KernelsPanel } from './components/KernelsPanel'
 import { PermissionsPanel } from './components/PermissionsPanel'
 import { SandboxPanel } from './components/SandboxPanel'
 import { FileEditorView } from './components/FileEditorView'
@@ -66,6 +67,7 @@ function Shell() {
 
   // Docks.
   const [dock, setDock] = useState<'files' | 'git' | 'permissions' | 'sandbox' | null>(null)
+  const [filesTab, setFilesTab] = useState<'files' | 'kernels'>('files')  // sub-tab of the Files dock
   // Terminals are PER SESSION — each session owns its own tabbed set of terminals
   // and its own dock open/closed state, so switching sessions swaps the whole
   // terminal dock (and every session's ptys keep running in the background). Each
@@ -130,6 +132,15 @@ function Shell() {
     setPane(activeId, (p) => ({
       tabs: p.tabs.some((t) => t.kind === 'file' && t.path === path) ? p.tabs : [...p.tabs, { kind: 'file', path }],
       active: { kind: 'file', path },
+    }))
+  }
+  // Focus an already-open notebook's tab (adding it if somehow absent) — used by the
+  // Files dock's open-notebook and by the Kernels tab's notebook list.
+  const focusNotebook = (id: string) => {
+    if (!activeId) return
+    setPane(activeId, (p) => ({
+      tabs: p.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'notebook', id }],
+      active: { kind: 'notebook', id },
     }))
   }
   const selectChat = () => { if (activeId) setPane(activeId, (p) => ({ ...p, active: null })) }
@@ -422,21 +433,36 @@ function Shell() {
           {dock && (
             <div className="shrink-0 min-h-0 border-l border-ctp-surface0" style={{ width: dockW }}>
               {dock === 'files' ? (
-                <FileManager
-                  key={termCwd}
-                  initialPath={termCwd}
-                  onOpenNotebook={(p) => void notebooks.openPath(p, activeId ?? undefined).then((id) => {
-                    // Focus the notebook's tab — including when it was already open,
-                    // where the newly-seen effect above wouldn't fire.
-                    if (id && activeId) setPane(activeId, (pane) => ({
-                      tabs: pane.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? pane.tabs : [...pane.tabs, { kind: 'notebook', id }],
-                      active: { kind: 'notebook', id },
-                    }))
-                  })}
-                  onOpenFile={openFile}
-                  onNewNotebook={(p) => notebooks.createPath(p, activeId ?? undefined)}
-                  onClose={() => setDock(null)}
-                />
+                <div className="flex flex-col h-full bg-ctp-base overflow-hidden">
+                  {/* Files ⇄ Kernels sub-tabs. */}
+                  <div className="shrink-0 flex bg-ctp-mantle border-b border-ctp-surface0 text-xs">
+                    {(['files', 'kernels'] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => setFilesTab(m)}
+                        className={`flex-1 py-1.5 capitalize transition-colors ${filesTab === m ? 'text-ctp-text border-b-2 border-ctp-mauve' : 'text-ctp-overlay hover:text-ctp-subtext border-b-2 border-transparent'}`}
+                      >{m}</button>
+                    ))}
+                  </div>
+                  <div className="flex-1 min-h-0">
+                    {filesTab === 'files' ? (
+                      <FileManager
+                        key={termCwd}
+                        initialPath={termCwd}
+                        onOpenNotebook={(p) => void notebooks.openPath(p, activeId ?? undefined).then((id) => {
+                          // Focus the notebook's tab — including when it was already open,
+                          // where the newly-seen effect above wouldn't fire.
+                          if (id) focusNotebook(id)
+                        })}
+                        onOpenFile={openFile}
+                        onNewNotebook={(p) => notebooks.createPath(p, activeId ?? undefined)}
+                        onClose={() => setDock(null)}
+                      />
+                    ) : (
+                      <KernelsPanel onFocus={focusNotebook} onClose={() => setDock(null)} />
+                    )}
+                  </div>
+                </div>
               ) : dock === 'git' ? (
                 <GitPanelView key={termCwd} cwd={termCwd} onClose={() => setDock(null)} />
               ) : !activeSession ? (
