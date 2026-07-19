@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events'
 import { randomUUID } from 'crypto'
-import { readFile, writeFile, rename, access } from 'fs/promises'
+import { readFile, writeFile, rename, access, realpath, rm } from 'fs/promises'
 import { watch, type FSWatcher } from 'fs'
 import { dirname, basename, resolve } from 'path'
 import type {
@@ -56,23 +56,30 @@ export class NotebookDocManager extends EventEmitter {
 
   // Open a notebook by path, reusing the doc if it's already open. Reads + parses
   // from disk on first open, mints stable ids, and starts watching the file.
-  async openPath(path: string): Promise<NotebookDoc> {
+  async openPath(path: string, guardRealDir?: string): Promise<NotebookDoc> {
     const abs = resolve(path)
     const existingId = this.byPath.get(abs)
     if (existingId) {
       this.pendingClose.delete(existingId)   // reopened before its deferred close fired
       return this.open.get(existingId)!.doc
     }
+    // SANDBOX.md G1: refuse a fresh read whose parent was relinked since authorization.
+    if (guardRealDir !== undefined) {
+      const now = await realpath(dirname(abs)).catch(() => null)
+      if (now !== guardRealDir) throw new Error(`refusing to open ${abs}: its directory changed since authorization (possible symlink-swap escape)`)
+    }
     const text = await readFile(abs, 'utf8')
     return this.register(abs, text)
   }
 
   // Create a fresh empty notebook at `path` (fails if it already exists), then open it.
-  async createPath(path: string): Promise<NotebookDoc> {
+  // `guardRealDir` (SANDBOX.md G1): the canonical parent dir the CALLER authorized — the
+  // write refuses if the parent has since been relinked out from under it.
+  async createPath(path: string, guardRealDir?: string): Promise<NotebookDoc> {
     const abs = resolve(path)
     if (await this.exists(abs)) throw new Error(`already exists: ${abs}`)
     const text = emptyNotebookText()
-    await this.atomicWrite(abs, text)
+    await this.atomicWrite(abs, text, guardRealDir)
     return this.register(abs, text)
   }
 
@@ -411,13 +418,13 @@ export class NotebookDocManager extends EventEmitter {
 
   // Write the doc through to disk (atomic temp+rename), clear dirty, refresh the
   // echo baseline so our own write doesn't come back as an "external" change.
-  async save(notebookId: string): Promise<void> {
+  async save(notebookId: string, guardRealDir?: string): Promise<void> {
     const nb = this.open.get(notebookId)
     if (!nb) return
     const text = serializeNotebook(nb.doc.cells, nb.meta)
     nb.writing = true
     try {
-      await this.atomicWrite(nb.doc.path, text)
+      await this.atomicWrite(nb.doc.path, text, guardRealDir)
       nb.baseline = text
       nb.doc.dirty = false
       nb.doc.conflict = false
@@ -604,10 +611,34 @@ export class NotebookDocManager extends EventEmitter {
 
   // Atomic write: temp file in the same dir + rename (same-filesystem, atomic on
   // POSIX) so a reader never sees a half-written notebook.
-  private async atomicWrite(abs: string, text: string): Promise<void> {
+  //
+  // SANDBOX.md G1 (TOCTOU symlink-swap): the caller authorized `abs` by canonicalizing it
+  // (realpath'ing the parent) at CHECK time, but this write re-resolves symlinks at
+  // syscall time — a confined box could swap the parent dir for a symlink in between and
+  // redirect the write out of its mounts. When the caller passes the parent realpath it
+  // authorized (`guardRealDir`), refuse if the parent's realpath no longer matches (it was
+  // relinked/moved since the check). We deliberately compare against the CHECKED value, not
+  // "parent must not be a symlink", so legitimate symlinked mount ancestors still work. The
+  // temp file is created with `wx` (O_EXCL) so a pre-planted final-component symlink can't
+  // be followed either. (A residual few-instruction window remains — the airtight fix is
+  // openat2/RESOLVE_NO_SYMLINKS, unavailable in Node; documented in SANDBOX.md.)
+  private async atomicWrite(abs: string, text: string, guardRealDir?: string): Promise<void> {
+    if (guardRealDir !== undefined) {
+      const now = await realpath(dirname(abs)).catch(() => null)
+      if (now !== guardRealDir) throw new Error(`refusing to write ${abs}: its directory changed since authorization (possible symlink-swap escape)`)
+    }
     const tmp = `${abs}.${randomUUID()}.tmp`
-    await writeFile(tmp, text, 'utf8')
-    await rename(tmp, abs)
+    await writeFile(tmp, text, { flag: 'wx' })
+    try {
+      if (guardRealDir !== undefined) {
+        const tmpDir = await realpath(dirname(tmp)).catch(() => null)
+        if (tmpDir !== guardRealDir) throw new Error(`refusing to write ${abs}: temp file resolved outside the authorized directory`)
+      }
+      await rename(tmp, abs)
+    } catch (e) {
+      await rm(tmp, { force: true }).catch(() => {})
+      throw e
+    }
   }
 }
 

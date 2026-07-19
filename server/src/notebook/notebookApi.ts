@@ -3,6 +3,7 @@ import type { NotebookDoc, CellLock, KernelStatus, KernelSpecsResponse, WsClient
 import type { WsHub } from '../ws/hub'
 import type { NotebookDocManager } from './notebookDocManager'
 import type { KernelManager } from '../jupyter/kernelManager'
+import { HOST_OWNER } from '../jupyter/kernelManager'
 
 // Mirrors sessionApi.ts: bridge the managers' events to the WS hub, register the
 // HTTP open/create/save/conflict routes, and route notebook WS client messages.
@@ -31,7 +32,11 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   app.post<{ Body: { path: string; sessionId?: string } }>('/api/notebook/open', async (req, reply) => {
     try {
       const doc = await notebooks.openPath(req.body.path)
-      if (req.body.sessionId) kernels.setOwner(doc.notebookId, req.body.sessionId)
+      // Always claim ownership so the kernel's confinement is decided (SANDBOX.md
+      // "Unowned-kernel escape"): a real session confines it to that box; no session
+      // (operator's own view) marks it HOST_OWNER so it runs on the host deliberately,
+      // distinct from a never-claimed notebook (which is refused).
+      kernels.setOwner(doc.notebookId, req.body.sessionId ?? HOST_OWNER)
       kernels.resync(doc.notebookId)   // reconnect a still-running kernel on reopen
       return { doc }
     } catch (e) {
@@ -42,7 +47,7 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   app.post<{ Body: { path: string; sessionId?: string } }>('/api/notebook/create', async (req, reply) => {
     try {
       const doc = await notebooks.createPath(req.body.path)
-      if (req.body.sessionId) kernels.setOwner(doc.notebookId, req.body.sessionId)
+      kernels.setOwner(doc.notebookId, req.body.sessionId ?? HOST_OWNER)   // see /open
       return { doc }
     } catch (e) {
       return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })

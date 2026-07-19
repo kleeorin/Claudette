@@ -200,3 +200,445 @@ private-netns purity.
 
 Honest ceiling: even perfect egress control still sends file contents to the model
 provider (inherent to using an LLM). We can block **third-party** exfil, not that.
+
+## Control-plane escape (in-box → unsandboxed session)
+
+The filesystem box confines *files*, but the session is Claude Code with a shell, and
+the network is shared (no `--unshare-net`). So a sandboxed (or prompt-injected) claude
+can reach the server's **control API** on loopback and ask it to create a session with
+`sandbox:{enabled:false}` (or `/` mounted rw) — a fully unconfined session. The box is
+an accident-guardrail, not a boundary against a motivated in-session agent.
+
+Three things enable it: (1) shared network → `127.0.0.1:<PORT>` is reachable from the
+box; (2) `/api/session/create` accepts a **caller-defined** sandbox, including none;
+(3) the box could obtain the auth token (it was in the child's env, and `.claudette-token`
+sat in the mounted project dir).
+
+**Done — env + token hygiene (closes the token-reachability leg):**
+- **A. `--clearenv`** in `wrapSandbox`/`wrapCommand` + a vetted allowlist
+  (`CLAUDE_ENV_ALLOW_PREFIXES`): the child no longer inherits the server's env, so
+  `CLAUDETTE_TOKEN` (and unrelated host secrets) never enter the box. Claude's own
+  auth/proxy/CA vars are passed through; a plain OAuth login needs none (creds live in
+  the bound `~/.claude`). Bonus: the confined Jupyter/kernel box no longer inherits
+  Claude's credentials either.
+- **B. Token off the mounts:** `rc_launch.sh` now persists the token under
+  `~/.config/claudette/` (never mounted), not the project dir, and migrates + removes a
+  legacy in-project `.claudette-token`.
+
+- **Token required even on loopback (done 2026-07-18).** A+B only bite if a token is
+  actually required, and a loopback bind with no `CLAUDETTE_TOKEN` used to run the
+  control API unauthenticated. `resolveAuth` now always requires a token: on loopback
+  with no env token it loads (or mints, 0600) the persistent one at
+  `~/.config/claudette/token` — the same file `rc_launch.sh` manages, outside every
+  sandbox mount, stable so devices stay logged in. `launch.sh` mirrors the source and
+  prints a ready-to-open `?token=` URL. Explicit opt-out: `CLAUDETTE_NO_AUTH=1`
+  (honored on loopback only; a non-loopback bind still refuses to start without an env
+  token — a silent file token shouldn't guard a deliberate exposure). Verified:
+  `scratchpad/auth-loopback-test.mjs` (17/17 — 401 without token, file minted + mode
+  600, cookie + Bearer + WS-upgrade gating, token stable across restart, opt-out open,
+  env token beats file).
+
+**C. Confinement can't be lowered by a request — DONE (2026-07-18).** Rather than try to
+distinguish an in-box caller from the real UI (unsolved), we made the privileged move
+*unavailable to everyone by default*: `normalizeSandbox` (`claude/sessionManager.ts`)
+**ignores `sandbox.enabled=false`** and forces confinement on, unless the operator launched
+with `CLAUDETTE_ALLOW_UNSANDBOXED=1` — a capability an in-box caller cannot grant itself.
+This is the single choke point for create / setSandbox / restore, so no path yields an
+unconfined session without the launch flag. (Sandbox mounts a caller supplies are still
+honored, but the app-source rw overlay below and the default-on confinement bound how much
+they can widen; broadening mounts is far less dangerous than `enabled:false` once the box
+holds no token.) Verified in `scratchpad/sandbox-escape-fixes-test.mts`.
+
+Note the layered result: even under `CLAUDETTE_NO_AUTH=1` (loopback open), a box that
+reaches `/api/session/create` still can't get an unconfined session (C), can't make the app
+source writable (self-mod fix), and any pane it makes is confined (terminal-pane fix) — the
+confinement guarantees are enforced in the session/pane logic, independent of auth. What
+`NO_AUTH` still exposes is the token-gated fs API (arbitrary host writes); the default
+(token required even on loopback, done) closes that because a confined box holds no token.
+
+**D. Cut the loopback reach — DEFERRED, now defense-in-depth (not a live escape).** With C
++ token-on-loopback + `--clearenv` (box has no token) + confined panes + confined kernels +
+read-only app source, every primitive reachable over loopback is either credential-gated
+(and the box holds no credential) or confined — so the shared network no longer *yields* an
+escape. Network isolation is still the durable belt-and-braces: **Level 3 `nftables`** to
+deny the box `127.0.0.1:<control-port>` while keeping DNS + Anthropic + the MCP port, or
+**Level 2** private-netns forwarding only the MCP port. Not implemented here because it's
+easy to break MCP+internet and hard to test without the operator; it closes enabler (1)
+but no longer gates a known escape.
+
+## Self-modification escape (rw-mounted server source + hot reload)
+
+The sharpest escape doesn't touch the API at all: **a session can rewrite the code of
+the process that sandboxes it.** The server runs *unsandboxed* (it's what spawns the
+bwrap boxes), and MCP tools (`mcp/appControlServer.ts`, `mcp/notebookTools.ts`) execute
+**in that server process**. In dev, the server is `tsx watch src/index.ts` — it
+**hot-reloads on any source change**. So if a session's read-write mounts include the
+running server's source tree (the "develop Claudette inside Claudette" case — cwd = the
+repo, mounted rw), the box can:
+
+- add a tool to `notebookTools.ts`, or rewrite `index.ts` / `sessionManager.ts` /
+  `sandbox.ts` itself, so it runs `child_process.exec(<anything>)`;
+- save the file → `tsx watch` reloads it → **arbitrary code in the host process**, with
+  the server's full privileges (token, whole host FS, network). No auth, no network
+  trick.
+
+Two flavors of "write MCP tools", only one of which escapes:
+- **MCP *config*** (`.mcp.json` in cwd, or `mcpServers` in the rw-mounted `~/.claude.json`;
+  `--strict-mcp-config` is not set, so claude loads them): the new stdio server is spawned
+  *by claude*, so it runs **inside** the box. Persistence/auto-run in-box, not an escape.
+- **MCP *tool code* / any server source**: runs **outside** the box via the reload path
+  above. Full RCE.
+
+Scope: this bites only when a session's rw mounts contain the running server's source AND
+it's in watch mode. A session sandboxed to some *other* project can't see the server
+source, so the vector is closed for it. But "dev Claudette in Claudette" is exactly that
+case, and is common.
+
+**FIXED (2026-07-18) — the app's own source is read-only inside every box by default.**
+`appSourceProtections` (`claude/sandbox.ts`) computes the running server's source dirs
+(`<appRoot>/server`, `<appRoot>/shared`; `appRoot` found by walking up from the module to
+the dir holding both, overridable with `CLAUDETTE_APP_ROOT`). When a session's mounts
+would expose those dirs **writable**, `bwrapBaseArgs` folds in an **`--ro-bind` overlay**
+of each — and because they're deeper paths than the rw mount that exposes them, bwrap's
+shallow-first layering makes just those subtrees read-only while the rest of a rw project
+(web/, docs, scratchpad, …) stays writable. So "dev Claudette in Claudette" still works for
+everything except editing the server's own source, and a confined box can't rewrite the
+code the host process would reload/restart. The overlay is added ONLY when a rw mount
+already exposes the source, so it never reveals source to an unrelated session.
+- **Opt out** (full rw source, e.g. actually developing the server in-box):
+  `CLAUDETTE_ALLOW_APP_SOURCE_MOUNT=1`. Combined with **not running `tsx watch` when
+  exposed** (serve built output; the current `npm run start` is non-watch), the self-mod
+  RCE is closed by default.
+- Verified in `scratchpad/sandbox-escape-fixes-test.mts` (server/ + shared/ resolve to
+  read-only; repo root stays rw; unrelated boxes get no source; flag lifts it) and a live
+  nested-bwrap run (writing `server/…` returns EROFS).
+
+**Deferred (harden):**
+- **`--strict-mcp-config`** so a session can't introduce MCP servers via project/user
+  config (minor — that flavor stays in-box — but tidy).
+- Node's own `node_modules` (incl. `tsx`) is still writable inside a repo-rw box; tampering
+  there only bites on the NEXT server start (not hot-reload), and overlaps the supply-chain
+  item — protect it too if the app root's `node_modules` should be treated as source.
+
+## Terminal-pane escape (unsandboxed pty spawn)
+
+**The terminal panes are not sandboxed at all** — this is the most direct escape of the
+set, and unlike the two above it needs no file write, no source tree, and no session
+config. `PaneManager.create()` (`pane/paneManager.ts`) does a bare:
+
+```js
+pty.spawn(process.env.SHELL || '/bin/bash', [], { cwd, env: process.env as … })
+```
+
+There is **no `wrapSandbox`** on this path. Claude *sessions* are spawned through bwrap
+(`claude/sandbox.ts`), but a terminal pane is a plain host pty. So the pane is a full,
+interactive, **unsandboxed shell running as the server's user**, and it inherits two
+things that make it worse than the fs-API primitive:
+
+- **`env: process.env`** — the pty gets the server's *entire* environment, including
+  `CLAUDETTE_TOKEN` and any other host secrets. Note this path is **not covered by fix A**
+  (`--clearenv` applies to `wrapSandbox`/`wrapCommand`, i.e. claude + kernels — not to
+  `pty.spawn`). So even after A ships, a pane still leaks the token.
+- **caller-controlled `cwd`** — `create(cwd, …)` takes an arbitrary absolute path,
+  unvalidated, so the shell can start anywhere on the host.
+
+**Reachability from inside a box.** The whole vector is driven over loopback with no
+extra capability the box doesn't have:
+1. `POST /api/pane/create {cwd:"/", cols, rows}` → returns a pane `id`
+   (`pane/paneApi.ts` → `PaneManager.create`).
+2. Open the app WebSocket `/ws?token=<token>` and send
+   `{type:"pane:input", id, data:"<shell> \n"}` → routed by `handlePaneClientMessage`
+   → `PaneManager.sendInput` → `proc.write(data)`. That's raw keystrokes into the pty:
+   **arbitrary command execution**, not just a file write.
+3. Output streams back as `pane:output` broadcasts (fanned to *every* WS client — a pane
+   is not scoped to its creator; any authed client can also read/drive a known pane id).
+
+The only gate is the WS auth token — and a sandboxed session inherits it in its env today
+(the same reason the control-plane escape works), so the gate is currently open to the box.
+
+**Demonstrated (2026-07-18):** created a pane at `cwd:/`, drove `whoami; ls
+~/Downloads; readlink /proc/$$/root` over `pane:input`. It ran as `kleeorin`, listed
+`~/Downloads` (a path *outside* this session's bwrap mounts, invisible to the box's own
+tools), and — the clincher — `/proc/<pid>/root` resolved to **`/`**, not a bwrap-remapped
+rootfs. A confined process would show the sandbox root there; `/` proves there is no mount/
+PID/namespace isolation on this pty whatsoever.
+
+**Relation to the other vectors.** Strictly the easiest of the three: the control-plane
+escape asks the server to *build* an unsandboxed session; self-modification needs a
+writable source tree + hot reload. Here the unsandboxed process already exists and is
+one HTTP POST + one WS frame away. It also gives an *interactive shell* (network, `curl`,
+`chmod`, cron, ssh-key drop, …), a superset of the fs API's write-a-file primitive.
+
+**FIXED (2026-07-18).** The pane pty now runs inside the owning session's box:
+- **`paneSpawnSpec` / `PaneManager.create`** (`pane/paneManager.ts`) resolve the session's
+  sandbox (via a resolver wired in `index.ts`, mirroring the kernel one) and, when it's
+  confined, spawn the shell through **`wrapCommand(cfg, cwd, shell, [])`** — the exact box
+  the session's Claude and Jupyter kernels get. `bwrapBaseArgs` `--clearenv`s it, so the
+  shell inherits no `CLAUDETTE_TOKEN`/host secrets. An UNconfined session's pane stays a
+  raw host shell (matching that session), but its env is still scrubbed of `CLAUDETTE_*`
+  (`sanitizedEnv`) as defense-in-depth.
+- **Verified** (`scratchpad/sandbox-escape-fixes-test.mts` argv assertions + a live
+  nested-bwrap run): a sandboxed pane's shell can't see `~/Downloads` (out-of-mount),
+  reads `$CLAUDETTE_TOKEN` as empty, and gets **read-only** `server/`+`shared/` while the
+  rest of the project stays writable (the self-mod overlay below).
+- The chdir honors the terminal's own cwd for UX; confinement comes from the session's
+  **mounts**, never the chdir (an out-of-mount cwd becomes an empty ro dir), so a
+  caller-chosen cwd can't widen visibility.
+
+**Still worth doing (defense-in-depth, not blocking):** owner-scope panes on the WS
+(`pane:input`/`pane:output` check the creating session) so one box can't drive/read
+another session's terminal — currently any authed client can, but the token is required
+even on loopback (done) and a confined box holds no token, so this is hardening, not a
+live hole.
+
+## Symlinked-mount escape (bwrap follows a symlinked bind source)
+
+`bwrap --bind SRC DEST` **follows a symlink at SRC and mounts its target** (verified
+live). Every data mount is emitted as `--bind <path> <path>` guarded only by `existsSync`
+(which follows symlinks) — no `lstat`/`realpath` check. The obligatory `<cwd>/.claude`
+mount lives *inside* the session's rw cwd, so a confined box can create it as a symlink:
+
+- box (rw cwd, no local `.claude`) runs `ln -s / <cwd>/.claude`;
+- `sandboxKey` folds in whether `<cwd>/.claude` exists, so the key flips and
+  `scheduleSandboxApply` **auto-relaunches** the session (resume-preserving) on the next
+  idle — no user click, no token;
+- the relaunch binds the link's target rw at `<cwd>/.claude` → the box now reads/writes
+  the entire target tree (`/` if pointed there), fully outside its mounts.
+
+Complete filesystem escape, self-triggered, needing no source tree, no API call, no
+credential.
+
+**FIXED (2026-07-18).** `bwrapBaseArgs` (`claude/sandbox.ts`) now runs each mount through
+`isUnsafeSymlinkMount`: a mount source that **is a symlink whose parent dir is box-
+writable** (inside some rw mount, by the mounts' *logical* dest paths — never a link's
+target, so a malicious link can't launder itself in) is **dropped with a warning**. The
+box-writable `<cwd>/.claude -> /` case is refused; a host-created symlink whose parent is
+*not* box-writable (e.g. `~/.claude` on a dotfiles symlink farm — `$HOME` isn't mounted)
+is kept and bound at its realpath. Verified in `scratchpad/sandbox-fs-escape-fixes-test.mts`
+(symlinked `<cwd>/.claude` and its target are never bound; real cwd + host-symlink mounts
+survive) and a live nested-bwrap run (the planted `.claude` is absent inside the box, so
+the secret is unreachable).
+
+## Notebook-MCP escape (unsandboxed arbitrary-path notebook read/write)
+
+The app-control MCP server and its notebook tool handlers (`mcp/notebookTools.ts`) run
+**in the unsandboxed server process**, and every session — sandboxed or not — is launched
+with that MCP server configured. So a confined session's Claude can call the notebook
+tools directly (the loopback URL token is embedded in its own launch config, not the app
+auth token), and the handler's file I/O is **not** confined to the session's mounts:
+
+- `read_notebook {path}` → `readFile(abs)` reads **any `.ipynb` on the host**, outside the
+  mounts, and returns every cell's source to the model (confidentiality escape);
+- `create_notebook {path}` / `edit_cell`/`add_cell {path}` + `save()` → `atomicWrite(abs)`
+  create or **overwrite any existing `.ipynb`** with attacker-controlled content
+  (integrity escape). Only the `.ipynb` extension bounds it.
+
+**FIXED (2026-07-18).** `registerNotebookTools` now takes a `NotebookSandboxResolver`
+(wired in `index.ts` the same way kernels/panes resolve a session's box). Before any path
+is opened/created/read/written, `accessError` calls `sandboxPathAccess(cfg, cwd, path)`
+(`claude/sandbox.ts`), which authorizes against the session's **data mounts** (`cfg.mounts`
+plus the obligatory global + local `.claude`): a write must land in a `rw` mount, a read in
+any mount, the **deepest** containing mount decides (matching bwrap's shallow-first
+layering), and both sides are canonicalized (symlinks resolved) so a link inside a mount
+can't launder access outward. An unconfined session (sandbox off / unavailable) keeps the
+old behavior. Verified in `scratchpad/sandbox-fs-escape-fixes-test.mts` (in-rw read+write,
+in-ro read-only, out-of-mount denied, global `.claude` reachable, symlink-out denied).
+
+**Note — the global `~/.claude` write→host-exec angle (documented, deferred).** `~/.claude`
+is always mounted **rw**, so a box can write `settings.json` hooks / plant agents / edit
+`<configDir>/.claude.json`; any plain `claude` the user later runs in a normal terminal
+(unsandboxed) would execute those. The write lands "inside a mount," but the effect is
+host-side. The durable fix is the per-session `CLAUDE_CONFIG_DIR` seeded with only
+credentials already floated above for the read side; until then this is a known tradeoff.
+
+## Venv-probe escape (unsandboxed exec of a discovered interpreter) — CRITICAL
+
+The kernel machinery auto-discovers a project's Python: `findNearestPython`
+(`jupyter/jupyterManager.ts`) walks up from a notebook's directory checking
+`.venv/bin/python3` / `venv/bin/python3` / `env/bin/python3`, and for each candidate runs
+`canImportJupyter` → **`execFile(candidate, ['-c', 'import jupyter_server'])`** — on the
+**unsandboxed server**, inheriting the server's full env (incl. `CLAUDETTE_TOKEN`).
+
+The notebook dir sits inside a confined session's **writable cwd**, so the box can plant
+its own executable there and get it run unsandboxed as the server user:
+
+1. box (rw cwd) writes an executable at `<cwd>/.venv/bin/python3` (any shell script);
+2. box calls `create_notebook` under its cwd (allowed) + `run_cell` — both box-reachable
+   MCP tools, no app token needed;
+3. `run_cell` → `KernelManager.serverFor` → `pythonFor` → `findNearestPython(<cwd>)` finds
+   the planted file and **executes it on the host**, with the server's env.
+
+Verified live: the planted binary ran with `HOME=/home/kleeorin` and the server's
+`CLAUDETTE_TOKEN` in its environment — full host compromise (read/write anywhere, and the
+token unlocks the token-gated fs/git/pane APIs). Strictly the most severe box-reachable
+vector found: no symlink, no source tree, no auth — one file write plus one MCP call.
+
+**FIXED (2026-07-18).** Discovery now carries the session's sandbox context
+(`findNearestPython(dir, sandbox)`, threaded through `pythonFor`/`serverFor`/
+`listKernelSpecs`). `canImportJupyter` probes a candidate whose **logical path lies in a
+box-writable mount** (`pathInWritableMount`, `claude/sandbox.ts` — logical, not realpath,
+so a symlink the box planted is still caught) **inside that session's box** via
+`wrapCommand`: a planted binary then runs confined (no token, no host FS; its escape
+attempts fail), while a real project venv still imports and launches. Candidates outside
+every rw mount — which the box could not have written — are probed directly, as before,
+and out-of-mount venvs are still ro-bound into the box for use. `listKernelSpecs` for a
+confined notebook now reads specs from that session's **confined** server rather than an
+unconfined `off:` one, so a box-writable interpreter is never launched unsandboxed even
+via the (token-gated) kernel picker. Verified in
+`scratchpad/sandbox-fs-escape-fixes-test.mts` (planted `.venv/bin/python3` does not
+execute on the host under confinement; unconfined behavior preserved).
+
+## Unowned-kernel escape (MCP-created/opened notebook runs its kernel unconfined) — CRITICAL
+
+The venv-probe fix threads a session's box through kernel discovery/launch — but **only
+when the notebook has an OWNER**. `KernelManager.sandboxForNotebook(notebookId)` looks up
+`owner.get(notebookId)` → `sandboxOf(sessionId)`; a notebook **no session owns** resolves
+to `undefined`, and `serverFor` then returns the shared **unconfined `off:` server**
+(`new JupyterManager(python)` → a plain `spawn(python, …, { env: {...process.env} })` at
+`root_dir=/`, carrying the server's full env **including `CLAUDETTE_TOKEN`**). Every kernel
+that server spawns runs **as the server user, outside every mount**.
+
+Ownership was set **only** on the fresh-open-with-focus path (`open_notebook`, or
+`targetDoc`'s open branch → `onFocus` → `setOwner`, wired in `index.ts`). Two
+**box-reachable** MCP paths skipped it, leaving the notebook unowned:
+
+- **`create_notebook`** never focuses, so it never set an owner; and
+- **`targetDoc`'s "already open" branch** returned the doc without claiming it.
+
+So a confined box, over the loopback MCP alone (no app token — the notebook tools use the
+box's own MCP URL token), could:
+
+1. `create_notebook {path:"<cwd>/pwn.ipynb"}` — passes the `sandboxPathAccess` gate (in its
+   rw cwd), leaves the notebook **unowned**;
+2. `add_cell {source:"<arbitrary python>"}` — the already-open branch, still unowned;
+3. `run_cell` → `ensureKernel` → `serverFor` → no owner → **unconfined kernel** → the cell
+   executes on the host, can **write anywhere** and read `CLAUDETTE_TOKEN` from its env.
+
+It also **silently bypassed the venv-probe fix**: with no owner, discovery ran
+`findNearestPython(dir, undefined)`, so a planted `<cwd>/.venv/bin/python3` was probed
+(executed) **on the host** again — the exact escape that fix closed, reachable through a
+path its test never drove (it called `findNearestPython` directly with an explicit box,
+not the `create_notebook`→`run_cell` MCP flow).
+
+**FIXED (2026-07-18).** Ownership is now claimed for the calling session on **every
+write/run** through the notebook tools, so the kernel that later executes is confined to
+that session's box:
+- **`notebookTools.ts`** — `targetDoc` calls `claimOwnership(sessionId, doc, need)` on both
+  the fresh-open and already-open branches (guarded to `need==='write'`, so a plain
+  `read_notebook` never steals a live kernel), and `create_notebook` calls
+  `kernels.setOwner(doc.notebookId, sid)` right after creating. Every mutating/running tool
+  (`edit/add/insert/delete/move/set_cell_type`, `run_cell`, `run_all`) resolves through
+  `targetDoc(need:'write')`, so all of them claim ownership **before** `ensureKernel` runs.
+- **`kernelManager.ts`** — `ensureKernel` now resolves the owner's required server **before**
+  reusing a kernel and reuses a live one **only** when it runs on that exact server
+  (`KernelClient.serverUrl`). If a notebook's confinement changed since its kernel started
+  (a sandboxed session claiming a notebook whose kernel was on the unconfined `off:`
+  server), the stale kernel is shut down and restarted on the correct confined server — so
+  a pre-existing unconfined kernel can't be reused either.
+- **Verified** in `scratchpad/sandbox-unowned-kernel-test.mts` (driving the real MCP
+  handlers: `create_notebook`, `edit_cell` on an already-open notebook, and `run_cell` all
+  leave the notebook owned by the calling session → its kernel takes the confined server;
+  `read_notebook` claims nothing). Existing sandbox tests still pass (server typecheck
+  clean).
+
+## The confinement seam (fail-closed, one place) — holistic hardening
+
+Every escape above is the same shape: a server-side actor doing work **on behalf of a
+session** while running *outside* that session's box. The defenses split into two kinds —
+**executors** (kernel, terminal pty, subprocess spawns) that must *run inside* the box, and
+**in-process handlers** (the MCP notebook tools) that can't be boxed and must instead
+*authorize their file/exec effects* against the box's mounts. The recurring root cause was
+that each actor resolved a session's box on its own, with the same fragile shape:
+
+```ts
+(sessionId) => { const s = sessions.get(sessionId); return s?.sandbox ? { cfg, cwd } : undefined }
+```
+
+That `undefined` **conflated two cases** — "deliberately unconfined" and "I couldn't resolve
+this session" — and both defaulted to *run on the host*. So a missing owner, an unknown id,
+or a torn-down session silently became **unconfined**. The notebook-MCP, venv-probe, and
+unowned-kernel escapes are all that one fail-**open** default.
+
+**DONE (2026-07-18) — a single fail-closed resolver.** `claude/sessionConfinement.ts`
+(`SessionConfinement`) is the one seam all three actors now share (wired once in `index.ts`,
+passed to `KernelManager`, `registerNotebookTools`, and `PaneManager`). `resolve(sessionId)`
+returns a three-way decision that keeps the two cases distinct:
+
+| mode | when | file op (`authorizePath`) | executor |
+|------|------|---------------------------|----------|
+| `confined` | known, sandbox-enabled, host can sandbox | inside mounts only (rw for writes) | wrapped in the session's box |
+| `host` | operator opted the session out, or host can't sandbox | allowed (already token-gated, single-user) | raw host spawn, env scrubbed |
+| **`deny`** | **session unknown / unresolved** | **denied** | **data-mount-less box** (kernel: refused) |
+
+The load-bearing change is the middle case no longer collapsing into `host`: an unresolved
+session is `deny`, the most-restrictive branch. Consequences enforced through the seam:
+- **Notebook MCP tools** — `accessError` is just `confinement.authorizePath(...)`; an
+  unknown session is denied instead of allowed whole-FS.
+- **Kernels** — `KernelManager.confinementForNotebook` maps a notebook's owner through the
+  seam; **no owner ⇒ `deny` ⇒ the kernel is refused**, never dropped to the shared `off:`
+  server. A notebook opened by the operator with no session is tagged `HOST_OWNER`
+  (deliberate host kernel), kept distinct from *never-claimed* (refused).
+- **Terminal panes** — `paneSpawnSpec` takes the decision directly; `deny` yields a
+  data-mount-less bwrap box (or refuses when the host can't sandbox), never a host shell.
+
+Net effect: the *next* server-side actor that forgets to thread a session through degrades
+to "broken but safe," not "host RCE." Verified in `scratchpad/session-confinement-test.mts`
+(unknown/undefined → `deny`; opted-out/no-sandbox → `host`; enabled → `confined`;
+`authorizePath` denies the unknown session and gates the confined one), plus the pane
+`deny`-mode assertion in `scratchpad/sandbox-escape-fixes-test.mts` and the reworked
+`sandbox-unowned-kernel-test.mts`. Server typecheck clean; all sandbox tests green.
+
+**Not covered by the seam (unchanged, still true):** it's a filesystem-write firewall, not a
+network or secrecy boundary — the shared network still allows exfil, and the always-rw
+`~/.claude` still lets a box plant hooks/agents a *later* unsandboxed `claude` would run
+(the write "lands in a mount," but the effect is deferred host-side). Both remain documented
+tradeoffs; the durable fix for the latter is the per-session `CLAUDE_CONFIG_DIR` floated above.
+
+## G1 — Notebook-write/read TOCTOU (symlink swap between check and I/O)
+
+Found during the "verify no more gaps" audit and **confirmed live**
+(`scratchpad/sandbox-toctou-check.mts`). The notebook MCP tools authorize a path by
+*canonicalizing* it — `sandboxPathAccess`→`canonicalizeForAccess` realpaths the parent of a
+not-yet-existing file — but the actual I/O (`NotebookDocManager.atomicWrite` /`openPath`)
+re-resolves symlinks at syscall time. A confined box that owns a rw mount can win a race:
+
+1. box makes a real dir `<rwmount>/d`, calls `create_notebook("<rwmount>/d/x.ipynb")`; the
+   gate canonicalizes parent `<rwmount>/d` → in-mount → allowed;
+2. between the check and the write, the box's shell swaps it: `rmdir d && ln -s /etc d`;
+3. `atomicWrite` writes `<rwmount>/d/x.ipynb.tmp` → follows the symlink → `/etc/…` and
+   renames into place — a write **outside the mounts** (bounded to `.ipynb` names; the read
+   direction leaks an out-of-mount file only if it parses as a notebook).
+
+**FIXED (2026-07-18).** The containment decision and the write-guard are now bound to **one**
+filesystem observation, so nothing can slip between "authorized" and "guarded":
+- **`SessionConfinement.authorizeResolved(sid, realDir, base, need)`** authorizes an I/O whose
+  parent the caller has *already* realpath'd to `realDir`, deciding containment on
+  `join(realDir, base)` — the exact value the caller then pins as the guard. (A plain
+  `authorizePath` + a *second* realpath would leave a swap window between the two.)
+- **`notebookTools.ts` `gate()`** does that single `realpath(dirname)`, passes the canonical
+  dir as `guard`, and **re-gates at every write AT WRITE TIME** (`applyAndSave`, `run_cell`,
+  `run_all` gate on `doc.path` right before `save`, not just at open) so a swap between open
+  and save is caught too.
+- **`NotebookDocManager.atomicWrite`/`openPath`** take the `guard` and refuse if
+  `realpath(dirname(abs))` no longer equals it (parent relinked since authorization); the temp
+  file is created `wx` (O_EXCL) so a pre-planted final-component symlink can't be followed.
+- Verified (`scratchpad/sandbox-toctou-check.mts`, 8/8): legit in-mount write works;
+  swap-*after*-authorize is refused (guard mismatch) with nothing escaping; swap-*before*-
+  authorize is denied (decision + guard from the same realpath); the read path is likewise
+  refused.
+
+**Residual (documented, irreducible in Node):** a sub-syscall window remains *inside*
+`atomicWrite`, between its `realpath` re-check and the `writeFile` open — a parent swap landing
+in those few instructions could still redirect the write. Closing it fully needs
+`openat2(RESOLVE_NO_SYMLINKS)` / a dir-fd relative write, which Node doesn't expose; the guard
+shrinks the exploitable window from "unbounded (any time before the write)" to that few-
+instruction race, which is extremely hard to win repeatably. The airtight fix is to do the
+write from a dir-fd (native addon) or inside the box.
+
+## Removed: `JupyterManager.install()` latent footgun
+
+The audit also found `JupyterManager.install()` — dead code (zero callers) that built
+`sh -c "${py} -m pip install …"` and ran it **unsandboxed** with a possibly box-writable `py`.
+Harmless while uncalled, but a wired-up future caller would be a box-reachable unconfined-RCE.
+**Removed** rather than left as a trap; if reintroduced, route it through `wrapCommand` like the
+other spawns.

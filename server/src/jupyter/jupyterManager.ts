@@ -2,7 +2,15 @@ import { spawn, execFile, type ChildProcess } from 'child_process'
 import { randomBytes } from 'crypto'
 import { access } from 'fs/promises'
 import { constants } from 'fs'
+import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
+import type { SandboxConfig, SandboxMount } from '@claudette/shared'
+import { wrapCommand, sandboxAvailable, pathVisibleInSandbox, pathInWritableMount } from '../claude/sandbox'
+
+// An optional per-server confinement: run the Jupyter server (and therefore every
+// kernel it spawns) inside a session's bwrap box, so notebook execution can't reach
+// outside the mounts. Given by KernelManager per sandboxed session (see SANDBOX.md).
+export interface JupyterSandbox { cfg: SandboxConfig; cwd: string }
 
 // Runs a local Jupyter server and hands back a 127.0.0.1 URL + token. Ported from
 // ClaudeMaster's `main/jupyterManager.ts`, LOCAL branch only — the remote/SSH spawn
@@ -16,12 +24,15 @@ export interface JupyterInfo { url: string; token: string }
 // `venv/bin/python3` at each level for an interpreter that can actually import
 // jupyter_server; return the first hit, else null. (CM ran this over SSH in one
 // shell loop; local we walk in node.) An explicit pythonPath always wins upstream.
-export async function findNearestPython(startDir: string): Promise<string | null> {
+// `sandbox`, when given, is the session this discovery is for — candidates inside its
+// writable mounts are probed INSIDE its box (see canImportJupyter) so a confined
+// session can't turn a planted `.venv/bin/python3` into unsandboxed host RCE.
+export async function findNearestPython(startDir: string, sandbox?: JupyterSandbox): Promise<string | null> {
   let d = resolve(startDir)
   for (;;) {
-    for (const v of ['.venv', 'venv']) {
+    for (const v of ['.venv', 'venv', 'env']) {
       const py = join(d, v, 'bin', 'python3')
-      if (await isExecutable(py) && await canImportJupyter(py)) return py
+      if (await isExecutable(py) && await canImportJupyter(py, sandbox)) return py
     }
     const parent = dirname(d)
     if (parent === d) return null   // reached '/'
@@ -48,9 +59,24 @@ async function waitReachable(url: string, token: string): Promise<void> {
 async function isExecutable(p: string): Promise<boolean> {
   return access(p, constants.X_OK).then(() => true, () => false)
 }
-function canImportJupyter(py: string): Promise<boolean> {
+// Probe whether `py` can import jupyter_server. SECURITY (SANDBOX.md "Venv-probe
+// escape"): `py` may live in a confined session's WRITABLE cwd, where the box could
+// plant a malicious "python3". Running it here — in the unsandboxed server, with the
+// server's full env incl. CLAUDETTE_TOKEN — is arbitrary host RCE (verified). So when
+// the candidate's path lies in a box-writable mount, run the probe INSIDE that session's
+// box (wrapCommand): a planted binary then executes confined (harmless) while a real
+// project venv still imports fine. Candidates the box could NOT have placed (outside
+// every rw mount — the box can't write there) are probed directly, as before.
+function canImportJupyter(py: string, sandbox?: JupyterSandbox): Promise<boolean> {
+  let cmd = py
+  let args = ['-c', 'import jupyter_server']
+  if (sandbox && sandboxAvailable() && pathInWritableMount(sandbox.cfg, sandbox.cwd, py)) {
+    const wrapped = wrapCommand(sandbox.cfg, sandbox.cwd, py, args)
+    cmd = wrapped.command
+    args = wrapped.args
+  }
   return new Promise((res) => {
-    execFile(py, ['-c', 'import jupyter_server'], (err) => res(!err))
+    execFile(cmd, args, (err) => res(!err))
   })
 }
 
@@ -59,8 +85,10 @@ export class JupyterManager {
   private infoPromise: Promise<JupyterInfo | null> | null = null
 
   // `pythonPath` is the interpreter to launch Jupyter with (e.g. from
-  // findNearestPython); defaults to the ambient `python3`.
-  constructor(private pythonPath = 'python3') {}
+  // findNearestPython); defaults to the ambient `python3`. `sandbox`, when given AND
+  // the host can confine, runs the whole server inside that bwrap box so its kernels
+  // are confined too.
+  constructor(private pythonPath = 'python3', private sandbox?: JupyterSandbox) {}
 
   start(): Promise<JupyterInfo | null> {
     if (this.infoPromise) return this.infoPromise
@@ -70,7 +98,7 @@ export class JupyterManager {
 
   private _spawnLocal(): Promise<JupyterInfo | null> {
     const token = randomBytes(24).toString('hex')
-    const proc = spawn(this.pythonPath, [
+    const jupyterArgv = [
       '-m', 'jupyter', 'server',
       '--no-browser',
       '--port=0',
@@ -83,8 +111,58 @@ export class JupyterManager {
       // Root at "/" so a kernel can start in any notebook's directory (passed as a
       // path relative to root_dir), which sets the kernel cwd.
       '--ServerApp.root_dir=/',
-    ], { env: process.env as Record<string, string> })
+    ]
+    const proc = this.sandbox && sandboxAvailable()
+      ? this._spawnSandboxed(jupyterArgv)
+      : spawn(this.pythonPath, jupyterArgv, { env: this._launchEnv() })
     return this._await(proc, token)
+  }
+
+  // `python -m jupyter server` finds the `jupyter-server` subcommand by scanning PATH,
+  // so a stray/broken `jupyter-server` earlier on PATH (e.g. a system /usr/local/bin
+  // stub whose python lacks jupyter_server) shadows the venv's and the server dies with
+  // "No module named 'jupyter_server'". Prepend the launch interpreter's own bin dir so
+  // ITS subcommands win — the same precedence `source .venv/bin/activate` would give.
+  // No-op for the bare `python3` (not an absolute path ⇒ nothing to prepend).
+  private venvBinPath(base = process.env.PATH ?? ''): string | undefined {
+    if (!this.pythonPath.startsWith('/')) return undefined
+    const bin = dirname(this.pythonPath)
+    return base ? `${bin}:${base}` : bin
+  }
+  private _launchEnv(): Record<string, string> {
+    const env = { ...process.env } as Record<string, string>
+    const p = this.venvBinPath()
+    if (p) env.PATH = p
+    return env
+  }
+
+  // Run the server inside the session's box. The kernelspecs + auto-venv launcher live
+  // under the user Jupyter data dir (~/.local/share/jupyter) which isn't otherwise in
+  // the sandbox, so mount it ro and point JUPYTER_PATH at it; the runtime dir must be
+  // WRITABLE, so send it to the sandbox's tmpfs /tmp. The kernels this server spawns
+  // inherit the box; kernel↔server ZMQ works because we don't --unshare-net.
+  private _spawnSandboxed(jupyterArgv: string[]): ChildProcess {
+    const dataDir = join(homedir(), '.local', 'share', 'jupyter')
+    const extraMounts: SandboxMount[] = [{ path: dataDir, mode: 'ro' }]
+    // The launch interpreter (e.g. a project's …/.venv/bin/python3) must be visible
+    // INSIDE the box to exec. When it lives under cwd it already is (cwd is bound); an
+    // ancestor/out-of-tree venv is NOT, so ro-bind its prefix (…/.venv) — skipping the
+    // bare `python3` (resolved from /usr, already in the baseline) and any interpreter
+    // a mount already covers, so we never re-bind (or accidentally override) cwd.
+    if (this.pythonPath.startsWith('/')) {
+      const prefix = dirname(dirname(this.pythonPath))   // …/.venv/bin/python3 → …/.venv
+      if (!pathVisibleInSandbox(this.sandbox!.cfg.mounts, prefix)) extraMounts.push({ path: prefix, mode: 'ro' })
+    }
+    const extraEnv: Record<string, string> = { JUPYTER_PATH: dataDir, JUPYTER_RUNTIME_DIR: '/tmp/jupyter-runtime' }
+    // Same PATH precedence fix as the unconfined spawn, but set INSIDE the box (bwrap
+    // passes our env through, so the venv bin must be prepended via --setenv here too).
+    const p = this.venvBinPath()
+    if (p) extraEnv.PATH = p
+    const { command, args } = wrapCommand(this.sandbox!.cfg, this.sandbox!.cwd, this.pythonPath, jupyterArgv, {
+      extraMounts,
+      extraEnv,
+    })
+    return spawn(command, args, { env: process.env as Record<string, string> })
   }
 
   // Jupyter prints its listening URL to stderr; the first such line means it's up.
@@ -122,20 +200,6 @@ export class JupyterManager {
   private reset(): void {
     this.server = null
     this.infoPromise = null
-  }
-
-  // pip-install the server + kernel into the launch interpreter. PEP-668
-  // "externally managed" interpreters refuse a plain install → --break-system-packages.
-  install(): Promise<boolean> {
-    const pkgs = 'jupyter-server notebook ipykernel'
-    const py = this.pythonPath
-    const script = `${py} -m pip install ${pkgs} || ${py} -m pip install --break-system-packages ${pkgs}`
-    return new Promise((resolve) => {
-      const proc = spawn('sh', ['-c', script], { env: process.env as Record<string, string> })
-      proc.on('exit', (code) => resolve(code === 0))
-      proc.on('error', () => resolve(false))
-      setTimeout(() => resolve(false), 300_000)
-    })
   }
 
   destroy(): void {

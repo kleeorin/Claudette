@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'child_process'
 import { existsSync, realpathSync, lstatSync, readlinkSync, copyFileSync, mkdirSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import path from 'path'
+import { fileURLToPath } from 'url'
 import type { SandboxConfig, SandboxMount } from '@claudette/shared'
 
 // Wraps a `claude …` invocation in a bubblewrap sandbox that confines the process
@@ -20,6 +21,111 @@ const BWRAP = 'bwrap'
 export interface SandboxSpawn {
   command: string
   args: string[]
+}
+
+// --- environment hygiene (SANDBOX.md "env isolation") ------------------------
+// The child used to inherit the SERVER's whole environment (spawned with
+// env: process.env, and bwrap never cleared it). That handed the sandboxed claude
+// the app's own CLAUDETTE_TOKEN — with which it could authenticate to the loopback
+// control API and create an UNSANDBOXED session, escaping the box. So we now
+// --clearenv and re-set only a vetted allowlist.
+//
+// Vars claude legitimately needs from the environment (auth for API-key / Bedrock /
+// Vertex setups, corporate proxy + CA config). Matched by prefix; passed through
+// ONLY when present. Everything else — including CLAUDETTE_* and any unrelated host
+// secret (DB URLs, GitHub tokens, …) — is dropped. `claude`'s normal OAuth creds
+// live in ~/.claude (a bound mount), not env, so a plain login needs none of these.
+const CLAUDE_ENV_ALLOW_PREFIXES = [
+  'ANTHROPIC_', 'CLAUDE_CODE_', 'AWS_', 'GOOGLE_', 'GCLOUD_', 'CLOUDSDK_', 'VERTEX', 'BEDROCK',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+  'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE',
+]
+
+// Locale/term vars kept for ANY confined program (harmless, and their absence
+// breaks UTF-8 output). Never secret.
+const BASE_ENV_KEYS = ['TERM', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_NUMERIC', 'LC_TIME', 'TZ']
+
+// The standard system PATH inside the box. Callers prepend program-specific bin dirs
+// (node, claude, a venv) so absolute-launched programs can still find sibling tools.
+const BASE_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+// Emit `--setenv K V` pairs for the process-env keys we choose to pass through:
+// the always-kept locale set, plus any key matching an allowed prefix — but NEVER a
+// CLAUDETTE_* var (our own secrets) even if a prefix would otherwise catch it.
+function passthroughEnvArgs(allowPrefixes: string[]): string[] {
+  const out: string[] = []
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v == null) continue
+    if (k.startsWith('CLAUDETTE')) continue
+    const keep = BASE_ENV_KEYS.includes(k) || allowPrefixes.some((p) => k.startsWith(p))
+    if (keep) out.push('--setenv', k, v)
+  }
+  return out
+}
+
+// --- confinement policy (SANDBOX.md escape-vector fixes) ---------------------
+// Two operator-only opt-outs. Both DEFAULT OFF so a (possibly in-box) request can
+// never lower confinement by itself — only the person who launched the server can.
+//
+//   CLAUDETTE_ALLOW_UNSANDBOXED=1       — permit sessions with sandbox disabled.
+//   CLAUDETTE_ALLOW_APP_SOURCE_MOUNT=1  — permit a box to have the server's own
+//                                         source tree WRITABLE (re-enables the
+//                                         self-modification escape; for dev-in-app).
+export function unsandboxedAllowed(): boolean {
+  return process.env.CLAUDETTE_ALLOW_UNSANDBOXED === '1'
+}
+export function appSourceMountAllowed(): boolean {
+  return process.env.CLAUDETTE_ALLOW_APP_SOURCE_MOUNT === '1'
+}
+
+// The repo/install root of THIS running server — the tree whose code a restart (or a
+// `tsx watch` hot-reload) would execute in the unsandboxed host process. Found by
+// walking up from this module to the dir that holds both `server/` and `shared/`;
+// overridable with CLAUDETTE_APP_ROOT. Cached.
+let cachedAppRoot: string | undefined
+export function appSourceRoot(): string {
+  if (cachedAppRoot) return cachedAppRoot
+  const override = process.env.CLAUDETTE_APP_ROOT
+  if (override) return (cachedAppRoot = path.resolve(override))
+  let dir = path.dirname(fileURLToPath(import.meta.url))   // …/server/src/claude
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(path.join(dir, 'server')) && existsSync(path.join(dir, 'shared'))) return (cachedAppRoot = dir)
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  // Fallback: server/src/claude → repo root is three levels up.
+  return (cachedAppRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'))
+}
+
+// The server's own executable source dirs — what the self-modification escape needs
+// WRITABLE (edit a tool / index.ts → reload/restart runs it unsandboxed). web/ is
+// client-only (not executed by the server process), so it is not a self-mod vector.
+function appSourceDirs(): string[] {
+  const root = appSourceRoot()
+  return [path.join(root, 'server'), path.join(root, 'shared')].filter((d) => existsSync(d))
+}
+
+// Read-only overlays that keep the server's own source read-only inside a box that
+// would OTHERWISE expose it writable (SANDBOX.md "Self-modification escape"). Emitted
+// only when some rw mount is an ancestor-or-equal of a source dir — so we never REVEAL
+// source to a session that didn't already mount it, and (because they're deeper paths)
+// bwrap layers them ON TOP of the broader rw bind, making just that subtree ro. The
+// rest of a rw project (web/, docs, scratchpad, …) stays writable. Opt out to keep the
+// source rw (dev-in-app) with CLAUDETTE_ALLOW_APP_SOURCE_MOUNT=1.
+function appSourceProtections(dataMounts: SandboxMount[]): SandboxMount[] {
+  if (appSourceMountAllowed()) return []
+  const out: SandboxMount[] = []
+  for (const dir of appSourceDirs()) {
+    const rd = path.resolve(dir)
+    const exposedRw = dataMounts.some((m) => {
+      if (m.mode !== 'rw') return false
+      const mp = path.resolve(m.path)
+      return mp === rd || rd.startsWith(mp + path.sep)
+    })
+    if (exposedRw) out.push({ path: rd, mode: 'ro' })
+  }
+  return out
 }
 
 // --- availability probe ------------------------------------------------------
@@ -95,9 +201,19 @@ function dnsMounts(): SandboxMount[] {
 
 // Build the full bwrap argv wrapping `claudeArgv` (the `claude …` args). `cwd` is
 // the session's working dir (chdir target + default writable mount from the caller).
-export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: string): SandboxSpawn {
+// Build the bwrap argv up to (but not including) the program: the system baseline,
+// the given data mounts (bound rw/ro, shallowest-first), the dropped-cwd guard, and
+// `--chdir cwd --setenv HOME`. Shared by wrapSandbox (claude) and wrapCommand (any
+// program, e.g. the Jupyter server) so both confine identically. Callers append their
+// own extra --setenv and the program+argv.
+function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[]): string[] {
   const home = homedir()
   const args: string[] = [
+    // Start from an EMPTY environment (see CLAUDE_ENV_ALLOW_PREFIXES): the child must
+    // not inherit the server's env, which carries CLAUDETTE_TOKEN. Everything the
+    // program needs is re-set explicitly below / by the caller. --clearenv must come
+    // before every --setenv, since it wipes the env at the point it appears.
+    '--clearenv',
     '--unshare-ipc', '--unshare-pid', '--unshare-uts',
     // NB: deliberately NO --unshare-net (shared network → loopback MCP + internet).
     '--die-with-parent',
@@ -106,6 +222,10 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
     '--tmpfs', '/tmp',
     '--ro-bind', '/usr', '/usr',
     '--ro-bind', '/etc', '/etc',
+    // Re-seed a safe baseline env. A caller that needs node/claude/venv on PATH
+    // overrides PATH with a fuller value AFTER this (last --setenv for a key wins).
+    '--setenv', 'PATH', BASE_PATH,
+    ...passthroughEnvArgs([]),   // locale/TZ only at the base; program creds added per-caller
   ]
   // usrmerge: recreate /bin /sbin /lib /lib64 as symlinks when the host has them as
   // symlinks (so the dynamic loader resolves); ro-bind them if they're real dirs.
@@ -115,37 +235,30 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
     else args.push('--ro-bind', d, d)
   }
 
-  // Runtime baseline. Two kinds: the dirs claude needs to EXECUTE (DNS, claude/node
-  // installs), and the OBLIGATORY data mounts — the global config dir (~/.claude,
-  // where creds + memory live) and the project-local .claude — both rw. These are the
-  // only enforced data mounts: they're always present so Claude keeps its config and
-  // memory even when the caller makes cwd read-only or drops it entirely.
-  const baseline: SandboxMount[] = [
-    ...dnsMounts(),
-    ...runtimeInstallMounts(),
-    { path: claudeConfigDir(), mode: 'rw' },
-    { path: path.join(cwd, '.claude'), mode: 'rw' },   // local .claude (skipped below if absent)
-  ]
-
-  // User mounts as-is. cwd is NO LONGER force-added, so it's fully optional — rw (the
-  // default a new session seeds), ro, or removed. De-dupe by path (last wins).
-  const userMounts = dedupeMounts(cfg.mounts)
-
   // Emit ALL binds shallowest-path-first so a rw pocket nested in a ro tree layers
-  // correctly (bwrap applies binds in argv order; a later, deeper bind wins).
-  const allMounts = sortShallowFirst([...baseline, ...userMounts])
+  // correctly (bwrap applies binds in argv order; a later, deeper bind wins). Fold in
+  // the app-source ro overlays (self-modification fix): being deeper than the rw mount
+  // that exposes them, they sort AFTER it and win, pinning the server's own source ro.
+  const allMounts = sortShallowFirst([...dataMounts, ...appSourceProtections(dataMounts)])
+  // The box-WRITABLE mountpoints (by their logical/dest path — that's where the box
+  // writes, regardless of where a symlink source points). Used to catch a dangerous
+  // symlinked mount source below.
+  const rwRoots = allMounts
+    .filter((m) => m.mode === 'rw' && existsSync(m.path))
+    .map((m) => path.resolve(m.path))
   for (const m of allMounts) {
     if (!existsSync(m.path)) continue
+    if (isUnsafeSymlinkMount(m.path, rwRoots)) continue   // escape guard (see fn)
     args.push(m.mode === 'rw' ? '--bind' : '--ro-bind', m.path, m.path)
   }
 
   // `--chdir cwd` (below) needs cwd to EXIST inside the sandbox. It does whenever a
   // mount lies on cwd's lineage: cwd itself, an ancestor (cwd sits inside it), or a
   // descendant like <cwd>/.claude (whose bind auto-creates the parent cwd). Only if
-  // NOTHING touches that lineage — cwd dropped AND no local .claude — do we present
-  // cwd as an empty READ-ONLY mountpoint (an ro-bound empty dir, NOT a writable
-  // `--dir`): chdir still resolves and the project stays invisible, but writes to cwd
-  // fail HARD (EROFS) instead of silently landing in throwaway tmpfs and being lost.
+  // NOTHING touches that lineage do we present cwd as an empty READ-ONLY mountpoint
+  // (an ro-bound empty dir, NOT a writable `--dir`): chdir still resolves and the
+  // project stays invisible, but writes to cwd fail HARD (EROFS) instead of silently
+  // landing in throwaway tmpfs and being lost.
   const c = path.resolve(cwd)
   const cwdReachable = allMounts.some((m) => {
     if (!existsSync(m.path)) return false
@@ -160,6 +273,27 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
     args.push('--ro-bind', empty, cwd)
   }
 
+  args.push('--chdir', cwd, '--setenv', 'HOME', home)
+  return args
+}
+
+export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: string): SandboxSpawn {
+  const home = homedir()
+  // Runtime baseline. Two kinds: the dirs claude needs to EXECUTE (DNS, claude/node
+  // installs), and the OBLIGATORY data mounts — the global config dir (~/.claude,
+  // where creds + memory live) and the project-local .claude — both rw. These are the
+  // only enforced data mounts: they're always present so Claude keeps its config and
+  // memory even when the caller makes cwd read-only or drops it entirely.
+  const baseline: SandboxMount[] = [
+    ...dnsMounts(),
+    ...runtimeInstallMounts(),
+    { path: claudeConfigDir(), mode: 'rw' },
+    { path: path.join(cwd, '.claude'), mode: 'rw' },   // local .claude (skipped below if absent)
+  ]
+  // User mounts as-is. cwd is NO LONGER force-added, so it's fully optional — rw (the
+  // default a new session seeds), ro, or removed. De-dupe by path (last wins).
+  const args = bwrapBaseArgs(cwd, [...baseline, ...dedupeMounts(cfg.mounts)])
+
   // Claude's main config lives at $HOME/.claude.json — a FILE next to the config
   // dir, NOT inside it. We can't bind that file directly (it's saved via write-tmp
   // + atomic rename, which fails EBUSY onto a bind-mounted file), and we don't mount
@@ -169,12 +303,150 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
   // sandbox starts with the user's prefs/trust instead of a blank config.
   const configDir = claudeConfigDir()
   ensureSandboxConfigJson(configDir, home)
-  args.push('--chdir', cwd, '--setenv', 'HOME', home, '--setenv', 'CLAUDE_CONFIG_DIR', configDir)
+  args.push('--setenv', 'CLAUDE_CONFIG_DIR', configDir)
+  // Under --clearenv the child starts with only BASE_PATH. Put node + the claude
+  // launcher's dir on PATH so claude (and any tool/subprocess it spawns) resolves —
+  // this --setenv PATH comes after the base one, so it wins.
+  const claudeBin = which('claude') ?? 'claude'
+  const binDirs = [nodeBinDir(), path.dirname(claudeBin)].filter(Boolean) as string[]
+  if (binDirs.length) args.push('--setenv', 'PATH', `${binDirs.join(':')}:${BASE_PATH}`)
+  // Pass through claude's own auth/proxy/CA env (API-key/Bedrock/Vertex/corp setups),
+  // never CLAUDETTE_TOKEN. A plain OAuth login needs none of these (creds live in the
+  // bound ~/.claude), so this is a no-op for the common case.
+  args.push(...passthroughEnvArgs(CLAUDE_ENV_ALLOW_PREFIXES))
   // Finally the program: `claude …`. Resolve to an absolute path (PATH inside the
   // sandbox is minimal); fall back to the bare name if resolution fails.
-  const claudeBin = which('claude') ?? 'claude'
   args.push(claudeBin, ...claudeArgv)
   return { command: BWRAP, args }
+}
+
+// Confine an ARBITRARY program (not claude) with the SAME box as a session — used to
+// run the Jupyter server (and thus its kernels) inside the session's sandbox so
+// notebook execution can't reach outside the mounts (SANDBOX.md "known limitation").
+// Unlike wrapSandbox this mounts ONLY the caller's data mounts (no ~/.claude — the
+// kernel must NOT see Claude's credentials), plus any `extraMounts`/`extraEnv` the
+// program needs (Jupyter: its data dir ro for kernelspecs, a writable runtime dir).
+export function wrapCommand(
+  cfg: SandboxConfig,
+  cwd: string,
+  program: string,
+  argv: string[],
+  opts: { extraMounts?: SandboxMount[]; extraEnv?: Record<string, string> } = {},
+): SandboxSpawn {
+  const args = bwrapBaseArgs(cwd, [...dedupeMounts(cfg.mounts), ...(opts.extraMounts ?? [])])
+  const bin = which(program) ?? program
+  // Under --clearenv, put the program's own bin dir on PATH (a venv/conda python, or
+  // node) so it finds its sibling tools. Deliberately NO claude auth passthrough here
+  // — a confined Jupyter/kernel must not inherit Claude's credentials (or the app's).
+  args.push('--setenv', 'PATH', `${path.dirname(bin)}:${BASE_PATH}`)
+  for (const [k, v] of Object.entries(opts.extraEnv ?? {})) args.push('--setenv', k, v)
+  args.push(bin, ...argv)
+  return { command: BWRAP, args }
+}
+
+// Is `p` visible (with its real contents) inside the box built from `mounts`? True
+// when some mount IS p or an ANCESTOR of p — its bind brings p in. A descendant mount
+// does NOT count: it only auto-creates empty ancestor dirs, so a binary living at p
+// wouldn't actually appear. Used to decide whether a venv interpreter chosen for a
+// confined Jupyter server needs its prefix ro-bound so the box can exec it.
+export function pathVisibleInSandbox(mounts: SandboxMount[], p: string): boolean {
+  const t = path.resolve(p)
+  return mounts.some((m) => {
+    if (!existsSync(m.path)) return false
+    const mp = path.resolve(m.path)
+    return mp === t || t.startsWith(mp + path.sep)
+  })
+}
+
+// bwrap's `--bind SRC DEST` FOLLOWS a symlink at SRC and mounts its target. So a mount
+// whose source is a symlink hands the choice of bound target to whoever created that
+// link. When the link node lives in a box-WRITABLE area, that "whoever" can be a
+// confined session: it plants `<cwd>/.claude -> /` in its rw cwd and, on the next
+// launch, gets `/` bound rw at that mountpoint — a full filesystem escape (SANDBOX.md
+// "Symlinked-mount escape"; verified live). Refuse such a mount. A symlink whose PARENT
+// is NOT box-writable was created by the host (e.g. ~/.claude on a dotfiles symlink
+// farm) and is safe — bwrap binds its realpath as intended. `rwRoots` are the LOGICAL
+// dest paths of the rw mounts (where the box writes), never a symlink's target, so a
+// malicious link can't launder itself into the writable set.
+function isUnsafeSymlinkMount(p: string, rwRoots: string[]): boolean {
+  if (!isSymlink(p)) return false
+  const parent = tryRealpath(path.dirname(path.resolve(p))) ?? path.dirname(path.resolve(p))
+  const boxWritable = rwRoots.some((r) => parent === r || parent.startsWith(r + path.sep))
+  if (boxWritable) {
+    console.warn(`[sandbox] refusing symlinked mount source ${p} → ${tryRealpath(p) ?? '?'}: its parent is writable inside the box, so binding it would follow the link out of the sandbox (potential escape). Mount the real path instead.`)
+  }
+  return boxWritable
+}
+
+// The DATA mounts a session's box actually exposes: the obligatory rw config dirs
+// (global ~/.claude + the local <cwd>/.claude when present) plus the caller's mounts.
+// Excludes the runtime/DNS baseline (node/claude/resolv.conf — no user files there).
+// Mirrors wrapSandbox's data-mount set so an OUT-OF-BAND file operation done on a
+// session's behalf (e.g. the notebook MCP tools, which run UNSANDBOXED in the server
+// process) can be authorized against exactly what the box itself could reach.
+export function sessionDataMounts(cfg: SandboxConfig, cwd: string): SandboxMount[] {
+  const baseline: SandboxMount[] = [
+    { path: claudeConfigDir(), mode: 'rw' },
+    ...(existsSync(path.join(cwd, '.claude')) ? [{ path: path.join(cwd, '.claude'), mode: 'rw' as const }] : []),
+  ]
+  return dedupeMounts([...baseline, ...cfg.mounts])
+}
+
+// Canonicalize a path for containment testing: realpath if it exists, else the
+// realpath of its parent + the basename (so a not-yet-created file is judged by the
+// real directory it would land in). Resolving symlinks here is what stops a symlink
+// under a mount from redirecting the write/read outside it.
+function canonicalizeForAccess(p: string): string {
+  const abs = path.resolve(p)
+  const real = tryRealpath(abs)
+  if (real) return real
+  const parentReal = tryRealpath(path.dirname(abs))
+  return parentReal ? path.join(parentReal, path.basename(abs)) : abs
+}
+
+// Can the box built for (cfg, cwd) READ / WRITE the host path `p`? A path is readable
+// when it lies inside ANY data mount, writable only inside a `rw` one; the DEEPEST
+// containing mount decides (matching bwrap's shallow-first layering, where a nested
+// mount wins). Both the target and the mount roots are canonicalized (symlinks
+// resolved) so neither side can be spoofed with a link. Used to confine server-side
+// file operations acting for a session to the same paths the session's own tools have.
+export function sandboxPathAccess(cfg: SandboxConfig, cwd: string, p: string): { read: boolean; write: boolean } {
+  const target = canonicalizeForAccess(p)
+  let best: { root: string; mode: 'rw' | 'ro' } | undefined
+  for (const m of sessionDataMounts(cfg, cwd)) {
+    const root = canonicalizeForAccess(m.path)
+    if (target === root || target.startsWith(root + path.sep)) {
+      if (!best || best.root.length < root.length) best = { root, mode: m.mode }
+    }
+  }
+  return { read: !!best, write: best?.mode === 'rw' }
+}
+
+// Is `p` inside a box-WRITABLE (rw) mount, judged by LOGICAL path (path.resolve, NOT
+// realpath)? Deliberately does NOT follow symlinks — it answers "could a confined
+// session have PLACED or redirected something at this path", which is what decides
+// whether e.g. an interpreter discovered there must be probed/run INSIDE the box rather
+// than executed on the host (SANDBOX.md "Venv-probe escape"). A symlink the box planted
+// at <cwd>/x still has its logical path inside the rw cwd, so it's caught here even
+// though its target resolves elsewhere.
+export function pathInWritableMount(cfg: SandboxConfig, cwd: string, p: string): boolean {
+  const target = path.resolve(p)
+  return sessionDataMounts(cfg, cwd).some((m) => {
+    if (m.mode !== 'rw') return false
+    const mp = path.resolve(m.path)
+    return target === mp || target.startsWith(mp + path.sep)
+  })
+}
+
+// A stable key for a sandbox config at a cwd: same key ⇒ same effective box. Drives
+// both the per-session relaunch-on-change detection and the KernelManager's Jupyter
+// pool (one confined server per distinct box). 'off' when confinement isn't in force.
+export function sandboxKey(cfg: SandboxConfig | undefined, cwd: string): string {
+  if (!cfg?.enabled || !sandboxAvailable()) return 'off'
+  // Fold in whether the obligatory local <cwd>/.claude currently EXISTS: wrapSandbox
+  // binds it only when present, so its appearance/removal changes the real mount set.
+  const localClaude = existsSync(path.join(cwd, '.claude')) ? '1' : '0'
+  return `on|lc${localClaude}|` + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
 }
 
 // A stable, empty directory to ro-bind onto cwd when the caller dropped cwd and there
@@ -256,6 +528,14 @@ function sortShallowFirst(mounts: SandboxMount[]): SandboxMount[] {
     const db = b.path.split(path.sep).length
     return da - db || a.path.localeCompare(b.path)
   })
+}
+
+// The directory holding the real `node` binary (following symlinks), or null. Put on
+// the sandbox PATH so a confined claude can spawn node/tools under --clearenv.
+function nodeBinDir(): string | null {
+  const node = which('node')
+  if (!node) return null
+  return path.dirname(tryRealpath(node) ?? node)
 }
 
 function which(bin: string): string | null {

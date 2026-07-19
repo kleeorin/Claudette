@@ -1,8 +1,17 @@
 import { EventEmitter } from 'events'
+import { dirname } from 'path'
 import type { KernelSpec } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
-import { JupyterManager, type JupyterInfo } from './jupyterManager'
+import { JupyterManager, findNearestPython, type JupyterInfo, type JupyterSandbox } from './jupyterManager'
 import { KernelClient, type KernelStatus } from './kernelClient'
+import { sandboxKey } from '../claude/sandbox'
+import type { Confinement, SessionConfinement } from '../claude/sessionConfinement'
+
+// Sentinel owner for a notebook opened OUTSIDE any session — the operator's own view via
+// the token-gated HTTP route with no sessionId. Its kernel runs on the host, deliberately.
+// Distinct from NO owner at all (a notebook nothing claimed → fail closed: refuse to start
+// a kernel, since it would otherwise land on the unconfined `off:` server).
+export const HOST_OWNER = '<host>'
 
 // Ties Jupyter + kernel client + the authoritative doc together: starts a kernel
 // per open notebook and routes its outputs back INTO the doc by cellId (the sink
@@ -16,6 +25,14 @@ export class KernelManager extends EventEmitter {
   private executing = new Set<string>()               // `${notebookId}:${cellId}` actually mid-execution
   private owner = new Map<string, string>()           // notebookId → owning sessionId (kills with the session)
   private specByNotebook = new Map<string, string>()  // notebookId → chosen kernelspec name
+  // Pool of Jupyter servers keyed by sandbox key (see sandboxKey): 'off' is the shared
+  // unconfined server; a sandboxed session gets its own server confined to its box, so
+  // the kernels it spawns can't escape the mounts. Lazily started, reused across
+  // notebooks with the same box, torn down on destroy().
+  private servers = new Map<string, JupyterManager>()
+  // Cache of the interpreter discovered for a directory (dir → python path). The venv
+  // doesn't move mid-session, so we don't re-walk the tree on every run.
+  private pythonCache = new Map<string, string>()
   // The default kernelspec for notebooks that haven't chosen one. Seeded from
   // CLAUDETTE_DEFAULT_KERNEL (set it to e.g. 'python-autovenv' to make the auto-venv
   // kernel the permanent default), and updated to whatever the user last picked so
@@ -32,7 +49,10 @@ export class KernelManager extends EventEmitter {
 
   constructor(
     private docs: NotebookDocManager,
-    private jupyter: JupyterManager,
+    // The single confinement seam (SANDBOX.md): resolves a notebook's OWNER session to a
+    // box so its kernel runs confined. A notebook whose owner can't be resolved fails
+    // closed (deny) — the kernel is refused, never dropped to the unconfined `off:` server.
+    private confinement: SessionConfinement,
   ) { super() }
 
   private setStatus(notebookId: string, status: KernelStatus): void {
@@ -68,11 +88,75 @@ export class KernelManager extends EventEmitter {
   // Is any cell of this notebook currently executing/queued?
   isRunning(notebookId: string): boolean { return (this.running.get(notebookId)?.size ?? 0) > 0 }
 
-  private async info(): Promise<JupyterInfo> {
-    const info = await this.jupyter.start()
-    if (!info) throw new Error('Jupyter server failed to start (is jupyter-server installed?)')
-    this.onJupyterStart?.(info)
+  // Get (or lazily spawn) the pooled Jupyter server for a sandbox key, and its URL +
+  // token. The 'off' server is the shared unconfined one and drives the browser proxy
+  // target; a sandboxed key gets a server confined to that session's box.
+  private async serverInfo(key: string, pythonPath: string, sandbox?: JupyterSandbox): Promise<JupyterInfo> {
+    let jm = this.servers.get(key)
+    if (!jm) {
+      jm = new JupyterManager(pythonPath, sandbox)
+      this.servers.set(key, jm)
+    }
+    const info = await jm.start()
+    if (!info) throw new Error(`Jupyter server failed to start with ${pythonPath} (is jupyter-server installed there?)`)
+    if (!sandbox) this.onJupyterStart?.(info)   // browser proxy points at a non-sandboxed server
     return info
+  }
+
+  // Resolve the interpreter to launch Jupyter with for a directory: the nearest
+  // .venv/venv/env that has jupyter_server (walking upward), else the ambient python3.
+  // This is why a project venv "just works" even when the system has no jupyter. The
+  // session's `sandbox` (when any) is passed to discovery so a candidate inside its
+  // writable mounts is probed INSIDE the box, not executed on the host (SANDBOX.md
+  // "Venv-probe escape").
+  private async pythonFor(dir: string, sandbox?: JupyterSandbox): Promise<string> {
+    // Cache per (dir, box): the same dir probed confined vs unconfined can legitimately
+    // differ, so results must not cross between a sandboxed and unsandboxed use of it.
+    const key = `${dir}|${sandbox ? sandboxKey(sandbox.cfg, sandbox.cwd) : 'off'}`
+    const cached = this.pythonCache.get(key)
+    if (cached) return cached
+    const py = (await findNearestPython(dir, sandbox)) ?? 'python3'
+    this.pythonCache.set(key, py)
+    return py
+  }
+
+  // The confinement decision for a notebook's kernel, from its OWNER (SANDBOX.md). No
+  // owner at all ⇒ `deny` (nothing claimed it — fail closed); the HOST sentinel ⇒ `host`
+  // (an operator's session-less notebook); a real owner ⇒ resolved via the seam (which is
+  // itself `host` for an unconfined session, `deny` for one that's since gone).
+  private confinementForNotebook(notebookId: string): Confinement {
+    const owner = this.owner.get(notebookId)
+    if (owner === undefined) return { mode: 'deny' }
+    if (owner === HOST_OWNER) return { mode: 'host' }
+    return this.confinement.resolve(owner)
+  }
+
+  // The box a notebook's kernel runs in, or undefined for a host (unconfined) kernel.
+  // Throws on `deny` — an unowned/orphaned notebook must NOT start a kernel, since that
+  // kernel would land on the shared unconfined `off:` server (SANDBOX.md "Unowned-kernel
+  // escape"). Refusing is safe: with ownership claimed on every MCP/HTTP open, `deny`
+  // only means a genuine wiring bug or a torn-down session.
+  private boxForNotebook(notebookId: string): JupyterSandbox | undefined {
+    const c = this.confinementForNotebook(notebookId)
+    if (c.mode === 'deny') throw new Error(`notebook ${notebookId} has no resolvable owning session — refusing to start a kernel (it would run unconfined)`)
+    return c.mode === 'confined' ? { cfg: c.cfg, cwd: c.cwd } : undefined
+  }
+
+  // The Jupyter server a notebook's kernel should run on: its owning session's confined
+  // server when that session is sandboxed, else a server for the notebook's discovered
+  // venv (non-sandboxed servers are pooled per interpreter, so notebooks sharing a venv
+  // share a server and different venvs each get their own).
+  private async serverFor(notebookId: string): Promise<JupyterInfo> {
+    const sandbox = this.boxForNotebook(notebookId)
+    const doc = this.docs.get(notebookId)
+    // Discover the project's venv the same way for both boxes — a confined session's
+    // Jupyter must run under the same interpreter that "just works" unconfined, not the
+    // bare system python3 (which usually lacks jupyter_server). JupyterManager ro-binds
+    // that venv into the box when it's outside the mounts; the discovery probe for a
+    // box-writable candidate runs INSIDE the box (see pythonFor / findNearestPython).
+    const python = await this.pythonFor(doc ? dirname(doc.path) : (sandbox?.cwd ?? process.cwd()), sandbox)
+    if (sandbox) return this.serverInfo(`${sandboxKey(sandbox.cfg, sandbox.cwd)}|${python}`, python, sandbox)
+    return this.serverInfo(`off:${python}`, python)
   }
 
   // Start (or reuse) a kernel bound to a notebook. The kernel's cwd is set to the
@@ -81,15 +165,29 @@ export class KernelManager extends EventEmitter {
   // notebook path relative to root_dir (which is '/'); Jupyter derives the kernel
   // cwd from its parent directory.
   async ensureKernel(notebookId: string): Promise<KernelClient> {
-    const existing = this.clients.get(notebookId)
-    if (existing) return existing
     const doc = this.docs.get(notebookId)
     if (!doc) throw new Error(`no such open notebook: ${notebookId}`)
+    // Resolve the server the notebook's CURRENT owner requires BEFORE reusing a kernel
+    // (pooled, so this is cheap when the box is unchanged). SECURITY (SANDBOX.md
+    // "Unowned-kernel escape"): a live kernel is reused only when it runs on that exact
+    // server. If the notebook's confinement has since changed — e.g. a sandboxed session
+    // claimed a notebook whose kernel had been started on the unconfined `off:` server —
+    // discard the stale kernel and start a fresh one on the correct (confined) server, so
+    // execution can never keep running outside the owner's box.
+    const info = await this.serverFor(notebookId)
+    const existing = this.clients.get(notebookId)
+    if (existing) {
+      if (existing.serverUrl === info.url) return existing
+      void existing.shutdown()
+      existing.dispose()
+      this.clients.delete(notebookId)
+      this.clearRunning(notebookId)
+      this.docs.bindKernel(notebookId, undefined)
+    }
     // root_dir is '/', so the resource path relative to it is the absolute path
     // minus its leading slash(es).
     const relPath = doc.path.replace(/^\/+/, '')
 
-    const info = await this.info()
     const spec = this.specName(notebookId)
     this.docs.setKernelName(notebookId, spec)
     const res = await fetch(`${info.url}/api/kernels`, {
@@ -112,7 +210,24 @@ export class KernelManager extends EventEmitter {
   // Available kernelspecs (starts Jupyter lazily if needed — the same server a run
   // would spin up). Returns Jupyter's default so the UI can preselect it.
   async listKernelSpecs(): Promise<{ specs: KernelSpec[]; default: string }> {
-    const info = await this.info()
+    // Read specs off the same venv server a run would use (discovered from an open
+    // notebook's dir), so the list reflects the project's kernels — not the system
+    // python's. Falls back to python3 when nothing is open / no venv is found.
+    // A confined notebook's specs come from ITS box (reusing the pooled confined
+    // server), never an unconfined `off:` server — otherwise a box-writable interpreter
+    // would be launched unsandboxed (SANDBOX.md "Venv-probe escape"). The discovery
+    // probe is likewise confined via pythonFor.
+    // Operator-initiated + token-gated (not box-reachable), so an unresolvable owner
+    // here falls back to the host `off:` server rather than throwing — but a CONFINED
+    // notebook still reads its specs from its own box, so a box-writable interpreter is
+    // never launched unsandboxed via the picker.
+    const first = this.docs.list()[0]
+    const c = first ? this.confinementForNotebook(first.notebookId) : { mode: 'host' as const }
+    const sandbox: JupyterSandbox | undefined = c.mode === 'confined' ? { cfg: c.cfg, cwd: c.cwd } : undefined
+    const python = await this.pythonFor(first ? dirname(first.path) : process.cwd(), sandbox)
+    const info = sandbox
+      ? await this.serverInfo(`${sandboxKey(sandbox.cfg, sandbox.cwd)}|${python}`, python, sandbox)
+      : await this.serverInfo(`off:${python}`, python)
     const res = await fetch(`${info.url}/api/kernelspecs`, { headers: { Authorization: `token ${info.token}` } })
     if (!res.ok) throw new Error(`failed to list kernelspecs: ${res.status}`)
     const data = await res.json() as {
@@ -233,6 +348,10 @@ export class KernelManager extends EventEmitter {
     this.owner.set(notebookId, sessionId)
   }
 
+  // The session that currently owns a notebook (whose box confines its kernel), or
+  // undefined if none. Exposed so the confinement of a notebook's execution is testable.
+  ownerOf(notebookId: string): string | undefined { return this.owner.get(notebookId) }
+
   // Kill the kernels for every notebook opened in a now-closed session.
   shutdownForSession(sessionId: string): void {
     for (const [notebookId, sid] of [...this.owner]) {
@@ -258,6 +377,7 @@ export class KernelManager extends EventEmitter {
   destroy(): void {
     for (const c of this.clients.values()) c.dispose()
     this.clients.clear()
-    this.jupyter.destroy()
+    for (const jm of this.servers.values()) jm.destroy()   // kill every pooled server
+    this.servers.clear()
   }
 }

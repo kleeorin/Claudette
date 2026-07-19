@@ -1,4 +1,5 @@
-import { extname, resolve } from 'path'
+import { extname, resolve, dirname, basename } from 'path'
+import { realpathSync } from 'fs'
 import { nbText as asText } from '@claudette/shared'
 import type { NbCell, NbCellType, NbOutput, NotebookDoc, NotebookOp } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
@@ -6,6 +7,7 @@ import type { KernelManager } from '../jupyter/kernelManager'
 import type { ActivePaneRegistry } from './activePaneRegistry'
 import type { TurnNotebookRegistry } from './turnNotebookRegistry'
 import type { AppControlMcpServer, McpToolResult } from './appControlServer'
+import type { SessionConfinement } from '../claude/sessionConfinement'
 
 // AppControl notebook tools. The KEY ClaudeMaster fix: handlers mutate the
 // authoritative doc DIRECTLY via NotebookDocManager (no UI round-trip) — an edit to
@@ -42,7 +44,25 @@ export function registerNotebookTools(
   // Steer the calling session's UI to focus a notebook (open_notebook). The doc is
   // already open server-side; this only moves the user's focus onto it.
   onFocus: (sessionId: string, doc: NotebookDoc) => void,
+  // The confinement seam (SANDBOX.md): gates the tools' UNSANDBOXED file I/O to the
+  // calling session's own mounts. A session that can't be resolved fails closed (deny),
+  // so the tools can't be tricked into acting for an unknown session.
+  confinement: SessionConfinement,
 ): void {
+  // Gate a path the tools are about to read/write to the calling session's sandbox AND
+  // capture its TOCTOU write-guard in the SAME filesystem observation (SANDBOX.md
+  // "Notebook-MCP escape" + G1). A confined session must not reach a notebook outside its
+  // mounts through the server process; and because the containment decision and the guard
+  // both derive from one `realpath(dirname)`, a symlink swap can't slip between "authorized"
+  // and "guard captured". Returns a Claude-facing error when out of bounds (or the session
+  // is unresolved — fail closed), else `{ guard }`: the canonical parent dir to pin for the
+  // open/write (undefined for an unconfined host session, which needs no guard).
+  function gate(sessionId: string, absPath: string, need: 'read' | 'write'): McpToolResult | { guard: string | undefined } {
+    const realDir = dirGuard(absPath)
+    if (confinement.authorizeResolved(sessionId, realDir ?? null, basename(absPath), need)) return { guard: realDir }
+    return { error: `${absPath} is outside this session's sandbox — ${need} not permitted. The notebook tools honor the same mounts as the session; only a path under a ${need === 'write' ? 'read-write' : 'mounted'} sandbox path can be ${need === 'write' ? 'written' : 'read'}. Ask the user to add it as a mount (the sandbox control) if it should be reachable.` }
+  }
+  const isGateErr = (x: McpToolResult | { guard: string | undefined }): x is McpToolResult => 'error' in x
   // A `path` field every cell tool accepts, but should almost always OMIT. Passing a
   // stale path from earlier in the conversation (when a different notebook was in
   // focus) is the classic wrong-notebook bug — the unset default always follows the
@@ -51,12 +71,14 @@ export function registerNotebookTools(
 
   const isErr = (x: NotebookDoc | McpToolResult): x is McpToolResult => 'error' in x
 
-  // Open (or reuse) the notebook at an absolute .ipynb path.
-  async function openByPath(path: string): Promise<NotebookDoc | McpToolResult> {
+  // Open (or reuse) the notebook at an absolute .ipynb path. `guard` (from gate()) pins the
+  // canonical parent so a fresh-open READ refuses if the dir was relinked since authorization
+  // (SANDBOX.md G1). An already-open doc reads from memory (no fs touch).
+  async function openByPath(path: string, guard?: string): Promise<NotebookDoc | McpToolResult> {
     if (!path) return { error: 'path is required (absolute .ipynb path)' }
     if (extname(path).toLowerCase() !== '.ipynb') return { error: `${path} is not a .ipynb notebook` }
     try {
-      return docs.getByPath(path) ?? await docs.openPath(path)
+      return docs.getByPath(path) ?? await docs.openPath(path, guard)
     } catch (e) {
       return { error: `cannot open ${path}: ${e instanceof Error ? e.message : String(e)}` }
     }
@@ -104,15 +126,31 @@ export function registerNotebookTools(
   // session so the change lands where Claude is working — never in whatever session
   // the user happens to be viewing. `focus:false` for read (don't pop a tab just to
   // inspect). A notebook already open in the calling pane isn't re-focused.
-  async function targetDoc(sessionId: string, args: Record<string, unknown>, focus = true): Promise<NotebookDoc | McpToolResult> {
+  async function targetDoc(sessionId: string, args: Record<string, unknown>, focus = true, need: 'read' | 'write' = 'write'): Promise<NotebookDoc | McpToolResult> {
     const t = resolveNotebook(sessionId, args)
     if (typeof t !== 'string') return t
+    const g = gate(sessionId, resolve(t), need)
+    if (isGateErr(g)) return g
     const already = docs.getByPath(t)
-    if (already) return already
-    const doc = await openByPath(t)
+    if (already) { claimOwnership(sessionId, already, need); return already }
+    const doc = await openByPath(t, g.guard)
     if (isErr(doc)) return doc
+    claimOwnership(sessionId, doc, need)
     if (focus) onFocus(sessionId, doc)
     return doc
+  }
+
+  // SECURITY (SANDBOX.md "Unowned-kernel escape"): a notebook's kernel is confined to
+  // whatever session OWNS the notebook (KernelManager.confinementForNotebook keys off the
+  // owner). A notebook that no session has claimed runs its kernel on the UNCONFINED
+  // `off:` server — so a confined box that creates/opens a notebook purely through these
+  // MCP tools (which don't otherwise set an owner) could execute cell code outside its
+  // box, with the server's env. So whenever a session MUTATES or RUNS a notebook here,
+  // make it the owner: the kernel that later executes is then confined to THAT session's
+  // box. Read-only access never claims ownership — it executes nothing and shouldn't
+  // steal a live kernel from the session that owns it.
+  function claimOwnership(sessionId: string, doc: NotebookDoc, need: 'read' | 'write'): void {
+    if (need === 'write') kernels.setOwner(doc.notebookId, sessionId)
   }
 
   // Resolve a 0-based index against the doc → cellId (with a clear out-of-range error).
@@ -134,11 +172,22 @@ export function registerNotebookTools(
     return i
   }
 
-  // Apply a mutation op then persist; map an op failure to an MCP error.
-  async function applyAndSave(doc: NotebookDoc, op: NotebookOp): Promise<McpToolResult> {
+  // The canonical parent dir of a path (one realpath), used by gate() as the containment
+  // basis AND the TOCTOU write-guard so the two can't diverge (SANDBOX.md G1). Undefined if
+  // it can't be resolved — gate() then denies (confined) or allows unguarded (host).
+  function dirGuard(absPath: string): string | undefined {
+    try { return realpathSync(dirname(absPath)) } catch { return undefined }
+  }
+
+  // Apply a mutation op then persist. The save is re-authorized-and-guarded on the doc's
+  // path AT WRITE TIME (SANDBOX.md G1) — bound to the actual write, not the earlier open —
+  // so a symlink swap of the notebook's directory between open and save can't redirect it.
+  async function applyAndSave(sessionId: string, doc: NotebookDoc, op: NotebookOp): Promise<McpToolResult> {
+    const g = gate(sessionId, doc.path, 'write')
+    if (isGateErr(g)) return g
     const r = docs.applyOp(op, 'claude')
     if (!r.ok) return { error: r.error }
-    await docs.save(doc.notebookId)
+    await docs.save(doc.notebookId, g.guard)
     return { text: 'ok' }
   }
 
@@ -158,7 +207,10 @@ export function registerNotebookTools(
     description: 'Open a notebook (absolute .ipynb `path`) and FOCUS it in the calling session, so it becomes the notebook the user is looking at. Use this to show the user a notebook before working on it — and as the way to switch focus when you must edit a notebook other than the one currently visible (the edit tools refuse a different notebook otherwise).',
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Absolute path to the .ipynb notebook.' } }, required: ['path'] },
     handler: async (sid, args) => {
-      const doc = await openByPath(String(args.path ?? ''))
+      const p = String(args.path ?? '')
+      const g = p ? gate(sid, resolve(p), 'read') : { guard: undefined }
+      if (isGateErr(g)) return g
+      const doc = await openByPath(p, g.guard)
       if (isErr(doc)) return doc
       onFocus(sid, doc)
       // Claude explicitly chose this notebook to work on → make it the turn's pinned
@@ -173,7 +225,7 @@ export function registerNotebookTools(
     description: 'Read a notebook (the active pane unless `path` is given): returns each cell with its 0-based index, type, source, and a summary of its outputs. Use this to see the current authoritative state (including run outputs) before editing by index.',
     inputSchema: { type: 'object', properties: { ...pathProp }, required: [] },
     handler: async (sid, args) => {
-      const doc = await targetDoc(sid, args, false)   // reading shouldn't pop a tab
+      const doc = await targetDoc(sid, args, false, 'read')   // reading shouldn't pop a tab
       if (isErr(doc)) return doc
       return { text: JSON.stringify({ path: doc.path, kernel: doc.kernelId ? 'running' : 'none', cells: doc.cells.map(describeCell) }, null, 1) }
     },
@@ -186,7 +238,7 @@ export function registerNotebookTools(
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
-      return applyAndSave(doc, { op: 'editCell', notebookId: doc.notebookId, cellId: id, source: String(args.source ?? '') })
+      return applyAndSave(sid, doc, { op: 'editCell', notebookId: doc.notebookId, cellId: id, source: String(args.source ?? '') })
     },
   })
 
@@ -196,7 +248,7 @@ export function registerNotebookTools(
     inputSchema: { type: 'object', properties: { ...pathProp, type: { type: 'string' }, source: { type: 'string' } }, required: [] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
-      return applyAndSave(doc, { op: 'addCell', notebookId: doc.notebookId, cellType: cellType(args.type), source: strOrUndef(args.source) })
+      return applyAndSave(sid, doc, { op: 'addCell', notebookId: doc.notebookId, cellType: cellType(args.type), source: strOrUndef(args.source) })
     },
   })
 
@@ -207,7 +259,7 @@ export function registerNotebookTools(
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const index = boundedIndex(args.index, doc.cells.length, 'index'); if (typeof index !== 'number') return index
-      return applyAndSave(doc, { op: 'insertCell', notebookId: doc.notebookId, index, cellType: cellType(args.type), source: strOrUndef(args.source) })
+      return applyAndSave(sid, doc, { op: 'insertCell', notebookId: doc.notebookId, index, cellType: cellType(args.type), source: strOrUndef(args.source) })
     },
   })
 
@@ -218,7 +270,7 @@ export function registerNotebookTools(
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
-      return applyAndSave(doc, { op: 'deleteCell', notebookId: doc.notebookId, cellId: id })
+      return applyAndSave(sid, doc, { op: 'deleteCell', notebookId: doc.notebookId, cellId: id })
     },
   })
 
@@ -230,7 +282,7 @@ export function registerNotebookTools(
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.from); if (typeof id !== 'string') return id
       const to = boundedIndex(args.to, doc.cells.length - 1, 'to'); if (typeof to !== 'number') return to
-      return applyAndSave(doc, { op: 'moveCell', notebookId: doc.notebookId, cellId: id, toIndex: to })
+      return applyAndSave(sid, doc, { op: 'moveCell', notebookId: doc.notebookId, cellId: id, toIndex: to })
     },
   })
 
@@ -241,7 +293,7 @@ export function registerNotebookTools(
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
-      return applyAndSave(doc, { op: 'setCellType', notebookId: doc.notebookId, cellId: id, cellType: cellType(args.type) })
+      return applyAndSave(sid, doc, { op: 'setCellType', notebookId: doc.notebookId, cellId: id, cellType: cellType(args.type) })
     },
   })
 
@@ -253,8 +305,14 @@ export function registerNotebookTools(
       const path = String(args.path ?? '')
       if (!path) return { error: 'path is required' }
       if (extname(path).toLowerCase() !== '.ipynb') return { error: 'path must end in .ipynb' }
+      const g = gate(sid, resolve(path), 'write')
+      if (isGateErr(g)) return g
       try {
-        await docs.createPath(path)
+        const doc = await docs.createPath(path, g.guard)
+        // Own it for THIS session now (SANDBOX.md "Unowned-kernel escape"): a freshly
+        // created notebook has no owner, so a later run_cell would spawn its kernel on
+        // the UNCONFINED server. Claiming it here confines that kernel to this box.
+        kernels.setOwner(doc.notebookId, sid)
         // Claude just made this notebook to populate it → pin it as the turn's working
         // notebook so the following path-unset cell tools land here, not in whatever
         // the user happens to be viewing.
@@ -273,7 +331,8 @@ export function registerNotebookTools(
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
       try {
         await kernels.runCell(doc.notebookId, id)
-        await docs.save(doc.notebookId)
+        const g = gate(sid, doc.path, 'write'); if (isGateErr(g)) return g
+        await docs.save(doc.notebookId, g.guard)
         const idx = doc.cells.findIndex((c) => c.id === id)
         return { text: JSON.stringify(describeCell(doc.cells[idx], idx), null, 1) }
       } catch (e) { return { error: `run failed: ${e instanceof Error ? e.message : String(e)}` } }
@@ -288,7 +347,8 @@ export function registerNotebookTools(
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       try {
         await kernels.runAll(doc.notebookId)
-        await docs.save(doc.notebookId)
+        const g = gate(sid, doc.path, 'write'); if (isGateErr(g)) return g
+        await docs.save(doc.notebookId, g.guard)
         return { text: JSON.stringify(doc.cells.map(describeCell), null, 1) }
       } catch (e) { return { error: `run_all failed: ${e instanceof Error ? e.message : String(e)}` } }
     },

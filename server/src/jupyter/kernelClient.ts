@@ -38,6 +38,12 @@ export class KernelClient {
     readonly kernelId: string,
   ) {}
 
+  // The Jupyter server this kernel runs on. KernelManager compares it against the
+  // server the notebook's CURRENT owner requires, so a confinement change (a sandboxed
+  // session claiming a notebook whose kernel was started unconfined) forces a restart
+  // on the right box instead of silently reusing the unconfined kernel.
+  get serverUrl(): string { return this.baseUrl }
+
   connect(): Promise<void> { return this.openSocket() }
 
   private openSocket(): Promise<void> {

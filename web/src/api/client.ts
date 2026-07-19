@@ -297,7 +297,7 @@ export const api = {
   },
   // Terminal pane: create/destroy over HTTP; input/resize over WS; output/exit via on.*.
   pane: {
-    create: (cwd: string) => post<CreatePaneResponse>('/api/pane/create', { cwd } as CreatePaneRequest),
+    create: (cwd: string, cols?: number, rows?: number, sessionId?: string) => post<CreatePaneResponse>('/api/pane/create', { cwd, cols, rows, sessionId } as CreatePaneRequest),
     destroy: (id: string) => post<OkResponse>('/api/pane/destroy', { id }),
     input: (id: string, data: string) => send({ type: 'pane:input', id, data }),
     resize: (id: string, cols: number, rows: number) => send({ type: 'pane:resize', id, cols, rows }),

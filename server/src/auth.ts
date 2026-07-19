@@ -1,13 +1,23 @@
 import crypto from 'crypto'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
 import type { IncomingMessage } from 'http'
 import type { FastifyRequest, FastifyReply } from 'fastify'
 
 // Access control for the app server. Two rules keep it safe-by-default:
 //
-//   • Loopback bind + no token  → open (local-only; the OS already gates it).
-//   • Any non-loopback bind      → a token is REQUIRED. `resolveAuth` refuses to
-//     start without CLAUDETTE_TOKEN, so you can't accidentally expose an
-//     unauthenticated server to a LAN / tunnel / Tailnet.
+//   • A token is ALWAYS required — even on a loopback bind. "Local-only" is not
+//     a boundary here: session sandboxes share the host network (SANDBOX.md
+//     "Control-plane escape"), so an in-box process can reach 127.0.0.1:<PORT>.
+//     Without CLAUDETTE_TOKEN set, a loopback server loads (or generates) a
+//     persistent token from ~/.config/claudette/token — the same file
+//     rc_launch.sh uses, deliberately OUTSIDE every sandbox mount. Explicit
+//     opt-out for tests/dev: CLAUDETTE_NO_AUTH=1 (honored on loopback only).
+//   • Any non-loopback bind      → CLAUDETTE_TOKEN is REQUIRED. `resolveAuth`
+//     refuses to start without it, so you can't accidentally expose an
+//     unauthenticated server to a LAN / tunnel / Tailnet (and a stale
+//     auto-generated file token can't silently guard a public bind).
 //
 // The token travels as an httpOnly, SameSite=Lax cookie: delivered once via
 // `/api/auth?token=…`, then sent automatically on every HTTP request AND the
@@ -26,14 +36,40 @@ function isLoopback(host: string): boolean {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '::ffff:127.0.0.1'
 }
 
+// Where the loopback token persists: ~/.config/claudette/token (same file
+// rc_launch.sh manages). ~/.config is never bind-mounted into a session sandbox,
+// so the box can't just read it. Stable across runs → devices stay logged in.
+export function tokenFilePath(): string {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config')
+  return path.join(base, 'claudette', 'token')
+}
+
+// Load the persisted token, or mint + persist a fresh one (0600, dir 0700).
+function loadOrCreateToken(): string {
+  const file = tokenFilePath()
+  try {
+    const t = fs.readFileSync(file, 'utf8').trim()
+    if (t) return t
+  } catch { /* missing/unreadable → create below */ }
+  const t = crypto.randomBytes(16).toString('hex')
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  fs.writeFileSync(file, t, { mode: 0o600 })
+  return t
+}
+
 // Decide the auth posture from HOST + CLAUDETTE_TOKEN. Exits the process with a
 // clear message if a non-loopback bind is requested without a token — failing
 // closed is the whole point.
 export function resolveAuth(host: string, envToken: string | undefined): Auth {
   const token = envToken && envToken.trim() ? envToken.trim() : null
   if (isLoopback(host)) {
-    // Local only. A token is optional here (set one to exercise the auth flow).
-    return { required: token != null, token }
+    if (token) return { required: true, token }
+    // Explicit, greppable opt-out (tests / a conscious "this box is airgapped").
+    // Loopback only — a non-loopback bind below still fails closed.
+    if (process.env.CLAUDETTE_NO_AUTH === '1') return { required: false, token: null }
+    // No env token: fall back to the persistent file token (created on first
+    // run). Loopback is NOT trusted — sandboxed sessions share this network.
+    return { required: true, token: loadOrCreateToken() }
   }
   // Exposed beyond loopback → a token is mandatory.
   if (!token) {

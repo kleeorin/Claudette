@@ -157,8 +157,11 @@ export interface ConversationsResponse { conversations: ConversationMeta[] }
 // GET /api/session/conversation?cwd=…&id=…  → the conversation replayed as events
 export interface ConversationResponse { events: ClaudeEvent[] }
 
-// POST /api/pane/create { cwd } → { id }   |   POST /api/pane/destroy { id }
-export interface CreatePaneRequest { cwd: string }
+// POST /api/pane/create { cwd, cols?, rows?, sessionId? } → { id }   |   POST /api/pane/destroy { id }
+// cols/rows let the client spawn the pty at the terminal's real size so the shell's
+// line-editing geometry matches what xterm renders from the very first prompt.
+// sessionId ties the pty to its owning session, so destroying the session reaps it.
+export interface CreatePaneRequest { cwd: string; cols?: number; rows?: number; sessionId?: string }
 export interface CreatePaneResponse { id: string }
 
 // GET /api/notebook/kernelspecs → the kernels the user can pick, + Jupyter's default.

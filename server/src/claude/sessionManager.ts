@@ -9,7 +9,7 @@ import type {
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
-import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt } from './sandbox'
+import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
 
 // Owns the set of Claude sessions and their engines. Ported from
 // ClaudeMaster's main-process SessionManager, minus the remote/SSH spawn path
@@ -548,19 +548,6 @@ export class SessionManager extends EventEmitter {
 }
 
 // A stable key of the sandbox state that WOULD be applied at launch: 'off' when
-// disabled or the host can't sandbox, else 'on' + the sorted mount set. Comparing
-// this to what a running engine launched with tells us a relaunch is needed.
-function sandboxKey(cfg: SandboxConfig | undefined, cwd: string): string {
-  if (!cfg?.enabled || !sandboxAvailable()) return 'off'
-  // Fold in whether the obligatory local <cwd>/.claude currently EXISTS: wrapSandbox
-  // binds it only when present, so its appearance/removal changes the real mount set.
-  // Including it here means a .claude created after launch makes the live key differ
-  // from appliedSandboxKey → the next idle auto-relaunches and picks it up (instead of
-  // it staying silently unmounted until a manual relaunch).
-  const localClaude = existsSync(path.join(cwd, '.claude')) ? '1' : '0'
-  return `on|lc${localClaude}|` + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
-}
-
 // Sandbox is ON BY DEFAULT (see SANDBOX.md): when the caller passes no config we seed
 // { enabled: true, mounts: [cwd rw] } — the convenient default. An explicit config is
 // honored AS-IS: cwd is now OPTIONAL (rw / ro / removed), so we never force it back in.
@@ -568,7 +555,17 @@ function sandboxKey(cfg: SandboxConfig | undefined, cwd: string): string {
 // wrapSandbox, and claude's working dir stays valid via its --chdir handling there.
 // Whether the sandbox is actually in force is decided at launch (host capability) and
 // reported via `sandboxed`.
-function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string): SandboxConfig {
-  if (!sandbox) return { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
-  return { enabled: sandbox.enabled, mounts: sandbox.mounts }
+export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string): SandboxConfig {
+  const cfg: SandboxConfig = !sandbox
+    ? { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
+    : { enabled: sandbox.enabled, mounts: sandbox.mounts }
+  // Confinement must NOT be lowerable by a request. A sandboxed session that reaches
+  // the loopback control API (SANDBOX.md "Control-plane escape") could otherwise ask
+  // for enabled:false and get an unconfined session. Force it on unless the OPERATOR
+  // opted in at launch (a capability an in-box caller cannot grant itself).
+  if (!cfg.enabled && !unsandboxedAllowed()) {
+    console.warn('[sandbox] ignoring sandbox.enabled=false — set CLAUDETTE_ALLOW_UNSANDBOXED=1 to permit unconfined sessions')
+    return { enabled: true, mounts: cfg.mounts }
+  }
+  return cfg
 }

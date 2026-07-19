@@ -7,12 +7,12 @@ import { fileURLToPath } from 'url'
 import type { WsClientMessage, HealthResponse } from '@claudette/shared'
 import { SessionManager } from './claude/sessionManager'
 import { sandboxAvailable } from './claude/sandbox'
+import { SessionConfinement } from './claude/sessionConfinement'
 import { WsHub } from './ws/hub'
 import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage, sendSessionSnapshots } from './session/sessionApi'
 import { loadState, saveState } from './session/sessionPersistence'
 import { NotebookDocManager } from './notebook/notebookDocManager'
 import { bridgeNotebookEvents, registerNotebookRoutes, handleNotebookClientMessage } from './notebook/notebookApi'
-import { JupyterManager } from './jupyter/jupyterManager'
 import { KernelManager } from './jupyter/kernelManager'
 import { JupyterProxy } from './jupyter/jupyterProxy'
 import { AppControlMcpServer } from './mcp/appControlServer'
@@ -23,7 +23,7 @@ import { PaneManager } from './pane/paneManager'
 import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from './pane/paneApi'
 import { registerFsRoutes } from './fs/fsApi'
 import { registerGitRoutes } from './git/gitApi'
-import { resolveAuth, makeAuthHook, isAuthed, authCookie } from './auth'
+import { resolveAuth, makeAuthHook, isAuthed, authCookie, tokenFilePath } from './auth'
 
 // Claudette app server. Single-user by design (PLAN §1). Binds loopback by
 // default; when HOST exposes it beyond loopback, an access token is required
@@ -56,8 +56,16 @@ const turnNotebooks = new TurnNotebookRegistry()
 
 // Core services.
 const notebooks = new NotebookDocManager()
-const jupyter = new JupyterManager()
-const kernels = new KernelManager(notebooks, jupyter)
+// The single confinement seam every server-side actor uses to confine work done ON
+// BEHALF OF a session — the kernel it runs, the terminal it spawns, the files its MCP
+// tools touch (SANDBOX.md). One object, so the fail-closed default (unresolved session →
+// deny, never host) is enforced identically everywhere instead of re-derived per site.
+// `sessions` is assigned below; the lookup closure only runs later, at use time.
+const confinement = new SessionConfinement((id) => sessions.get(id))
+// A notebook's kernel runs in its owning session's box: KernelManager resolves the owner
+// through `confinement` and spawns a Jupyter server confined to that box, so notebook
+// execution can't escape the mounts (and an unowned notebook is refused, not run host).
+const kernels = new KernelManager(notebooks, confinement)
 const jupyterProxy = new JupyterProxy()
 // Point the browser-facing proxy at Jupyter once it lazily starts (first cell run).
 kernels.onJupyterStart = (info) => jupyterProxy.setTarget(info)
@@ -69,12 +77,15 @@ registerNotebookTools(mcp, notebooks, kernels, activePanes, turnNotebooks, (sess
   kernels.setOwner(doc.notebookId, sessionId)   // Claude opened it in this session → dies with it
   notebooks.cancelClose(doc.notebookId)         // re-focusing a mid-close notebook keeps it open
   hub.broadcast({ type: 'session:focusPane', id: sessionId, notebookId: doc.notebookId, path: doc.path })
-})
+}, confinement)
 const sessions = new SessionManager({ mcpConfig: (sid) => mcp.configFor(sid) })
-// Closing a session kills the kernels of notebooks opened in it.
-sessions.on('destroyed', (id: string) => kernels.shutdownForSession(id))
+// Terminal panes are confined to their owning session's box (SANDBOX.md
+// "Terminal-pane escape") — through the same `confinement` seam as kernels/notebook tools.
+const panes = new PaneManager(confinement)
+// Closing a session kills the kernels of notebooks opened in it, and any terminal
+// ptys it owns (server-side, so it happens even with no browser connected).
+sessions.on('destroyed', (id: string) => { kernels.shutdownForSession(id); panes.destroyForSession(id) })
 
-const panes = new PaneManager()
 bridgeSessionEvents(sessions, hub)
 bridgeNotebookEvents(notebooks, kernels, hub)
 bridgePaneEvents(panes, hub)
@@ -118,6 +129,7 @@ function shutdown(): void {
   void saveState(sessions.saved())
   sessions.shutdown()
   kernels.destroy()   // kill the Jupyter server (and with it every notebook kernel)
+  panes.destroyAll()  // kill every terminal pty (don't rely on SIGHUP-on-fd-close)
   setTimeout(() => { sessions.killHard(); process.exit(0) }, 800)
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, shutdown)
@@ -239,9 +251,10 @@ async function start(): Promise<void> {
   })
   app.log.info(`Claudette server ready on http://${HOST}:${PORT}`)
   if (auth.required) {
-    app.log.info(`Access token REQUIRED. Authenticate a device once via: <origin>/?token=${maskToken(auth.token!)}`)
+    app.log.info(`Access token REQUIRED (${maskToken(auth.token!)}). Authenticate a device once via <origin>/?token=…` +
+      ` — full token: $CLAUDETTE_TOKEN or ${tokenFilePath()}`)
   } else {
-    app.log.info('Access token: not set (loopback-only). Set CLAUDETTE_TOKEN + a non-loopback HOST to expose securely.')
+    app.log.info('Access token DISABLED (CLAUDETTE_NO_AUTH=1, loopback-only). Anything that can reach this port — including sandboxed sessions — has full control.')
   }
 }
 

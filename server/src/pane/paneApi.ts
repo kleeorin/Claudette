@@ -13,7 +13,7 @@ export function bridgePaneEvents(panes: PaneManager, hub: WsHub): void {
 
 export function registerPaneRoutes(app: FastifyInstance, panes: PaneManager): void {
   app.post<{ Body: CreatePaneRequest }>('/api/pane/create', async (req): Promise<CreatePaneResponse> => {
-    return { id: panes.create(req.body.cwd) }
+    return { id: panes.create(req.body.cwd, req.body.cols, req.body.rows, req.body.sessionId) }
   })
   app.post<{ Body: { id: string } }>('/api/pane/destroy', async (req) => {
     panes.destroy(req.body.id)
