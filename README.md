@@ -39,6 +39,11 @@ but can't execute):
 pip install jupyter-server ipykernel      # or: python3 -m pip install …
 ```
 
+**4. bubblewrap** *(optional — for sandboxing sessions)* — lets a session confine
+Claude (and its notebook kernels) to a chosen set of folders. Without it, sessions
+run unconfined and the UI labels them "sandbox unavailable". Install + enable it once
+per machine — see [Sandboxing sessions](#sandboxing-sessions-bubblewrap) below.
+
 **Then clone and launch:**
 
 ```bash
@@ -55,11 +60,16 @@ runs `npm install` for you on first run and whenever the lockfile changes.
 
 ### Exposing it beyond localhost (phone / another device / VPN)
 
-By default the server binds loopback (`127.0.0.1`) and needs no token — from the
-**same machine**, the firewall is irrelevant and any port works. To reach it from
+By default the server binds loopback (`127.0.0.1`) — from the **same machine**, the
+firewall is irrelevant and any port works. An access token is required **even there**:
+without `CLAUDETTE_TOKEN` set, the server auto-generates one and persists it at
+`~/.config/claudette/token`, and `launch.sh` prints a ready-to-open `?token=` URL.
+(Loopback is not a trust boundary here — sandboxed sessions share the host network,
+see `SANDBOX.md`. Opt out consciously with `CLAUDETTE_NO_AUTH=1`.) To reach it from
 **another device** you bind a non-loopback address, and the server then **requires
-an access token** (it refuses to start without one — fail-closed by design, because
-Claudette runs shell commands and drives Claude, unlike a plain file server).
+`CLAUDETTE_TOKEN` explicitly** (it refuses to start without one — fail-closed by
+design, because Claudette runs shell commands and drives Claude, unlike a plain file
+server).
 
 **Always use `--build` for remote access** — it serves the UI and the API from a
 *single* origin, so there's only **one** port to reach. (Plain `./launch.sh` is dev
@@ -92,6 +102,16 @@ CLAUDETTE_TOKEN=<your-secret> HOST=0.0.0.0 PORT=8916 ./launch.sh --build
 - `HOST=0.0.0.0` — listen on all interfaces (incl. the VPN one), not just loopback.
 - `PORT=8916` — any open port **≥ 1024** (ports below 1024 need root to bind).
 - No firewall changes needed if the port is already reachable over the VPN.
+
+> **Allow the hostname if you reach it by name in _dev_ mode.** Vite (dev only)
+> rejects requests whose `Host` header isn't the bind address — so opening the dev
+> server at `http://box.internal:5273` over a VPN gives *"Blocked request. This host
+> is not allowed."* Allowlist it:
+> ```bash
+> HOST=0.0.0.0 WEB_ALLOWED_HOSTS=box.internal ./launch.sh      # comma-separate several; `all` allows any
+> ```
+> **Build mode has no Vite**, so it needs none of this — another reason to prefer
+> `--build` for remote access.
 
 #### Locked-down firewall (no inbound ports) → Tailscale
 
@@ -126,3 +146,38 @@ and build has *one*:
 - **Build mode** compiles the UI to static files (`web/dist/`) and the Node server
   serves **both the UI and the API from one origin** (`:4319`). No Vite, no proxy,
   one port. This is the way to run it for real, and what remote access should use.
+
+## Sandboxing sessions (bubblewrap)
+
+A session can **confine Claude — and its notebook kernels — to a chosen set of
+folders** using [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`), an
+unprivileged Linux sandbox. It's a *filesystem* firewall: Claude can read/write only
+the mounts you grant and can't see anything else; the network stays open. Full design
+in [`SANDBOX.md`](./SANDBOX.md).
+
+**1. Install bubblewrap:**
+
+```bash
+sudo apt install -y bubblewrap     # Debian/Ubuntu
+sudo dnf install -y bubblewrap     # Fedora
+sudo pacman -S bubblewrap          # Arch
+```
+
+**2. Turn it on (one-time, per machine):**
+
+```bash
+./scripts/enable-sandbox.sh            # detect + apply the minimal fix (idempotent)
+./scripts/enable-sandbox.sh --check    # probe only; exit 0 = sandbox works
+```
+
+Bubblewrap runs **fully unprivileged at runtime** — but modern distros (Ubuntu 23.10+)
+ship with unprivileged *user namespaces* locked down, and bwrap needs them. Re-enabling
+that is a **one-time privileged action** (`enable-sandbox.sh` uses `sudo` for it, then
+never again): on Ubuntu it installs a bwrap-only AppArmor profile granting `userns`;
+on older distros it flips the `sysctl` knob. Same class of one-time setup as Docker's
+daemon/group. After that, every session is confined with no further root.
+
+**Without it, Claudette still runs** — sessions launch unconfined and are labeled
+"sandbox unavailable"; it never shows a false green light. Manage a session's
+confinement from the **Sandbox** panel (or the chip in its meta bar): toggle it, add
+folders, set each read-only or read-write.

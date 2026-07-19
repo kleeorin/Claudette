@@ -8,3 +8,4 @@ out/
 .claudette-token
 # Generated phone-pairing QR — encodes the URL WITH the access token; never commit.
 /qr.png
+.chrome-headless/

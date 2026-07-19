@@ -10,9 +10,10 @@
 # Security model (see PLAN §1 / auth.ts): nothing is public. Only your tailnet
 # devices can reach it (WireGuard), and the app itself requires an access token.
 #
-# The token is persisted to .claudette-token so it is STABLE across runs — your
-# installed phone app (PWA) keeps its login and doesn't need re-scanning. Override
-# for one run with  CLAUDETTE_TOKEN=… ./rc_launch.sh  (also rewrites the file).
+# The token is persisted under ~/.config/claudette/ (NOT in the project dir, which is
+# mounted into session sandboxes) so it is STABLE across runs — your installed phone
+# app (PWA) keeps its login and doesn't need re-scanning. Override for one run with
+# CLAUDETTE_TOKEN=… ./rc_launch.sh  (also rewrites the file).
 #
 #   ./rc_launch.sh                 # build + serve + run (HTTPS on 443)
 #   PORT=4319 ./rc_launch.sh       # change the local app port (serve follows)
@@ -29,7 +30,20 @@ cd "$ROOT"
 
 HOST="127.0.0.1"                 # app binds loopback; tailscale serve fronts it
 PORT="${PORT:-4319}"
-TOKEN_FILE="$ROOT/.claudette-token"
+# Persist the token OUTSIDE the project dir. The project is bind-mounted read-write
+# into each session's sandbox, so a token file living there is readable by a
+# (potentially compromised) sandboxed Claude — which could then authenticate to the
+# control API and create an unsandboxed session. ~/.config is never mounted.
+TOKEN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claudette"
+TOKEN_FILE="$TOKEN_DIR/token"
+mkdir -p "$TOKEN_DIR"; chmod 700 "$TOKEN_DIR"
+# One-time migration: relocate a legacy in-project token, then remove the exposed copy.
+LEGACY_TOKEN_FILE="$ROOT/.claudette-token"
+if [ -s "$LEGACY_TOKEN_FILE" ] && [ ! -s "$TOKEN_FILE" ]; then
+  cp "$LEGACY_TOKEN_FILE" "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+  echo "==> migrated access token out of the project dir → $TOKEN_FILE"
+fi
+[ -e "$LEGACY_TOKEN_FILE" ] && rm -f "$LEGACY_TOKEN_FILE"
 
 # --- prerequisites ----------------------------------------------------------
 command -v node >/dev/null 2>&1 || { echo "error: node not found. Install Node 20+." >&2; exit 1; }
@@ -49,7 +63,7 @@ elif [ -s "$TOKEN_FILE" ]; then
 else
   TOKEN="$(openssl rand -hex 16)"
   printf '%s' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
-  echo "==> generated a new access token → .claudette-token"
+  echo "==> generated a new access token → $TOKEN_FILE"
 fi
 
 # --- dependencies + production build ----------------------------------------

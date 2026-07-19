@@ -10,7 +10,10 @@ import { WebSocket } from 'ws'
 const APP = 'http://127.0.0.1:4319'
 const OUT = '/tmp/claudette-shots'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-const token = (await readFile('.claudette-token', 'utf8')).trim()
+// Token now lives under ~/.config/claudette/ (out of the mounted project dir); fall
+// back to the CLAUDETTE_TOKEN env for one-off overrides.
+const tokenPath = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/claudette/token`
+const token = (process.env.CLAUDETTE_TOKEN || (await readFile(tokenPath, 'utf8'))).trim()
 
 await spawnSync('mkdir', ['-p', OUT])
 function spawnSync(cmd, args) { return new Promise((r) => spawn(cmd, args).on('exit', r)) }

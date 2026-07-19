@@ -1,5 +1,137 @@
 # Claudette — Handover
-_Last updated: 2026-07-14_
+_Last updated: 2026-07-18_
+
+## 2026-07-18 (latest) — ALL KNOWN SANDBOX ESCAPES CLOSED (code) ✅ UNCOMMITTED, needs restart
+Implemented fixes for every documented escape vector. All typecheck clean; verified by
+`scratchpad/sandbox-escape-fixes-test.mts` (18/18 argv-level) + a live nested-bwrap run.
+**Live `:4319` still runs the OLD code — a server restart is required to activate all of
+this** (the running server is plain `tsx src/index.ts`, NOT `tsx watch` — corrects the old
+gotcha — so my edits did NOT hot-reload and did NOT disturb this session).
+
+- **Terminal-pane escape → FIXED** (`server/src/pane/paneManager.ts`, `server/src/index.ts`).
+  New `paneSpawnSpec` + a sandbox resolver wired in `index.ts` (mirrors the kernel one):
+  a pane for a confined session spawns its shell via `wrapCommand(cfg, cwd, shell, [])` —
+  the same bwrap box as the session's Claude/kernels, `--clearenv`'d. Unconfined session →
+  raw shell but env scrubbed of `CLAUDETTE_*` (`sanitizedEnv`). Live proof: sandboxed pane
+  can't see `~/Downloads`, `$CLAUDETTE_TOKEN` empty, `server/` EROFS, `scratchpad/` writable.
+- **Self-modification escape → FIXED** (`server/src/claude/sandbox.ts`). `appSourceProtections`
+  adds an `--ro-bind` overlay of `<appRoot>/server` + `/shared` inside any box that would
+  otherwise expose them rw (bwrap shallow-first layering pins just those subtrees ro; rest
+  of the project stays writable; never revealed to a box that didn't mount them). Opt out:
+  `CLAUDETTE_ALLOW_APP_SOURCE_MOUNT=1`. `appRoot` auto-detected (walk up to the dir with
+  server/+shared/), override `CLAUDETTE_APP_ROOT`.
+- **Control-plane escape / Fix C → FIXED** (`server/src/claude/sessionManager.ts`).
+  `normalizeSandbox` (now exported) ignores `sandbox.enabled=false` and forces confinement
+  ON unless `CLAUDETTE_ALLOW_UNSANDBOXED=1` — single choke point for create/setSandbox/
+  restore. Confinement can't be lowered by a (possibly in-box) request.
+- **Token even on loopback + clearenv (earlier this session)** → the box holds NO credential,
+  so it can't call the authenticated API at all. Kernels already confined per-session.
+- **Fix D (network isolation) — DEFERRED BY USER DECISION (2026-07-18), now defense-in-depth**,
+  not a live escape (every loopback-reachable primitive is credential-gated-and-box-has-no-cred,
+  or confined). Its remaining value is *third-party exfil* protection (a prompt-injected Claude
+  phoning home), NOT escape. Recommended when revisited: Level 3 (nftables allowlist on a
+  dedicated UID/cgroup) — a host-config change to design WITH the operator. See SANDBOX.md.
+- **New operator flags** (all default-OFF/secure): `CLAUDETTE_ALLOW_UNSANDBOXED`,
+  `CLAUDETTE_ALLOW_APP_SOURCE_MOUNT`, `CLAUDETTE_APP_ROOT`, `CLAUDETTE_NO_AUTH`.
+  ⚠ **Dev-in-Claudette impact:** after restart, a session whose cwd is this repo gets
+  `server/`+`shared/` READ-ONLY. To edit the server's own source from inside a session, the
+  operator must set `CLAUDETTE_ALLOW_APP_SOURCE_MOUNT=1` (and to make an unsandboxed session,
+  `CLAUDETTE_ALLOW_UNSANDBOXED=1`).
+- Still open (hardening, not live holes): owner-scope panes on the WS; `--strict-mcp-config`;
+  node_modules writable in a repo-rw box (next-start-only, supply-chain-adjacent); Fix D.
+
+## 2026-07-18 (later) — Security (i) DONE: token required even on loopback ✅ UNCOMMITTED
+Implements the recommended first security step from the 07-18 review (closes the local
+leg of the control-plane escape: an in-box process — post-fix-A envless, no config mount —
+can no longer call the loopback API unauthenticated).
+- **`server/src/auth.ts`**: `resolveAuth` loopback branch now always requires a token —
+  env `CLAUDETTE_TOKEN` if set, else loads-or-mints (0600, dir 0700) the persistent one at
+  `${XDG_CONFIG_HOME:-~/.config}/claudette/token` (same file `rc_launch.sh` manages; never
+  mounted into boxes; stable so devices stay logged in). Explicit opt-out `CLAUDETTE_NO_AUTH=1`
+  (loopback only). Non-loopback: unchanged fail-closed (env token mandatory — a silent file
+  token shouldn't guard a deliberate exposure). New export `tokenFilePath()`.
+- **`launch.sh`**: mirrors the token source (env → file → generate via openssl) and prints a
+  ready-to-open `?token=` URL for both dev and `--build`; `CLAUDETTE_NO_AUTH=1` respected.
+  **`index.ts`**: startup log points at the token file (still masked). **README.md** +
+  **SANDBOX.md** updated (SANDBOX "Done" list now includes this).
+- Verified: `scratchpad/auth-loopback-test.mjs` **17/17** (401 without token; file minted
+  mode 600; Bearer + cookie + WS-upgrade gating; token stable across restart; NO_AUTH opt-out
+  open; env token beats file). Typecheck clean. **Server restart needed to take effect.**
+- ⚠ **Ripple:** throwaway test servers now need `CLAUDETTE_NO_AUTH=1` (or a token) — older
+  scratchpad UI tests that boot :4321 unauthenticated will 401 until run that way. After the
+  live server restarts, the browser needs one `?token=` visit (launch.sh prints it).
+- Remaining security queue: ~~self-modification → Fix C → terminal-pane~~ ALL DONE — see the
+  "ALL KNOWN SANDBOX ESCAPES CLOSED" entry at the top. Only Fix D (network) + minor hardening left.
+- **NEW vector documented (2026-07-18):** SANDBOX.md § "Terminal-pane escape (unsandboxed
+  pty spawn)". (Now FIXED — see top entry.) `PaneManager.create()` does a bare `pty.spawn(shell,{cwd,env:process.env})`
+  with **no `wrapSandbox`** — every terminal pane is an unsandboxed host shell as the
+  server's user, inheriting `CLAUDETTE_TOKEN` (NOT covered by fix A) and an arbitrary
+  caller-controlled `cwd`. Driven purely over loopback: `POST /api/pane/create` → WS
+  `pane:input` = arbitrary RCE (a superset of the fs-API write). DEMONSTRATED this session
+  (`/proc/self/root` = `/`, listed `~/Downloads` from outside the box). Real fix: route the
+  pane pty through the same bwrap wrapper as sessions; also extend `--clearenv` to it, scope
+  `cwd`, and owner-scope panes on the WS. This is arguably the highest-value fix now — a
+  terminal that escapes makes the box around the chat moot.
+
+## 2026-07-18 (later) — 0a DONE: doubling fix + Agents tray browser-verified ✅
+`scratchpad/doubling-agents-test.mjs` (7/7) against a REAL Claude session on the :4321
+throwaway server: turn 1 (bash + marker-word prose) → marker renders exactly once, no
+long line repeats (doubling fix holds); turn 2 (forced subagent) → Agents tray + AgentCard
+with type chip + status label render live (Agent-vs-Task fix holds). `web/dist` rebuilt 07-18.
+- **In-box testing gotchas (durable):** host Chrome lives in `/opt` → INVISIBLE inside a
+  sandboxed session. Use the project-local Chrome for Testing at
+  `.chrome-headless/chrome/linux-*/chrome-linux64/chrome` (gitignored; re-download via
+  `npx @puppeteer/browsers install chrome@stable --path .chrome-headless`), passed to tests
+  via `CHROME_BIN`. Also: this session still INHERITS `CLAUDETTE_TOKEN` (fix A isn't live
+  until the server restarts) — a throwaway server picks it up from env and then requires
+  token auth even on loopback; launch it with `env -u CLAUDETTE_TOKEN`. And `pkill -f` can
+  match its OWN shell's command line (exit 144 killed the compound) — use a bracket in the
+  pattern, e.g. `pkill -f 'remote-debugging-port=936[0-9]'`.
+
+## 2026-07-18 — Agent rendering fixes + sandbox security review (A/B done) ⚠ ALL UNCOMMITTED, not yet live
+Three workstreams this session. **Everything is in the working tree, uncommitted.** A/B need
+a **server restart/reload** to take effect; the two web fixes need a **web reload** (`web/dist`
+already rebuilt; dev `:5273` hot-reloads). I did NOT restart the running server — it would kill
+this very session (I'm running *inside* a Claudette sandboxed session, cwd = this repo).
+
+**1. Chat "doubling" fix** (`web/src/store/chat.tsx`). The phone-join `ASSISTANT` reducer
+(uncommitted from a prior turn) duplicated assistant prose: with `--include-partial-messages`,
+a message can arrive as >1 `assistant` event; the reducer wiped the whole `open` index map after
+each, so the 2nd (cumulative) event couldn't find the already-streamed item and re-materialized
+it. Fix: `ASSISTANT` no longer clears `open` wholesale; reset per message on the stream's
+`message_start` (new `MSG_START` action + a branch in `handleStreamEvent`); the materialize-fresh
+path registers the new item's id back into `open` so cumulative snapshots finalize in place.
+Typecheck clean. **Not yet browser-verified against a live doubling repro.**
+
+**2. Agents tray was always empty** (`web/src/store/chat.tsx` + `components/ChatView.tsx`). The
+subagent tool in CLI **2.1.207 is named `Agent`, not `Task`**; `collectAgents`,
+`countRunningAgents`, and the ChatView render-filter all matched only `Task`, so `agents` was
+always `[]` and the whole `AgentsTray` was gated out. Fix: `export const isSubagentTool = (n) =>
+n==='Task' || n==='Agent'` applied at all four sites. Rebuilt `web/dist`. Confirmed live: the
+session's subagent `tool_use` has `name:"Agent"` with children carrying `parent_tool_use_id`.
+
+**3. Sandbox security review — A+B implemented, C/D + self-modification documented.**
+Full threat-model + fixes now live in **`SANDBOX.md`** (new sections: "Control-plane escape" and
+"Self-modification escape"). Summary:
+- **Core hole:** sandbox is filesystem-only (deliberately no `--unshare-net`), so a sandboxed
+  session can reach the loopback control API and `POST /api/session/create` with
+  `sandbox:{enabled:false}` → a fully **unsandboxed** session. Demonstrated by hand this session.
+- **Fix A — env isolation** (`server/src/claude/sandbox.ts`): added `--clearenv` + an allowlist
+  (`CLAUDE_ENV_ALLOW_PREFIXES`, `passthroughEnvArgs`, `BASE_PATH`, `nodeBinDir`) so the child no
+  longer inherits `CLAUDETTE_TOKEN`/unrelated host secrets; claude's own auth/proxy/CA vars pass
+  through. Kernels (`wrapCommand`) get no creds (bonus). **Tested** via `/tmp/sbtest.mts`: token
+  gone, `MY_DB_PASSWORD` gone, `ANTHROPIC_API_KEY` passed, `claude --version` exit 0 in-box.
+- **Fix B — token off the mounts** (`rc_launch.sh`, `scratchpad/ui-screenshots.mjs`): token now
+  persists to `~/.config/claudette/token` (never mounted) with a migrate+delete of the legacy
+  in-project `.claudette-token`. Live exposed copy already migrated/removed.
+- **Deferred (documented, NOT coded):** **C** = API must not let a confined caller lower its own
+  confinement (hard: server can't tell in-box loopback caller from the real UI); **D** = network
+  isolation (nftables/pasta) to cut the loopback reach; **Self-modification escape** = the sharpest
+  one and **unaddressed by A–D**: session cwd = repo mounted rw + server under `tsx watch` → edit
+  any `server/src/**` (e.g. an MCP tool in `mcp/notebookTools.ts`) → hot-reload runs arbitrary code
+  **unsandboxed**. Needs *no token/network*. Only mitigations: don't rw-mount the app's own source
+  into a session; don't run `tsx watch` when exposed. Also recommended: **require a token even on
+  loopback** (else the local API is unauthenticated and A/B don't bite locally).
 
 ## 2026-07-14 — FIX: Claude-opened notebook leaked into the VIEWED session ✅
 A notebook a Claude tool opened (in background session X) attached to whatever session
@@ -380,8 +512,16 @@ panes, **asserts**), `git-shot.mjs`, `files-shot.mjs`. Shots land in `/tmp/claud
 **`layout-shots.mjs` / `ui-screenshots.mjs` are STALE** (predate the redesign).
 
 ## Gotchas (durable)
-- **A running server does NOT hot-reload.** `tsx src/index.ts` (no `--watch`) serves a *prebuilt*
-  bundle → rebuild + restart to see edits. The live `:4319` instance predates ALL 07-11/07-12 work.
+- **The running `:4319` server is plain `tsx src/index.ts` — NO watch** (verified 2026-07-18
+  via the process tree: `sh -c tsx src/index.ts` → `tsx` → `node … src/index.ts`, no `watch`
+  anywhere). So server *source* edits do NOT hot-reload and do NOT disturb running sessions;
+  changes go live only on a **manual restart** (which drops WS clients + relaunches sessions,
+  killing any session running inside this repo). This CORRECTS the earlier "hot-reloads under
+  `tsx watch`" note. (The `dev` script IS `tsx watch`, but this instance wasn't started that
+  way.) Because it doesn't watch, the self-modification escape isn't *live* here — but it's
+  still fixed in code (app source is ro in boxes; see SANDBOX.md). The **web** bundle is served
+  from `web/dist` (static) — web changes need `npm run build -w @claudette/web` for `:4319`;
+  dev `:5273` hot-reloads web via Vite.
 - **Web dev port is 5273** (not 5173). **`NODE_ENV=development` is exported in this shell** — web's
   `build` re-pins `NODE_ENV=production` (else a bloated dev bundle / dead SW). Don't remove.
 - **`@fastify/static` wildcard handler** serves rebuilt hashed assets without a restart — keep it.
@@ -400,6 +540,19 @@ panes, **asserts**), `git-shot.mjs`, `files-shot.mjs`. Shots land in `/tmp/claud
 - Bundle is ~2.0 MB (CodeMirror + xterm + Milkdown) — fine for localhost; code-split later.
 
 ## Next steps
+**Immediate (2026-07-18 session — all uncommitted):**
+0a. ~~Browser-verify the doubling fix + Agents tray~~ ✅ DONE (see 07-18 later entry;
+    `scratchpad/doubling-agents-test.mjs` 7/7). Live `:4319` still needs a restart to pick it up.
+0b. **Security — DONE.** token-on-loopback + terminal-pane + self-modification + Fix C all
+    implemented + tested (see the top "ALL KNOWN SANDBOX ESCAPES CLOSED" entry). Remaining is
+    only Fix D (network isolation, now defense-in-depth) + minor hardening (owner-scope panes,
+    --strict-mcp-config, node_modules). **Activate with a server restart** (not yet done —
+    would drop this session; the running server is the OLD code).
+0c. **Commit** the working-tree changes once the user says so (memory: never commit without an
+    order). Touched: `web/src/store/chat.tsx`, `web/src/components/ChatView.tsx`,
+    `server/src/claude/sandbox.ts`, `rc_launch.sh`, `scratchpad/ui-screenshots.mjs`, `SANDBOX.md`,
+    plus the earlier uncommitted Phase-2 files already in `git status`.
+
 1. **Rebuild to go live** — `./rc_launch.sh` (outward) or `./launch.sh` (dev). No schema change.
 2. **Phase 2 remaining** (pick one): **permissions center** (view/edit Claude Code allow/deny/ask
    rules — CM has `../ClaudeMaster/src/main/permissions.ts` + `HANDOVER-permissions.md` to port) ·
@@ -426,5 +579,6 @@ HTTPS certs done; first HTTPS hit provisions the cert (~10 s). Boot-persistence 
 ## References
 `PLAN.md` (architecture + decisions) · `TASKS.md` (P0/P1 checklist — pre-dates Phase 2) ·
 `~/.claude/plans/hashed-sleeping-moler.md` (approved shell-redesign plan) · `NOTEBOOK-PLAN.md` ·
-`README.md` · `../ClaudeMaster/` (port source; `permissions.ts` + `HANDOVER-permissions.md` for the
-next task) · memory index `MEMORY.md`.
+`README.md` · **`SANDBOX.md`** (bwrap model + the full escape-vector threat model / fixes A–D +
+self-modification — read before touching sandbox or session-create) · `../ClaudeMaster/` (port
+source; `permissions.ts` + `HANDOVER-permissions.md` for the next task) · memory index `MEMORY.md`.

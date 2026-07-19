@@ -35,6 +35,28 @@ fi
 command -v claude  >/dev/null 2>&1 || echo "warn: 'claude' not on PATH — chat sessions won't start (npm i -g @anthropic-ai/claude-code)." >&2
 python3 -c 'import jupyter_server' >/dev/null 2>&1 || echo "warn: jupyter_server not importable for python3 — notebooks won't run (pip install jupyter-server ipykernel)." >&2
 
+# --- access token ------------------------------------------------------------
+# The server now requires a token EVEN ON LOOPBACK (sandboxed sessions share the
+# host network — see SANDBOX.md "Control-plane escape"). Mirror the server's
+# token source (env → ~/.config/claudette/token → generate) so we can print a
+# ready-to-open authenticated URL. Opt out with CLAUDETTE_NO_AUTH=1.
+AUTH_QS=""
+if [ "${CLAUDETTE_NO_AUTH:-}" != "1" ]; then
+  TOKEN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claudette"
+  TOKEN_FILE="$TOKEN_DIR/token"
+  if [ -n "${CLAUDETTE_TOKEN:-}" ]; then
+    TOKEN="$CLAUDETTE_TOKEN"
+  elif [ -s "$TOKEN_FILE" ]; then
+    TOKEN="$(cat "$TOKEN_FILE")"
+  else
+    mkdir -p "$TOKEN_DIR"; chmod 700 "$TOKEN_DIR"
+    TOKEN="$(openssl rand -hex 16)"
+    printf '%s' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+    echo "==> generated a new access token → $TOKEN_FILE"
+  fi
+  AUTH_QS="?token=$TOKEN"
+fi
+
 # --- dependencies -----------------------------------------------------------
 # Install if node_modules is missing or the lockfile changed since last install.
 if [ ! -d node_modules ] || [ package-lock.json -nt node_modules/.package-lock.json ] 2>/dev/null; then
@@ -47,6 +69,7 @@ if [ "${1:-}" = "--build" ]; then
   echo "==> building web…"
   npm run build -w @claudette/web
   echo "==> serving app + API from one origin on http://$HOST:$PORT"
+  echo "    open http://$HOST:$PORT/$AUTH_QS   (authenticates this browser once)"
   if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ] && [ -z "${CLAUDETTE_TOKEN:-}" ]; then
     echo "    note: HOST is non-loopback — set CLAUDETTE_TOKEN=\$(openssl rand -hex 24) to expose securely (the server will refuse to start otherwise)." >&2
   fi
@@ -58,6 +81,6 @@ fi
 
 echo "==> Claudette dev"
 echo "    server : http://$HOST:$PORT"
-echo "    web    : http://$HOST:$WEB_PORT   <-- open this"
+echo "    web    : http://$HOST:$WEB_PORT/$AUTH_QS   <-- open this (authenticates this browser once)"
 echo
 exec npm run dev
