@@ -1,3 +1,4 @@
+import DOMPurify from 'dompurify'
 import { nbText as asText, type NbOutput } from '@claudette/shared'
 
 // Renders one nbformat output dict. Unlike ClaudeMaster's Output (which consumed a
@@ -8,6 +9,18 @@ function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '')
 }
 
+// Kernel-produced `text/html` and SVG are attacker-controlled: any library's
+// `_repr_html_`, or a hand-crafted `.ipynb` opened from disk, can carry
+// `<img onerror>`, `<script>`, `javascript:` URLs, etc. Rendered raw they would
+// execute in the app's authenticated origin (full fs/pane/git API) — and a
+// sandboxed kernel's HTML would escape confinement through the operator's
+// browser. Sanitize before injecting: DOMPurify strips scripts/event handlers/
+// unsafe URLs while keeping benign markup (tables, styles) so pandas/plotly
+// output still renders. DOMPurify's default profile covers HTML, SVG and MathML.
+function sanitizeHtml(html: string): string {
+  return DOMPurify.sanitize(html)
+}
+
 // Richest-first: prefer HTML/image/svg over plain text; fall back to any text-ish
 // bundle (latex/markdown/json) so an output is never rendered blank just because it
 // lacks a `text/plain` alternative.
@@ -16,7 +29,7 @@ function MimeContent({ data }: { data: Record<string, unknown> }) {
   if (html) {
     // `nb-html` scopes table styling in index.css that restores pandas DataFrame
     // readability (the global reset strips th/td padding + borders).
-    return <div className="text-sm nb-html" dangerouslySetInnerHTML={{ __html: html }} />
+    return <div className="text-sm nb-html" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) }} />
   }
   // Bitmap images (base64-encoded in the mime bundle).
   for (const mime of ['image/png', 'image/jpeg', 'image/gif'] as const) {
@@ -24,7 +37,7 @@ function MimeContent({ data }: { data: Record<string, unknown> }) {
     if (typeof b64 === 'string') return <img src={`data:${mime};base64,${b64}`} className="max-w-full" alt="" />
   }
   const svg = asText(data['image/svg+xml'])
-  if (svg) return <div dangerouslySetInnerHTML={{ __html: svg }} />
+  if (svg) return <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(svg) }} />
   const plain = asText(data['text/plain'])
   if (plain) return <pre className="text-xs text-ctp-text whitespace-pre-wrap font-mono">{plain}</pre>
   // Text-ish fallbacks with no text/plain alternative (LaTeX from Math/SymPy,
