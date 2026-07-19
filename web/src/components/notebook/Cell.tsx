@@ -21,19 +21,14 @@ interface Props {
   onCodeChange: (code: string) => void
   onEditorFocus: () => void
   onEditorBlur: () => void
-  onTogglePin: () => void
   onRun: () => void           // Ctrl/Cmd+Enter — run in place
   onRunAdvance: () => void    // Shift+Enter — run, then move to next cell
   onEscape: () => void        // leave the editor (enter command mode)
   onInsertBelow: () => void   // Alt+Enter — run and insert a cell below
-  onMoveUp: () => void
-  onMoveDown: () => void
-  onToggleType: () => void
-  onRemove: () => void
-  onDuplicate: () => void
-  onSplit: () => void         // split this cell into two at the editor's cursor
   onReorder: (fromIndex: number) => void
-  onMenu: (x: number, y: number) => void   // open the cell context menu at (x, y)
+  // The ⋯ button opens the cell action menu at (x, y). Everything that used to be a
+  // per-cell gutter button (move/convert/duplicate/split/pin/delete) now lives there.
+  onMenu: (x: number, y: number) => void
   // Register this cell's editor so the notebook find bar can highlight + scroll to
   // matches inside it (null on unmount).
   registerView: (id: string, view: EditorView | null) => void
@@ -56,7 +51,7 @@ interface Props {
 const COMMIT_DEBOUNCE_MS = 500
 
 export function Cell(props: Props) {
-  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, onSelect, onMoveUp, onMoveDown, onToggleType, onRemove, onDuplicate, onSplit, onReorder, onTogglePin, onBeginEdit, onToggleCollapse, onMenu } = props
+  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, onSelect, onReorder, onBeginEdit, onToggleCollapse, onMenu } = props
   const editorRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const cbRef = useRef(props)
@@ -72,7 +67,18 @@ export function Cell(props: Props) {
   // its rendered output. Code/raw cells always show the editor.
   const showEditor = !isMarkdown || !rendered
   const [outputCollapsed, setOutputCollapsed] = useState(false)
+  const [minimized, setMinimized] = useState(false)
   const outputs = cell.outputs ?? []
+
+  // An "annotation" is a comment line at the very top of the cell — a Python `#`
+  // comment in code, or a leading `#`/heading line in markdown/raw. When one is
+  // present the whole cell can be minimized (double-click the gutter) down to just
+  // that line, shown as a title. Without one there's nothing to title it with, so
+  // minimize is disabled.
+  const firstNonBlank = cell.source.split('\n').map((l) => l.trim()).find((l) => l !== '') ?? ''
+  const annotation = firstNonBlank.startsWith('#') ? firstNonBlank.replace(/^#+\s*/, '').trim() || firstNonBlank : null
+  const canMinimize = annotation !== null
+  const isMinimized = minimized && canMinimize
 
   // Only send an editCell when the buffer actually differs from the server's current
   // source. A blur (click away, Ctrl+click another cell) flushes unconditionally, and
@@ -92,7 +98,7 @@ export function Cell(props: Props) {
   }
 
   useEffect(() => {
-    if (!editorRef.current || !showEditor) return
+    if (!editorRef.current || !showEditor || isMinimized) return
     const lang: Extension[] = cell.cellType === 'markdown' ? [markdown()] : cell.cellType === 'code' ? [python()] : []
     // For markdown, running/leaving blurs the editor first — the blur handler is the
     // single "exit edit" path (commits the buffer, then NotebookView re-renders it).
@@ -136,7 +142,7 @@ export function Cell(props: Props) {
     viewRef.current = view
     cbRef.current.registerView(cell.id, view)
     return () => { cbRef.current.registerView(cell.id, null); view.destroy(); viewRef.current = null }
-  }, [cell.id, cell.cellType, showEditor]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cell.id, cell.cellType, showEditor, isMinimized]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Push EXTERNAL source changes (a Claude edit, a reload) into the built editor —
   // but never while the user is typing here (focusedRef), and only when the text
@@ -166,7 +172,6 @@ export function Cell(props: Props) {
       className={`group flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50 bg-ctp-accent/[0.06]' : ''}`}
       onMouseDown={onSelect}
       onFocus={onSelect}
-      onContextMenu={(e) => { e.preventDefault(); onMenu(e.clientX, e.clientY) }}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
       onDrop={(e) => {
         const from = Number(e.dataTransfer.getData('application/x-cell-index'))
@@ -177,7 +182,8 @@ export function Cell(props: Props) {
       <div
         draggable
         onDragStart={(e) => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('application/x-cell-index', String(index)) }}
-        title="Drag to reorder"
+        onDoubleClick={(e) => { if (canMinimize) { e.stopPropagation(); setMinimized((v) => !v) } }}
+        title={canMinimize ? (isMinimized ? 'Double-click to expand' : 'Drag to reorder · double-click to minimize') : 'Drag to reorder'}
         className="w-12 shrink-0 text-right pt-1.5 text-xs text-ctp-overlay font-mono select-none cursor-grab active:cursor-grabbing"
       >
         {collapsible ? (
@@ -193,6 +199,17 @@ export function Cell(props: Props) {
       </div>
 
       <div className="flex-1 min-w-0 space-y-1">
+        {isMinimized ? (
+          <button
+            onClick={() => setMinimized(false)}
+            title="Minimized — click to expand (or double-click the gutter)"
+            className="w-full flex items-center gap-1.5 text-left px-3 py-1 text-[13px] text-ctp-subtext italic truncate border border-dashed border-ctp-surface1 rounded hover:bg-ctp-surface0/40"
+          >
+            <span className="shrink-0 not-italic text-ctp-overlay">▸</span>
+            <span className="truncate">{annotation}</span>
+          </button>
+        ) : (
+        <>
         <div data-cell-id={cell.id} className={`transition-colors ${borderClass}`}>
           {showEditor ? (
             <div ref={editorRef} />
@@ -241,36 +258,21 @@ export function Cell(props: Props) {
             )}
           </div>
         )}
+        </>
+        )}
       </div>
 
-      {/* Per-cell actions — appear on hover */}
+      {/* Cell actions live behind this ⋯ button (copy/cut/paste, move, convert, pin,
+          delete…). Right-clicking the cell is left as the native browser menu so
+          selecting + copying text inside a cell works normally. */}
       <div className="w-5 shrink-0 self-start mt-1.5 flex flex-col items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-ctp-overlay">
         <button
           onClick={(e) => { e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); onMenu(r.right, r.bottom + 2) }}
-          title="More actions (copy, cut, paste…) · or right-click the cell"
+          title="Cell actions (copy, cut, move, delete…)"
           aria-label="Cell actions"
           className="text-[11px] leading-none px-0.5 py-0.5 rounded hover:bg-ctp-surface0 hover:text-ctp-text"
         >⋯</button>
-        <CellBtn onClick={onTogglePin} title={pinned ? 'Unpin (allow Claude to edit)' : 'Pin (lock for Claude)'} active={pinned}>{pinned ? '🔒' : '🔓'}</CellBtn>
-        <CellBtn onClick={onMoveUp} title="Move up">↑</CellBtn>
-        <CellBtn onClick={onMoveDown} title="Move down">↓</CellBtn>
-        <CellBtn onClick={onToggleType} title={isCode ? 'Convert to markdown' : 'Convert to code'}>{isCode ? 'M' : '{}'}</CellBtn>
-        <CellBtn onClick={onDuplicate} title="Duplicate cell">⧉</CellBtn>
-        {showEditor && <CellBtn onClick={onSplit} title="Split cell at cursor">✂</CellBtn>}
-        <CellBtn onClick={onRemove} title="Delete cell" danger>✕</CellBtn>
       </div>
     </div>
-  )
-}
-
-function CellBtn({ children, onClick, title, danger, active }: { children: React.ReactNode; onClick: () => void; title: string; danger?: boolean; active?: boolean }) {
-  return (
-    <button
-      onClick={(e) => { e.stopPropagation(); onClick() }}
-      title={title}
-      className={`text-[10px] leading-none px-0.5 py-0.5 rounded hover:bg-ctp-surface0 ${active ? 'text-ctp-mauve' : ''} ${danger ? 'hover:text-ctp-red' : 'hover:text-ctp-text'}`}
-    >
-      {children}
-    </button>
   )
 }

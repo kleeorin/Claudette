@@ -295,6 +295,24 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     setMatchIdx((i) => (i + dir + matches.length) % matches.length)
   }
 
+  // Load the available kernelspecs (+ Jupyter's default). Reset the error flag on
+  // each attempt so a retry can clear a prior failure; a failure leaves specs null
+  // (not []) so the menu shows a retry affordance rather than "No kernels found".
+  // NOTE: this hook and the effect below MUST stay above the `if (!doc)` return —
+  // when a notebook is closed `doc` goes undefined and the early return runs; any
+  // hook after it would be skipped, tripping React's rules-of-hooks and (absent an
+  // error boundary) blanking the whole app.
+  const loadSpecs = useCallback(() => {
+    setSpecsError(false)
+    nb.kernelSpecs()
+      .then((r) => { setSpecs(r.specs); setSpecDefault(r.default) })
+      .catch(() => { setSpecs(null); setSpecsError(true) })
+  }, [nb])
+
+  // Fetch specs when the notebook opens so the header can name the real kernel
+  // (not a hardcoded guess) even before anything has run.
+  useEffect(() => { loadSpecs() }, [loadSpecs])
+
   if (!doc) {
     return <div className="flex-1 flex items-center justify-center text-xs text-ctp-overlay">Loading…</div>
   }
@@ -395,20 +413,6 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     const i = cells.findIndex((c) => c.id === selectedId)
     if (i >= 0 && cells[i + 1]) nb.mergeCells(notebookId, [selectedId, cells[i + 1].id])
   }
-
-  // Load the available kernelspecs (+ Jupyter's default). Reset the error flag on
-  // each attempt so a retry can clear a prior failure; a failure leaves specs null
-  // (not []) so the menu shows a retry affordance rather than "No kernels found".
-  const loadSpecs = useCallback(() => {
-    setSpecsError(false)
-    nb.kernelSpecs()
-      .then((r) => { setSpecs(r.specs); setSpecDefault(r.default) })
-      .catch(() => { setSpecs(null); setSpecsError(true) })
-  }, [nb])
-
-  // Fetch specs when the notebook opens so the header can name the real kernel
-  // (not a hardcoded guess) even before anything has run.
-  useEffect(() => { loadSpecs() }, [loadSpecs])
 
   const openKernelMenu = () => {
     // Anchor the menu to the button in VIEWPORT coords and render it through a portal
@@ -639,18 +643,11 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
               onCodeChange={(code) => nb.updateSource(notebookId, cell.id, code)}
               onEditorFocus={() => { if (!pinned) nb.claim(notebookId, cell.id, 'focus') }}
               onEditorBlur={() => { if (isMd) endEdit(cell.id); if (!pinned) nb.release(notebookId, cell.id) }}
-              onTogglePin={() => pinned ? nb.release(notebookId, cell.id) : nb.claim(notebookId, cell.id, 'pin')}
               // Markdown "run" = render (the editor blur already did that); code runs.
               onRun={() => { if (!isMd) nb.run(notebookId, cell.id) }}
               onRunAdvance={() => { if (isMd) selectNextVisible(); else runAdvance(i, cell.id) }}
               onEscape={() => { selectOnly(cell.id); listRef.current?.focus() }}
               onInsertBelow={() => { nb.run(notebookId, cell.id); nb.addCell(notebookId, 'code', cell.id) }}
-              onMoveUp={() => nb.moveCell(notebookId, cell.id, i - 1)}
-              onMoveDown={() => nb.moveCell(notebookId, cell.id, i + 1)}
-              onToggleType={() => nb.setCellType(notebookId, cell.id, cell.cellType === 'code' ? 'markdown' : 'code')}
-              onRemove={() => { const n = (cells[i + 1] ?? cells[i - 1])?.id; nb.deleteCell(notebookId, cell.id); if (n) selectOnly(n); else { setSelectedId(null); setSelected(new Set()) } }}
-              onDuplicate={() => duplicate(cell.id)}
-              onSplit={() => splitAtCursor(cell.id)}
               onReorder={(from) => { const src = cells[from]; if (src) nb.moveCell(notebookId, src.id, i) }}
               registerView={registerCellView}
               onMenu={(x, y) => { selectOnly(cell.id); setCellMenu({ cellId: cell.id, x, y }) }}
@@ -663,6 +660,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
         const c = cells.find((x) => x.id === cellMenu.cellId)
         if (!c) return null
         const i = cells.findIndex((x) => x.id === cellMenu.cellId)
+        const menuPinned = lockOf(c.id)?.reason === 'pin'
         return (
           <CellContextMenu
             x={cellMenu.x} y={cellMenu.y}
@@ -670,6 +668,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
             hasClipboard={!!cellClipboard?.length}
             canSplit={c.cellType !== 'markdown' || mdEditing.has(c.id)}
             hasBelow={i < cells.length - 1}
+            pinned={menuPinned}
             onClose={() => setCellMenu(null)}
             onRun={() => nb.run(notebookId, c.id)}
             onCopy={() => copyCell(c.id)}
@@ -682,6 +681,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
             onSplit={() => splitAtCursor(c.id)}
             onMoveUp={() => nb.moveCell(notebookId, c.id, i - 1)}
             onMoveDown={() => nb.moveCell(notebookId, c.id, i + 1)}
+            onTogglePin={() => menuPinned ? nb.release(notebookId, c.id) : nb.claim(notebookId, c.id, 'pin')}
             onDelete={() => removeCell(c.id)}
           />
         )
@@ -696,14 +696,14 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
 // scroll never clips it; closes on outside click / Escape. `Paste` only shows when
 // the cell clipboard has content; `Split`/`Merge below` only when they're meaningful.
 function CellContextMenu({
-  x, y, isCode, hasClipboard, canSplit, hasBelow,
-  onClose, onRun, onCopy, onCut, onPasteAbove, onPasteBelow, onDuplicate, onConvert, onMergeBelow, onSplit, onMoveUp, onMoveDown, onDelete,
+  x, y, isCode, hasClipboard, canSplit, hasBelow, pinned,
+  onClose, onRun, onCopy, onCut, onPasteAbove, onPasteBelow, onDuplicate, onConvert, onMergeBelow, onSplit, onMoveUp, onMoveDown, onTogglePin, onDelete,
 }: {
-  x: number; y: number; isCode: boolean; hasClipboard: boolean; canSplit: boolean; hasBelow: boolean
+  x: number; y: number; isCode: boolean; hasClipboard: boolean; canSplit: boolean; hasBelow: boolean; pinned: boolean
   onClose: () => void
   onRun: () => void; onCopy: () => void; onCut: () => void; onPasteAbove: () => void; onPasteBelow: () => void
   onDuplicate: () => void; onConvert: () => void; onMergeBelow: () => void; onSplit: () => void
-  onMoveUp: () => void; onMoveDown: () => void; onDelete: () => void
+  onMoveUp: () => void; onMoveDown: () => void; onTogglePin: () => void; onDelete: () => void
 }) {
   useEffect(() => {
     const close = () => onClose()
@@ -715,7 +715,7 @@ function CellContextMenu({
   const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
   const run = (fn: () => void) => () => { onClose(); fn() }
   const left = Math.min(x, window.innerWidth - 200)
-  const top = Math.min(y, window.innerHeight - 340)
+  const top = Math.min(y, window.innerHeight - 380)
   return createPortal(
     <div style={{ left, top }} onClick={(e) => e.stopPropagation()} className="fixed z-[60] w-48 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs">
       {isCode && <><button className={item} onClick={run(onRun)}>▶ Run cell</button><div className="my-1 border-t border-ctp-surface0" /></>}
@@ -730,6 +730,8 @@ function CellContextMenu({
       {canSplit && <button className={item} onClick={run(onSplit)}>Split at cursor</button>}
       <button className={item} onClick={run(onMoveUp)}>Move up</button>
       <button className={item} onClick={run(onMoveDown)}>Move down</button>
+      <div className="my-1 border-t border-ctp-surface0" />
+      <button className={item} onClick={run(onTogglePin)}>{pinned ? 'Unpin (allow Claude edits)' : 'Pin (lock for Claude)'}</button>
       <div className="my-1 border-t border-ctp-surface0" />
       <button className={`${item} text-ctp-red hover:bg-ctp-red/15`} onClick={run(onDelete)}>Delete</button>
     </div>,
