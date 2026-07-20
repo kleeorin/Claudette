@@ -1,5 +1,6 @@
 import { execFile } from 'child_process'
 import type { GitStatus, GitFileStatus, GitDiff, GitResult, GitLog, GitBranches } from '@claudette/shared'
+import { errMessage } from '../util/errMessage'
 
 // Local git operations for the Git panel (Phase 2). Ported from ClaudeMaster's
 // gitManager, with its remote/SSH branch dropped — Claudette is local-only until
@@ -30,12 +31,11 @@ function wrap(message: string, code: number | string | undefined, stdout: string
   return e
 }
 
-const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
 // Parse `git status --porcelain=v1 -b -z`. Records are NUL-terminated; the first
 // is the branch header, and rename/copy entries are followed by their source
 // path as a separate record.
-function parseStatus(out: string): { branch: string; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[] } {
+function parseStatus(out: string): Omit<Extract<GitStatus, { repo: true }>, 'repo'> {
   const recs = out.split('\0')
   let branch = ''
   let upstream: string | null = null
@@ -93,7 +93,7 @@ export async function status(dir: string): Promise<GitStatus> {
     return { repo: true, ...parseStatus(out) }
   } catch (err) {
     if ((err as { gitCode?: number | string }).gitCode === 128) return { repo: false }
-    return { repo: 'error', error: errMsg(err) }
+    return { repo: 'error', error: errMessage(err) }
   }
 }
 
@@ -112,41 +112,41 @@ export async function diff(dir: string, file: string, staged: boolean, untracked
     const args = ['diff', ...(staged ? ['--cached'] : []), '--', file]
     return { ok: true, diff: await git(dir, args) }
   } catch (err) {
-    return { ok: false, error: errMsg(err) }
+    return { ok: false, error: errMessage(err) }
   }
 }
 
 export async function stage(dir: string, file: string): Promise<GitResult> {
   try { await git(dir, ['add', '--', file]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 export async function unstage(dir: string, file: string): Promise<GitResult> {
   try { await git(dir, ['reset', '-q', 'HEAD', '--', file]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 export async function stageAll(dir: string): Promise<GitResult> {
   try { await git(dir, ['add', '-A']); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Stage modifications and deletions of already-tracked files only (`add -u`),
 // leaving untracked files alone — unlike stageAll (`add -A`).
 export async function stageTracked(dir: string): Promise<GitResult> {
   try { await git(dir, ['add', '-u']); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 export async function unstageAll(dir: string): Promise<GitResult> {
   try { await git(dir, ['reset', '-q', 'HEAD']); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 export async function commit(dir: string, message: string): Promise<GitResult> {
   if (!message.trim()) return { ok: false, error: 'Empty commit message' }
   try { await git(dir, ['commit', '-m', message]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Field/record separators that can't occur in commit metadata, so we can split
@@ -170,14 +170,14 @@ export async function log(dir: string, limit = 100): Promise<GitLog> {
   } catch (err) {
     // A repo with no commits yet exits 128 — treat as an empty log, not an error.
     if ((err as { gitCode?: number | string }).gitCode === 128) return { ok: true, commits: [] }
-    return { ok: false, error: errMsg(err) }
+    return { ok: false, error: errMessage(err) }
   }
 }
 
 // The patch for a single commit (message header + diff).
 export async function show(dir: string, hash: string): Promise<GitDiff> {
   try { return { ok: true, diff: await git(dir, ['show', '--no-color', hash]) } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // --- Branches ----------------------------------------------------------------
@@ -185,37 +185,41 @@ export async function show(dir: string, hash: string): Promise<GitDiff> {
 // Local branches plus the checked-out one (empty when HEAD is detached).
 export async function branches(dir: string): Promise<GitBranches> {
   try {
-    const out = await git(dir, ['branch', '--format=%(refname:short)'])
+    // Independent reads — run them together rather than back-to-back.
+    const [out, currentRaw] = await Promise.all([
+      git(dir, ['branch', '--format=%(refname:short)']),
+      git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    ])
     const branches = out.split('\n').map((s) => s.trim()).filter(Boolean)
-    const current = (await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim()
+    const current = currentRaw.trim()
     return { ok: true, current: current === 'HEAD' ? '' : current, branches }
-  } catch (err) { return { ok: false, error: errMsg(err) } }
+  } catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Create `name` off the current HEAD and switch to it.
 export async function createBranch(dir: string, name: string): Promise<GitResult> {
   if (!name.trim()) return { ok: false, error: 'Empty branch name' }
   try { await git(dir, ['switch', '-c', name.trim()]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Switch to an existing branch (fails if uncommitted changes would be overwritten).
 export async function checkoutBranch(dir: string, name: string): Promise<GitResult> {
   try { await git(dir, ['switch', name]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Delete a local branch. `force` (-D) drops the merged-only safety check.
 export async function deleteBranch(dir: string, name: string, force: boolean): Promise<GitResult> {
   try { await git(dir, ['branch', force ? '-D' : '-d', name]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Merge `name` into the current branch. Conflicts surface as ok:false with git's
 // message; the user resolves them in the terminal.
 export async function mergeBranch(dir: string, name: string): Promise<GitResult> {
   try { await git(dir, ['merge', '--no-edit', name]); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // --- Remote ------------------------------------------------------------------
@@ -226,14 +230,14 @@ export async function mergeBranch(dir: string, name: string): Promise<GitResult>
 // Fetch remote refs without touching the working tree — updates ahead/behind.
 export async function fetch(dir: string): Promise<GitResult> {
   try { await git(dir, ['fetch']); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Pull with fast-forward-only by default so we never spawn a merge editor; a
 // divergent history surfaces as ok:false and the user resolves it in the terminal.
 export async function pull(dir: string): Promise<GitResult> {
   try { await git(dir, ['pull', '--ff-only']); return { ok: true } }
-  catch (err) { return { ok: false, error: errMsg(err) } }
+  catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Push the current branch. `setUpstream` publishes an unpushed branch
@@ -242,5 +246,5 @@ export async function push(dir: string, setUpstream: boolean): Promise<GitResult
   try {
     await git(dir, setUpstream ? ['push', '-u', 'origin', 'HEAD'] : ['push'])
     return { ok: true }
-  } catch (err) { return { ok: false, error: errMsg(err) } }
+  } catch (err) { return { ok: false, error: errMessage(err) } }
 }

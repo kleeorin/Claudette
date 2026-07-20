@@ -77,10 +77,10 @@ export const NOTEBOOK_DENY = 'NotebookEdit,Write(**/*.ipynb),Edit(**/*.ipynb)'
 // The native file tools we intercept for notebooks, and where each carries its
 // target path. If a call targets a .ipynb, return the deny message steering Claude
 // to the app-control notebook tools; otherwise return null (allow normal handling).
+const NATIVE_FILE_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit'])
 function notebookGuard(toolName: string, input: Record<string, unknown> | undefined): string | null {
   const pathKey = toolName === 'NotebookEdit' ? 'notebook_path' : 'file_path'
-  const nativeFileTools = new Set(['Write', 'Edit', 'NotebookEdit'])
-  if (!nativeFileTools.has(toolName)) return null
+  if (!NATIVE_FILE_TOOLS.has(toolName)) return null
   const target = input?.[pathKey]
   if (typeof target !== 'string' || !target.toLowerCase().endsWith('.ipynb')) return null
   return 'Claudette manages .ipynb files through its own tools — the native '

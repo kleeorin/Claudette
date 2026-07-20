@@ -12,9 +12,15 @@ import type { JupyterInfo } from './jupyterManager'
 // Jupyter's REST/asset/output resources (rich outputs, /files) from one origin.
 export class JupyterProxy {
   private info: JupyterInfo | null = null
+  private target: { hostname: string; port: number } | null = null
   private wss = new WebSocketServer({ noServer: true })
 
-  setTarget(info: JupyterInfo | null): void { this.info = info }
+  // Parse the upstream host ONCE per target change (not per proxied request).
+  setTarget(info: JupyterInfo | null): void {
+    this.info = info
+    if (info) { const u = new URL(info.url); this.target = { hostname: u.hostname, port: Number(u.port) } }
+    else this.target = null
+  }
   get ready(): boolean { return this.info !== null }
 
   // Rewrite `/jupyter/<rest>` → `<jupyter-host>/<rest>`.
@@ -22,8 +28,7 @@ export class JupyterProxy {
     return url.replace(/^\/jupyter/, '') || '/'
   }
   private host(): { hostname: string; port: number } {
-    const u = new URL(this.info!.url)
-    return { hostname: u.hostname, port: Number(u.port) }
+    return this.target!   // non-null whenever this.info is (callers guard on this.info)
   }
 
   // HTTP: forward method/headers/body, add the token as an Authorization header.

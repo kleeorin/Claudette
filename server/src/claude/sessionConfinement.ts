@@ -33,6 +33,13 @@ export type Confinement =
 // runs, but every user path is invisible and every write lands in throwaway tmpfs.
 export const DENY_ALL_SANDBOX: SandboxConfig = { enabled: true, mounts: [] }
 
+// Who a piece of work (e.g. a notebook's kernel) belongs to. A typed sum replaces the
+// `'<host>'` string sentinel that used to share the session-id namespace (a session
+// literally named that would have been misclassified as host). `undefined` = nothing
+// claimed it (fail closed); `{ host: true }` = a deliberate session-less host owner
+// (the operator's own view); `{ session }` = a real session, resolved via the seam.
+export type Owner = { session: string } | { host: true }
+
 export class SessionConfinement {
   constructor(private lookup: (sessionId: string) => SessionBox | undefined) {}
 
@@ -44,6 +51,15 @@ export class SessionConfinement {
     if (!s) return { mode: 'deny' }
     if (!s.sandbox?.enabled || !sandboxAvailable()) return { mode: 'host' }
     return { mode: 'confined', cfg: s.sandbox, cwd: s.cwd }
+  }
+
+  // The one place the owner→confinement rule lives (was re-spelled in kernelManager,
+  // paneManager, notebookApi): unclaimed ⇒ deny, deliberate host ⇒ host, session ⇒
+  // resolve. Centralizing it means "no owner fails closed" can't be forgotten at a site.
+  resolveOwner(owner: Owner | undefined): Confinement {
+    if (owner === undefined) return { mode: 'deny' }
+    if ('host' in owner) return { mode: 'host' }
+    return this.resolve(owner.session)
   }
 
   // For IN-PROCESS handlers (the notebook MCP tools, and any future server-side file op

@@ -70,7 +70,7 @@ export class PaneManager extends EventEmitter {
 
   create(cwd: string, cols?: number, rows?: number, sessionId?: string): string {
     const id = randomUUID()
-    const c: Confinement = sessionId ? this.confinement.resolve(sessionId) : { mode: 'host' }
+    const c: Confinement = this.confinement.resolveOwner(sessionId ? { session: sessionId } : { host: true })
     const spec = paneSpawnSpec(cwd, c)
     const proc = pty.spawn(spec.command, spec.args, {
       name: 'xterm-256color',

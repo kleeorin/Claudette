@@ -4,6 +4,7 @@ import {
 import { homedir } from 'os'
 import path from 'path'
 import { claudeConfigDir } from './sandbox'
+import { errMessage } from '../util/errMessage'
 
 // Cross-session hook poisoning (SANDBOX.md): `settings.json` / `settings.local.json`
 // at BOTH the user scope (~/.claude) and the project scope (<cwd>/.claude) can define
@@ -174,7 +175,7 @@ export function scrubbedHostConfigDir(): string | null {
     }
     return mirror
   } catch (e) {
-    console.warn(`[sandbox] host-mode config scrub failed (${e instanceof Error ? e.message : e}); falling back to the real config dir — hooks in an exposed config could run. Prefer keeping sessions sandboxed.`)
+    console.warn(`[sandbox] host-mode config scrub failed (${errMessage(e)}); falling back to the real config dir — hooks in an exposed config could run. Prefer keeping sessions sandboxed.`)
     return null
   }
 }

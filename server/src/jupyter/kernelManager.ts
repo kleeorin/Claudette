@@ -1,17 +1,17 @@
 import { EventEmitter } from 'events'
+import { errMessage } from '../util/errMessage'
 import { dirname } from 'path'
-import type { KernelSpec } from '@claudette/shared'
+import type { KernelSpec, KernelSpecsResponse } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
 import { JupyterManager, findNearestPython, type JupyterInfo, type JupyterSandbox } from './jupyterManager'
 import { KernelClient, type KernelStatus } from './kernelClient'
 import { sandboxKey } from '../claude/sandbox'
-import type { Confinement, SessionConfinement } from '../claude/sessionConfinement'
+import type { Confinement, Owner, SessionConfinement } from '../claude/sessionConfinement'
 
 // Sentinel owner for a notebook opened OUTSIDE any session — the operator's own view via
 // the token-gated HTTP route with no sessionId. Its kernel runs on the host, deliberately.
 // Distinct from NO owner at all (a notebook nothing claimed → fail closed: refuse to start
 // a kernel, since it would otherwise land on the unconfined `off:` server).
-export const HOST_OWNER = '<host>'
 
 // Ties Jupyter + kernel client + the authoritative doc together: starts a kernel
 // per open notebook and routes its outputs back INTO the doc by cellId (the sink
@@ -23,7 +23,7 @@ export class KernelManager extends EventEmitter {
   private status = new Map<string, KernelStatus>()
   private running = new Map<string, Set<string>>()    // notebookId → cellIds currently executing/queued
   private executing = new Set<string>()               // `${notebookId}:${cellId}` actually mid-execution
-  private owner = new Map<string, string>()           // notebookId → owning sessionId (kills with the session)
+  private owner = new Map<string, Owner>()           // notebookId → owning sessionId (kills with the session)
   private specByNotebook = new Map<string, string>()  // notebookId → chosen kernelspec name
   // Pool of Jupyter servers keyed by sandbox key (see sandboxKey): 'off' is the shared
   // unconfined server; a sandboxed session gets its own server confined to its box, so
@@ -125,10 +125,7 @@ export class KernelManager extends EventEmitter {
   // (an operator's session-less notebook); a real owner ⇒ resolved via the seam (which is
   // itself `host` for an unconfined session, `deny` for one that's since gone).
   private confinementForNotebook(notebookId: string): Confinement {
-    const owner = this.owner.get(notebookId)
-    if (owner === undefined) return { mode: 'deny' }
-    if (owner === HOST_OWNER) return { mode: 'host' }
-    return this.confinement.resolve(owner)
+    return this.confinement.resolveOwner(this.owner.get(notebookId))
   }
 
   // The box a notebook's kernel runs in, or undefined for a host (unconfined) kernel.
@@ -155,8 +152,15 @@ export class KernelManager extends EventEmitter {
     // that venv into the box when it's outside the mounts; the discovery probe for a
     // box-writable candidate runs INSIDE the box (see pythonFor / findNearestPython).
     const python = await this.pythonFor(doc ? dirname(doc.path) : (sandbox?.cwd ?? process.cwd()), sandbox)
-    if (sandbox) return this.serverInfo(`${sandboxKey(sandbox.cfg, sandbox.cwd)}|${python}`, python, sandbox)
-    return this.serverInfo(`off:${python}`, python)
+    return this.serverForBox(python, sandbox)
+  }
+
+  // The pooled Jupyter server for an interpreter in (or out of) a box: keyed per box
+  // (`<sandboxKey>|<python>`) or `off:<python>` for the unconfined host. One place so
+  // serverFor and listKernelSpecs can't drift on the key format.
+  private serverForBox(python: string, sandbox?: JupyterSandbox): Promise<JupyterInfo> {
+    const key = sandbox ? `${sandboxKey(sandbox.cfg, sandbox.cwd)}|${python}` : `off:${python}`
+    return this.serverInfo(key, python, sandbox)
   }
 
   // Start (or reuse) a kernel bound to a notebook. The kernel's cwd is set to the
@@ -209,7 +213,7 @@ export class KernelManager extends EventEmitter {
 
   // Available kernelspecs (starts Jupyter lazily if needed — the same server a run
   // would spin up). Returns Jupyter's default so the UI can preselect it.
-  async listKernelSpecs(): Promise<{ specs: KernelSpec[]; default: string }> {
+  async listKernelSpecs(): Promise<KernelSpecsResponse> {
     // Read specs off the same venv server a run would use (discovered from an open
     // notebook's dir), so the list reflects the project's kernels — not the system
     // python's. Falls back to python3 when nothing is open / no venv is found.
@@ -225,9 +229,7 @@ export class KernelManager extends EventEmitter {
     const c = first ? this.confinementForNotebook(first.notebookId) : { mode: 'host' as const }
     const sandbox: JupyterSandbox | undefined = c.mode === 'confined' ? { cfg: c.cfg, cwd: c.cwd } : undefined
     const python = await this.pythonFor(first ? dirname(first.path) : process.cwd(), sandbox)
-    const info = sandbox
-      ? await this.serverInfo(`${sandboxKey(sandbox.cfg, sandbox.cwd)}|${python}`, python, sandbox)
-      : await this.serverInfo(`off:${python}`, python)
+    const info = await this.serverForBox(python, sandbox)
     const res = await fetch(`${info.url}/api/kernelspecs`, { headers: { Authorization: `token ${info.token}` } })
     if (!res.ok) throw new Error(`failed to list kernelspecs: ${res.status}`)
     const data = await res.json() as {
@@ -276,7 +278,7 @@ export class KernelManager extends EventEmitter {
         this.docs.clearCellOutputs(notebookId, cellId)
         this.docs.appendCellOutput(notebookId, cellId, {
           output_type: 'error', ename: 'KernelStartError',
-          evalue: e instanceof Error ? e.message : String(e), traceback: [],
+          evalue: errMessage(e), traceback: [],
         })
         return
       }
@@ -344,18 +346,19 @@ export class KernelManager extends EventEmitter {
 
   // Record which session a notebook was opened in — closing that session kills its
   // kernel (see shutdownForSession). Last opener wins.
-  setOwner(notebookId: string, sessionId: string): void {
-    this.owner.set(notebookId, sessionId)
+  setOwner(notebookId: string, owner: Owner): void {
+    this.owner.set(notebookId, owner)
   }
 
-  // The session that currently owns a notebook (whose box confines its kernel), or
-  // undefined if none. Exposed so the confinement of a notebook's execution is testable.
-  ownerOf(notebookId: string): string | undefined { return this.owner.get(notebookId) }
+  // The owner of a notebook (whose box confines its kernel), or undefined if none.
+  // Exposed so the confinement of a notebook's execution is testable.
+  ownerOf(notebookId: string): Owner | undefined { return this.owner.get(notebookId) }
 
-  // Kill the kernels for every notebook opened in a now-closed session.
+  // Kill the kernels for every notebook opened in a now-closed session (host-owned
+  // notebooks have no session and are left alone).
   shutdownForSession(sessionId: string): void {
-    for (const [notebookId, sid] of [...this.owner]) {
-      if (sid !== sessionId) continue
+    for (const [notebookId, owner] of [...this.owner]) {
+      if (!('session' in owner) || owner.session !== sessionId) continue
       this.shutdown(notebookId)
       this.owner.delete(notebookId)
     }

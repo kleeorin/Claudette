@@ -30,8 +30,7 @@ import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir } from './con
 
 interface Session extends SessionInfo {
   engine: ClaudeEngine | null   // null once the Claude process has exited (relaunchable)
-  sandbox?: SandboxConfig       // requested bwrap confinement (see sandbox.ts / SANDBOX.md)
-  sandboxed?: boolean           // EFFECTIVE: did the last launch actually wrap in bwrap
+  // sandbox / sandboxed come from SessionInfo (see SANDBOX.md; sandboxed = EFFECTIVE)
   appliedSandboxKey?: string    // sandbox state actually in force at last launch (pending detection)
   sandboxApplyTimer?: ReturnType<typeof setTimeout>  // debounce for auto-apply-when-idle
   claudeSessionId: string       // claude's own session id (for --resume)

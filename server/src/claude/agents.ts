@@ -7,10 +7,11 @@
 // edit files. The SessionManager wiring (getAgent + SUBSESSION_REPORT_INSTRUCTION →
 // claudeArgs) reads these on every launch/relaunch.
 
-export interface Agent {
-  id: string
-  name: string                 // display name / sidebar badge
-  description: string          // shown to an orchestrating agent via list_agents + the role picker
+import type { AgentInfo } from '@claudette/shared'
+
+// The client-facing id/name/description come from AgentInfo (the role-picker contract);
+// the rest is the server-only charter/tool-scope the client never sees.
+export interface Agent extends AgentInfo {
   systemPrompt?: string        // persistent charter → --append-system-prompt
   model?: string               // pin a model; undefined = user default
   allowedTools?: string[]      // whitelist → --allowedTools (auto-approve)

@@ -13,6 +13,7 @@
 // local-only, so — unlike the ClaudeMaster original — there is no remote/ssh path.
 import { homedir } from 'os'
 import { join, dirname } from 'path'
+import { errMessage } from '../util/errMessage'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import type {
   EffectivePermissions, PermissionRule, PermissionMode, PermissionScope, PermissionFile,
@@ -76,8 +77,12 @@ export async function getEffective(cwd: string, agentId?: string): Promise<Effec
     let mode: PermissionMode = 'default'
     let modeScope: PermissionScope | undefined
 
-    for (const scope of ['user', 'project', 'local'] as PermissionScope[]) {
-      const { exists, unreadable, data } = await readSettings(paths[scope])
+    const scopes: PermissionScope[] = ['user', 'project', 'local']
+    // Read the three files together, then merge in precedence order below.
+    const loaded = await Promise.all(scopes.map((s) => readSettings(paths[s])))
+    for (let i = 0; i < scopes.length; i++) {
+      const scope = scopes[i]
+      const { exists, unreadable, data } = loaded[i]
       files.push({ scope, path: paths[scope], exists, unreadable })
       if (!data) continue
       const { allow, deny, ask, mode: fileMode } = extract(data)
@@ -91,7 +96,7 @@ export async function getEffective(cwd: string, agentId?: string): Promise<Effec
   } catch (err) {
     return {
       cwd, mode: 'default', rules: [], files: [], notebookFunnel, agent,
-      error: err instanceof Error ? err.message : String(err),
+      error: errMessage(err),
     }
   }
 }
@@ -104,7 +109,7 @@ async function writeSettings(absPath: string, data: Record<string, unknown>): Pr
     await mkdir(dirname(absPath), { recursive: true })
     await writeFile(absPath, text, 'utf8')
     return { ok: true }
-  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  } catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Read-modify-write one settings file's permissions[action] list. `mutate` returns
@@ -126,7 +131,7 @@ async function editRule(
     perms[action] = next
     root.permissions = perms
     return writeSettings(absPath, root)
-  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) } }
+  } catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 // Add an allow/deny/ask rule to a scope's settings file (no-op if already present).

@@ -75,7 +75,7 @@ kernels.onJupyterStart = (info) => jupyterProxy.setTarget(info)
 // per-session --mcp-config is injected into each Claude launch via the hook below.
 const mcp = new AppControlMcpServer()
 registerNotebookTools(mcp, notebooks, kernels, activePanes, turnNotebooks, (sessionId, doc) => {
-  kernels.setOwner(doc.notebookId, sessionId)   // Claude opened it in this session → dies with it
+  kernels.setOwner(doc.notebookId, { session: sessionId })   // Claude opened it in this session → dies with it
   notebooks.cancelClose(doc.notebookId)         // re-focusing a mid-close notebook keeps it open
   hub.broadcast({ type: 'session:focusPane', id: sessionId, notebookId: doc.notebookId, path: doc.path })
 }, confinement)

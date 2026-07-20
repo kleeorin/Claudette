@@ -1,4 +1,5 @@
 import { readdir, stat, readFile, writeFile, mkdir, rename, cp, rm } from 'fs/promises'
+import { errMessage } from '../util/errMessage'
 import { createReadStream } from 'fs'
 import { resolve, dirname, isAbsolute, basename, extname } from 'path'
 import { homedir } from 'os'
@@ -14,6 +15,18 @@ function toAbs(raw: string): string {
 // Does a path exist? Used to refuse move/copy that would clobber a destination.
 async function exists(p: string): Promise<boolean> {
   try { await stat(p); return true } catch { return false }
+}
+
+// Read at most `maxBytes` (+1, since stream `end` is inclusive) without slurping the
+// whole file — used by the text preview so a giant file costs O(cap), not O(size).
+function readCapped(p: string, maxBytes: number): Promise<Buffer> {
+  return new Promise((res, rej) => {
+    const chunks: Buffer[] = []
+    createReadStream(p, { end: maxBytes })
+      .on('data', (c) => chunks.push(c as Buffer))
+      .on('end', () => res(Buffer.concat(chunks)))
+      .on('error', rej)
+  })
 }
 
 // Filesystem browse endpoint backing the file/folder picker. Single-user, local
@@ -68,14 +81,16 @@ async function readPreview(path: string): Promise<FilePreview> {
       return { kind: 'pdf', name, dataUrl: `data:application/pdf;base64,${buf.toString('base64')}` }
     }
     const { size } = await stat(path)
-    const buf = await readFile(path)
+    // Read at most the cap (not the whole file — a huge text file shouldn't be slurped
+    // to preview 2 MB of it); `truncated` comes from the real size.
+    const buf = await readCapped(path, MAX_TEXT_BYTES)
     // Binary heuristic: a NUL byte in the first chunk means "not text".
     if (buf.subarray(0, 8000).includes(0)) return { kind: 'binary', name }
     const truncated = size > MAX_TEXT_BYTES
     const text = buf.subarray(0, MAX_TEXT_BYTES).toString('utf8')
     return { kind: 'text', name, text, truncated }
   } catch (err) {
-    return { kind: 'error', name, message: err instanceof Error ? err.message : String(err) }
+    return { kind: 'error', name, message: errMessage(err) }
   }
 }
 
@@ -98,13 +113,13 @@ export function registerFsRoutes(app: FastifyInstance): void {
     // Default to the user's home; resolve relatives against it too.
     const home = homedir()
     const raw = req.query.path?.trim()
-    const abs = raw ? (isAbsolute(raw) ? resolve(raw) : resolve(home, raw)) : home
+    const abs = raw ? toAbs(raw) : home
     try {
       const entries = await listDir(abs)
       const parent = dirname(abs)
       return { path: abs, parent: parent === abs ? null : parent, entries }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
+      const msg = errMessage(e)
       // A file path (not a dir) is a common mistake — nudge toward its folder.
       return { error: /ENOTDIR/.test(msg) ? `Not a directory: ${abs}` : msg }
     }
@@ -125,7 +140,7 @@ export function registerFsRoutes(app: FastifyInstance): void {
     const { path, text } = req.body
     if (!path?.trim()) return { ok: false, error: 'path is required' }
     try { await writeFile(toAbs(path), text ?? '', 'utf8'); return { ok: true } }
-    catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+    catch (e) { return { ok: false, error: errMessage(e) } }
   })
 
   // Create a new empty file; `wx` fails (rather than clobbers) if it already exists.
@@ -133,7 +148,7 @@ export function registerFsRoutes(app: FastifyInstance): void {
     const { path } = req.body
     if (!path?.trim()) return { ok: false, error: 'path is required' }
     try { await writeFile(toAbs(path), '', { flag: 'wx' }); return { ok: true } }
-    catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+    catch (e) { return { ok: false, error: errMessage(e) } }
   })
 
   // Create a directory (recursive — parents made as needed, existing dir is a no-op).
@@ -141,7 +156,7 @@ export function registerFsRoutes(app: FastifyInstance): void {
     const { path } = req.body
     if (!path?.trim()) return { ok: false, error: 'path is required' }
     try { await mkdir(toAbs(path), { recursive: true }); return { ok: true } }
-    catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+    catch (e) { return { ok: false, error: errMessage(e) } }
   })
 
   // --- move / copy / delete — back the file-browser context actions. -----------
@@ -162,7 +177,7 @@ export function registerFsRoutes(app: FastifyInstance): void {
         else throw e
       }
       return { ok: true }
-    } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+    } catch (e) { return { ok: false, error: errMessage(e) } }
   })
 
   // Copy a file or directory (recursive). Refuses to overwrite an existing target.
@@ -174,7 +189,7 @@ export function registerFsRoutes(app: FastifyInstance): void {
       if (await exists(dst)) return { ok: false, error: `already exists: ${basename(dst)}` }
       await cp(src, dst, { recursive: true, errorOnExist: true, force: false })
       return { ok: true }
-    } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+    } catch (e) { return { ok: false, error: errMessage(e) } }
   })
 
   // Delete a file or directory (recursive). Guards the obvious catastrophes ('/'
@@ -185,7 +200,7 @@ export function registerFsRoutes(app: FastifyInstance): void {
     const abs = toAbs(raw)
     if (abs === '/' || abs === homedir()) return { ok: false, error: 'refusing to delete this directory' }
     try { await rm(abs, { recursive: true, force: false }); return { ok: true } }
-    catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) } }
+    catch (e) { return { ok: false, error: errMessage(e) } }
   })
 
   // Stream a file to the browser as a download (Content-Disposition: attachment).
@@ -202,6 +217,6 @@ export function registerFsRoutes(app: FastifyInstance): void {
       reply.header('Content-Type', 'application/octet-stream')
       reply.header('Content-Length', s.size)
       return reply.send(createReadStream(abs))
-    } catch (e) { reply.code(404); return { error: e instanceof Error ? e.message : String(e) } }
+    } catch (e) { reply.code(404); return { error: errMessage(e) } }
   })
 }

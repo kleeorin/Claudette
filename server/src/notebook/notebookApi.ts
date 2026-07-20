@@ -1,9 +1,9 @@
 import type { FastifyInstance } from 'fastify'
+import { errMessage } from '../util/errMessage'
 import type { NotebookDoc, CellLock, KernelStatus, KernelSpecsResponse, WsClientMessage } from '@claudette/shared'
 import type { WsHub } from '../ws/hub'
 import type { NotebookDocManager } from './notebookDocManager'
 import type { KernelManager } from '../jupyter/kernelManager'
-import { HOST_OWNER } from '../jupyter/kernelManager'
 
 // Mirrors sessionApi.ts: bridge the managers' events to the WS hub, register the
 // HTTP open/create/save/conflict routes, and route notebook WS client messages.
@@ -34,23 +34,23 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
       const doc = await notebooks.openPath(req.body.path)
       // Always claim ownership so the kernel's confinement is decided (SANDBOX.md
       // "Unowned-kernel escape"): a real session confines it to that box; no session
-      // (operator's own view) marks it HOST_OWNER so it runs on the host deliberately,
+      // (operator's own view) marks it host-owned so it runs on the host deliberately,
       // distinct from a never-claimed notebook (which is refused).
-      kernels.setOwner(doc.notebookId, req.body.sessionId ?? HOST_OWNER)
+      kernels.setOwner(doc.notebookId, req.body.sessionId ? { session: req.body.sessionId } : { host: true })
       kernels.resync(doc.notebookId)   // reconnect a still-running kernel on reopen
       return { doc }
     } catch (e) {
-      return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })
+      return reply.code(400).send({ error: errMessage(e) })
     }
   })
 
   app.post<{ Body: { path: string; sessionId?: string } }>('/api/notebook/create', async (req, reply) => {
     try {
       const doc = await notebooks.createPath(req.body.path)
-      kernels.setOwner(doc.notebookId, req.body.sessionId ?? HOST_OWNER)   // see /open
+      kernels.setOwner(doc.notebookId, req.body.sessionId ? { session: req.body.sessionId } : { host: true })   // see /open
       return { doc }
     } catch (e) {
-      return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })
+      return reply.code(400).send({ error: errMessage(e) })
     }
   })
 
@@ -59,7 +59,7 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
       await notebooks.save(req.body.notebookId)
       return { ok: true }
     } catch (e) {
-      return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) })
+      return reply.code(400).send({ error: errMessage(e) })
     }
   })
 
@@ -78,11 +78,11 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   // offers "reload from disk" (discard local) or "keep mine" (overwrite disk).
   app.post<{ Body: { notebookId: string } }>('/api/notebook/reload', async (req, reply) => {
     try { await notebooks.reloadFromDisk(req.body.notebookId); return { ok: true } }
-    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }) }
+    catch (e) { return reply.code(400).send({ error: errMessage(e) }) }
   })
   app.post<{ Body: { notebookId: string } }>('/api/notebook/keepMine', async (req, reply) => {
     try { await notebooks.keepMine(req.body.notebookId); return { ok: true } }
-    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }) }
+    catch (e) { return reply.code(400).send({ error: errMessage(e) }) }
   })
 
   // Undo / redo the last cell op (server-owned history). `applied` says whether a
@@ -99,7 +99,7 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   // Kernel controls: the pickable specs, plus restart / interrupt / choose-spec.
   app.get('/api/notebook/kernelspecs', async (_req, reply): Promise<KernelSpecsResponse> => {
     try { return await kernels.listKernelSpecs() }
-    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }) as unknown as KernelSpecsResponse }
+    catch (e) { return reply.code(400).send({ error: errMessage(e) }) as unknown as KernelSpecsResponse }
   })
   app.post<{ Body: { notebookId: string } }>('/api/notebook/kernel/restart', async (req) => {
     await kernels.restart(req.body.notebookId)
@@ -117,7 +117,7 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   })
   app.post<{ Body: { notebookId: string; name: string } }>('/api/notebook/kernel/setSpec', async (req, reply) => {
     try { await kernels.setKernelSpec(req.body.notebookId, req.body.name); return { ok: true } }
-    catch (e) { return reply.code(400).send({ error: e instanceof Error ? e.message : String(e) }) }
+    catch (e) { return reply.code(400).send({ error: errMessage(e) }) }
   })
 }
 

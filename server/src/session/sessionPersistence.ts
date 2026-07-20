@@ -1,6 +1,6 @@
 import { join } from 'path'
 import { homedir } from 'os'
-import { readFile, writeFile, mkdir } from 'fs/promises'
+import { readFile, writeFile, mkdir, rename } from 'fs/promises'
 import type { SavedSession } from '@claudette/shared'
 
 // Persist the open session set so a server restart restores them (each re-launched
@@ -17,7 +17,6 @@ export async function saveState(sessions: SavedSession[]): Promise<void> {
     // Atomic-ish: write temp + rename so a crash mid-write can't corrupt the file.
     const tmp = `${FILE}.tmp`
     await writeFile(tmp, JSON.stringify(sessions))
-    const { rename } = await import('fs/promises')
     await rename(tmp, FILE)
   } catch { /* best-effort; a failed save just means no restore next boot */ }
 }

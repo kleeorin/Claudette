@@ -51,7 +51,7 @@ const turns = new TurnNotebookRegistry()
 const handlers = new Map<string, McpTool['handler']>()
 const fakeMcp = { register: (t: McpTool) => handlers.set(t.name, t.handler) } as unknown as AppControlMcpServer
 registerNotebookTools(fakeMcp, docs, kernels, panes, turns,
-  (sid, doc) => { kernels.setOwner(doc.notebookId, sid) },   // mirrors index.ts onFocus→setOwner
+  (sid, doc) => { kernels.setOwner(doc.notebookId, { session: sid }) },   // mirrors index.ts onFocus→setOwner
   confinement,
 )
 const call = (name: string, args: Record<string, unknown>): Promise<McpToolResult> => handlers.get(name)!(SID, args)
@@ -64,7 +64,7 @@ await (async () => {
   const r1 = await call('create_notebook', { path: nb1 })
   check('create_notebook succeeds', !r1.error, r1.error)
   check('create_notebook OWNS the notebook for the calling session (kernel would be confined)',
-    kernels.ownerOf(nbId(nb1)!) === SID, `owner=${kernels.ownerOf(nbId(nb1)!)}`)
+    (kernels.ownerOf(nbId(nb1)!) as { session: string } | undefined)?.session === SID, `owner=${kernels.ownerOf(nbId(nb1)!)}`)
 
   // --- 2. A write tool on an ALREADY-OPEN notebook claims ownership ------------
   // Simulate the notebook being open but owned by nobody (the pre-fix state: opened via
@@ -77,7 +77,7 @@ await (async () => {
   const r2 = await call('edit_cell', { path: nb2, index: 0, source: "import os; os.system('id')" })
   check('edit_cell (already-open) succeeds', !r2.error, r2.error)
   check('edit_cell on an already-open notebook CLAIMS ownership (targetDoc write path)',
-    kernels.ownerOf(nbId(nb2)!) === SID, `owner=${kernels.ownerOf(nbId(nb2)!)}`)
+    (kernels.ownerOf(nbId(nb2)!) as { session: string } | undefined)?.session === SID, `owner=${kernels.ownerOf(nbId(nb2)!)}`)
 
   // --- 3. run_cell also lands ownership (defense at the exact exec point) ------
   const nb3 = path.join(proj, 'run.ipynb')
@@ -89,7 +89,7 @@ await (async () => {
   check('precondition: nb3 is unowned', kernels.ownerOf(nbId(nb3)!) === undefined)
   await call('run_cell', { path: nb3, index: 0 }).catch(() => ({}))
   check('run_cell claims ownership at resolution (kernel starts confined)',
-    kernels.ownerOf(nbId(nb3)!) === SID, `owner=${kernels.ownerOf(nbId(nb3)!)}`)
+    (kernels.ownerOf(nbId(nb3)!) as { session: string } | undefined)?.session === SID, `owner=${kernels.ownerOf(nbId(nb3)!)}`)
 
   // --- 4. read_notebook does NOT steal ownership ------------------------------
   const nb4 = path.join(proj, 'readonly.ipynb')

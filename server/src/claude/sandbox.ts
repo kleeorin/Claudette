@@ -171,7 +171,7 @@ export function sandboxAvailable(): boolean {
   return cachedAvailable
 }
 
-export function resetSandboxProbe(): void { cachedAvailable = undefined }
+export function resetSandboxProbe(): void { cachedAvailable = undefined; whichCache.clear() }
 
 function probe(): boolean {
   try {
@@ -429,7 +429,15 @@ export function sessionDataMounts(cfg: SandboxConfig, cwd: string): SandboxMount
   // pinned ro UNCONDITIONALLY (even when absent) so an in-process actor can't create
   // one where the box's seed bind stops its own tools — matching Layer 1's effect.
   const settingsRo: SandboxMount[] = settingsJsonPaths(cwd).map((p) => ({ path: path.resolve(p), mode: 'ro' as const }))
-  return [...mounts, ...appSourceProtections(mounts), ...settingsRo]
+  const full = [...mounts, ...appSourceProtections(mounts), ...settingsRo]
+  // Apply the SAME symlinked-mount escape guard the box does (bwrapBaseArgs), or the two
+  // diverge: bwrap drops a box-writable symlinked mount source (e.g. a planted
+  // <cwd>/.claude -> /outside) via isUnsafeSymlinkMount, but this authorizer would
+  // otherwise realpath that mount ROOT to its target and trust it — authorizing an
+  // out-of-band notebook write to a path the box itself refuses to bind. rwRoots are the
+  // LOGICAL rw dest paths (never a link's target), exactly as the box computes them.
+  const rwRoots = full.filter((m) => m.mode === 'rw' && existsSync(m.path)).map((m) => path.resolve(m.path))
+  return full.filter((m) => !isUnsafeSymlinkMount(m.path, rwRoots))
 }
 
 // Canonicalize a path for containment testing: realpath if it exists, else the
@@ -581,12 +589,20 @@ function nodeBinDir(): string | null {
   return path.dirname(tryRealpath(node) ?? node)
 }
 
+// Resolved binary paths (claude/node) don't move within a run; memoize so a launch
+// doesn't spawn `sh` ~4× to re-resolve them. Cleared alongside the sandbox probe.
+const whichCache = new Map<string, string | null>()
 function which(bin: string): string | null {
+  const hit = whichCache.get(bin)
+  if (hit !== undefined) return hit
+  let result: string | null
   try {
-    return execFileSync('sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).trim() || null
+    result = execFileSync('sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).trim() || null
   } catch {
-    return null
+    result = null
   }
+  whichCache.set(bin, result)
+  return result
 }
 
 function tryRealpath(p: string): string | null {

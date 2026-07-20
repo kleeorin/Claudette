@@ -1,4 +1,5 @@
 import http from 'http'
+import { errMessage } from '../util/errMessage'
 import { randomUUID } from 'crypto'
 import type { AddressInfo } from 'net'
 
@@ -91,7 +92,7 @@ export class AppControlMcpServer {
             const r = await tool.handler(sessionId, (msg.params?.arguments as Record<string, unknown>) ?? {})
             return reply({ content: [{ type: 'text', text: r.error ?? r.text ?? 'ok' }], isError: !!r.error })
           } catch (e) {
-            return asErr(`error: ${e instanceof Error ? e.message : String(e)}`)
+            return asErr(`error: ${errMessage(e)}`)
           }
         }
         default:
