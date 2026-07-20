@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode, SessionInfo } from '@claudette/shared'
-import { useChat, collectAgents, countRunningAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
+import { useChat, collectAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
 import { prettyPath } from '../lib/paths'
@@ -58,7 +58,6 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // the turn is active, so an interrupted (never-completed) Task doesn't latch on.
   // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
   const agents = useMemo(() => collectAgents(items), [items])
-  const agentsRunning = countRunningAgents(items, running)
   // Dismissed agent cards (view-only). Agents are derived from the immutable
   // transcript each render, so there's nothing to delete — we filter by a stable
   // key instead. App keys ChatView by session id, so switching sessions unmounts
@@ -234,7 +233,6 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
         cwd={session.cwd}
         mode={session.permissionMode ?? 'default'}
         onSetMode={(m) => setMode(sessionId, m)}
-        agentsRunning={agentsRunning}
       />
       {state === 'exited' && (
         <div className="shrink-0 px-4 py-2 bg-ctp-red/10 border-b border-ctp-red/30 text-[11px] text-ctp-red whitespace-pre-wrap">
@@ -722,12 +720,19 @@ function useNow(intervalMs: number | null): number {
 // Poll the plan-quota usage endpoint (session/weekly %). The CLI stream no longer
 // carries a usage fraction, so this HTTP poll is the source for the rate-limit chips.
 // Account-global (not per-session), so one interval suffices; refetch on mount, every
-// 60s, and when the tab regains focus. Empty ⇒ no OAuth token / endpoint unreachable.
+// 60s, and when the tab regains focus.
+//
+// The endpoint returns `{ windows: [] }` not only for "no OAuth token" but also for
+// TRANSIENT upstream failures — a 401 mid-way through the CLI's token refresh, a 429,
+// or a network blip all collapse to empty. Overwriting good data with that empty result
+// is what made the chips blink out for ~60s and then return. So keep the last non-empty
+// snapshot and only replace it when a poll actually carries windows; a genuinely
+// token-less install simply stays at the initial empty state and shows no chip.
 function useUsage(): UsageWindow[] {
   const [windows, setWindows] = useState<UsageWindow[]>([])
   useEffect(() => {
     let alive = true
-    const load = () => { api.http.usage().then((u) => { if (alive) setWindows(u.windows) }).catch(() => {}) }
+    const load = () => { api.http.usage().then((u) => { if (alive && u.windows.length) setWindows(u.windows) }).catch(() => {}) }
     load()
     const iv = setInterval(load, 60_000)
     const onVis = () => { if (!document.hidden) load() }
@@ -739,10 +744,9 @@ function useUsage(): UsageWindow[] {
 
 // Always-visible status bar: session title + cwd, then model, real context usage
 // (tokens + %), cost, and a chip per rate-limit window (session / weekly).
-function MetaBar({ meta, session, title, cwd, mode, onSetMode, agentsRunning }: {
+function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
   meta: SessionMeta; session: SessionInfo; title?: string; cwd?: string
   mode: PermissionMode; onSetMode: (mode: PermissionMode) => void
-  agentsRunning: number
 }) {
   const tokens = meta.contextTokens
   const win = meta.contextWindow
@@ -800,13 +804,6 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode, agentsRunning }: 
             ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pctLabel})</span>
             : <span className="text-ctp-surface2">—</span>}
         </span>
-
-        {agentsRunning > 0 && (
-          <span className="flex items-center gap-1 text-ctp-mauve" title={`${agentsRunning} subagent${agentsRunning > 1 ? 's' : ''} running`}>
-            <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />
-            {agentsRunning} agent{agentsRunning > 1 ? 's' : ''} running
-          </span>
-        )}
 
         {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} />)}
       </div>
