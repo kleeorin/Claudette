@@ -1,5 +1,5 @@
 import {
-  createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode,
+  createContext, useContext, useEffect, useState, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
 import type { SessionInfo, SessionState, PermissionMode, SetModeResult, SandboxConfig, AgentInfo } from '@claudette/shared'
 import { api, getHealth } from '../api/client'
@@ -179,8 +179,14 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     setSessions((prev) => prev.map((s) => (s.id === id && s.state === 'idle' ? { ...s, state: 'running' } : s)))
   }, [])
 
+  // Memoize so unrelated session-state churn doesn't hand every consumer a new
+  // context object identity and re-render them all.
+  const value = useMemo(
+    () => ({ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, isFresh, markBusy, attention }),
+    [sessions, activeId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, isFresh, markBusy, attention],
+  )
   return (
-    <SessionsContext.Provider value={{ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, isFresh, markBusy, attention }}>
+    <SessionsContext.Provider value={value}>
       {children}
     </SessionsContext.Provider>
   )

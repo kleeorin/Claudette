@@ -1,5 +1,5 @@
 import {
-  createContext, useContext, useReducer, useEffect, useCallback, useRef, type ReactNode,
+  createContext, useContext, useReducer, useEffect, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
 import type { ClaudeEvent, PermissionRequest, PermissionDecision } from '@claudette/shared'
 import { api } from '../api/client'
@@ -690,8 +690,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const slashCommandsFor = useCallback((sessionId: string) => state.slash[sessionId] ?? [], [state.slash])
   const metaFor = useCallback((sessionId: string) => state.meta[sessionId] ?? {}, [state.meta])
 
+  // Memoize the context value so a streamed token (which re-renders ChatProvider)
+  // doesn't hand every consumer a fresh object identity and re-render them all.
+  const value = useMemo(
+    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript }),
+    [transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript],
+  )
   return (
-    <ChatContext.Provider value={{ transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript }}>
+    <ChatContext.Provider value={value}>
       {children}
     </ChatContext.Provider>
   )

@@ -1,5 +1,5 @@
 import {
-  createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode,
+  createContext, useContext, useEffect, useState, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
 import type { NotebookDoc, CellLock, LockReason, KernelStatus, NbCellType, KernelSpecsResponse } from '@claudette/shared'
 import { api } from '../api/client'
@@ -154,7 +154,9 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     api.notebook.op({ op: 'runAll', notebookId })
   }, [markRunning])
 
-  const value: ContextValue = {
+  // Memoize so a notebook WS event (frequent during execution) doesn't rebuild the
+  // value + `open` array identity and re-render every consumer.
+  const value = useMemo<ContextValue>(() => ({
     open: order.map((id) => docs[id]).filter(Boolean),
     openPath, createPath, close,
     wasLocallyOpened: (id) => localIds.current.has(id),
@@ -189,7 +191,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     interruptKernel: (notebookId) => { void api.notebook.kernelInterrupt(notebookId) },
     shutdownKernel: (notebookId) => { void api.notebook.kernelShutdown(notebookId) },
     setKernelSpec: (notebookId, name) => { void api.notebook.kernelSetSpec(notebookId, name) },
-  }
+  }), [order, docs, locks, kernels, running, openPath, createPath, close, run, runMany, runAll])
 
   return <NotebooksContext.Provider value={value}>{children}</NotebooksContext.Provider>
 }

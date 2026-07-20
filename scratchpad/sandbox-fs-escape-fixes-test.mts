@@ -99,6 +99,18 @@ console.log(`(host sandboxAvailable=${sandboxAvailable()}; scratch=${root})\n`)
   fs.symlinkSync(secret, escLink)
   const viaLink = sandboxPathAccess(c, proj, path.join(escLink, 'nb.ipynb'))
   check('symlink inside a mount pointing out: NOT writable (canonicalized)', !viaLink.write && !viaLink.read)
+  fs.unlinkSync(escLink)
+
+  // The authorizer must apply the SAME symlinked-mount guard the box does: a box-planted
+  // <cwd>/.claude -> <out-of-mount> is a symlink whose parent (proj) is box-writable, so
+  // the box DROPS it — and the authorizer must too, or it realpaths that mount root to its
+  // target and authorizes an out-of-mount notebook write the box itself refuses.
+  const planted = path.join(proj, '.claude')
+  fs.symlinkSync(secret, planted)
+  const viaRootLink = sandboxPathAccess(c, proj, path.join(secret, 'evil.ipynb'))
+  check('box-planted symlinked <cwd>/.claude does NOT authorize its target (authorizer == box)',
+    !viaRootLink.write && !viaRootLink.read)
+  fs.unlinkSync(planted)
 }
 
 // --- 3. Venv-probe escape: a box-writable candidate is probed IN-BOX ----------

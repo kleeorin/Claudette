@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import DOMPurify from 'dompurify'
 import { nbText as asText, type NbOutput } from '@claudette/shared'
 
@@ -60,18 +61,22 @@ function sanitizeHtml(html: string): string {
 // lacks a `text/plain` alternative.
 function MimeContent({ data }: { data: Record<string, unknown> }) {
   const html = asText(data['text/html'])
+  const svg = asText(data['image/svg+xml'])
+  // Sanitizing (DOMPurify parses the whole blob) is memoized so a re-render that
+  // doesn't change the output — e.g. a sibling cell ticking — doesn't re-sanitize.
+  const cleanHtml = useMemo(() => (html ? sanitizeHtml(html) : ''), [html])
+  const cleanSvg = useMemo(() => (svg ? sanitizeHtml(svg) : ''), [svg])
   if (html) {
     // `nb-html` scopes table styling in index.css that restores pandas DataFrame
     // readability (the global reset strips th/td padding + borders).
-    return <div className="text-sm nb-html" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) }} />
+    return <div className="text-sm nb-html" dangerouslySetInnerHTML={{ __html: cleanHtml }} />
   }
   // Bitmap images (base64-encoded in the mime bundle).
   for (const mime of ['image/png', 'image/jpeg', 'image/gif'] as const) {
     const b64 = data[mime]
     if (typeof b64 === 'string') return <img src={`data:${mime};base64,${b64}`} className="max-w-full" alt="" />
   }
-  const svg = asText(data['image/svg+xml'])
-  if (svg) return <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(svg) }} />
+  if (svg) return <div dangerouslySetInnerHTML={{ __html: cleanSvg }} />
   const plain = asText(data['text/plain'])
   if (plain) return <pre className="text-xs text-ctp-text whitespace-pre-wrap font-mono">{plain}</pre>
   // Text-ish fallbacks with no text/plain alternative (LaTeX from Math/SymPy,

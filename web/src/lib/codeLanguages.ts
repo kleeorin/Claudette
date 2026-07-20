@@ -23,6 +23,8 @@ import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile'
 const ts = () => javascript({ jsx: true, typescript: true })
 const js = () => javascript({ jsx: true })
 const sh = () => StreamLanguage.define(shell)
+const dockerfile = () => StreamLanguage.define(dockerFile)
+const tomlLang = () => StreamLanguage.define(toml)
 
 // Map file extension (no dot, lowercase) → CodeMirror language extension.
 const byExt: Record<string, () => Extension> = {
@@ -42,13 +44,13 @@ const byExt: Record<string, () => Extension> = {
   php: php,
   sql: sql,
   sh: sh, bash: sh, zsh: sh,
-  toml: () => StreamLanguage.define(toml),
-  dockerfile: () => StreamLanguage.define(dockerFile),
+  toml: tomlLang,
+  dockerfile: dockerfile,
 }
 
 // Filenames that have no useful extension.
 const byName: Record<string, () => Extension> = {
-  dockerfile: () => StreamLanguage.define(dockerFile),
+  dockerfile: dockerfile,
   '.bashrc': sh, '.zshrc': sh, '.profile': sh,
 }
 

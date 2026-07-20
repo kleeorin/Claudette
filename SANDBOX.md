@@ -668,6 +668,57 @@ shrinks the exploitable window from "unbounded (any time before the write)" to t
 instruction race, which is extremely hard to win repeatably. The airtight fix is to do the
 write from a dir-fd (native addon) or inside the box.
 
+## G2 — Symlinked-mount authorizer divergence (box refuses a mount the authorizer trusts)
+
+Found by an adversarial re-test of the confinement guarantees and **confirmed live**
+(`scratchpad/sandbox-symlink-authorizer-probe.mts`, exit 0 after the fix). The
+"Symlinked-mount escape" fix was applied in **one** place — the bwrap arg builder
+(`bwrapBaseArgs`), which drops a box-writable symlinked mount source via
+`isUnsafeSymlinkMount`. But the **out-of-band** path authorizer the notebook MCP tools use —
+`sessionDataMounts` → `sandboxPathAccess` → `canonicalizeForAccess` — did **not** apply that
+guard, so the two diverged on exactly the mount the box refuses:
+
+1. `sessionDataMounts` adds `<cwd>/.claude` whenever `existsSync` sees it — and `existsSync`
+   **follows the symlink**, so a box-planted `<cwd>/.claude -> /outside` is admitted as a
+   trusted rw mount root (the `isUnsafeSymlinkMount` guard lived only in the box path);
+2. `sandboxPathAccess` then `canonicalizeForAccess`es that root — `realpath` resolves the link
+   to its **target** — so the target `/outside` becomes a trusted rw area. (The fix's own
+   invariant, "canonicalizing stops a link *inside* a mount laundering outward," **inverts**
+   when the link *is* the mount root: canonicalizing it outward *expands* the authorized set.)
+3. Because the notebook tools run **unsandboxed** in the server (`NotebookDocManager.atomicWrite`),
+   that authorization becomes a real host write: a confined box runs
+   `ln -s /out-of-mount <cwd>/.claude`, then `create_notebook`/`add_cell` with
+   `path="<cwd>/.claude/x.ipynb"` → the server writes/overwrites the `.ipynb` **outside the
+   mounts** (read direction leaks any out-of-mount file that parses as a notebook).
+
+Bounded like the parent notebook-MCP vector (`.ipynb`-named files, attacker-controlled JSON),
+but a genuine violation of the write-confinement guarantee. **Worse than the original symlink
+escape in one respect:** it needs no relaunch — the authorizer calls `sessionDataMounts` **live
+on every MCP call**, so the planted link bites immediately.
+
+**FIXED (2026-07-19).** `sessionDataMounts` now applies the **same** guard the box does, so the
+authorizer and the box never diverge on the mount set:
+
+```ts
+const full = [...mounts, ...appSourceProtections(mounts), ...settingsRo]
+const rwRoots = full.filter((m) => m.mode === 'rw' && existsSync(m.path)).map((m) => path.resolve(m.path))
+return full.filter((m) => !isUnsafeSymlinkMount(m.path, rwRoots))
+```
+
+`rwRoots` are the **logical** rw dest paths (never a link's target), exactly as `bwrapBaseArgs`
+computes them, so a box-writable symlinked `<cwd>/.claude` is dropped from the authorizer's
+mount set just as it is dropped from the box's binds. A host-created symlink whose parent is not
+box-writable (dotfiles farm) is still kept, matching the box. Verified: the probe now returns
+`read=false write=false` and logs the same refusal the box emits; a permanent regression
+assertion was added to `scratchpad/sandbox-fs-escape-fixes-test.mts` (13/13) — a planted
+`<cwd>/.claude -> secret` must not authorize an out-of-mount `.ipynb`. Full sandbox suite green,
+server typecheck clean.
+
+**Note (defense working, observed during the fix):** the patch had to be applied by the operator
+because the session doing the audit was itself confined, and the self-modification fix pins
+`server/` **read-only** inside every box — the in-box edit failed `EROFS`. Independent live
+evidence that "a confined box cannot rewrite the code of the process that sandboxes it" holds.
+
 ## Removed: `JupyterManager.install()` latent footgun
 
 The audit also found `JupyterManager.install()` — dead code (zero callers) that built
