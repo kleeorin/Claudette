@@ -1,7 +1,8 @@
-import { readdir, readFile, stat } from 'fs/promises'
+import { readdir, readFile, stat, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
-import type { ConversationMeta, ClaudeEvent } from '@claudette/shared'
+import crypto from 'crypto'
+import type { ConversationMeta, ClaudeEvent, RewindPoint } from '@claudette/shared'
 
 // Claude stores each conversation as a JSONL transcript under
 // ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. The dir name is the absolute
@@ -86,4 +87,56 @@ export async function readConversation(cwd: string, id: string): Promise<ClaudeE
     }
   }
   return events
+}
+
+// --- /rewind ------------------------------------------------------------------
+
+// The user turns of a conversation, as rewind points (oldest first). Each is one real
+// text prompt — a string-content user line that isn't a tool_result echo or a
+// slash-command / caveat wrapper (isNoise) — keyed by its uuid, the boundary
+// forkConversationBefore truncates at. `id` is the session's current claude session id.
+export async function listRewindPoints(cwd: string, id: string): Promise<RewindPoint[]> {
+  const full = join(projectDir(cwd), `${id}.jsonl`)
+  let raw: string
+  try { raw = await readFile(full, 'utf8') } catch { return [] }
+  const points: RewindPoint[] = []
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    let o: Record<string, unknown>
+    try { o = JSON.parse(line) } catch { continue }
+    if (o.type !== 'user' || o.isMeta || o.isSidechain) continue
+    if (typeof o.uuid !== 'string') continue
+    const content = (o.message as { content?: unknown })?.content
+    if (typeof content !== 'string' || !content.trim() || isNoise(content)) continue
+    const ts = typeof o.timestamp === 'string' ? Date.parse(o.timestamp) : NaN
+    points.push({ uuid: o.uuid, text: content.trim(), mtimeMs: Number.isNaN(ts) ? 0 : ts, ordinal: points.length + 1 })
+  }
+  return points
+}
+
+// Fork a conversation to JUST BEFORE the user turn `uuid`: copy every transcript line
+// preceding that one into a NEW conversation (fresh claude session id, stamped through
+// each line's sessionId) and return the new id. The original transcript is left intact —
+// a rewind is itself a fork, so resuming the original undoes it. Returns null if `uuid`
+// isn't a line in this transcript.
+export async function forkConversationBefore(cwd: string, id: string, uuid: string): Promise<string | null> {
+  const dir = projectDir(cwd)
+  let raw: string
+  try { raw = await readFile(join(dir, `${id}.jsonl`), 'utf8') } catch { return null }
+  const lines = raw.split('\n').filter((l) => l.trim())
+  const cut = lines.findIndex((l) => {
+    try { return (JSON.parse(l) as { uuid?: unknown }).uuid === uuid } catch { return false }
+  })
+  if (cut < 0) return null
+  const newId = crypto.randomUUID()
+  const kept = lines.slice(0, cut).map((l) => {
+    try {
+      const o = JSON.parse(l) as Record<string, unknown>
+      if ('sessionId' in o) o.sessionId = newId   // re-key the prefix to the fork
+      return JSON.stringify(o)
+    } catch { return l }
+  })
+  // Trailing newline keeps the file line-framed like the CLI writes it.
+  await writeFile(join(dir, `${newId}.jsonl`), kept.length ? kept.join('\n') + '\n' : '')
+  return newId
 }

@@ -6,6 +6,7 @@ import type {
   NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus,
   CreatePaneRequest, CreatePaneResponse,
   ConversationMeta, ConversationsResponse, ConversationResponse,
+  RewindPoint, RewindPointsResponse, RewindResponse,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
   ActivePane, KernelSpecsResponse, SandboxConfig,
@@ -219,6 +220,10 @@ export const api = {
       (await get<ConversationsResponse>(`/api/session/conversations?cwd=${encodeURIComponent(cwd)}`)).conversations,
     readConversation: async (cwd: string, id: string): Promise<ClaudeEvent[]> =>
       (await get<ConversationResponse>(`/api/session/conversation?cwd=${encodeURIComponent(cwd)}&id=${encodeURIComponent(id)}`)).events,
+    // /rewind: the current conversation's rewindable user turns, and forking to one.
+    rewindPoints: async (id: string): Promise<RewindPoint[]> =>
+      (await get<RewindPointsResponse>(`/api/session/rewindPoints?id=${encodeURIComponent(id)}`)).points,
+    rewind: (id: string, uuid: string) => post<RewindResponse>('/api/session/rewind', { id, uuid }),
     // Plan-quota usage (session/weekly %), polled — see useUsage. Account-global.
     usage: (): Promise<UsageResponse> => get<UsageResponse>('/api/usage'),
   },

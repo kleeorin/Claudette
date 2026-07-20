@@ -1,11 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ConversationMeta, PermissionMode, SessionInfo } from '@claudette/shared'
+import type { ConversationMeta, PermissionMode, RewindPoint, SessionInfo } from '@claudette/shared'
 import { useChat, collectAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
 import { prettyPath } from '../lib/paths'
 import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
+import { RewindPicker } from './RewindPicker'
 import { SandboxControl } from './SandboxControl'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { useMentionComplete } from '../hooks/useMentionComplete'
@@ -33,6 +34,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const { sessions, setMode, isFresh, markBusy } = useSessions()
   const session = sessions.find((s) => s.id === sessionId)
   const [showResume, setShowResume] = useState(false)
+  const [showRewind, setShowRewind] = useState(false)
   const state = session?.state ?? 'idle'
   const items = transcriptFor(sessionId)
   const pending = pendingFor(sessionId)
@@ -188,10 +190,12 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
     : []
 
   // Returns true if handled natively (don't send as a turn). /clear starts a fresh
-  // conversation + wipes the transcript; /resume opens the conversation picker.
+  // conversation + wipes the transcript; /resume opens the conversation picker;
+  // /rewind opens the turn picker (fork the transcript to an earlier point).
   const handleSlash = (t: string): boolean => {
     if (t === '/clear') { clearTranscript(sessionId); void api.http.restartFresh(sessionId); return true }
     if (t === '/resume') { setShowResume(true); return true }
+    if (t === '/rewind') { setShowRewind(true); return true }
     return false
   }
 
@@ -215,6 +219,18 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
     await api.http.resumeInto(sessionId, meta.id)
   }
 
+  // Rewind to a past turn: fork the transcript to just before it (server also resumes
+  // the engine into the fork), then wipe the pane and replay the truncated history so
+  // the UI matches the engine's new context. The next turn continues from that point.
+  const pickRewind = async (point: RewindPoint) => {
+    setShowRewind(false)
+    if (!session) return
+    const res = await api.http.rewind(sessionId, point.uuid)
+    if (!res.ok || !res.newId) return   // point vanished (e.g. conversation changed) — leave the pane as-is
+    clearTranscript(sessionId)
+    loadTranscript(sessionId, await api.http.readConversation(session.cwd, res.newId))
+  }
+
   if (!session) {
     return (
       <div className="flex items-center justify-center h-full text-ctp-overlay text-xs">
@@ -226,6 +242,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   return (
     <div className="relative flex flex-col h-full bg-ctp-base text-ctp-text">
       {showResume && <ResumePicker cwd={session.cwd} onPick={pickResume} onClose={() => setShowResume(false)} />}
+      {showRewind && <RewindPicker sessionId={sessionId} onPick={pickRewind} onClose={() => setShowRewind(false)} />}
       <MetaBar
         meta={meta}
         session={session}
@@ -415,7 +432,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
 }
 
 // Slash commands Claudette handles itself (not passed through as a turn).
-const NATIVE_SLASH = ['clear', 'resume']
+const NATIVE_SLASH = ['clear', 'resume', 'rewind']
 
 // Vertical rhythm between transcript items: prose (user/assistant text) gets room
 // to breathe; tool calls, their results, and consecutive tool rows pull into tight

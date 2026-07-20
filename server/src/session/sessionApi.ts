@@ -6,11 +6,12 @@ import type {
   ResumeIntoRequest, ConversationsResponse, ConversationResponse, SandboxConfig,
   SetAgentRequest, RenameSessionRequest, ListAgentsResponse,
   PermissionsResponse, EditRuleRequest, WriteResult,
+  RewindPointsResponse, RewindRequest, RewindResponse,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { listAgents } from '../claude/agents'
 import { getEffective, addRule, removeRule } from '../claude/permissions'
-import { listConversations, readConversation } from '../claude/conversations'
+import { listConversations, readConversation, listRewindPoints, forkConversationBefore } from '../claude/conversations'
 import { WsHub } from '../ws/hub'
 
 // The session API layer: HTTP lifecycle routes + a bridge from SessionManager's
@@ -137,6 +138,29 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
   app.get<{ Querystring: { cwd: string; id: string } }>('/api/session/conversation', async (req): Promise<ConversationResponse> => ({
     events: await readConversation(req.query.cwd, req.query.id),
   }))
+
+  // /rewind — the rewindable user turns of a session's CURRENT conversation. Resolved
+  // from the live session (its cwd + claude session id) so the client needn't track
+  // which conversation is in force.
+  app.get<{ Querystring: { id: string } }>('/api/session/rewindPoints', async (req): Promise<RewindPointsResponse> => {
+    const info = sessions.get(req.query.id)
+    const claudeId = sessions.claudeSessionId(req.query.id)
+    if (!info || !claudeId) return { points: [] }
+    return { points: await listRewindPoints(info.cwd, claudeId) }
+  })
+
+  // /rewind — fork the session's current conversation to just before `uuid` and resume
+  // the engine into the fork. The original conversation is untouched (the fork is a
+  // copy), so the rewind can be undone by resuming the original via /resume.
+  app.post<{ Body: RewindRequest }>('/api/session/rewind', async (req): Promise<RewindResponse> => {
+    const info = sessions.get(req.body.id)
+    const claudeId = sessions.claudeSessionId(req.body.id)
+    if (!info || !claudeId) return { ok: false, error: 'no such session' }
+    const newId = await forkConversationBefore(info.cwd, claudeId, req.body.uuid)
+    if (!newId) return { ok: false, error: 'rewind point not found in this conversation' }
+    sessions.resumeInto(req.body.id, newId)
+    return { ok: true, newId }
+  })
 }
 
 // Dispatch a client→server WS message that drives a session. Returns true if the

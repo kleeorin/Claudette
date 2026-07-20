@@ -1,6 +1,6 @@
 import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
-  SessionInfo, SessionState, SetModeResult, ConversationMeta, ActivePane, SandboxConfig,
+  SessionInfo, SessionState, SetModeResult, ConversationMeta, RewindPoint, ActivePane, SandboxConfig,
   AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult,
 } from './types'
 import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
@@ -158,6 +158,15 @@ export interface ResumeIntoRequest { id: string; claudeSessionId: string }
 export interface ConversationsResponse { conversations: ConversationMeta[] }
 // GET /api/session/conversation?cwd=…&id=…  → the conversation replayed as events
 export interface ConversationResponse { events: ClaudeEvent[] }
+
+// GET /api/session/rewindPoints?id=…  → the session's current conversation as a list
+// of rewindable user turns (newest last), for the native /rewind picker.
+export interface RewindPointsResponse { points: RewindPoint[] }
+// POST /api/session/rewind { id, uuid } — fork the session's current conversation to
+// just before `uuid` and resume the engine into the fork. `newId` is the fork's claude
+// session id (read it back with /api/session/conversation to replay the truncated view).
+export interface RewindRequest { id: string; uuid: string }
+export interface RewindResponse { ok: boolean; newId?: string; error?: string }
 
 // POST /api/pane/create { cwd, cols?, rows?, sessionId? } → { id }   |   POST /api/pane/destroy { id }
 // cols/rows let the client spawn the pty at the terminal's real size so the shell's

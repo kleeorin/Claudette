@@ -169,6 +169,16 @@ export interface ConversationMeta {
   turns: number       // user-turn count
 }
 
+// A point the conversation can be rewound to — one past user turn. Rewinding forks
+// the transcript truncated to JUST BEFORE this turn (so the turn and everything
+// after it drop away and you continue from there); see conversations.ts.
+export interface RewindPoint {
+  uuid: string        // the user message's uuid — the fork boundary
+  text: string        // the turn's prompt, for preview
+  mtimeMs: number     // when it was sent, for ordering + "N ago" display
+  ordinal: number     // 1-based turn number, for display
+}
+
 // --- Remotes -----------------------------------------------------------------
 
 // A saved SSH remote. `host` is anything ssh accepts as a destination
