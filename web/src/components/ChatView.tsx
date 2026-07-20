@@ -639,13 +639,18 @@ function AgentCard({ agent, running, onDismiss }: { agent: AgentView; running: b
           </span>
           <span className="shrink-0 text-ctp-surface2 text-[10px]">{open ? '▾' : '▸'}</span>
         </button>
-        <button
-          onClick={onDismiss}
-          title={active ? 'Dismiss card (the agent keeps running)' : 'Dismiss'}
-          className="shrink-0 text-ctp-overlay hover:text-ctp-red px-0.5 leading-none"
-        >
-          ×
-        </button>
+        {/* Only a finished agent can be dismissed. Dismissing a still-running one used to
+            hide it while it kept running detached — with no way to bring the card back,
+            so you'd lose its live progress and its eventual result for good. */}
+        {!active && (
+          <button
+            onClick={onDismiss}
+            title="Dismiss"
+            className="shrink-0 text-ctp-overlay hover:text-ctp-red px-0.5 leading-none"
+          >
+            ×
+          </button>
+        )}
       </div>
 
       {/* Collapsed ticker: step count + the agent's most recent action. */}
