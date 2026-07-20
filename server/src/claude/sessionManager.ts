@@ -10,6 +10,7 @@ import type {
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
+import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir } from './configProtection'
 
 // Owns the set of Claude sessions and their engines. Ported from
 // ClaudeMaster's main-process SessionManager, minus the remote/SSH spawn path
@@ -83,7 +84,14 @@ export class SessionManager extends EventEmitter {
   // string-content user echo to avoid a double prompt on replay. Tool-result user
   // events (array content) are real transcript material and are kept.
   private buffer(id: string, e: ClaudeEvent): void {
-    if (e.type === 'user' && typeof (e as { message?: { content?: unknown } }).message?.content === 'string') return
+    // Drop only the CLI's echo of a user PROMPT (mirrored via userTurn) — but KEEP
+    // system-injected turns like <task-notification>, which drive agent-tray state. The
+    // invariant: a reconnect snapshot reconstructs the same state the live stream did;
+    // without it, a device joining after a background agent finished replays it as running.
+    if (e.type === 'user') {
+      const content = (e as { message?: { content?: unknown } }).message?.content
+      if (typeof content === 'string' && !content.includes('<task-notification>')) return
+    }
     const buf = this.transcripts.get(id) ?? []
     buf.push(e)
     if (buf.length > TRANSCRIPT_CAP) buf.splice(0, buf.length - TRANSCRIPT_CAP)
@@ -173,13 +181,34 @@ export class SessionManager extends EventEmitter {
       return
     }
     session.sandboxed = canSandbox
+
+    // Cross-session hook poisoning (SANDBOX.md, configProtection.ts). A confined
+    // session's config becomes "exposed" — a later HOST-MODE session against it gets a
+    // scrubbed config mirror (hooks/mcpServers stripped) so nothing the box could have
+    // written to settings executes unsandboxed. bwrap ignores the child env (--clearenv
+    // sets CLAUDE_CONFIG_DIR itself), so this override only bites the host-mode branch.
+    let launchEnv = process.env as Record<string, string>
+    if (canSandbox) {
+      markConfigExposed(runCwd)
+    } else if (isConfigExposed(runCwd)) {
+      const scrubbed = scrubbedHostConfigDir()
+      if (scrubbed) launchEnv = { ...process.env, CLAUDE_CONFIG_DIR: scrubbed } as Record<string, string>
+      // Single host-execution chokepoint: an exposed config can carry hooks/MCP a confined
+      // session wrote at ANY scope. Read only the (scrubbed) user config, ignore project +
+      // local entirely — so create-after-launch project settings, settings.local.json, and
+      // project-scope hooks are all inert. --strict-mcp-config keeps Claudette's own
+      // app-control server (it rides --mcp-config) while dropping settings-defined MCP. No
+      // per-file pin can be raced here; the pin/scrub layers become defense-in-depth.
+      spawn = { ...spawn, args: [...spawn.args, '--setting-sources', 'user', '--strict-mcp-config'] }
+    }
+
     session.appliedSandboxKey = sandboxKey(session.sandbox, runCwd)   // what's now actually running
 
     const engine = new ClaudeEngine({
       command: spawn.command,
       args: spawn.args,
       cwd: runCwd,
-      env: process.env as Record<string, string>,
+      env: launchEnv,
       permissionMode: session.permissionMode,   // so "allow all" auto-approves without the CLI's cooperation
     })
 

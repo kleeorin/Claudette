@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import type { SandboxConfig, SandboxMount } from '@claudette/shared'
+import { ensureUserSettingsPinnable, settingsJsonPaths } from './configProtection'
 
 // Wraps a `claude …` invocation in a bubblewrap sandbox that confines the process
 // to a set of mounts (see SANDBOX.md). We do NOT --unshare-net, so the shared
@@ -98,12 +99,22 @@ export function appSourceRoot(): string {
   return (cachedAppRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..'))
 }
 
-// The server's own executable source dirs — what the self-modification escape needs
-// WRITABLE (edit a tool / index.ts → reload/restart runs it unsandboxed). web/ is
-// client-only (not executed by the server process), so it is not a self-mod vector.
+// Repo paths that end up EXECUTED on the host — what the self-modification escape
+// needs writable (edit one → a reload/restart, host shell invocation, or operator
+// browser runs it unsandboxed). Beyond the server process's own source this covers
+// runtime-imported node_modules, the built web assets served to the operator's
+// browser, the launch/utility scripts run from the operator's host shell, and the
+// package manifests that drive host npm builds. Files bind fine: bwrap --ro-bind
+// works on files as well as dirs.
 function appSourceDirs(): string[] {
   const root = appSourceRoot()
-  return [path.join(root, 'server'), path.join(root, 'shared')].filter((d) => existsSync(d))
+  return [
+    'server', 'shared',                        // executed by the server process
+    'node_modules',                            // imported at runtime by the unsandboxed server
+    'web/dist',                                // served from disk to the authenticated operator browser
+    'launch.sh', 'rc_launch.sh', 'scripts',    // run on the HOST by the operator's shell
+    'package.json', 'package-lock.json',       // drive host npm build/workspace scripts
+  ].map((p) => path.join(root, p)).filter((d) => existsSync(d))
 }
 
 // Read-only overlays that keep the server's own source read-only inside a box that
@@ -126,6 +137,25 @@ function appSourceProtections(dataMounts: SandboxMount[]): SandboxMount[] {
     if (exposedRw) out.push({ path: rd, mode: 'ro' })
   }
   return out
+}
+
+// `~/.claude/settings.json` and a project `<cwd>/.claude/settings.json` can define
+// hooks + MCP servers that Claude runs as shell. Both sit in rw-mounted config dirs,
+// so a confined session could write a malicious hook that later runs on the HOST when
+// an unsandboxed session reads it (SANDBOX.md "cross-session hook poisoning"). Pin them
+// read-only over the rw config binds — same trick as appSourceProtections. Existing
+// hooks still FIRE (ro blocks writes, not reads); only writing NEW hooks from the box
+// is stopped. Allow-always still persists to the local scope (settings.local.json, rw).
+// The user-scope create-after-launch gap (a ~/.claude/settings.json that did NOT exist
+// at launch) is closed by ensureUserSettingsPinnable() (called in wrapSandbox), which
+// materializes a valid `{}` so the ro-bind below has a real file to pin. The
+// neutralization of anything that still slips through (settings.local.json, a project
+// settings.json created from scratch, pre-existing hooks) is Layer 2 (configProtection.ts).
+function hookSettingsProtections(cwd: string): SandboxMount[] {
+  return [
+    path.join(claudeConfigDir(), 'settings.json'),
+    path.join(cwd, '.claude', 'settings.json'),
+  ].filter((f) => existsSync(f)).map((f) => ({ path: path.resolve(f), mode: 'ro' as const }))
 }
 
 // --- availability probe ------------------------------------------------------
@@ -292,7 +322,11 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
   ]
   // User mounts as-is. cwd is NO LONGER force-added, so it's fully optional — rw (the
   // default a new session seeds), ro, or removed. De-dupe by path (last wins).
-  const args = bwrapBaseArgs(cwd, [...baseline, ...dedupeMounts(cfg.mounts)])
+  // Layer 1: make the user-scope settings.json a real `{}` when absent so the ro-bind
+  // below actually pins it (closes create-after-launch for ~/.claude). Must run BEFORE
+  // hookSettingsProtections, which only ro-binds files that exist.
+  ensureUserSettingsPinnable()
+  const args = bwrapBaseArgs(cwd, [...baseline, ...dedupeMounts(cfg.mounts), ...hookSettingsProtections(cwd)])
 
   // Claude's main config lives at $HOME/.claude.json — a FILE next to the config
   // dir, NOT inside it. We can't bind that file directly (it's saved via write-tmp
@@ -389,7 +423,13 @@ export function sessionDataMounts(cfg: SandboxConfig, cwd: string): SandboxMount
     { path: claudeConfigDir(), mode: 'rw' },
     ...(existsSync(path.join(cwd, '.claude')) ? [{ path: path.join(cwd, '.claude'), mode: 'rw' as const }] : []),
   ]
-  return dedupeMounts([...baseline, ...cfg.mounts])
+  const mounts = dedupeMounts([...baseline, ...cfg.mounts])
+  // Include the same ro overlays the box gets (app source + settings.json), or the
+  // out-of-band path would authorize writes the box itself refuses. settings.json is
+  // pinned ro UNCONDITIONALLY (even when absent) so an in-process actor can't create
+  // one where the box's seed bind stops its own tools — matching Layer 1's effect.
+  const settingsRo: SandboxMount[] = settingsJsonPaths(cwd).map((p) => ({ path: path.resolve(p), mode: 'ro' as const }))
+  return [...mounts, ...appSourceProtections(mounts), ...settingsRo]
 }
 
 // Canonicalize a path for containment testing: realpath if it exists, else the
@@ -412,14 +452,17 @@ function canonicalizeForAccess(p: string): string {
 // file operations acting for a session to the same paths the session's own tools have.
 export function sandboxPathAccess(cfg: SandboxConfig, cwd: string, p: string): { read: boolean; write: boolean } {
   const target = canonicalizeForAccess(p)
-  let best: { root: string; mode: 'rw' | 'ro' } | undefined
-  for (const m of sessionDataMounts(cfg, cwd)) {
+  // Resolve precedence with the SAME rule bwrap uses — shallowest-first emission, last
+  // containing bind wins — so this out-of-band authorizer can't diverge from the box
+  // (a "deepest-wins" variant drifts on same-path rw/ro ties, where bwrap appends the
+  // ro overlay last ⇒ it wins; iterating in emission order and taking the last match
+  // reproduces that for ties and any future overlay alike).
+  let match: SandboxMount | undefined
+  for (const m of sortShallowFirst(sessionDataMounts(cfg, cwd))) {
     const root = canonicalizeForAccess(m.path)
-    if (target === root || target.startsWith(root + path.sep)) {
-      if (!best || best.root.length < root.length) best = { root, mode: m.mode }
-    }
+    if (target === root || target.startsWith(root + path.sep)) match = m
   }
-  return { read: !!best, write: best?.mode === 'rw' }
+  return { read: !!match, write: match?.mode === 'rw' }
 }
 
 // Is `p` inside a box-WRITABLE (rw) mount, judged by LOGICAL path (path.resolve, NOT

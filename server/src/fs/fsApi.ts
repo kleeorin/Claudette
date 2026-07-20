@@ -80,6 +80,20 @@ async function readPreview(path: string): Promise<FilePreview> {
 }
 
 export function registerFsRoutes(app: FastifyInstance): void {
+  // One guard for the whole /api/fs/* surface (O1 + O4). The auth cookie is
+  // SameSite=Lax, so it still rides a top-level CROSS-SITE request: a malicious page
+  // can point window.location/<a> at /api/fs/download?path=/etc/passwd (read) or
+  // auto-submit a form at a write route. Sec-Fetch metadata is the reliable signal —
+  // refuse anything the browser tags cross-site. The app's own same-origin fetch()s
+  // pass, dev/proxy setups report same-site, and a directly-typed URL reports 'none'.
+  app.addHook('onRequest', async (req, reply) => {
+    if (!req.url.startsWith('/api/fs/')) return
+    const site = req.headers['sec-fetch-site']
+    if (typeof site === 'string' && site !== 'same-origin' && site !== 'same-site' && site !== 'none') {
+      return reply.code(403).send({ error: 'cross-site request to /api/fs refused' })
+    }
+  })
+
   app.get<{ Querystring: { path?: string } }>('/api/fs/list', async (req): Promise<FsListResponse> => {
     // Default to the user's home; resolve relatives against it too.
     const home = homedir()

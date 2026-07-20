@@ -444,12 +444,43 @@ can't launder access outward. An unconfined session (sandbox off / unavailable) 
 old behavior. Verified in `scratchpad/sandbox-fs-escape-fixes-test.mts` (in-rw read+write,
 in-ro read-only, out-of-mount denied, global `.claude` reachable, symlink-out denied).
 
-**Note — the global `~/.claude` write→host-exec angle (documented, deferred).** `~/.claude`
-is always mounted **rw**, so a box can write `settings.json` hooks / plant agents / edit
-`<configDir>/.claude.json`; any plain `claude` the user later runs in a normal terminal
-(unsandboxed) would execute those. The write lands "inside a mount," but the effect is
-host-side. The durable fix is the per-session `CLAUDE_CONFIG_DIR` seeded with only
-credentials already floated above for the read side; until then this is a known tradeoff.
+**Cross-session hook poisoning — the global `~/.claude` write→host-exec angle (FIXED, two layers).**
+`~/.claude` is mounted **rw** (Claude writes creds/history/`.claude.json` there via atomic
+rename, which EBUSYs onto a file bind — so the dir is bound as a unit), so a box could write
+`settings.json` / `settings.local.json` `hooks` + `mcpServers` that a *later* unsandboxed
+("host-mode") `claude` would execute host-side. Closed by `configProtection.ts` +
+`sandbox.ts`:
+
+- **Layer 1 (write side).** Every `settings.json` (user + project) is pinned **read-only**
+  inside the box (`hookSettingsProtections`). `ensureUserSettingsPinnable()` first
+  materializes a valid `{}` at `~/.claude/settings.json` when absent, so the ro-bind has a
+  real file to pin — closing "create it after launch" for the user scope. Existing hooks
+  still *fire* (ro blocks writes, not reads); `settings.local.json` stays **rw** so
+  "allow-always" keeps persisting. `sessionDataMounts()` pins the same `settings.json` paths
+  ro for the in-process actors (notebook MCP), so the out-of-band path can't write what the
+  box can't.
+- **Layer 2 (execution side).** `markConfigExposed(cwd)` records every config a confined
+  session ran against (persisted ledger; the *shared* user scope taints all later host-mode
+  sessions). When a host-mode session launches against an exposed config, `sessionManager`
+  points its `CLAUDE_CONFIG_DIR` at `scrubbedHostConfigDir()` — a fresh mirror that symlinks
+  creds/state back to the real dir (shared) but replaces `settings.json` +
+  `settings.local.json` with scrubbed copies (`hooks`/`mcpServers` stripped). So anything
+  that slipped past Layer 1 (a `settings.local.json` hook, or a directive predating this fix)
+  never executes unsandboxed.
+
+**Residuals (documented, not silently ignored).** (1) A confined session can still create a
+*project* `<cwd>/.claude/settings.json` from scratch when no `.claude/` existed at launch — we
+deliberately don't write into the user's repo to seed it, and Layer 2 does not scrub project
+scope in host mode (Claude reads it relative to cwd with no redirect). Its neutralization
+relies on the same project being reused in host mode. (2) A host-mode session run against an
+exposed config uses a scrubbed config *mirror*; top-level files rewritten by atomic rename
+(`.claude.json`, refreshed creds) may not flow back to the shared dir for that run
+(directory state — projects/todos/history — is symlinked and persists). Both are the price of
+keeping the shared-dir rw bind; full closure is per-session config isolation. Verified in an
+ad-hoc harness: a bwrap `--ro-bind` over `settings.json` blocks in-box writes (EROFS);
+`wrapSandbox` emits `--ro-bind` for the user `settings.json` (rw `--bind` for the config dir,
+`settings.local.json` left writable); the scrub strips `hooks`+`mcpServers` while keeping
+`permissions`/other prefs and leaves creds/projects as symlinks to the real dir.
 
 ## Venv-probe escape (unsandboxed exec of a discovered interpreter) — CRITICAL
 
@@ -589,10 +620,12 @@ to "broken but safe," not "host RCE." Verified in `scratchpad/session-confinemen
 `sandbox-unowned-kernel-test.mts`. Server typecheck clean; all sandbox tests green.
 
 **Not covered by the seam (unchanged, still true):** it's a filesystem-write firewall, not a
-network or secrecy boundary — the shared network still allows exfil, and the always-rw
-`~/.claude` still lets a box plant hooks/agents a *later* unsandboxed `claude` would run
-(the write "lands in a mount," but the effect is deferred host-side). Both remain documented
-tradeoffs; the durable fix for the latter is the per-session `CLAUDE_CONFIG_DIR` floated above.
+network or secrecy boundary — the shared network still allows exfil. The `~/.claude`
+hook/`mcpServers` write→host-exec angle it used to leave open is now closed by the two-layer
+`configProtection.ts` fix (settings.json pinned ro in-box + host-mode sessions read a scrubbed
+config mirror); see "Cross-session hook poisoning" above for the mechanism and its residuals.
+Planting non-executable *agents* under `~/.claude` remains a lesser tradeoff (an agent charter
+is data a later session would still run under confinement, not host shell).
 
 ## G1 — Notebook-write/read TOCTOU (symlink swap between check and I/O)
 
