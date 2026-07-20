@@ -80,9 +80,8 @@ echo "  Open on your phone:"
 echo "    $URL"
 echo
 
-if [ -n "$PNG" ]; then
+npx --yes qrcode "$URL"         # terminal QR — scan it off the screen
+if [ -n "$PNG" ]; then          # …and, when asked, also drop a PNG to open/scan later
   npx --yes qrcode -o "$PNG" -w 520 "$URL"
   echo "  PNG written: $PNG"
-else
-  npx --yes qrcode "$URL"       # terminal QR — scan it off the screen
 fi

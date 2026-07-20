@@ -16,7 +16,13 @@
 # CLAUDETTE_TOKEN=… ./rc_launch.sh  (also rewrites the file).
 #
 #   ./rc_launch.sh                 # build + serve + run (HTTPS on 443)
+#   ./rc_launch.sh --new           # mint a FRESH token (rotates; devices must re-scan)
 #   PORT=4319 ./rc_launch.sh       # change the local app port (serve follows)
+#
+# Whenever a new token is minted (--new, or the first-ever run) a scannable QR PNG
+# is written next to the token file (~/.config/claudette/qr.png) — NOT in the
+# project dir, since the PNG encodes the token and the project dir is mounted into
+# session sandboxes.
 #
 # To STOP exposing it later:  tailscale serve --https=443 off
 set -euo pipefail
@@ -27,6 +33,16 @@ cd "$ROOT"
 # Use nvm's Node no matter which terminal launched us (see the helper for why).
 # shellcheck source=scripts/use-nvm-node.sh
 . "$ROOT/scripts/use-nvm-node.sh"
+
+# --- args -------------------------------------------------------------------
+NEW_TOKEN=0
+for arg in "$@"; do
+  case "$arg" in
+    --new)     NEW_TOKEN=1 ;;
+    -h|--help) echo "usage: [PORT=…] ./rc_launch.sh [--new]   (--new mints a fresh access token)"; exit 0 ;;
+    *)         echo "rc_launch: unknown argument '$arg' (try --new or --help)" >&2; exit 1 ;;
+  esac
+done
 
 HOST="127.0.0.1"                 # app binds loopback; tailscale serve fronts it
 PORT="${PORT:-4319}"
@@ -55,14 +71,21 @@ fi
 tailscale status >/dev/null 2>&1 || { echo "error: Tailscale isn't connected. Run 'sudo tailscale up'." >&2; exit 1; }
 
 # --- access token (stable across runs) --------------------------------------
-if [ -n "${CLAUDETTE_TOKEN:-}" ]; then
+# GENERATED = did THIS run mint a fresh token? (--new, or the first-ever run.) When
+# it did, existing devices' saved logins are invalidated, so we also drop a QR PNG.
+GENERATED=0
+if [ "$NEW_TOKEN" = "1" ]; then
+  TOKEN="$(openssl rand -hex 16)"
+  printf '%s' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; GENERATED=1
+  echo "==> --new: rotated the access token → $TOKEN_FILE (existing devices must re-scan)"
+elif [ -n "${CLAUDETTE_TOKEN:-}" ]; then
   TOKEN="$CLAUDETTE_TOKEN"
   printf '%s' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
 elif [ -s "$TOKEN_FILE" ]; then
   TOKEN="$(cat "$TOKEN_FILE")"
 else
   TOKEN="$(openssl rand -hex 16)"
-  printf '%s' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+  printf '%s' "$TOKEN" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; GENERATED=1
   echo "==> generated a new access token → $TOKEN_FILE"
 fi
 
@@ -88,9 +111,19 @@ fi
 rm -f /tmp/rc_serve.err
 
 # --- show the phone URL + QR ------------------------------------------------
+# On a freshly-minted token, also write a PNG so you can open/scan it later. It
+# ENCODES THE TOKEN, so it lives beside the token file (~/.config/claudette, never
+# mounted into a session sandbox) — writing it into the project dir would let a
+# sandboxed session read the token straight out of the image.
+QR_PNG="$TOKEN_DIR/qr.png"
 echo
 if [ -x "$ROOT/scripts/phone-qr.sh" ]; then
-  CLAUDETTE_TOKEN="$TOKEN" "$ROOT/scripts/phone-qr.sh" || true
+  if [ "$GENERATED" = "1" ]; then
+    CLAUDETTE_TOKEN="$TOKEN" "$ROOT/scripts/phone-qr.sh" --png "$QR_PNG" || true
+    chmod 600 "$QR_PNG" 2>/dev/null || true
+  else
+    CLAUDETTE_TOKEN="$TOKEN" "$ROOT/scripts/phone-qr.sh" || true
+  fi
 else
   BASE="$(tailscale serve status 2>/dev/null | grep -oE 'https?://[A-Za-z0-9._-]+\.ts\.net(:[0-9]+)?' | head -1)"
   echo "  Open on your phone (Tailscale ON):  ${BASE}/?token=${TOKEN}"
