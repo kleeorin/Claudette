@@ -570,7 +570,7 @@ function AgentsTray({ agents, running, onDismiss, onDismissFinished }: {
   onDismissFinished: () => void
 }) {
   const [open, setOpen] = useState(true)
-  const active = agents.filter((a) => !a.result).length
+  const active = agents.filter((a) => !a.result && (a.launched || running)).length
   const finished = agents.length - active
   return (
     <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-mantle/60">
