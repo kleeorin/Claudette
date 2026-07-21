@@ -1,8 +1,14 @@
 import {
   createContext, useContext, useReducer, useEffect, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
-import type { ClaudeEvent, PermissionRequest, PermissionDecision } from '@claudette/shared'
+import type { ClaudeEvent, PermissionRequest, PermissionDecision, TaskRecord } from '@claudette/shared'
+import { isSubagentTool, isAsyncLaunchAck, userContentText, parseTaskNotification } from '@claudette/shared'
 import { api } from '../api/client'
+
+// Re-export the subagent-parsing helpers (now owned by @claudette/shared, so server
+// and client derive identically) under their old store path — existing importers
+// (ChatView) keep working unchanged.
+export { isSubagentTool }
 
 // Ported from ClaudeMaster's renderer chat store. The only transport change:
 // `window.api` (Electron IPC) → `api` (the WS/HTTP client). ClaudeMaster's
@@ -53,6 +59,10 @@ interface State {
   slash: Record<string, string[]>
   open: Record<string, Record<number, string>>
   meta: Record<string, SessionMeta>
+  // The server's authoritative subagent registry per session (connect snapshot +
+  // live session:tasks). The durable fallback that settles a tray card when its
+  // terminal signal never reached the transcript.
+  tasks: Record<string, TaskRecord[]>
 }
 
 type Action =
@@ -72,6 +82,7 @@ type Action =
   | { type: 'REMOVE_PENDING'; sessionId: string; requestId: string }          // one prompt answered/resolved
   | { type: 'CLEAR_PENDING'; sessionId: string }                              // drop the whole queue
   | { type: 'SET_SLASH'; sessionId: string; commands: string[] }
+  | { type: 'SET_TASKS'; sessionId: string; tasks: TaskRecord[] }   // replace the subagent registry (snapshot / live)
   | { type: 'SET_META'; sessionId: string; meta: Partial<SessionMeta> }
   | { type: 'SET_LIMIT'; sessionId: string; limitType: string; info: RateLimitInfo }
   | { type: 'CLEAR_LIMITS'; sessionId: string }
@@ -83,6 +94,10 @@ interface AssistantBlock { index: number; kind: 'text' | 'thinking' | 'tool_use'
 
 let seq = 0
 const nextId = () => `i${++seq}`
+
+// Stable empty-array identity so a session with no subagents doesn't hand consumers a
+// fresh [] each render (which would defeat memoization in the tray).
+const EMPTY_TASKS: TaskRecord[] = []
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -206,13 +221,16 @@ function reducer(state: State, action: Action): State {
     }
     case 'SET_SLASH':
       return { ...state, slash: { ...state.slash, [action.sessionId]: action.commands } }
+    case 'SET_TASKS':
+      return { ...state, tasks: { ...state.tasks, [action.sessionId]: action.tasks } }
     case 'CLEAR': {
       const transcripts = { ...state.transcripts }; delete transcripts[action.sessionId]
       const pending = { ...state.pending }; delete pending[action.sessionId]
       const slash = { ...state.slash }; delete slash[action.sessionId]
       const open = { ...state.open }; delete open[action.sessionId]
       const meta = { ...state.meta }; delete meta[action.sessionId]
-      return { transcripts, pending, slash, open, meta }
+      const tasks = { ...state.tasks }; delete tasks[action.sessionId]
+      return { transcripts, pending, slash, open, meta, tasks }
     }
     default:
       return state
@@ -431,46 +449,6 @@ function metaFromReplay(events: ClaudeEvent[]): Partial<SessionMeta> {
   return meta
 }
 
-// The tool the model calls to spawn a subagent. Named `Task` on some CLIs and
-// `Agent` on others (FleetView) — match both so the Agents tray recognizes a
-// subagent regardless of which name this CLI emits.
-export const isSubagentTool = (name: string): boolean => name === 'Task' || name === 'Agent'
-
-// A background/async subagent launch returns an IMMEDIATE tool_result that only
-// acknowledges the launch ("Async agent launched successfully…") — it is NOT the
-// agent's output, which arrives much later as a <task-notification>. Treat this ack
-// as "launched, still running", never as the terminal result — otherwise the tray
-// card flips to done the instant the agent starts.
-const ASYNC_LAUNCH_ACK = /Async agent launched successfully/i
-function isAsyncLaunchAck(content: string): boolean {
-  return ASYNC_LAUNCH_ACK.test(content)
-}
-
-// Flatten a user message's content (string, or an array of blocks) to plain text.
-function userContentText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map((b) => { const o = b as { type?: string; text?: unknown }; return o?.type === 'text' && typeof o.text === 'string' ? o.text : '' })
-      .join('\n')
-  }
-  return ''
-}
-
-// The harness injects a <task-notification> (delivered as a plain user turn) when a
-// background agent stops — the real lifecycle signal, replacing the launch ack. Parse
-// the Task tool-use-id it settles and whether it failed. It isn't written to the CLI's
-// jsonl, so it only reaches us on the live stream / connect snapshot, never a resume.
-interface TaskNotification { toolUseId: string; isError: boolean; summary: string }
-function parseTaskNotification(text: string): TaskNotification | null {
-  if (!text.includes('<task-notification>')) return null
-  const toolUseId = /<tool-use-id>\s*([^<\s]+)\s*<\/tool-use-id>/.exec(text)?.[1]
-  if (!toolUseId) return null
-  const status = (/<status>\s*([^<]+?)\s*<\/status>/.exec(text)?.[1] ?? '').toLowerCase()
-  const summary = /<summary>\s*([^<]*?)\s*<\/summary>/.exec(text)?.[1]?.trim()
-  return { toolUseId, isError: status === 'failed' || status === 'error', summary: summary || `Agent ${status || 'finished'}` }
-}
-
 // One subagent, assembled from a transcript: its `Task` call + its own nested
 // activity (steps) + its final result. Drives the Agents tray — the Task no longer
 // renders inline in the conversation.
@@ -487,7 +465,7 @@ export interface AgentView {
 
 // Pull every subagent out of a transcript. Groups each subagent's calls/results
 // (parentId === the Task's toolId) under its Task, and pairs the Task's result.
-export function collectAgents(items: TranscriptItem[]): AgentView[] {
+export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): AgentView[] {
   const resultByTool = new Map<string, Extract<TranscriptItem, { kind: 'tool_result' }>>()
   const launchedTools = new Set<string>()
   const childrenByParent = new Map<string, TranscriptItem[]>()
@@ -501,21 +479,34 @@ export function collectAgents(items: TranscriptItem[]): AgentView[] {
     const pid = (it.kind === 'tool_use' || it.kind === 'tool_result' || it.kind === 'text' || it.kind === 'thinking') ? it.parentId : undefined
     if (pid) { const a = childrenByParent.get(pid) ?? []; a.push(it); childrenByParent.set(pid, a) }
   }
+  // The server's authoritative registry, keyed by tool id — the fallback that settles a
+  // card when its terminal tool_result / <task-notification> never reached the transcript.
+  const registry = new Map((tasks ?? []).map((t) => [t.toolId, t]))
   const agents: AgentView[] = []
   for (const it of items) {
     if (it.kind !== 'tool_use' || !isSubagentTool(it.name)) continue
     const input = (it.input ?? {}) as { description?: string; prompt?: string; subagent_type?: string }
+    const rec = it.toolId ? registry.get(it.toolId) : undefined
     agents.push({
       id: it.id, toolId: it.toolId,
       type: input.subagent_type || 'agent',
       description: input.description || 'Subagent task',
       prompt: input.prompt,
       steps: it.toolId ? childrenByParent.get(it.toolId) ?? [] : [],
-      launched: it.toolId ? launchedTools.has(it.toolId) : false,
-      result: it.toolId ? resultByTool.get(it.toolId) : undefined,
+      launched: (it.toolId ? launchedTools.has(it.toolId) : false) || !!rec?.launched,
+      // Transcript result wins; else synthesize a terminal result from a settled registry
+      // record so a card whose completion was lost still shows as finished.
+      result: (it.toolId ? resultByTool.get(it.toolId) : undefined) ?? terminalFromRecord(rec),
     })
   }
   return agents
+}
+
+// A settled (done/failed) registry record → the synthetic tool_result the tray uses to
+// mark a card finished. A still-running record yields nothing (the card stays running).
+function terminalFromRecord(rec: TaskRecord | undefined): Extract<TranscriptItem, { kind: 'tool_result' }> | undefined {
+  if (!rec || rec.status === 'running') return undefined
+  return { kind: 'tool_result', id: `reg-${rec.toolId}`, toolUseId: rec.toolId, isError: rec.status === 'failed', content: rec.summary ?? '' }
 }
 
 // How many subagents are still in flight. A BACKGROUND agent (launch acked, no
@@ -523,13 +514,19 @@ export function collectAgents(items: TranscriptItem[]): AgentView[] {
 // FOREGROUND agent (no ack, no result) is only in flight while the parent turn is
 // active — gating on `turnActive` keeps an interrupted Task from latching on forever.
 // Drives the sidebar dot + the MetaBar chip.
-export function countRunningAgents(items: TranscriptItem[], turnActive: boolean): number {
+export function countRunningAgents(items: TranscriptItem[], turnActive: boolean, tasks?: TaskRecord[]): number {
   const finished = new Set<string>()   // has a terminal (non-ack) result
   const launched = new Set<string>()   // background agent, launch acked
   for (const it of items) {
     if (it.kind !== 'tool_result') continue
     if (isAsyncLaunchAck(it.content)) launched.add(it.toolUseId)
     else finished.add(it.toolUseId)
+  }
+  // Fold in the authoritative registry: a settled record counts as finished (so a lost
+  // completion no longer keeps the count stuck), a launched one as a live background agent.
+  for (const t of tasks ?? []) {
+    if (t.status !== 'running') finished.add(t.toolId)
+    else if (t.launched) launched.add(t.toolId)
   }
   return items.reduce((n, it) => {
     if (it.kind !== 'tool_use' || !isSubagentTool(it.name) || it.toolId == null || finished.has(it.toolId)) return n
@@ -542,6 +539,7 @@ interface ContextValue {
   pendingFor: (sessionId: string) => PermissionRequest | undefined
   slashCommandsFor: (sessionId: string) => string[]
   metaFor: (sessionId: string) => SessionMeta
+  tasksFor: (sessionId: string) => TaskRecord[]
   sendTurn: (sessionId: string, text: string) => void
   interrupt: (sessionId: string) => void
   respond: (sessionId: string, requestId: string, decision: PermissionDecision) => void
@@ -552,7 +550,7 @@ interface ContextValue {
 const ChatContext = createContext<ContextValue | null>(null)
 
 export function ChatProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, { transcripts: {}, pending: {}, slash: {}, open: {}, meta: {} })
+  const [state, dispatch] = useReducer(reducer, { transcripts: {}, pending: {}, slash: {}, open: {}, meta: {}, tasks: {} })
   const stateRef = useRef(state); stateRef.current = state
 
   useEffect(() => {
@@ -612,8 +610,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     // slash catalog + MetaBar + rate-limit chips, and surface any still-pending
     // permission so THIS device (e.g. the phone) can answer it. LOAD replaces rather
     // than appends, so a reconnect is idempotent.
-    const offSnapshot = api.on.snapshot((id, evs, pending) => {
+    const offSnapshot = api.on.snapshot((id, evs, pending, tasks) => {
       dispatch({ type: 'LOAD', sessionId: id, items: evs.flatMap((e) => itemsFromEvent(e, true)) })
+      // The authoritative registry from the snapshot: settles cards whose completion
+      // is no longer in the (possibly-evicted) replayed transcript.
+      dispatch({ type: 'SET_TASKS', sessionId: id, tasks: tasks ?? [] })
       const meta = metaFromReplay(evs)
       if (Object.keys(meta).length) dispatch({ type: 'SET_META', sessionId: id, meta })
       for (const e of evs) {
@@ -625,6 +626,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
       dispatch({ type: 'SET_PENDING', sessionId: id, reqs: pending ?? [] })
+    })
+    // Live subagent-registry updates — the durable fallback that settles a tray card
+    // even when its terminal <task-notification> was evicted / never buffered / lost.
+    const offTasks = api.on.tasks((id, tks) => {
+      dispatch({ type: 'SET_TASKS', sessionId: id, tasks: tks })
     })
     const offPerm = api.on.permission((id, req) => {
       dispatch({ type: 'ADD_PENDING', sessionId: id, req })
@@ -645,7 +651,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const offState = api.on.stateChange((id, s) => {
       if (s === 'idle' && stateRef.current.pending[id]?.length) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
     })
-    return () => { offEvent(); offSnapshot(); offPerm(); offUserTurn(); offPermResolved(); offState() }
+    return () => { offEvent(); offSnapshot(); offTasks(); offPerm(); offUserTurn(); offPermResolved(); offState() }
   }, [])
 
   const sendTurn = useCallback((sessionId: string, text: string) => {
@@ -689,12 +695,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const pendingFor = useCallback((sessionId: string) => state.pending[sessionId]?.[0], [state.pending])
   const slashCommandsFor = useCallback((sessionId: string) => state.slash[sessionId] ?? [], [state.slash])
   const metaFor = useCallback((sessionId: string) => state.meta[sessionId] ?? {}, [state.meta])
+  const tasksFor = useCallback((sessionId: string) => state.tasks[sessionId] ?? EMPTY_TASKS, [state.tasks])
 
   // Memoize the context value so a streamed token (which re-renders ChatProvider)
   // doesn't hand every consumer a fresh object identity and re-render them all.
   const value = useMemo(
-    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript }),
-    [transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript],
+    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript }),
+    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript],
   )
   return (
     <ChatContext.Provider value={value}>

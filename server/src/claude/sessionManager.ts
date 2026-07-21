@@ -5,10 +5,16 @@ import path from 'path'
 import crypto from 'crypto'
 import type {
   SessionInfo, SessionState, ClaudeEvent, PermissionRequest, PermissionDecision,
-  PermissionMode, SetModeResult, SavedSession, SandboxConfig,
+  PermissionMode, SetModeResult, SavedSession, SandboxConfig, TaskRecord,
+} from '@claudette/shared'
+import {
+  isSubagentTool, isAsyncLaunchAck, parseTaskNotification,
+  assistantToolUses, userToolResults, userEventText,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
+import { listRewindPoints } from './conversations'
+import { snapshot, saveRef } from '../git/shadowSnapshots'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
 import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir } from './configProtection'
 
@@ -41,6 +47,10 @@ interface Session extends SessionInfo {
   stderrTail: string            // recent stderr, so a fast failure can show why
   resumeFallbackTried?: boolean // retried a missing --resume target as a fresh session once
   sawInit?: boolean             // a system/init arrived this launch (distinguishes real turns from startup failures)
+  // A pre-turn working-tree snapshot (git commit sha) awaiting the turn's message
+  // uuid, which is known only once the turn ends — see attachPendingSnapshot. Backs
+  // /rewind code-restore (Phase 2). `text` matches the snapshot to its user turn.
+  pendingSnapshot?: { commit: string; text: string }
 }
 
 // A session that dies within this window of launching never really started
@@ -74,8 +84,17 @@ export class SessionManager extends EventEmitter {
   // slot) is what stops a second prompt from shadowing the first — the shadowed one
   // used to stay blocked forever, so the session looked like it hung "working".
   private pendingPerms = new Map<string, Map<string, PermissionRequest>>()
+  // sessionId → (Task/Agent tool_use id → record). The AUTHORITATIVE per-session subagent
+  // registry — un-capped and persisted, unlike the transcript ring — so a background
+  // agent's terminal outcome survives eviction, a never-buffered resume, or a restart,
+  // and a tray card can always settle. Fed from the same engine event tap as buffer()
+  // (recordTask) and force-settled when the engine dies (settleOpenTasks).
+  private tasks = new Map<string, Map<string, TaskRecord>>()
 
   constructor(private readonly opts: SessionManagerOpts = {}) { super() }
+
+  // The subagent records for a session (for the connect snapshot + persistence).
+  tasksOf(id: string): TaskRecord[] { return [...(this.tasks.get(id)?.values() ?? [])] }
 
   // Append an event to a session's transcript buffer, capped at TRANSCRIPT_CAP
   // (oldest dropped). The live UI shows user PROMPTS via the userTurn mirror, not the
@@ -229,6 +248,13 @@ export class SessionManager extends EventEmitter {
       if (e.type === 'result' && !session.sawInit) return
       this.emit('event', id, e)
       this.buffer(id, e)   // keep for the connect-time snapshot (late-joining devices)
+      this.recordTask(id, e)   // authoritative subagent registry (durable tray-card state)
+      // Key this turn's pre-turn working-tree snapshot to its message uuid so /rewind
+      // can restore code to this point. Fired on the FIRST assistant event (the user
+      // line, with its uuid, is on disk by the time the model replies) so the snapshot
+      // ref is written early in the turn — not racing a client that opens /rewind the
+      // instant the turn ends. `result` is a fallback if no assistant event appeared.
+      if (e.type === 'assistant' || e.type === 'result') void this.attachPendingSnapshot(session)
     })
     engine.on('ready', (sid: string) => {
       // claude may hand back a different id (e.g. on resume mismatch); trust it.
@@ -253,6 +279,9 @@ export class SessionManager extends EventEmitter {
       this.setState(id, state)
     })
     engine.on('exit', (code: number | null) => {
+      // The engine (and its in-process subagents) just died — settle any task still
+      // marked running so no tray card is stranded, whatever exit path we take below.
+      this.settleOpenTasks(id)
       // A resumeInto() kill: relaunch straight into the chosen conversation
       // rather than treating the exit as a crash/close.
       if (session.replacing) {
@@ -341,6 +370,7 @@ export class SessionManager extends EventEmitter {
     session.resumeFallbackTried = false
     this.transcripts.delete(id)          // rebinding to another conversation → drop old buffer
     this.pendingPerms.delete(id)
+    this.tasks.delete(id)                // different conversation → its subagents are irrelevant
     if (session.engine) {
       session.replacing = true
       session.engine.kill()
@@ -360,6 +390,7 @@ export class SessionManager extends EventEmitter {
     session.resume = false
     this.transcripts.delete(id)          // fresh conversation → drop the old snapshot buffer
     this.pendingPerms.delete(id)
+    this.tasks.delete(id)                // fresh conversation → no carried-over subagents
     if (session.engine) {
       session.replacing = true
       session.engine.kill()
@@ -372,7 +403,7 @@ export class SessionManager extends EventEmitter {
 
   // --- turn I/O (replaces keystroke sendInput) -------------------------------
 
-  sendUserTurn(id: string, text: string, turnId?: string): void {
+  async sendUserTurn(id: string, text: string, turnId?: string): Promise<void> {
     const session = this.sessions.get(id)
     if (!session?.engine) return
     // A new user message = a new turn: notify listeners so per-turn state (e.g. the
@@ -386,7 +417,101 @@ export class SessionManager extends EventEmitter {
     buf.push({ type: 'user', message: { content: text } } as unknown as ClaudeEvent)
     if (buf.length > TRANSCRIPT_CAP) buf.splice(0, buf.length - TRANSCRIPT_CAP)
     this.transcripts.set(id, buf)
+    // Snapshot the working tree BEFORE the turn runs (git-only; no-op elsewhere), so
+    // /rewind can later restore code to this pre-edit state. Awaited so the capture
+    // lands before Claude can edit; keyed to the turn's uuid when the turn ends.
+    session.pendingSnapshot = undefined
+    const commit = await snapshot(session.cwd).catch(() => null)
+    if (commit) session.pendingSnapshot = { commit, text }
+    if (!session.engine) return   // engine may have exited during the await
     session.engine.sendUserTurn(text)
+  }
+
+  // Key a turn's pending pre-turn snapshot to the uuid of its user message, so a rewind
+  // point — also uuid-keyed — maps straight to it. Called repeatedly through the turn;
+  // it no-ops once keyed (pending cleared) and only commits on a CONFIDENT match — the
+  // latest not-yet-snapshotted turn whose text equals what we sent. If the user line
+  // isn't on disk yet (no match), pending is left for a later call to resolve, so we
+  // never mis-key this snapshot onto an earlier turn. Best effort: a non-git session or
+  // a never-matching turn simply leaves no code snapshot.
+  private async attachPendingSnapshot(session: Session): Promise<void> {
+    const pending = session.pendingSnapshot
+    if (!pending) return
+    try {
+      const points = await listRewindPoints(session.cwd, session.claudeSessionId)
+      const match = [...points].reverse().find((p) => !p.hasSnapshot && p.text === pending.text.trim())
+      if (!match) return   // user line not on disk yet — retry on a later event
+      session.pendingSnapshot = undefined   // clear only once we've found the turn to key
+      await saveRef(session.cwd, match.uuid, pending.commit)
+    } catch { /* leave pending; a later event (or result) retries */ }
+  }
+
+  // Fold one raw stream-json event into the subagent registry. Runs from the same tap
+  // as buffer(), so it captures a subagent's identity when its Task tool_use is first
+  // seen — meaning a card can be reconstructed even after both the tool_use and the
+  // <task-notification> are evicted from the ring. Emits 'task' (live UI) + 'changed'
+  // (persist) only when something actually changed.
+  private recordTask(id: string, e: ClaudeEvent): void {
+    const m = this.tasks.get(id) ?? new Map<string, TaskRecord>()
+    let changed = false
+    if (e.type === 'assistant') {
+      for (const b of assistantToolUses(e)) {
+        if (!isSubagentTool(b.name) || m.has(b.id)) continue
+        const input = b.input as { subagent_type?: string; description?: string; prompt?: string }
+        m.set(b.id, {
+          toolId: b.id,
+          type: input.subagent_type || 'agent',
+          description: input.description || 'Subagent task',
+          prompt: typeof input.prompt === 'string' ? input.prompt : undefined,
+          launched: false,
+          status: 'running',
+        })
+        changed = true
+      }
+    } else if (e.type === 'user') {
+      for (const tr of userToolResults(e)) {
+        const rec = m.get(tr.toolUseId)
+        if (!rec) continue
+        // The async-launch ack marks a background agent launched (still running); any
+        // OTHER tool_result for a Task is a foreground agent's terminal output.
+        if (isAsyncLaunchAck(tr.content)) {
+          if (!rec.launched) { rec.launched = true; changed = true }
+        } else if (rec.status === 'running') {
+          rec.status = 'done'; changed = true
+        }
+      }
+      // A <task-notification> is the terminal signal for a background agent.
+      const notif = parseTaskNotification(userEventText(e))
+      const rec = notif ? m.get(notif.toolUseId) : undefined
+      if (notif && rec && rec.status === 'running') {
+        rec.status = notif.isError ? 'failed' : 'done'
+        rec.summary = notif.summary
+        changed = true
+      }
+    }
+    if (changed) {
+      this.tasks.set(id, m)
+      this.emit('task', id, this.tasksOf(id))
+      this.emit('changed')   // persist created/settled tasks (throttled by the save timer)
+    }
+  }
+
+  // The liveness fallback the client lacks: when a session's engine dies (crash, close,
+  // relaunch, resume-fallback), its in-process subagents die with it — so mark every
+  // still-'running' task terminal. A card for a dead agent can then never stay "running",
+  // even if its <task-notification> never arrived. Only called on engine death — never on
+  // turn-idle — so a genuinely-live background agent isn't settled early.
+  private settleOpenTasks(id: string, reason = 'Agent ended (session stopped)'): void {
+    const m = this.tasks.get(id)
+    if (!m) return
+    let changed = false
+    for (const rec of m.values()) {
+      if (rec.status !== 'running') continue
+      rec.status = 'failed'
+      if (!rec.summary) rec.summary = reason
+      changed = true
+    }
+    if (changed) { this.emit('task', id, this.tasksOf(id)); this.emit('changed') }
   }
 
   interrupt(id: string): void {
@@ -548,6 +673,7 @@ export class SessionManager extends EventEmitter {
       agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
       sandbox: s.sandbox,
       claudeSessionId: s.claudeSessionId,
+      tasks: this.tasksOf(s.id).length ? this.tasksOf(s.id) : undefined,
     }))
   }
 
@@ -564,6 +690,18 @@ export class SessionManager extends EventEmitter {
         /* trusted */ true,   // a persisted config was already operator-approved
       )
       ids.push(id)
+      // Rehydrate the subagent registry. Any task persisted as 'running' can't actually
+      // be — its in-process agent died with the previous server — so settle it to failed
+      // so a restored session never shows a card stuck running.
+      if (s.tasks?.length) {
+        const m = new Map<string, TaskRecord>()
+        for (const t of s.tasks) {
+          m.set(t.toolId, t.status === 'running'
+            ? { ...t, status: 'failed', summary: t.summary ?? 'Agent ended (server restarted)' }
+            : t)
+        }
+        this.tasks.set(id, m)
+      }
     }
     return ids
   }
@@ -583,6 +721,7 @@ export class SessionManager extends EventEmitter {
     this.sessions.delete(id)
     this.transcripts.delete(id)   // free the snapshot buffers with the session
     this.pendingPerms.delete(id)
+    this.tasks.delete(id)         // free the subagent registry with the session
     this.emit('changed')   // set shrank → re-persist
   }
 }

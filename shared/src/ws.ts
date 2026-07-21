@@ -1,7 +1,7 @@
 import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
-  SessionInfo, SessionState, SetModeResult, ConversationMeta, RewindPoint, ActivePane, SandboxConfig,
-  AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult,
+  SessionInfo, SessionState, SetModeResult, ConversationMeta, RewindPoint, RewindMode, RewindPreview, ActivePane, SandboxConfig,
+  AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult, TaskRecord,
 } from './types'
 import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
 
@@ -50,7 +50,11 @@ export type WsServerMessage =
   // device joining an in-progress session (e.g. the phone) sees the conversation
   // AND can answer a pending "allow" prompt, instead of a blank stream. Events are
   // replayed like a resumed conversation; `pending` is set only if one awaits.
-  | { type: 'session:snapshot'; id: string; events: ClaudeEvent[]; pending?: PermissionRequest[] }
+  | { type: 'session:snapshot'; id: string; events: ClaudeEvent[]; pending?: PermissionRequest[]; tasks?: TaskRecord[] }
+  // Live updates to a session's subagent registry — broadcast whenever a task is first
+  // seen, launched, or settled — so every tab's tray reflects the authoritative outcome
+  // even if the driving <task-notification> was evicted / never buffered.
+  | { type: 'session:tasks'; id: string; tasks: TaskRecord[] }
   // Per-session streaming events (namespaced by session id).
   | { type: 'session:event'; id: string; event: ClaudeEvent }
   | { type: 'session:permission'; id: string; request: PermissionRequest }
@@ -162,11 +166,16 @@ export interface ConversationResponse { events: ClaudeEvent[] }
 // GET /api/session/rewindPoints?id=…  → the session's current conversation as a list
 // of rewindable user turns (newest last), for the native /rewind picker.
 export interface RewindPointsResponse { points: RewindPoint[] }
-// POST /api/session/rewind { id, uuid } — fork the session's current conversation to
-// just before `uuid` and resume the engine into the fork. `newId` is the fork's claude
-// session id (read it back with /api/session/conversation to replay the truncated view).
-export interface RewindRequest { id: string; uuid: string }
-export interface RewindResponse { ok: boolean; newId?: string; error?: string }
+// GET /api/session/rewindPreview?id=…&uuid=…  → what a code-restore to this turn would
+// change, for the confirm dialog. null when the turn has no snapshot.
+export interface RewindPreviewResponse { preview: RewindPreview | null }
+// POST /api/session/rewind { id, uuid, mode, deleteNewer? } — rewind to just before
+// `uuid`. mode 'conversation' forks the transcript + resumes into the fork (`newId` is
+// the fork's claude session id, read back with /api/session/conversation); 'code'
+// restores the working tree to the turn's snapshot (`reverted`/`deleted` = file counts);
+// 'both' does both. deleteNewer removes untracked files created since (code/both only).
+export interface RewindRequest { id: string; uuid: string; mode: RewindMode; deleteNewer?: boolean }
+export interface RewindResponse { ok: boolean; newId?: string; error?: string; reverted?: number; deleted?: number }
 
 // POST /api/pane/create { cwd, cols?, rows?, sessionId? } → { id }   |   POST /api/pane/destroy { id }
 // cols/rows let the client spawn the pty at the terminal's real size so the shell's

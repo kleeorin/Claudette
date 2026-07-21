@@ -2,3 +2,4 @@
 export * from './types'
 export * from './notebook'
 export * from './ws'
+export * from './tasks'

@@ -3,6 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import crypto from 'crypto'
 import type { ConversationMeta, ClaudeEvent, RewindPoint } from '@claudette/shared'
+import { snapshottedUuids } from '../git/shadowSnapshots'
 
 // Claude stores each conversation as a JSONL transcript under
 // ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. The dir name is the absolute
@@ -109,8 +110,11 @@ export async function listRewindPoints(cwd: string, id: string): Promise<RewindP
     const content = (o.message as { content?: unknown })?.content
     if (typeof content !== 'string' || !content.trim() || isNoise(content)) continue
     const ts = typeof o.timestamp === 'string' ? Date.parse(o.timestamp) : NaN
-    points.push({ uuid: o.uuid, text: content.trim(), mtimeMs: Number.isNaN(ts) ? 0 : ts, ordinal: points.length + 1 })
+    points.push({ uuid: o.uuid, text: content.trim(), mtimeMs: Number.isNaN(ts) ? 0 : ts, ordinal: points.length + 1, hasSnapshot: false })
   }
+  // Mark which turns have a working-tree snapshot (one batch lookup for the whole list).
+  const snapped = await snapshottedUuids(cwd)
+  for (const p of points) p.hasSnapshot = snapped.has(p.uuid)
   return points
 }
 

@@ -683,7 +683,7 @@ function Empty() {
 
 function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void; width: number }) {
   const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
-  const { transcriptFor } = useChat()   // per-session running-agent count for the row badge
+  const { transcriptFor, tasksFor } = useChat()   // per-session running-agent count for the row badge
   const [showNew, setShowNew] = useState(false)
   const [confirmClose, setConfirmClose] = useState<SessionInfo | null>(null)
   const pick = (id: string) => { setActive(id); onClose() }
@@ -716,7 +716,7 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
           {sessions.map((s) => (
             <SessionRow
               key={s.id} session={s} active={s.id === activeId} attention={attention.has(s.id)}
-              runningAgents={countRunningAgents(transcriptFor(s.id), s.state === 'running')}
+              runningAgents={countRunningAgents(transcriptFor(s.id), s.state === 'running', tasksFor(s.id))}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
             />
           ))}

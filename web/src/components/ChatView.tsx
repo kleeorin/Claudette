@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ConversationMeta, PermissionMode, RewindPoint, SessionInfo } from '@claudette/shared'
+import type { ConversationMeta, PermissionMode, RewindPoint, RewindMode, SessionInfo } from '@claudette/shared'
 import { useChat, collectAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
@@ -30,7 +30,7 @@ const dismissedBySession = new Map<string, Set<string>>()
 // (P1.14); other slash commands pass through as a turn. Permission-mode switch
 // lives in the MetaBar (P1.4).
 export function ChatView({ sessionId, isActive }: { sessionId: string; isActive: boolean }) {
-  const { transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
+  const { transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
   const { sessions, setMode, isFresh, markBusy } = useSessions()
   const session = sessions.find((s) => s.id === sessionId)
   const [showResume, setShowResume] = useState(false)
@@ -59,7 +59,8 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // Live subagent count = Task tool_uses with no matching tool_result yet. Only while
   // the turn is active, so an interrupted (never-completed) Task doesn't latch on.
   // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
-  const agents = useMemo(() => collectAgents(items), [items])
+  const tasks = tasksFor(sessionId)
+  const agents = useMemo(() => collectAgents(items, tasks), [items, tasks])
   // Dismissed agent cards (view-only). Agents are derived from the immutable
   // transcript each render, so there's nothing to delete — we filter by a stable
   // key instead. App keys ChatView by session id, so switching sessions unmounts
@@ -219,16 +220,19 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
     await api.http.resumeInto(sessionId, meta.id)
   }
 
-  // Rewind to a past turn: fork the transcript to just before it (server also resumes
-  // the engine into the fork), then wipe the pane and replay the truncated history so
-  // the UI matches the engine's new context. The next turn continues from that point.
-  const pickRewind = async (point: RewindPoint) => {
+  // Rewind to a past turn. mode 'code' only restores files (conversation untouched);
+  // 'conversation'/'both' also fork the transcript before the turn (the server resumes
+  // the engine into the fork) — so wipe the pane and replay the truncated history to
+  // match the engine's new context. The next turn continues from that point.
+  const pickRewind = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean) => {
     setShowRewind(false)
     if (!session) return
-    const res = await api.http.rewind(sessionId, point.uuid)
-    if (!res.ok || !res.newId) return   // point vanished (e.g. conversation changed) — leave the pane as-is
-    clearTranscript(sessionId)
-    loadTranscript(sessionId, await api.http.readConversation(session.cwd, res.newId))
+    const res = await api.http.rewind(sessionId, point.uuid, mode, deleteNewer)
+    if (!res.ok) return   // point vanished or restore failed — leave the pane as-is
+    if (res.newId) {
+      clearTranscript(sessionId)
+      loadTranscript(sessionId, await api.http.readConversation(session.cwd, res.newId))
+    }
   }
 
   if (!session) {

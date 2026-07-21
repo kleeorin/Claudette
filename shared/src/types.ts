@@ -75,6 +75,23 @@ export interface SavedSession {
   permissionMode?: PermissionMode  // per-session mode (re-applied on restore)
   sandbox?: SandboxConfig  // bwrap confinement config (re-applied on restore)
   claudeSessionId?: string // claude's own --session-id, for --resume on restore
+  tasks?: TaskRecord[]     // subagent lifecycle registry, so a restart doesn't strand tray cards
+}
+
+// The authoritative record of a subagent's lifecycle, kept server-side per session
+// (see SessionManager) so a background agent's terminal outcome survives even when its
+// <task-notification> is evicted from the capped transcript ring, was never buffered
+// (a resumed/off-stream agent), or is lost to a server restart. Keyed by the Task/Agent
+// tool_use id. This is the durable fallback a tray card settles from when no terminal
+// tool_result ever reached the client — the fix for sticky "running" cards.
+export interface TaskRecord {
+  toolId: string            // Task/Agent tool_use id (pairs with <tool-use-id>)
+  type: string              // subagent_type
+  description: string
+  prompt?: string
+  launched: boolean         // async-launch ack seen (a detached background agent)
+  status: 'running' | 'done' | 'failed'
+  summary?: string          // terminal summary, for the settled card
 }
 
 // --- Native chat backend (stream-json) ---------------------------------------
@@ -177,6 +194,19 @@ export interface RewindPoint {
   text: string        // the turn's prompt, for preview
   mtimeMs: number     // when it was sent, for ordering + "N ago" display
   ordinal: number     // 1-based turn number, for display
+  hasSnapshot: boolean // a working-tree snapshot exists → code-restore available here
+}
+
+// What a /rewind restores. `conversation` forks the chat to before the turn; `code`
+// restores the working tree to that turn's snapshot; `both` does both.
+export type RewindMode = 'conversation' | 'code' | 'both'
+
+// What restoring a turn's code snapshot would change, for the confirm dialog. Paths
+// are relative to the repo root. `reverted` = files whose contents differ from the
+// snapshot; `deleted` = untracked files created since (removed only when deleteNewer).
+export interface RewindPreview {
+  reverted: string[]
+  deleted: string[]
 }
 
 // --- Remotes -----------------------------------------------------------------

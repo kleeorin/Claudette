@@ -6,7 +6,8 @@ import type {
   NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus,
   CreatePaneRequest, CreatePaneResponse,
   ConversationMeta, ConversationsResponse, ConversationResponse,
-  RewindPoint, RewindPointsResponse, RewindResponse,
+  RewindPoint, RewindMode, RewindPreview, RewindPointsResponse, RewindPreviewResponse, RewindResponse,
+  TaskRecord,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
   ActivePane, KernelSpecsResponse, SandboxConfig,
@@ -51,8 +52,11 @@ function channel<A extends unknown[]>() {
 }
 
 const events = channel<[string, ClaudeEvent]>()
-// [id, buffered events, pending permission] — the connect-time per-session catch-up.
-const snapshots = channel<[string, ClaudeEvent[], PermissionRequest[] | undefined]>()
+// [id, buffered events, pending permission, subagent registry] — the connect-time
+// per-session catch-up. `tasks` lets a reconnecting tab settle cards even when the
+// transcript no longer carries the completion.
+const snapshots = channel<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined]>()
+const tasks = channel<[string, TaskRecord[]]>()   // [id, subagent registry] — live updates
 const permissions = channel<[string, PermissionRequest]>()
 const userTurns = channel<[string, string, string | undefined]>()   // [id, text, turnId]
 const permsResolved = channel<[string, string]>()                   // [id, requestId]
@@ -82,7 +86,8 @@ function send(msg: WsClientMessage): void {
 function dispatch(msg: WsServerMessage): void {
   switch (msg.type) {
     case 'session:list': lists.emit(msg.sessions); break
-    case 'session:snapshot': snapshots.emit(msg.id, msg.events, msg.pending); break
+    case 'session:snapshot': snapshots.emit(msg.id, msg.events, msg.pending, msg.tasks); break
+    case 'session:tasks': tasks.emit(msg.id, msg.tasks); break
     case 'session:event': events.emit(msg.id, msg.event); break
     case 'session:permission': permissions.emit(msg.id, msg.request); break
     case 'session:userTurn': userTurns.emit(msg.id, msg.text, msg.turnId); break
@@ -167,7 +172,9 @@ export const api = {
   // Streaming subscriptions (namespaced by session id, except list/connected).
   on: {
     event: (fn: Fn<[string, ClaudeEvent]>) => events.on(fn),
-    snapshot: (fn: Fn<[string, ClaudeEvent[], PermissionRequest[] | undefined]>) => snapshots.on(fn),
+    snapshot: (fn: Fn<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined]>) => snapshots.on(fn),
+    // Live subagent-registry updates (session:tasks) — the durable tray-card fallback.
+    tasks: (fn: Fn<[string, TaskRecord[]]>) => tasks.on(fn),
     permission: (fn: Fn<[string, PermissionRequest]>) => permissions.on(fn),
     // A user turn mirrored from the server (any device); turnId de-dupes the sender's echo.
     userTurn: (fn: Fn<[string, string, string | undefined]>) => userTurns.on(fn),
@@ -220,10 +227,14 @@ export const api = {
       (await get<ConversationsResponse>(`/api/session/conversations?cwd=${encodeURIComponent(cwd)}`)).conversations,
     readConversation: async (cwd: string, id: string): Promise<ClaudeEvent[]> =>
       (await get<ConversationResponse>(`/api/session/conversation?cwd=${encodeURIComponent(cwd)}&id=${encodeURIComponent(id)}`)).events,
-    // /rewind: the current conversation's rewindable user turns, and forking to one.
+    // /rewind: the current conversation's rewindable user turns; a code-restore preview
+    // for one turn; and the rewind itself (conversation fork and/or code restore).
     rewindPoints: async (id: string): Promise<RewindPoint[]> =>
       (await get<RewindPointsResponse>(`/api/session/rewindPoints?id=${encodeURIComponent(id)}`)).points,
-    rewind: (id: string, uuid: string) => post<RewindResponse>('/api/session/rewind', { id, uuid }),
+    rewindPreview: async (id: string, uuid: string): Promise<RewindPreview | null> =>
+      (await get<RewindPreviewResponse>(`/api/session/rewindPreview?id=${encodeURIComponent(id)}&uuid=${encodeURIComponent(uuid)}`)).preview,
+    rewind: (id: string, uuid: string, mode: RewindMode, deleteNewer?: boolean) =>
+      post<RewindResponse>('/api/session/rewind', { id, uuid, mode, deleteNewer }),
     // Plan-quota usage (session/weekly %), polled — see useUsage. Account-global.
     usage: (): Promise<UsageResponse> => get<UsageResponse>('/api/usage'),
   },

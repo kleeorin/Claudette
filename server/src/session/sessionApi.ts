@@ -6,12 +6,14 @@ import type {
   ResumeIntoRequest, ConversationsResponse, ConversationResponse, SandboxConfig,
   SetAgentRequest, RenameSessionRequest, ListAgentsResponse,
   PermissionsResponse, EditRuleRequest, WriteResult,
-  RewindPointsResponse, RewindRequest, RewindResponse,
+  RewindPointsResponse, RewindPreviewResponse, RewindRequest, RewindResponse,
+  TaskRecord,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { listAgents } from '../claude/agents'
 import { getEffective, addRule, removeRule } from '../claude/permissions'
 import { listConversations, readConversation, listRewindPoints, forkConversationBefore } from '../claude/conversations'
+import { previewRestore, restore } from '../git/shadowSnapshots'
 import { WsHub } from '../ws/hub'
 
 // The session API layer: HTTP lifecycle routes + a bridge from SessionManager's
@@ -37,6 +39,10 @@ export function bridgeSessionEvents(sessions: SessionManager, hub: WsHub): void 
     hub.broadcast({ type: 'session:ready', id, claudeSessionId }))
   sessions.on('exit', (id: string, failed: boolean, error: string) =>
     hub.broadcast({ type: 'session:exit', id, failed, error }))
+  // Live subagent-registry updates → every tab, so tray cards settle from the
+  // authoritative record even when a <task-notification> was evicted / never buffered.
+  sessions.on('task', (id: string, tasks: TaskRecord[]) =>
+    hub.broadcast({ type: 'session:tasks', id, tasks }))
 }
 
 // Send a freshly-connected socket the per-session catch-up it needs to render an
@@ -47,8 +53,11 @@ export function sendSessionSnapshots(sessions: SessionManager, hub: WsHub, ws: i
   for (const s of sessions.list()) {
     const events = sessions.transcriptOf(s.id)
     const pending = sessions.pendingPermissionsOf(s.id)
-    if (events.length === 0 && pending.length === 0) continue
-    hub.send(ws, { type: 'session:snapshot', id: s.id, events, pending })
+    const tasks = sessions.tasksOf(s.id)
+    // Include a tasks-only session too: its transcript may have been evicted while a
+    // settled subagent record still needs to reach a freshly-connected tab.
+    if (events.length === 0 && pending.length === 0 && tasks.length === 0) continue
+    hub.send(ws, { type: 'session:snapshot', id: s.id, events, pending, tasks })
   }
 }
 
@@ -149,17 +158,38 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     return { points: await listRewindPoints(info.cwd, claudeId) }
   })
 
-  // /rewind — fork the session's current conversation to just before `uuid` and resume
-  // the engine into the fork. The original conversation is untouched (the fork is a
-  // copy), so the rewind can be undone by resuming the original via /resume.
+  // /rewind — what a code-restore to this turn would change (files reverted/deleted),
+  // for the confirm dialog. null when the turn has no working-tree snapshot.
+  app.get<{ Querystring: { id: string; uuid: string } }>('/api/session/rewindPreview', async (req): Promise<RewindPreviewResponse> => {
+    const info = sessions.get(req.query.id)
+    if (!info) return { preview: null }
+    return { preview: await previewRestore(info.cwd, req.query.uuid) }
+  })
+
+  // /rewind — rewind to just before `uuid`. Per `mode`: 'conversation' forks the
+  // transcript + resumes into the fork (original left intact, undoable via /resume);
+  // 'code' restores the working tree to the turn's snapshot; 'both' does both. The
+  // code restore runs FIRST so a failure there aborts before the conversation moves.
   app.post<{ Body: RewindRequest }>('/api/session/rewind', async (req): Promise<RewindResponse> => {
-    const info = sessions.get(req.body.id)
-    const claudeId = sessions.claudeSessionId(req.body.id)
+    const { id, uuid, mode, deleteNewer } = req.body
+    const info = sessions.get(id)
+    const claudeId = sessions.claudeSessionId(id)
     if (!info || !claudeId) return { ok: false, error: 'no such session' }
-    const newId = await forkConversationBefore(info.cwd, claudeId, req.body.uuid)
-    if (!newId) return { ok: false, error: 'rewind point not found in this conversation' }
-    sessions.resumeInto(req.body.id, newId)
-    return { ok: true, newId }
+
+    let reverted: number | undefined, deleted: number | undefined
+    if (mode === 'code' || mode === 'both') {
+      const res = await restore(info.cwd, uuid, !!deleteNewer)
+      if (!res.ok) return { ok: false, error: res.error }
+      reverted = res.reverted; deleted = res.deleted
+    }
+
+    let newId: string | undefined
+    if (mode === 'conversation' || mode === 'both') {
+      newId = (await forkConversationBefore(info.cwd, claudeId, uuid)) ?? undefined
+      if (!newId) return { ok: false, error: 'rewind point not found in this conversation', reverted, deleted }
+      sessions.resumeInto(id, newId)
+    }
+    return { ok: true, newId, reverted, deleted }
   })
 }
 
