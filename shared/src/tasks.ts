@@ -42,6 +42,22 @@ export function parseTaskNotification(text: string): TaskNotification | null {
   return { toolUseId, isError: status === 'failed' || status === 'error', summary: summary || `Agent ${status || 'finished'}` }
 }
 
+// The current CLI delivers a background agent's completion NOT as a <task-notification>
+// user turn but as a first-class `system` event: { subtype: 'task_notification',
+// tool_use_id, status, summary }. Same terminal signal, different envelope — and the
+// user-turn parser above never sees a `system` event, which is why a completed
+// background card used to hang "running" forever. Parse the settle straight off the
+// event. `tool_use_id` is the Task tool-use id (the registry / resultByTool key).
+export function parseSystemTaskNotification(e: ClaudeEvent): TaskNotification | null {
+  const o = e as unknown as { type?: string; subtype?: string; tool_use_id?: unknown; status?: unknown; summary?: unknown }
+  if (o.type !== 'system' || o.subtype !== 'task_notification' || typeof o.tool_use_id !== 'string' || !o.tool_use_id) return null
+  const status = String(o.status ?? '').toLowerCase()
+  const summary = typeof o.summary === 'string' ? o.summary.trim() : ''
+  // Anything other than a clean completion counts as an error state (failed / cancelled
+  // / killed / interrupted); an empty status is treated as a normal finish, not an error.
+  return { toolUseId: o.tool_use_id, isError: status !== '' && status !== 'completed' && status !== 'done', summary: summary || `Agent ${status || 'finished'}` }
+}
+
 // --- raw stream-json extractors (server-side) --------------------------------
 // The client parses events into TranscriptItems first; the server holds raw events,
 // so these pull the same tool_use / tool_result / content shapes straight off a

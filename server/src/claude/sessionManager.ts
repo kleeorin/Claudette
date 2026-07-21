@@ -8,7 +8,7 @@ import type {
   PermissionMode, SetModeResult, SavedSession, SandboxConfig, TaskRecord,
 } from '@claudette/shared'
 import {
-  isSubagentTool, isAsyncLaunchAck, parseTaskNotification,
+  isSubagentTool, isAsyncLaunchAck, parseTaskNotification, parseSystemTaskNotification,
   assistantToolUses, userToolResults, userEventText,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
@@ -480,8 +480,19 @@ export class SessionManager extends EventEmitter {
           rec.status = 'done'; changed = true
         }
       }
-      // A <task-notification> is the terminal signal for a background agent.
+      // A <task-notification> user turn is the terminal signal on older CLIs.
       const notif = parseTaskNotification(userEventText(e))
+      const rec = notif ? m.get(notif.toolUseId) : undefined
+      if (notif && rec && rec.status === 'running') {
+        rec.status = notif.isError ? 'failed' : 'done'
+        rec.summary = notif.summary
+        changed = true
+      }
+    } else if (e.type === 'system') {
+      // The current CLI delivers that same terminal signal as a `system` event
+      // (subtype task_notification) instead — settle the background card off it, else
+      // a completed background agent hangs "running" until the engine exits/restarts.
+      const notif = parseSystemTaskNotification(e)
       const rec = notif ? m.get(notif.toolUseId) : undefined
       if (notif && rec && rec.status === 'running') {
         rec.status = notif.isError ? 'failed' : 'done'

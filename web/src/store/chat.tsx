@@ -2,7 +2,7 @@ import {
   createContext, useContext, useReducer, useEffect, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
 import type { ClaudeEvent, PermissionRequest, PermissionDecision, TaskRecord } from '@claudette/shared'
-import { isSubagentTool, isAsyncLaunchAck, userContentText, parseTaskNotification } from '@claudette/shared'
+import { isSubagentTool, isAsyncLaunchAck, userContentText, parseTaskNotification, parseSystemTaskNotification } from '@claudette/shared'
 import { api } from '../api/client'
 
 // Re-export the subagent-parsing helpers (now owned by @claudette/shared, so server
@@ -301,6 +301,15 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
   // On a subagent's own events this is the parent Task's tool id — tag its items so
   // the UI can nest them under that agent's card.
   const parentId = (() => { const p = (e as { parent_tool_use_id?: unknown }).parent_tool_use_id; return typeof p === 'string' && p ? p : undefined })()
+  // The current CLI signals a background agent's completion as a `system` event
+  // (subtype task_notification), not a <task-notification> user turn. Synthesize the
+  // terminal tool_result its Task is still waiting on so the tray card settles even if
+  // the authoritative task-registry broadcast is missed.
+  const sysNotif = parseSystemTaskNotification(e)
+  if (sysNotif) {
+    out.push({ kind: 'tool_result', id: nextId(), toolUseId: sysNotif.toolUseId, isError: sysNotif.isError, content: sysNotif.summary })
+    return out
+  }
   if (e.type === 'assistant') {
     const content = (e as { message?: { content?: unknown[] } }).message?.content ?? []
     for (const b of content as Array<Record<string, unknown>>) {
