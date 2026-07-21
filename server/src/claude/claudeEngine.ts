@@ -74,6 +74,13 @@ export function disallowedValue(agentDisallowed?: string[]): string {
 // match — the handlePermission guard still covers the prompting path).
 export const NOTEBOOK_DENY = 'NotebookEdit,Write(**/*.ipynb),Edit(**/*.ipynb)'
 
+// Tools that must ALWAYS reach the user — even under "allow all" (bypassPermissions).
+// They exist to COLLECT input, so auto-approving them returns no answer and silently
+// defeats their purpose. AskUserQuestion is the interactive question prompt (Claudette
+// renders it as a card); auto-allowing it under bypass is what made questions "not come
+// through" — the model got an empty allow and moved on without ever asking the user.
+export const ALWAYS_PROMPT = new Set(['AskUserQuestion'])
+
 // The native file tools we intercept for notebooks, and where each carries its
 // target path. If a call targets a .ipynb, return the deny message steering Claude
 // to the app-control notebook tools; otherwise return null (allow normal handling).
@@ -354,8 +361,10 @@ export class ClaudeEngine extends EventEmitter {
     // the decision to us regardless of its own --permission-mode; honouring bypass
     // here is what actually makes "allow all" take effect (and instantly on a live
     // switch, since setPermissionMode updates this.mode). The notebook deny above
-    // still wins — .ipynb edits stay funnelled through the app tools.
-    if (this.mode === 'bypassPermissions') {
+    // still wins — .ipynb edits stay funnelled through the app tools. ALWAYS_PROMPT
+    // tools (AskUserQuestion) are the exception: auto-allowing them returns no answer,
+    // so they must reach the user even here.
+    if (this.mode === 'bypassPermissions' && !ALWAYS_PROMPT.has(req.toolName)) {
       this.write({
         type: 'control_response',
         response: { subtype: 'success', request_id: requestId, response: { behavior: 'allow', updatedInput: req.input } },
