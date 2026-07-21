@@ -103,15 +103,24 @@ CLAUDETTE_TOKEN=<your-secret> HOST=0.0.0.0 PORT=8916 ./launch.sh --build
 - `PORT=8916` — any open port **≥ 1024** (ports below 1024 need root to bind).
 - No firewall changes needed if the port is already reachable over the VPN.
 
-> **Allow the hostname if you reach it by name in _dev_ mode.** Vite (dev only)
-> rejects requests whose `Host` header isn't the bind address — so opening the dev
-> server at `http://box.internal:5273` over a VPN gives *"Blocked request. This host
-> is not allowed."* Allowlist it:
+> **Dev mode over a VPN by hostname — allowlist it (and pass a token).** Vite (dev
+> only) rejects requests whose `Host` header isn't the bind address, so opening the
+> dev server at `http://box.internal:8080` over a VPN gives *"Blocked request. This
+> host is not allowed."* Allowlist the host with `WEB_ALLOWED_HOSTS`, choose the port
+> you open with `WEB_PORT`, and — since `HOST=0.0.0.0` is non-loopback — set
+> `CLAUDETTE_TOKEN` (the server refuses to start without one):
 > ```bash
-> HOST=0.0.0.0 WEB_ALLOWED_HOSTS=box.internal ./launch.sh      # comma-separate several; `all` allows any
+> CLAUDETTE_TOKEN=<your-secret> \
+>   HOST=0.0.0.0 \
+>   WEB_ALLOWED_HOSTS=box.internal \
+>   WEB_PORT=8080 \
+>   ./launch.sh
+> # then open, once:  http://box.internal:8080/?token=<your-secret>
 > ```
-> **Build mode has no Vite**, so it needs none of this — another reason to prefer
-> `--build` for remote access.
+> `WEB_ALLOWED_HOSTS` takes a comma-separated list; `all` (or `*`) disables the check.
+> Only `WEB_PORT` needs to be reachable — Vite proxies the API to the backend over
+> loopback. **Build mode has no Vite**, so it needs none of this — another reason to
+> prefer `--build` for remote access.
 
 #### Locked-down firewall (no inbound ports) → Tailscale
 
