@@ -102,7 +102,13 @@ export function Cell(props: Props) {
     const lang: Extension[] = cell.cellType === 'markdown' ? [markdown()] : cell.cellType === 'code' ? [python()] : []
     // For markdown, running/leaving blurs the editor first — the blur handler is the
     // single "exit edit" path (commits the buffer, then NotebookView re-renders it).
-    const leave = (v: EditorView) => { if (isMarkdown) v.contentDOM.blur() }
+    // Code cells keep focus on run, so their debounced buffer would otherwise still be
+    // pending: flush it here so the editCell reaches the server (same WS, in order)
+    // before the runCell, and the kernel executes the latest keystrokes, not stale source.
+    const leave = (v: EditorView) => {
+      if (isMarkdown) v.contentDOM.blur()
+      else flushCommit(v.state.doc.toString())
+    }
     const runKeys = [
       { key: 'Shift-Enter', run: (v: EditorView) => { leave(v); cbRef.current.onRunAdvance(); return true } },
       { key: 'Mod-Enter', run: (v: EditorView) => { leave(v); cbRef.current.onRun(); return true } },
