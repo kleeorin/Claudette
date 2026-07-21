@@ -3,6 +3,7 @@ import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, SessionInfo, SessionState,
   CreateSessionRequest, CreateSessionResponse, ListSessionsResponse,
   OkResponse, SetModeRequest, SetModeResult, PermissionMode,
+  TrustQueryResponse, TrustFolderRequest,
   NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus,
   CreatePaneRequest, CreatePaneResponse, ListPanesResponse, AttachPaneResponse,
   ConversationMeta, ConversationsResponse, ConversationResponse,
@@ -211,6 +212,10 @@ export const api = {
   // Lifecycle over HTTP.
   http: {
     createSession: (req: CreateSessionRequest) => post<CreateSessionResponse>('/api/session/create', req),
+    // Workspace trust: is this cwd trusted, and mark it trusted (see server/claude/trust.ts).
+    checkTrust: async (cwd: string): Promise<boolean> =>
+      (await get<TrustQueryResponse>(`/api/session/trust?cwd=${encodeURIComponent(cwd)}`)).trusted,
+    trustFolder: (cwd: string) => post<OkResponse>('/api/session/trust', { cwd } as TrustFolderRequest),
     listSessions: async (): Promise<SessionInfo[]> =>
       (await get<ListSessionsResponse>('/api/session/list')).sessions,
     destroySession: (id: string) => post<OkResponse>('/api/session/destroy', { id }),
@@ -270,6 +275,14 @@ export const api = {
       get<FilePreview>(`/api/fs/read?path=${encodeURIComponent(path)}`),
     write: (path: string, text: string) => post<WriteResult>('/api/fs/write', { path, text }),
     createFile: (path: string) => post<WriteResult>('/api/fs/createFile', { path }),
+    // Upload one file into `dir`: stream its bytes as the raw request body (no JSON
+    // base64 bloat / body cap). Server names it after `file.name` inside `dir`.
+    upload: async (dir: string, file: File): Promise<WriteResult> => {
+      const res = await fetch(`/api/fs/upload?dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`, {
+        method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file,
+      })
+      return res.json()
+    },
     mkdir: (path: string) => post<WriteResult>('/api/fs/mkdir', { path }),
     rename: (from: string, to: string) => post<WriteResult>('/api/fs/rename', { from, to }),
     copy: (from: string, to: string) => post<WriteResult>('/api/fs/copy', { from, to }),

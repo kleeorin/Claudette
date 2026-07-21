@@ -1,6 +1,8 @@
 import { readdir, stat, readFile, writeFile, mkdir, rename, cp, rm } from 'fs/promises'
 import { errMessage } from '../util/errMessage'
-import { createReadStream } from 'fs'
+import { createReadStream, createWriteStream } from 'fs'
+import { pipeline } from 'stream/promises'
+import type { Readable } from 'stream'
 import { resolve, dirname, isAbsolute, basename, extname } from 'path'
 import { homedir } from 'os'
 import type { FastifyInstance } from 'fastify'
@@ -109,6 +111,12 @@ export function registerFsRoutes(app: FastifyInstance): void {
     }
   })
 
+  // Upload bodies arrive as a raw octet-stream. Hand the request stream straight
+  // through (don't buffer) so /api/fs/upload can pipe it to disk: no 1 MB JSON
+  // body cap, and the auth preHandler still runs (and can 401) before the handler
+  // consumes a single byte. Nothing else on the server posts octet-stream inbound.
+  app.addContentTypeParser('application/octet-stream', (_req, payload, done) => done(null, payload))
+
   app.get<{ Querystring: { path?: string } }>('/api/fs/list', async (req): Promise<FsListResponse> => {
     // Default to the user's home; resolve relatives against it too.
     const home = homedir()
@@ -149,6 +157,29 @@ export function registerFsRoutes(app: FastifyInstance): void {
     if (!path?.trim()) return { ok: false, error: 'path is required' }
     try { await writeFile(toAbs(path), '', { flag: 'wx' }); return { ok: true } }
     catch (e) { return { ok: false, error: errMessage(e) } }
+  })
+
+  // Upload a file into `dir` under `name` by streaming the raw request body to
+  // disk. `wx` refuses to clobber an existing file (like createFile) — the browser
+  // surfaces the collision. `basename(name)` strips any path components so an
+  // upload can only land directly in the chosen folder, never traverse out of it.
+  app.post<{ Querystring: { dir?: string; name?: string } }>('/api/fs/upload', async (req): Promise<WriteResult> => {
+    const dir = req.query.dir?.trim()
+    const rawName = req.query.name?.trim()
+    if (!dir || !rawName) return { ok: false, error: 'dir and name are required' }
+    const name = basename(rawName)
+    if (!name || name === '.' || name === '..') return { ok: false, error: 'invalid file name' }
+    const target = resolve(toAbs(dir), name)
+    try {
+      if (await exists(target)) return { ok: false, error: `already exists: ${name}` }
+      await pipeline(req.body as Readable, createWriteStream(target, { flags: 'wx' }))
+      return { ok: true }
+    } catch (e) {
+      // A failed/aborted stream can leave a partial file — clean it up so a retry
+      // isn't blocked by the `wx` "already exists" guard.
+      await rm(target, { force: true }).catch(() => {})
+      return { ok: false, error: errMessage(e) }
+    }
   })
 
   // Create a directory (recursive — parents made as needed, existing dir is a no-op).

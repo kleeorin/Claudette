@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
@@ -46,6 +46,12 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   const [confirmDel, setConfirmDel] = useState<DirEntry | null>(null)
   const [opErr, setOpErr] = useState<string | null>(null)
   const [clipTick, setClipTick] = useState(0)
+  // Upload: a hidden <input type=file> we click programmatically, plus per-batch
+  // progress (done/total) that also disables the button while it runs.
+  const uploadInput = useRef<HTMLInputElement | null>(null)
+  const [uploading, setUploading] = useState<{ done: number; total: number } | null>(null)
+  // The "+ New" dropdown that gathers the notebook/file/folder/upload add actions.
+  const [addOpen, setAddOpen] = useState(false)
 
   const load = useCallback(async (path?: string) => {
     setLoading(true); setErr(null)
@@ -65,6 +71,16 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
     window.addEventListener('keydown', onKey)
     return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
   }, [menu])
+  // Same outside-click / Escape close for the "+ New" dropdown. The trigger stops
+  // propagation so opening it isn't immediately undone by this same listener.
+  useEffect(() => {
+    if (!addOpen) return
+    const close = () => setAddOpen(false)
+    const onKey = (ev: KeyboardEvent) => { if (ev.key === 'Escape') setAddOpen(false) }
+    window.addEventListener('click', close)
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
+  }, [addOpen])
 
   // --- file operations -------------------------------------------------------
   const run = async (p: Promise<{ ok: true } | { ok: false; error: string }>) => {
@@ -96,6 +112,25 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   }
   const duplicateEntry = async (e: DirEntry) => { setMenu(null); await run(api.fs.copy(joinPath(dir, e.name), joinPath(dir, withCopySuffix(e.name)))) }
   const doDelete = async () => { const e = confirmDel; if (!e) return; setConfirmDel(null); await run(api.fs.remove(joinPath(dir, e.name))) }
+  // Upload the picked files into the current folder, one at a time so a big file
+  // doesn't starve the rest and progress advances predictably. Collect per-file
+  // failures (e.g. name collisions) into opErr, then refresh the listing.
+  const uploadFiles = async (files: FileList | null) => {
+    const list = files ? Array.from(files) : []
+    if (list.length === 0) return
+    setOpErr(null)
+    setUploading({ done: 0, total: list.length })
+    const errors: string[] = []
+    for (let i = 0; i < list.length; i++) {
+      const r = await api.fs.upload(dir, list[i])
+      if (!r.ok) errors.push(`${list[i].name}: ${r.error}`)
+      setUploading({ done: i + 1, total: list.length })
+    }
+    setUploading(null)
+    if (errors.length) setOpErr(errors.join(' · '))
+    await load(dir)
+  }
+
   const download = (e: DirEntry) => {
     setMenu(null)
     const a = document.createElement('a')
@@ -141,6 +176,7 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
 
   const visible = entries.filter((e) => showHidden || !e.name.startsWith('.'))
   const actBtn = 'flex-1 text-[11px] py-1 rounded text-ctp-subtext hover:bg-ctp-surface0 hover:text-ctp-text transition-colors'
+  const addItem = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2 text-xs'
 
   return (
     <div className="flex flex-col h-full bg-ctp-base overflow-hidden">
@@ -172,9 +208,33 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
       {/* Create actions */}
       <div className="shrink-0 border-b border-ctp-surface0 px-2 py-1.5">
         <div className="flex items-center gap-1">
-          <button className={actBtn} onClick={() => beginCreate('notebook')} title="New notebook here">+ Notebook</button>
-          <button className={actBtn} onClick={() => beginCreate('file')} title="New file here">+ File</button>
-          <button className={actBtn} onClick={() => beginCreate('folder')} title="New folder here">+ Folder</button>
+          <div className="relative flex-1">
+            <button
+              className={`${actBtn} w-full`}
+              onClick={(e) => { e.stopPropagation(); setAddOpen((o) => !o) }}
+              disabled={!!uploading}
+              title="Add to this folder"
+            >{uploading ? `↑ ${uploading.done}/${uploading.total}` : '+ New ▾'}</button>
+            {addOpen && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="absolute left-0 top-full mt-1 z-50 w-40 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1"
+              >
+                <button className={addItem} onClick={() => { setAddOpen(false); beginCreate('notebook') }}>📓 Notebook</button>
+                <button className={addItem} onClick={() => { setAddOpen(false); beginCreate('file') }}>📄 File</button>
+                <button className={addItem} onClick={() => { setAddOpen(false); beginCreate('folder') }}>📁 Folder</button>
+                <div className="my-1 border-t border-ctp-surface0" />
+                <button className={addItem} onClick={() => { setAddOpen(false); uploadInput.current?.click() }}>↑ Upload files…</button>
+              </div>
+            )}
+          </div>
+          <input
+            ref={uploadInput}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => { const f = e.target.files; e.target.value = ''; void uploadFiles(f) }}
+          />
           {fileClipboard && (
             <button
               className={actBtn}
