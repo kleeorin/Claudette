@@ -482,11 +482,25 @@ export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): Ag
   // The server's authoritative registry, keyed by tool id — the fallback that settles a
   // card when its terminal tool_result / <task-notification> never reached the transcript.
   const registry = new Map((tasks ?? []).map((t) => [t.toolId, t]))
+  // The last user turn: a subagent whose Task call precedes it belongs to a COMPLETED
+  // past turn. Such an agent can't still be running once a newer turn has started (a
+  // live background agent would carry a registry record) — so if it also has no result
+  // and no record, it's a leftover and must settle, not re-light on the session's
+  // running flag. Without this, any resultless old Task re-shows "running…starting…"
+  // whenever the session is busy again.
+  let lastUserIndex = -1
+  for (let i = 0; i < items.length; i++) if (items[i].kind === 'user') lastUserIndex = i
   const agents: AgentView[] = []
-  for (const it of items) {
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
     if (it.kind !== 'tool_use' || !isSubagentTool(it.name)) continue
     const input = (it.input ?? {}) as { description?: string; prompt?: string; subagent_type?: string }
     const rec = it.toolId ? registry.get(it.toolId) : undefined
+    const txResult = it.toolId ? resultByTool.get(it.toolId) : undefined
+    const pastTurn = i < lastUserIndex
+    // A past-turn agent with neither a real result nor a live registry record is a
+    // leftover — synthesize a terminal result so it shows finished (and dismissable).
+    const stale = !txResult && !rec && pastTurn ? staleResult(it.toolId ?? it.id) : undefined
     agents.push({
       id: it.id, toolId: it.toolId,
       type: input.subagent_type || 'agent',
@@ -494,9 +508,8 @@ export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): Ag
       prompt: input.prompt,
       steps: it.toolId ? childrenByParent.get(it.toolId) ?? [] : [],
       launched: (it.toolId ? launchedTools.has(it.toolId) : false) || !!rec?.launched,
-      // Transcript result wins; else synthesize a terminal result from a settled registry
-      // record so a card whose completion was lost still shows as finished.
-      result: (it.toolId ? resultByTool.get(it.toolId) : undefined) ?? terminalFromRecord(rec),
+      // Transcript result wins; else a settled registry record; else the stale marker.
+      result: txResult ?? terminalFromRecord(rec) ?? stale,
     })
   }
   return agents
@@ -507,6 +520,12 @@ export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): Ag
 function terminalFromRecord(rec: TaskRecord | undefined): Extract<TranscriptItem, { kind: 'tool_result' }> | undefined {
   if (!rec || rec.status === 'running') return undefined
   return { kind: 'tool_result', id: `reg-${rec.toolId}`, toolUseId: rec.toolId, isError: rec.status === 'failed', content: rec.summary ?? '' }
+}
+
+// A stable synthetic result marking a leftover subagent (past turn, no result, no
+// registry record) as ended, so its card settles instead of re-lighting on the session.
+function staleResult(key: string): Extract<TranscriptItem, { kind: 'tool_result' }> {
+  return { kind: 'tool_result', id: `stale-${key}`, toolUseId: key, isError: false, content: 'Ended in an earlier turn.' }
 }
 
 // How many subagents are still in flight. A BACKGROUND agent (launch acked, no
@@ -524,12 +543,19 @@ export function countRunningAgents(items: TranscriptItem[], turnActive: boolean,
   }
   // Fold in the authoritative registry: a settled record counts as finished (so a lost
   // completion no longer keeps the count stuck), a launched one as a live background agent.
+  const hasRec = new Set<string>()
   for (const t of tasks ?? []) {
+    hasRec.add(t.toolId)
     if (t.status !== 'running') finished.add(t.toolId)
     else if (t.launched) launched.add(t.toolId)
   }
-  return items.reduce((n, it) => {
+  // Past-turn agents (Task call precedes the last user turn) with no live registry record
+  // are leftovers, not in flight — mirror collectAgents' stale rule so the count matches.
+  let lastUserIndex = -1
+  for (let i = 0; i < items.length; i++) if (items[i].kind === 'user') lastUserIndex = i
+  return items.reduce((n, it, i) => {
     if (it.kind !== 'tool_use' || !isSubagentTool(it.name) || it.toolId == null || finished.has(it.toolId)) return n
+    if (i < lastUserIndex && !hasRec.has(it.toolId)) return n   // stale leftover
     return n + (launched.has(it.toolId) || turnActive ? 1 : 0)
   }, 0)
 }
