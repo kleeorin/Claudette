@@ -4,7 +4,7 @@ import type {
   CreateSessionRequest, CreateSessionResponse, ListSessionsResponse,
   OkResponse, SetModeRequest, SetModeResult, PermissionMode,
   NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus,
-  CreatePaneRequest, CreatePaneResponse,
+  CreatePaneRequest, CreatePaneResponse, ListPanesResponse, AttachPaneResponse,
   ConversationMeta, ConversationsResponse, ConversationResponse,
   RewindPoint, RewindMode, RewindPreview, RewindPointsResponse, RewindPreviewResponse, RewindResponse,
   TaskRecord,
@@ -315,10 +315,15 @@ export const api = {
     push: (cwd: string, setUpstream = false) => post<GitResult>('/api/git/push', { cwd, setUpstream }),
   },
   // Terminal pane: create/destroy over HTTP; input/resize over WS; output/exit via on.*.
+  // list/attach/prune drive refresh survival — a reloaded client reattaches to its
+  // saved ptys (replaying `attach`'s scrollback) and prunes the orphans.
   pane: {
     create: (cwd: string, cols?: number, rows?: number, sessionId?: string) => post<CreatePaneResponse>('/api/pane/create', { cwd, cols, rows, sessionId } as CreatePaneRequest),
     destroy: (id: string) => post<OkResponse>('/api/pane/destroy', { id }),
     input: (id: string, data: string) => send({ type: 'pane:input', id, data }),
     resize: (id: string, cols: number, rows: number) => send({ type: 'pane:resize', id, cols, rows }),
+    list: () => get<ListPanesResponse>('/api/pane/list'),
+    attach: (id: string) => post<AttachPaneResponse>('/api/pane/attach', { id }),
+    prune: (keep: string[]) => post<OkResponse>('/api/pane/prune', { keep }),
   },
 }

@@ -184,5 +184,19 @@ export interface RewindResponse { ok: boolean; newId?: string; error?: string; r
 export interface CreatePaneRequest { cwd: string; cols?: number; rows?: number; sessionId?: string }
 export interface CreatePaneResponse { id: string }
 
+// Reattach across a page refresh: the server keeps the ptys alive and buffers each
+// pane's recent output; the client persists its pane ids and reconnects to them.
+// GET /api/pane/list → the live panes, so the client can drop saved terminals whose
+// pty is gone (e.g. after a server restart) and prune orphans.
+export interface PaneInfo { id: string; cwd: string; sessionId?: string }
+export interface ListPanesResponse { panes: PaneInfo[] }
+// POST /api/pane/attach { id } → the pane's buffered scrollback, written into the
+// fresh xterm before it subscribes to live `pane:output`.
+export interface AttachPaneRequest { id: string }
+export interface AttachPaneResponse { data: string }
+// POST /api/pane/prune { keep } → kill every live pane whose id is NOT in `keep` (the
+// ids the client restored), sweeping ptys that no longer have a tab.
+export interface PrunePanesRequest { keep: string[] }
+
 // GET /api/notebook/kernelspecs → the kernels the user can pick, + Jupyter's default.
 export interface KernelSpecsResponse { specs: KernelSpec[]; default: string }

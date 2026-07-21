@@ -2,57 +2,117 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { useTerminal, type TerminalAPI } from '../hooks/useTerminal'
 
-// A single shell pane (P1.10/P1.17). Creates a server-side pty on mount, binds an
-// xterm to it (output over WS, input/resize back over WS), and tears the pty down
-// on unmount. The parent (App) keeps this mounted once opened so the shell + its
-// scrollback survive tab switches.
-export function TerminalView({ cwd, visible, sessionId }: { cwd: string; visible: boolean; sessionId?: string }) {
+// A single shell pane (P1.10/P1.17). Two modes, driven by whether `paneId` is given:
+//   • CREATE (no paneId) — spawn a fresh server pty, bind an xterm, and report the new
+//     id up via `onCreated` so the parent can persist it.
+//   • ATTACH (paneId set) — a reloaded/reopened client rebinds to an EXISTING pty: it
+//     replays the server's buffered scrollback, then streams live output. This is how
+//     terminals + their processes survive a page refresh.
+//
+// The pty's lifetime is owned by the PARENT, not this view: unmounting NO LONGER kills
+// the pty (that's what makes refresh non-destructive). A pane dies only on an explicit
+// close (parent calls api.pane.destroy), when its session is destroyed (server reaps),
+// or on server exit. The one exception is a create that resolves after we've already
+// unmounted — that pane was never reported, so we destroy it to avoid a leak.
+export function TerminalView(
+  { cwd, visible, sessionId, paneId, onCreated }: {
+    cwd: string
+    visible: boolean
+    sessionId?: string
+    paneId?: string                       // set → attach to this existing pty
+    onCreated?: (paneId: string) => void  // create mode → report the new pty id
+  },
+) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const paneIdRef = useRef<string | null>(null)
+  const paneIdRef = useRef<string | null>(paneId ?? null)
   const [exited, setExited] = useState(false)
 
-  // The pane id is assigned async (after create), so every call reads it live from
-  // the ref; output is filtered to this pane.
+  // Output ordering across the async scrollback replay: live `pane:output` frames that
+  // arrive before the replay is written are queued, then flushed after it, so history
+  // never interleaves with live output. `ready` starts true in create mode (no
+  // scrollback to wait for). `writeToTerm` is xterm's writer, captured from useTerminal.
+  const readyRef = useRef<boolean>(!paneId)
+  const queueRef = useRef<string[]>([])
+  const writeToTerm = useRef<((data: string) => void) | null>(null)
+
   const termApi = useRef<TerminalAPI>({
     sendInput: (data) => { const id = paneIdRef.current; if (id) api.pane.input(id, data) },
     sendResize: (cols, rows) => { const id = paneIdRef.current; if (id) api.pane.resize(id, cols, rows) },
-    subscribeOutput: (cb) => api.on.paneOutput((id, data) => { if (id === paneIdRef.current) cb(data) }),
+    subscribeOutput: (cb) => {
+      writeToTerm.current = cb
+      return api.on.paneOutput((id, data) => {
+        if (id !== paneIdRef.current) return
+        if (!readyRef.current) { queueRef.current.push(data); return }
+        cb(data)
+      })
+    },
   }).current
 
   const { fit, focus, getSize } = useTerminal(containerRef, termApi)
 
   // Kept mounted-but-hidden across tab switches (so scrollback survives); a hidden
-  // container fits to 0, so re-fit + focus whenever we become visible again.
+  // container fits to 0, so re-fit + focus whenever we become visible again — and
+  // resize the pty to match, which also corrects an attached pty whose window is a
+  // different size than when it was first spawned (the refresh-reattach case).
   useEffect(() => {
-    if (visible) requestAnimationFrame(() => { fit(); focus() })
-  }, [visible, fit, focus])
+    if (!visible) return
+    requestAnimationFrame(() => {
+      fit(); focus()
+      const id = paneIdRef.current
+      const size = getSize()
+      if (id && size) api.pane.resize(id, size.cols, size.rows)
+    })
+  }, [visible, fit, focus, getSize])
 
   useEffect(() => {
     let disposed = false
-    let paneId: string | null = null
+    let createdId: string | null = null
     const offExit = api.on.paneExit((id) => { if (id === paneIdRef.current) setExited(true) })
-    // Fit BEFORE creating the pty so it spawns at the terminal's real size — the
-    // shell then draws its very first prompt at the right width, so typed chars
-    // don't overwrite the prompt and history recall doesn't shift a line. (fitRef is
-    // set by useTerminal's effect, which runs before this one.) Re-send the size once
-    // more after create as a backstop for any layout that settled in between.
-    fit()
-    const initial = getSize()
-    void api.pane.create(cwd, initial?.cols, initial?.rows, sessionId).then(({ id }) => {
-      if (disposed) { void api.pane.destroy(id); return }
-      paneId = id
-      paneIdRef.current = id
-      requestAnimationFrame(() => {
-        fit()
-        focus()
-        const size = getSize()
-        if (size) api.pane.resize(id, size.cols, size.rows)
+
+    if (paneId) {
+      // ATTACH: paneIdRef is already this id, so live output starts queueing at once.
+      // Pull the buffered scrollback, write it, flush the queue, then go live. Re-fit +
+      // resize so the pty matches this (possibly new) window size.
+      void api.pane.attach(paneId).then(({ data }) => {
+        if (disposed) return
+        if (data) writeToTerm.current?.(data)
+        for (const chunk of queueRef.current) writeToTerm.current?.(chunk)
+        queueRef.current = []
+        readyRef.current = true
+        requestAnimationFrame(() => {
+          fit(); focus()
+          const size = getSize()
+          if (size) api.pane.resize(paneId, size.cols, size.rows)
+        })
+      }).catch(() => { readyRef.current = true })
+    } else {
+      // CREATE: fit BEFORE create so the pty spawns at the terminal's real size — the
+      // shell draws its first prompt at the right width (typed chars don't overwrite the
+      // prompt; history recall doesn't shift a line). Re-send the size after create as a
+      // backstop for any layout that settled in between, and report the id upward.
+      fit()
+      const initial = getSize()
+      void api.pane.create(cwd, initial?.cols, initial?.rows, sessionId).then(({ id }) => {
+        // Unmounted before create resolved → nobody learned this id; destroy it so it
+        // doesn't leak as a headless process.
+        if (disposed) { void api.pane.destroy(id); return }
+        createdId = id
+        paneIdRef.current = id
+        onCreated?.(id)
+        requestAnimationFrame(() => {
+          fit(); focus()
+          const size = getSize()
+          if (size) api.pane.resize(id, size.cols, size.rows)
+        })
       })
-    })
+    }
+
     return () => {
       disposed = true
       offExit()
-      if (paneId) void api.pane.destroy(paneId)
+      // NOTE: no destroy here — the pty outlives this view (refresh survival). The only
+      // cleanup is the disposed-before-create guard above, handled inside the .then.
+      void createdId
       paneIdRef.current = null
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps

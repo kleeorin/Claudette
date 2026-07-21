@@ -1,5 +1,8 @@
 import type { FastifyInstance } from 'fastify'
-import type { CreatePaneRequest, CreatePaneResponse, WsClientMessage } from '@claudette/shared'
+import type {
+  CreatePaneRequest, CreatePaneResponse, WsClientMessage,
+  ListPanesResponse, AttachPaneRequest, AttachPaneResponse, PrunePanesRequest,
+} from '@claudette/shared'
 import type { WsHub } from '../ws/hub'
 import type { PaneManager } from './paneManager'
 
@@ -17,6 +20,20 @@ export function registerPaneRoutes(app: FastifyInstance, panes: PaneManager): vo
   })
   app.post<{ Body: { id: string } }>('/api/pane/destroy', async (req) => {
     panes.destroy(req.body.id)
+    return { ok: true }
+  })
+  // Reattach support (refresh survival). `list` lets a reloaded client see which of its
+  // saved pane ids are still live; `attach` returns the buffered scrollback to replay
+  // into a fresh xterm before it subscribes to live output; `prune` kills every pane
+  // NOT in the client's restored set (sweeps orphans from past refreshes).
+  app.get('/api/pane/list', async (): Promise<ListPanesResponse> => {
+    return { panes: panes.list() }
+  })
+  app.post<{ Body: AttachPaneRequest }>('/api/pane/attach', async (req): Promise<AttachPaneResponse> => {
+    return { data: panes.snapshot(req.body.id) }
+  })
+  app.post<{ Body: PrunePanesRequest }>('/api/pane/prune', async (req) => {
+    panes.prune(req.body.keep)
     return { ok: true }
   })
 }

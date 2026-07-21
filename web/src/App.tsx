@@ -47,9 +47,38 @@ const EMPTY_PANE: Pane = { tabs: [], active: null }
 
 // A session's terminal dock: its open/closed state, its tabbed terminals, and which
 // tab is focused. Tracked PER SESSION (keyed by session id) so terminals follow the
-// session you switch to.
-type TermPane = { open: boolean; terms: { id: string; cwd: string }[]; active: string | null }
+// session you switch to. A terminal's `key` is a stable local id (tab identity);
+// `paneId` is the server pty it's bound to — null only in the brief window between
+// creating a fresh terminal and the server reporting its id. Persisting `paneId` is
+// what lets a refreshed page REATTACH to the still-running shell.
+type TermEntry = { key: string; paneId: string | null; cwd: string }
+type TermPane = { open: boolean; terms: TermEntry[]; active: string | null }
 const EMPTY_TERM: TermPane = { open: false, terms: [], active: null }
+
+// --- layout persistence (localStorage) --------------------------------------
+// The processes live server-side; only the LAYOUT (which terminals/notebooks are open
+// per session, their sizes, the active tab) is persisted here so a refresh can restore
+// the view and reattach. Notebooks are stored by PATH, not the volatile server-assigned
+// notebookId (which changes across a server restart) — restore reopens by path.
+const LS_KEY = 'claudette:layout:v1'
+type PersistContentTab = { kind: 'file' | 'notebook'; path: string }
+type PersistContent = { active: string | null; tabs: PersistContentTab[] }  // active = 'f:<path>' | 'n:<path>' | null
+interface Persisted {
+  v: 1
+  layout: 'side' | 'stack'
+  sizes: { sideW: number; stackH: number; dockW: number; termH: number; sidebarW: number }
+  seq: number                                 // termSeq high-water, so restored keys don't collide
+  terms: Record<string, TermPane>
+  content: Record<string, PersistContent>
+}
+function loadPersisted(): Persisted | null {
+  try { const raw = localStorage.getItem(LS_KEY); const p = raw ? JSON.parse(raw) : null; return p?.v === 1 ? p as Persisted : null } catch { return null }
+}
+function savePersisted(p: Persisted): void {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(p)) } catch { /* quota / private mode — layout just won't persist */ }
+}
+// Read once at module load (client-only) so useState initializers can hydrate from it.
+const INITIAL = loadPersisted()
 
 function Shell() {
   const { sessions, activeId, setActive, homeDir } = useSessions()
@@ -60,7 +89,19 @@ function Shell() {
   const notif = useNotifications(sessions, activeId, setActive)
 
   // Content panes per session — switching sessions swaps the whole tab set + focus.
-  const [bySession, setBySession] = useState<Record<string, Pane>>({})
+  // Hydrate FILE tabs synchronously from the saved layout; notebook tabs are reopened
+  // by path in an effect below (their ids must be re-minted after a reload).
+  const [bySession, setBySession] = useState<Record<string, Pane>>(() => {
+    const c = INITIAL?.content
+    if (!c) return {}
+    const out: Record<string, Pane> = {}
+    for (const [sid, pc] of Object.entries(c)) {
+      const tabs: Content[] = pc.tabs.filter((t) => t.kind === 'file').map((t) => ({ kind: 'file', path: t.path }))
+      const active: Content | null = pc.active?.startsWith('f:') ? { kind: 'file', path: pc.active.slice(2) } : null
+      out[sid] = { tabs, active }
+    }
+    return out
+  })
 
   // Pending "save before closing?" prompt for a dirty / still-running notebook tab.
   const [closeNb, setCloseNb] = useState<{ id: string; name: string; dirty: boolean; running: boolean } | null>(null)
@@ -73,21 +114,24 @@ function Shell() {
   // terminal dock (and every session's ptys keep running in the background). Each
   // terminal captures its cwd at creation. Terminal ids are globally unique (via the
   // shared `termSeq`) so every session's terminals can be mounted at once.
-  const [termsBySession, setTermsBySession] = useState<Record<string, TermPane>>({})
-  const termSeq = useRef(0)
+  const [termsBySession, setTermsBySession] = useState<Record<string, TermPane>>(() => INITIAL?.terms ?? {})
+  // Seed past the highest restored key so freshly-opened terminals never collide with a
+  // restored one. Ref mirror lets the reconcile effect read current terms synchronously.
+  const termSeq = useRef<number>(INITIAL?.seq ?? 0)
+  const termsRef = useRef(termsBySession); termsRef.current = termsBySession
 
   // Companion orientation for the content split (phones default to stacked).
   const [layout, setLayout] = useState<'side' | 'stack'>(
-    () => (typeof window !== 'undefined' && window.innerWidth < 768 ? 'stack' : 'side'),
+    () => INITIAL?.layout ?? (typeof window !== 'undefined' && window.innerWidth < 768 ? 'stack' : 'side'),
   )
 
   // Resizable sizes (px). sideW/stackH = Claude companion size; dockW = right dock;
-  // termH = bottom dock; sidebarW = session sidebar.
-  const [sideW, setSideW] = useState(420)
-  const [stackH, setStackH] = useState(280)
-  const [dockW, setDockW] = useState(320)
-  const [termH, setTermH] = useState(240)
-  const [sidebarW, setSidebarW] = useState(288)
+  // termH = bottom dock; sidebarW = session sidebar. Restored from the saved layout.
+  const [sideW, setSideW] = useState(INITIAL?.sizes.sideW ?? 420)
+  const [stackH, setStackH] = useState(INITIAL?.sizes.stackH ?? 280)
+  const [dockW, setDockW] = useState(INITIAL?.sizes.dockW ?? 320)
+  const [termH, setTermH] = useState(INITIAL?.sizes.termH ?? 240)
+  const [sidebarW, setSidebarW] = useState(INITIAL?.sizes.sidebarW ?? 288)
   const splitRef = useRef<HTMLDivElement>(null)
 
   // One generic pointer-drag divider: startSize captured on down, then
@@ -241,21 +285,31 @@ function Shell() {
 
   const addTerm = (cwd: string) => {
     if (!activeId) return
-    const id = `t${++termSeq.current}`   // globally unique across sessions
-    setTermPane(activeId, (p) => ({ open: true, terms: [...p.terms, { id, cwd }], active: id }))
+    const key = `t${++termSeq.current}`   // globally unique across sessions
+    setTermPane(activeId, (p) => ({ open: true, terms: [...p.terms, { key, paneId: null, cwd }], active: key }))
   }
-  const closeTerm = (id: string) => {
+  // A TerminalView in create mode reports the server pty id once spawned; record it so
+  // the layout persists it (for reattach) and closeTerm can destroy the right pty.
+  const setTermPaneId = (sid: string, key: string, paneId: string) =>
+    setTermsBySession((prev) => {
+      const st = prev[sid]
+      if (!st) return prev
+      return { ...prev, [sid]: { ...st, terms: st.terms.map((t) => (t.key === key ? { ...t, paneId } : t)) } }
+    })
+  const closeTerm = (key: string) => {
     if (!activeId) return
     setTermPane(activeId, (p) => {
-      const rest = p.terms.filter((t) => t.id !== id)   // unmounting its TerminalView tears the pty down
+      const entry = p.terms.find((t) => t.key === key)
+      if (entry?.paneId) void api.pane.destroy(entry.paneId)   // explicit close kills the pty (refresh does NOT)
+      const rest = p.terms.filter((t) => t.key !== key)
       return {
         open: rest.length > 0 ? p.open : false,         // last one → dock closes (as before first open)
         terms: rest,
-        active: p.active === id ? (rest[rest.length - 1]?.id ?? null) : p.active,
+        active: p.active === key ? (rest[rest.length - 1]?.key ?? null) : p.active,
       }
     })
   }
-  const selectTerm = (id: string) => { if (activeId) setTermPane(activeId, (p) => ({ ...p, active: id })) }
+  const selectTerm = (key: string) => { if (activeId) setTermPane(activeId, (p) => ({ ...p, active: key })) }
   const hideTerm = () => { if (activeId) setTermPane(activeId, (p) => ({ ...p, open: false })) }
   // Toggle the active session's dock: opening with no terminals yet spawns the first.
   const toggleTerm = () => {
@@ -266,9 +320,13 @@ function Shell() {
   }
   const toggleDock = (which: 'files' | 'git' | 'permissions' | 'sandbox') => setDock((d) => (d === which ? null : which))
 
-  // When a session goes away, drop its terminal dock — unmounting those
-  // TerminalViews tears down the ptys the session owned.
+  // When a session goes away, drop its terminal dock. The server already reaped the
+  // ptys it owned (sessions.on('destroyed') → panes.destroyForSession), so this is
+  // pure client-state cleanup. GUARD: the session list loads async, so skip while it's
+  // empty — otherwise a refresh with restored terminals would drop them all before the
+  // list arrives.
   useEffect(() => {
+    if (sessions.length === 0) return
     const ids = new Set(sessions.map((s) => s.id))
     setTermsBySession((prev) => {
       let changed = false
@@ -280,6 +338,98 @@ function Shell() {
       return changed ? next : prev
     })
   }, [sessions])
+
+  // --- refresh survival: reconcile, persist, restore notebooks ----------------
+  // ONCE on load: reconcile the restored terminal layout against the ptys the server
+  // actually still has. Drop terminals whose pty is gone (e.g. the server restarted and
+  // cleared them), then PRUNE every server pty that isn't in a restored tab — this is
+  // what sweeps the "headless" orphans left by past refreshes. (Single-user local tool:
+  // a second open tab would prune this tab's fresh panes; acceptable.)
+  const reconciled = useRef(false)
+  useEffect(() => {
+    if (reconciled.current) return
+    reconciled.current = true
+    void api.pane.list().then(({ panes }) => {
+      const live = new Set(panes.map((p) => p.id))
+      const keep: string[] = []
+      setTermsBySession((prev) => {
+        const next: Record<string, TermPane> = {}
+        for (const [sid, st] of Object.entries(prev)) {
+          const terms = st.terms.filter((t) => t.paneId == null || live.has(t.paneId))
+          for (const t of terms) if (t.paneId) keep.push(t.paneId)
+          const active = terms.some((t) => t.key === st.active) ? st.active : (terms[terms.length - 1]?.key ?? null)
+          next[sid] = { open: terms.length > 0 ? st.open : false, terms, active }
+        }
+        return next
+      })
+      void api.pane.prune(keep)
+    }).catch(() => { /* server not up yet; nothing to reconcile */ })
+  }, [])
+
+  // ONCE on load: reopen the notebooks that were open per session (by path → fresh id),
+  // rebuilding each session's content tabs in their saved order. Reopening reconnects
+  // the still-running kernel server-side. Mark each seen so the newly-opened effect
+  // above doesn't ALSO attach it to whatever session is currently active.
+  useEffect(() => {
+    const c = INITIAL?.content
+    if (!c) return
+    let cancelled = false
+    void (async () => {
+      for (const [sid, pc] of Object.entries(c)) {
+        const nbTabs = pc.tabs.filter((t) => t.kind === 'notebook')
+        if (nbTabs.length === 0) continue
+        const pathToId = new Map<string, string>()
+        await Promise.all(nbTabs.map(async (t) => {
+          const id = await notebooks.openPath(t.path, sid)
+          if (id) { pathToId.set(t.path, id); seenNb.current.add(id) }
+        }))
+        if (cancelled) return
+        setBySession((prev) => {
+          const tabs: Content[] = []
+          for (const t of pc.tabs) {
+            if (t.kind === 'file') tabs.push({ kind: 'file', path: t.path })
+            else { const id = pathToId.get(t.path); if (id) tabs.push({ kind: 'notebook', id }) }
+          }
+          let active: Content | null = null
+          if (pc.active?.startsWith('f:')) active = { kind: 'file', path: pc.active.slice(2) }
+          else if (pc.active?.startsWith('n:')) { const id = pathToId.get(pc.active.slice(2)); if (id) active = { kind: 'notebook', id } }
+          return { ...prev, [sid]: { tabs, active } }
+        })
+      }
+    })()
+    return () => { cancelled = true }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist the layout on every change. Notebooks are recorded by PATH (skip a tab whose
+  // doc hasn't loaded yet — it saves on the next round once the path is known; a session
+  // with such a tab carries over its previous save so nothing is transiently lost).
+  useEffect(() => {
+    const prev = loadPersisted()
+    const content: Record<string, PersistContent> = {}
+    for (const [sid, p] of Object.entries(bySession)) {
+      const out: PersistContentTab[] = []
+      let pending = false
+      for (const t of p.tabs) {
+        if (t.kind === 'file') { out.push({ kind: 'file', path: t.path }); continue }
+        const doc = notebooks.open.find((o) => o.notebookId === t.id)
+        if (!doc) { pending = true; break }
+        out.push({ kind: 'notebook', path: doc.path })
+      }
+      if (pending) { if (prev?.content[sid]) content[sid] = prev.content[sid]; continue }
+      let active: string | null = null
+      const a = p.active
+      if (a?.kind === 'file') active = `f:${a.path}`
+      else if (a?.kind === 'notebook') { const doc = notebooks.open.find((o) => o.notebookId === a.id); active = doc ? `n:${doc.path}` : null }
+      if (out.length || active) content[sid] = { active, tabs: out }
+    }
+    savePersisted({
+      v: 1, layout,
+      sizes: { sideW, stackH, dockW, termH, sidebarW },
+      seq: termSeq.current,
+      terms: termsBySession,
+      content,
+    })
+  }, [termsBySession, bySession, sideW, stackH, dockW, termH, sidebarW, layout, notebooks.open])
 
   // Tab strip for the CURRENT session's pane, enriched with live doc metadata.
   const tabs: Tab[] = pane.tabs.map((t) => {
@@ -382,15 +532,15 @@ function Shell() {
                 <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
                   {terms.map((t, i) => (
                     <div
-                      key={t.id}
-                      onClick={() => selectTerm(t.id)}
+                      key={t.key}
+                      onClick={() => selectTerm(t.key)}
                       title={t.cwd}
-                      className={`group flex items-center gap-1.5 pl-2 pr-1 shrink-0 cursor-pointer text-[11px] border-b-2 ${activeTerm === t.id ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-subtext hover:text-ctp-text'}`}
+                      className={`group flex items-center gap-1.5 pl-2 pr-1 shrink-0 cursor-pointer text-[11px] border-b-2 ${activeTerm === t.key ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-subtext hover:text-ctp-text'}`}
                     >
                       <span className="text-ctp-overlay">❯</span>
                       <span>Terminal {i + 1}</span>
                       <button
-                        onClick={(e) => { e.stopPropagation(); closeTerm(t.id) }}
+                        onClick={(e) => { e.stopPropagation(); closeTerm(t.key) }}
                         title="Close terminal"
                         className="opacity-0 group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red p-0.5 rounded leading-none"
                       >
@@ -399,7 +549,7 @@ function Shell() {
                     </div>
                   ))}
                   <button onClick={() => addTerm(termCwd)} title="New terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text px-1.5 text-sm leading-none">+</button>
-                  <span className="ml-auto self-center text-[10px] text-ctp-overlay font-mono truncate max-w-[45%]">{prettyPath(terms.find((t) => t.id === activeTerm)?.cwd ?? termCwd)}</span>
+                  <span className="ml-auto self-center text-[10px] text-ctp-overlay font-mono truncate max-w-[45%]">{prettyPath(terms.find((t) => t.key === activeTerm)?.cwd ?? termCwd)}</span>
                   <button onClick={hideTerm} title="Hide terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text p-0.5">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                   </button>
@@ -409,10 +559,16 @@ function Shell() {
                     only the active session's active terminal is shown. */}
                 <div className="flex-1 min-h-0 relative">
                   {allTerms.map((t) => {
-                    const show = t.sid === activeId && dockShown && activeTerm === t.id
+                    const show = t.sid === activeId && dockShown && activeTerm === t.key
                     return (
-                      <div key={t.id} className={show ? 'absolute inset-0' : 'hidden'}>
-                        <TerminalView cwd={t.cwd} visible={show} sessionId={t.sid} />
+                      <div key={t.key} className={show ? 'absolute inset-0' : 'hidden'}>
+                        <TerminalView
+                          cwd={t.cwd}
+                          visible={show}
+                          sessionId={t.sid}
+                          paneId={t.paneId ?? undefined}
+                          onCreated={(pid) => setTermPaneId(t.sid, t.key, pid)}
+                        />
                       </div>
                     )
                   })}

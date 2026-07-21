@@ -54,11 +54,27 @@ export function paneSpawnSpec(cwd: string, c: Confinement): PaneSpawn {
   return { command, args, cwd: box.cwd || homedir(), env }
 }
 
+// Per-pane server state: the pty, its cwd + owning session (for listing/reaping),
+// and a bounded scrollback buffer so a browser that refreshed can REATTACH and
+// replay the output it missed (xterm's scrollback lives only in the page that died).
+interface Pane {
+  proc: pty.IPty
+  cwd: string
+  sessionId?: string
+  buf: string[]     // chunks of recent output
+  bufBytes: number  // running total, trimmed to BUF_CAP
+}
+
+// How much recent output we retain per pane for replay-on-attach. Enough for a couple
+// of full screens of scrollback without letting a chatty process grow unbounded.
+const BUF_CAP = 256 * 1024
+
+// What `list()` exposes to the client for reconcile (which saved terminals still map
+// to a live pty; which live ptys are orphans to prune).
+export interface PaneInfo { id: string; cwd: string; sessionId?: string }
+
 export class PaneManager extends EventEmitter {
-  private panes = new Map<string, pty.IPty>()
-  // Which session owns each pane, so killing a session reaps its terminals
-  // server-side (a live browser isn't required to drive the cleanup).
-  private owner = new Map<string, string>()
+  private panes = new Map<string, Pane>()
 
   // `confinement` resolves a session's box so its terminal is confined to match (see
   // SANDBOX.md). A pane created with NO sessionId is a deliberate operator terminal
@@ -82,19 +98,44 @@ export class PaneManager extends EventEmitter {
       cwd: spec.cwd,
       env: spec.env,
     })
-    this.panes.set(id, proc)
-    if (sessionId) this.owner.set(id, sessionId)
-    proc.onData((data) => this.emit('output', id, data))
-    proc.onExit(() => { this.panes.delete(id); this.owner.delete(id); this.emit('exit', id) })
+    const pane: Pane = { proc, cwd, sessionId, buf: [], bufBytes: 0 }
+    this.panes.set(id, pane)
+    proc.onData((data) => { this.append(pane, data); this.emit('output', id, data) })
+    proc.onExit(() => { this.panes.delete(id); this.emit('exit', id) })
     return id
   }
 
-  sendInput(id: string, data: string): void { this.panes.get(id)?.write(data) }
-  resize(id: string, cols: number, rows: number): void { this.panes.get(id)?.resize(cols, rows) }
-  destroy(id: string): void { this.panes.get(id)?.kill(); this.panes.delete(id); this.owner.delete(id) }
+  // Append output to a pane's replay buffer, trimming oldest chunks past the cap.
+  private append(pane: Pane, data: string): void {
+    pane.buf.push(data)
+    pane.bufBytes += data.length
+    while (pane.bufBytes > BUF_CAP && pane.buf.length > 1) {
+      pane.bufBytes -= pane.buf.shift()!.length
+    }
+  }
+
+  sendInput(id: string, data: string): void { this.panes.get(id)?.proc.write(data) }
+  resize(id: string, cols: number, rows: number): void { this.panes.get(id)?.proc.resize(cols, rows) }
+  destroy(id: string): void { this.panes.get(id)?.proc.kill(); this.panes.delete(id) }
   destroyAll(): void { for (const id of [...this.panes.keys()]) this.destroy(id) }
   // Kill every pty owned by a session (called when that session is destroyed).
   destroyForSession(sessionId: string): void {
-    for (const [id, sid] of [...this.owner]) if (sid === sessionId) this.destroy(id)
+    for (const [id, p] of [...this.panes]) if (p.sessionId === sessionId) this.destroy(id)
+  }
+
+  // Whether a pane id still maps to a live pty (a refreshed client checks its saved ids).
+  has(id: string): boolean { return this.panes.has(id) }
+  // Every live pane, so the client can reconcile its saved layout against reality.
+  list(): PaneInfo[] {
+    return [...this.panes].map(([id, p]) => ({ id, cwd: p.cwd, sessionId: p.sessionId }))
+  }
+  // Buffered scrollback for a reattaching client to write into its fresh xterm before
+  // it subscribes to live output. Empty string for an unknown/dead pane.
+  snapshot(id: string): string { return this.panes.get(id)?.buf.join('') ?? '' }
+  // Kill every pane whose id is NOT in `keep` — the client calls this on load with the
+  // ids it restored, so ptys with no surviving tab (orphans from past refreshes) die.
+  prune(keep: string[]): void {
+    const keepSet = new Set(keep)
+    for (const id of [...this.panes.keys()]) if (!keepSet.has(id)) this.destroy(id)
   }
 }
