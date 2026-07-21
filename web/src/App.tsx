@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { SessionsProvider, useSessions } from './store/sessions'
 import { ChatProvider, useChat, countRunningAgents } from './store/chat'
 import { NotebooksProvider, useNotebooks } from './store/notebooks'
-import { ChatView } from './components/ChatView'
+import { ChatView, SidebarUsage } from './components/ChatView'
 import { NotebookView } from './components/NotebookView'
 import { TerminalView } from './components/TerminalView'
 import { GitPanelView } from './components/GitPanelView'
@@ -707,8 +707,12 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
           <button onClick={onClose} className="md:hidden ml-1 text-ctp-overlay hover:text-ctp-text text-sm" aria-label="Close">✕</button>
         </div>
 
-        <div className="px-3 pt-3 pb-1 flex items-center justify-between shrink-0">
-          <span className="text-[10px] font-medium uppercase tracking-wider text-ctp-overlay">Sessions</span>
+        <div className="px-3 pt-3 pb-1 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center flex-wrap gap-x-2 gap-y-0.5 min-w-0">
+            <span className="text-[10px] font-medium uppercase tracking-wider text-ctp-overlay">Sessions</span>
+            {/* Account-global session/weekly quota — shown once here in the mutual column. */}
+            <SidebarUsage />
+          </div>
           <button onClick={() => setShowNew(true)} title="New session" className="text-ctp-overlay hover:text-ctp-accent text-base leading-none w-6 h-6 flex items-center justify-center rounded hover:bg-ctp-surface0 transition-colors">+</button>
         </div>
         <div className="flex-1 overflow-y-auto px-2 space-y-0.5">

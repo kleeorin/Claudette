@@ -24,6 +24,22 @@ const autoResumed = new Set<string>()
 // A cleared card therefore stays cleared when you return to the session.
 const dismissedBySession = new Map<string, Set<string>>()
 
+// Shell-like composer history (Up/Down recall the messages you've sent), persisted
+// per session in localStorage so it survives a page reload AND a /clear — unlike the
+// transcript, which is wiped by /clear and only present once a conversation resumes.
+// Capped so a long-lived session can't grow the key without bound.
+const HIST_CAP = 200
+const histKey = (id: string) => `claudette:msghist:${id}`
+function loadHist(id: string): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(histKey(id)) ?? '[]')
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+  } catch { return [] }
+}
+function saveHist(id: string, h: string[]): void {
+  try { localStorage.setItem(histKey(id), JSON.stringify(h)) } catch { /* quota / disabled storage — recall just won't persist */ }
+}
+
 // Native chat frontend for a Claude session — ported from ClaudeMaster. Renders
 // the structured transcript, streams tokens, and surfaces permission /
 // AskUserQuestion prompts as native cards. Handles /clear + /resume natively
@@ -53,9 +69,29 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const mention = useMentionComplete({ draft, setDraft, taRef, cwd: session?.cwd ?? '' })
 
   // --- input history (shell-like Up/Down over the messages you've sent) ---------
-  // The turns you've sent this session, oldest→newest. `histPtr` counts steps back
-  // (0 = the live draft); `stashRef` holds the in-progress draft while browsing.
-  const sentHistory = useMemo(() => items.filter((it) => it.kind === 'user').map((it) => it.text), [items])
+  // The turns you've sent this session, oldest→newest, persisted across reloads (see
+  // loadHist/saveHist). `histPtr` counts steps back (0 = the live draft); `stashRef`
+  // holds the in-progress draft while browsing. Loaded per session on mount — ChatView
+  // is keyed by session id, so switching sessions remounts and re-reads the right key.
+  const [sentHistory, setSentHistory] = useState<string[]>(() => loadHist(sessionId))
+  // Seed from a resumed conversation the first time its transcript lands, so an existing
+  // conversation has recall before you send anything this run. Seed-once (only when the
+  // stored history is empty) and persist it, so a later /clear doesn't lose the seed.
+  const transcriptSent = useMemo(() => items.filter((it) => it.kind === 'user').map((it) => it.text), [items])
+  useEffect(() => {
+    if (!transcriptSent.length) return
+    setSentHistory((h) => { if (h.length) return h; const seeded = transcriptSent.slice(-HIST_CAP); saveHist(sessionId, seeded); return seeded })
+  }, [transcriptSent, sessionId])
+  // Append a just-sent message (skipping an immediate duplicate, like a shell), trim to
+  // the cap, and persist.
+  const pushHistory = useCallback((text: string) => {
+    setSentHistory((h) => {
+      if (h[h.length - 1] === text) return h
+      const next = [...h, text].slice(-HIST_CAP)
+      saveHist(sessionId, next)
+      return next
+    })
+  }, [sessionId])
   // Live subagent count = Task tool_uses with no matching tool_result yet. Only while
   // the turn is active, so an interrupted (never-completed) Task doesn't latch on.
   // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
@@ -203,6 +239,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const submit = () => {
     const t = draft.trim()
     if (!t) return
+    pushHistory(draft)   // remember it for Up/Down recall (including slash commands, shell-style)
     setHistPtr(0); stashRef.current = ''
     if (handleSlash(t)) { setDraft(''); return }
     sendTurn(sessionId, draft)
@@ -782,29 +819,9 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
   const pctLabel = pct == null ? undefined : pct === 0 && (tokens ?? 0) > 0 ? '<1%' : `${pct}%`
   const barPct = pct == null ? 0 : Math.max(pct, (tokens ?? 0) > 0 ? 1 : 0)
   const barColor = pct == null ? 'bg-ctp-accent' : pct >= 92 ? 'bg-ctp-red' : pct >= 80 ? 'bg-ctp-yellow' : 'bg-ctp-accent'
-  // Tick while any chip has a reset time, so an expired window self-clears below even
-  // when the session is idle (the CLI only reports usage near a limit — there's no
-  // "0%" event to clear it, so without this a stale chip would linger until the next
-  // turn or reconnect).
-  const hasResetable = !!meta.limits && Object.values(meta.limits).some((rl) => rl.resetsAt)
-  const now = useNow(hasResetable ? 30_000 : null)
-  // Quota chips. PREFER the polled `/api/usage` endpoint — it carries a continuous
-  // session + weekly % (the stream no longer does). Map each window onto the RateChip's
-  // shape (five_hour/seven_day). Only when the endpoint is unavailable (no OAuth token /
-  // offline) fall back to the stream's rate_limit_event chips: Session always, Weekly
-  // once it's worth attention (>85%), dropping windows whose reset time has passed.
-  const usage = useUsage()
-  const usageChips: RateLimitInfo[] = usage.map((w) => ({
-    rateLimitType: w.group === 'session' ? 'five_hour' : 'seven_day',
-    percentUsed: w.percent,
-    resetsAt: w.resetsAt,
-    status: w.severity && w.severity !== 'normal' ? w.severity : 'allowed',
-  }))
-  const streamChips = (meta.limits ? Object.values(meta.limits) : [])
-    .filter((rl) => !(rl.resetsAt && rl.resetsAt * 1000 <= now))
-    .filter((rl) => !isWeekly(rl.rateLimitType) || (rl.percentUsed ?? 0) > 85)
-  const limits = (usageChips.length ? usageChips : streamChips)
-    .sort((a, b) => limitRank(a.rateLimitType) - limitRank(b.rateLimitType))
+  // The session/weekly quota chips are account-global (identical for every session),
+  // so they now live once in the sidebar header (SidebarUsage) rather than here. The
+  // ctx meter below stays — it's the one usage figure that IS unique per session.
 
   return (
     <div className="shrink-0 flex items-center flex-wrap gap-x-3 gap-y-1 px-4 sm:px-5 min-h-[3rem] py-1.5 border-b border-ctp-surface0">
@@ -830,8 +847,6 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
             ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pctLabel})</span>
             : <span className="text-ctp-surface2">—</span>}
         </span>
-
-        {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} />)}
       </div>
     </div>
   )
@@ -885,7 +900,7 @@ function ModeSelect({ mode, onSetMode }: { mode: PermissionMode; onSetMode: (m: 
   )
 }
 
-function RateChip({ rl }: { rl: RateLimitInfo }) {
+function RateChip({ rl, compact }: { rl: RateLimitInfo; compact?: boolean }) {
   const status = rl.status ?? 'allowed'
   const ok = status === 'allowed'
   const bad = /reject|exceed|block|limit_reached/i.test(status)
@@ -898,7 +913,62 @@ function RateChip({ rl }: { rl: RateLimitInfo }) {
   return (
     <span className={color} title={`${label} limit: ${status}${rl.isUsingOverage ? ' (using overage)' : ''}${resets ? ` · ${resets}` : ''}`}>
       {ok ? '●' : '▲'} {label}{usedPct}{rl.isUsingOverage ? ' · overage' : ''}
-      {rl.resetsAt ? <span className="text-ctp-surface2"> · {new Date(rl.resetsAt * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span> : null}
+      {/* Compact (sidebar) chip keeps the reset clock in the tooltip only, to stay narrow. */}
+      {!compact && rl.resetsAt ? <span className="text-ctp-surface2"> · {new Date(rl.resetsAt * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span> : null}
+    </span>
+  )
+}
+
+// Account-level quota chips (Session / Weekly) for the sidebar header. These windows
+// are account-global — the same for every session — so they belong once in the mutual
+// sidebar column, not inside any single session's MetaBar.
+//
+// PREFER the polled `/api/usage` endpoint (a continuous session + weekly %). Only when
+// it's unavailable (no OAuth token / offline) fall back to the stream's rate_limit_event
+// data — and there, pool every session's limits and keep the MOST-INFORMED reading per
+// window (highest %, latest reset). The CLI only emits usage near a limit, so one idle
+// session may know nothing while another already saw the window; pooling picks whichever
+// session is best informed.
+export function SidebarUsage() {
+  const { sessions } = useSessions()
+  const { metaFor } = useChat()
+  const usage = useUsage()
+
+  const usageChips: RateLimitInfo[] = usage.map((w) => ({
+    rateLimitType: w.group === 'session' ? 'five_hour' : 'seven_day',
+    percentUsed: w.percent,
+    resetsAt: w.resetsAt,
+    status: w.severity && w.severity !== 'normal' ? w.severity : 'allowed',
+  }))
+
+  // Only the stream fallback ages out (the endpoint refreshes itself on its poll), so
+  // tick to self-clear expired windows only when we're actually in fallback mode.
+  const now = useNow(usageChips.length ? null : 30_000)
+
+  const pooled = new Map<string, RateLimitInfo>()
+  for (const s of sessions) {
+    const limits = metaFor(s.id).limits
+    if (!limits) continue
+    for (const rl of Object.values(limits)) {
+      const key = isWeekly(rl.rateLimitType) ? 'weekly' : rl.rateLimitType ?? 'limit'
+      const cur = pooled.get(key)
+      const better = !cur
+        || (rl.percentUsed ?? 0) > (cur.percentUsed ?? 0)
+        || ((rl.percentUsed ?? 0) === (cur.percentUsed ?? 0) && (rl.resetsAt ?? 0) > (cur.resetsAt ?? 0))
+      if (better) pooled.set(key, rl)
+    }
+  }
+  const streamChips = [...pooled.values()]
+    .filter((rl) => !(rl.resetsAt && rl.resetsAt * 1000 <= now))
+    .filter((rl) => !isWeekly(rl.rateLimitType) || (rl.percentUsed ?? 0) > 85)
+
+  const limits = (usageChips.length ? usageChips : streamChips)
+    .sort((a, b) => limitRank(a.rateLimitType) - limitRank(b.rateLimitType))
+
+  if (!limits.length) return null
+  return (
+    <span className="flex items-center flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-ctp-overlay normal-case tracking-normal">
+      {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} compact />)}
     </span>
   )
 }
