@@ -25,6 +25,18 @@ async function accessToken(): Promise<string | null> {
 
 interface RawLimit { kind?: string; group?: string; percent?: number; severity?: string; resets_at?: string }
 
+// The upstream endpoint is aggressively rate-limited — a couple of quick hits and it
+// starts returning 429. With no caching we'd fetch on EVERY /api/usage request, and
+// the client polls each open tab every 60s plus on every tab focus, so 429s are easy
+// to trigger — and each one used to blank the meter ("session usage gone"). So: cache
+// the last SUCCESSFUL snapshot, serve it without re-fetching while fresh (TTL), and
+// serve it STALE on any error so a transient 429 never makes the chip vanish. The
+// numbers move slowly (% of a 5h / weekly window), so a short TTL loses nothing.
+const CACHE_TTL_MS = 60_000     // serve the cached snapshot without re-fetching
+const MIN_REFETCH_MS = 20_000   // even when stale, never hit upstream more often than this
+let cache: { value: UsageResponse; at: number } | null = null
+let lastAttempt = 0
+
 function labelFor(l: RawLimit): string {
   if (l.group === 'session') return 'Session'
   if (l.group === 'weekly') return 'Weekly'
@@ -34,13 +46,25 @@ function labelFor(l: RawLimit): string {
 // Fetch + normalize. Keeps the primary "session" window and the top-level weekly
 // ("weekly_all"); skips the model-scoped weekly sub-windows (noise for a single meter).
 export async function fetchUsage(): Promise<UsageResponse | null> {
+  const now = Date.now()
+  // Fresh cache: skip the upstream call entirely.
+  if (cache && now - cache.at < CACHE_TTL_MS) return cache.value
+  // Every failure path below falls back to the last good snapshot (stale-on-error), so
+  // a transient 429 / offline blip keeps the meter showing the last known numbers
+  // instead of blanking it. Null only until the very first success (or no OAuth token).
+  const stale = cache?.value ?? null
+  // Throttle upstream calls even when the cache is stale, so many tabs / rapid polls
+  // can't gang up and trip the endpoint's rate limit.
+  if (now - lastAttempt < MIN_REFETCH_MS) return stale
+  lastAttempt = now
+
   const token = await accessToken()
-  if (!token) return null
+  if (!token) return stale
   let res: Response
   try {
     res = await fetch(USAGE_URL, { headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': OAUTH_BETA } })
-  } catch { return null }   // offline / DNS — no meter this tick, try again next poll
-  if (!res.ok) return null  // 401 (token expired between CLI refreshes) / 5xx — same
+  } catch { return stale }   // offline / DNS — keep showing the last snapshot
+  if (!res.ok) return stale  // 401 (token expired between CLI refreshes) / 429 / 5xx — same
   const data = await res.json() as { limits?: RawLimit[] }
   const windows: UsageWindow[] = (Array.isArray(data.limits) ? data.limits : [])
     .filter((l) => (l.group === 'session' || l.kind === 'weekly_all') && typeof l.percent === 'number')
@@ -52,7 +76,9 @@ export async function fetchUsage(): Promise<UsageResponse | null> {
       resetsAt: l.resets_at ? Math.floor(Date.parse(l.resets_at) / 1000) || undefined : undefined,
       severity: l.severity,
     }))
-  return { windows, fetchedAt: Date.now() }
+  const value: UsageResponse = { windows, fetchedAt: now }
+  cache = { value, at: now }
+  return value
 }
 
 export function registerUsageRoutes(app: FastifyInstance): void {
