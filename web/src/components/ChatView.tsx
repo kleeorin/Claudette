@@ -847,6 +847,8 @@ function MetaBar({ meta, session, title, cwd, mode, onSetMode }: {
             ? <span className="font-mono text-ctp-subtext">{fmtTokens(tokens)} / {fmtTokens(win)} ({pctLabel})</span>
             : <span className="text-ctp-surface2">—</span>}
         </span>
+
+        <RestartButton session={session} />
       </div>
     </div>
   )
@@ -895,6 +897,47 @@ function ModeSelect({ mode, onSetMode }: { mode: PermissionMode; onSetMode: (m: 
           onConfirm={() => { setConfirmBypass(false); void apply('bypassPermissions') }}
           onCancel={() => setConfirmBypass(false)}
         />
+      )}
+    </span>
+  )
+}
+
+// Restart JUST this session's `claude` process (resume-preserving), not the whole
+// session — kernels, terminals, and the conversation survive. Backs the same
+// resume-restart the server uses to apply config changes (relaunchApply): kill →
+// the exit handler relaunches via the `replacing` flag, which never fires
+// SessionManager's own `exit`, so panes/kernels are never released. The one recovery
+// for a session whose engine dropped its auth ("Not logged in") mid-run: a fresh
+// process re-reads the (by-now refreshed) credentials. Confirms first only when a
+// turn is live, since a restart interrupts it.
+function RestartButton({ session }: { session: SessionInfo }) {
+  const [busy, setBusy] = useState(false)
+  const [confirm, setConfirm] = useState(false)
+  const active = session.state === 'running' || session.state === 'waiting'
+  const restart = async () => {
+    setConfirm(false)
+    setBusy(true)
+    try { await api.http.relaunchApply(session.id) } finally { setBusy(false) }
+  }
+  return (
+    <span className="relative flex items-center">
+      <button
+        onClick={() => (active ? setConfirm(true) : void restart())}
+        disabled={busy}
+        title="Restart the Claude process — keeps the conversation, kernels, and terminals"
+        aria-label="Restart Claude"
+        className="flex items-center justify-center w-5 h-5 rounded text-ctp-overlay hover:text-ctp-text hover:bg-ctp-surface0 transition-colors disabled:opacity-40"
+      >
+        <span className={busy ? 'inline-block animate-spin' : 'inline-block'} aria-hidden>↻</span>
+      </button>
+      {confirm && (
+        <div className="absolute top-full right-0 mt-1 z-20 w-60 rounded-lg border border-ctp-surface1 bg-ctp-mantle shadow-pop p-2.5 text-[11px] leading-snug text-ctp-subtext">
+          <p className="mb-2">Restart Claude? The current turn is interrupted. The conversation, kernels, and terminals are kept.</p>
+          <div className="flex justify-end gap-2">
+            <button className="px-2 py-0.5 rounded text-ctp-overlay hover:bg-ctp-surface0" onClick={() => setConfirm(false)}>Cancel</button>
+            <button className="px-2 py-0.5 rounded bg-ctp-accent/20 text-ctp-text hover:bg-ctp-accent/30" onClick={() => void restart()}>Restart</button>
+          </div>
+        </div>
       )}
     </span>
   )

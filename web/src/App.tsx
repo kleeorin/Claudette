@@ -298,7 +298,7 @@ function Shell() {
 
   return (
     <div className="flex h-full bg-ctp-base overflow-hidden">
-      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} />
+      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} />
       <div
         {...dividerProps({ axis: 'x', get: () => sidebarW, set: setSidebarW, sign: 1, min: 200, max: () => 560 })}
         title="Drag to resize"
@@ -333,7 +333,6 @@ function Shell() {
           onToggleDock={toggleDock}
           termOpen={termOpen}
           onToggleTerm={toggleTerm}
-          notif={notif}
         />
 
         <div className="flex-1 min-h-0 flex">
@@ -538,7 +537,7 @@ type Tab = { key: string; kind: 'notebook' | 'file'; id: string; label: string; 
 
 // Tab strip: Chat + one tab per open content item, then the dock toggles (Files /
 // Git / Terminal) and the companion-orientation control.
-function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout, onSetLayout, showLayout, dock, onToggleDock, termOpen, onToggleTerm, notif }: {
+function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout, onSetLayout, showLayout, dock, onToggleDock, termOpen, onToggleTerm }: {
   tabs: Tab[]
   active: Content | null
   onSelectChat: () => void
@@ -547,7 +546,6 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
   layout: 'side' | 'stack'; onSetLayout: (l: 'side' | 'stack') => void; showLayout: boolean
   dock: 'files' | 'git' | 'permissions' | 'sandbox' | null; onToggleDock: (w: 'files' | 'git' | 'permissions' | 'sandbox') => void
   termOpen: boolean; onToggleTerm: () => void
-  notif: NotificationsApi
 }) {
   const tab = (on: boolean) =>
     `px-3 h-8 flex items-center gap-1.5 text-xs border-b-2 -mb-px whitespace-nowrap transition-colors ${
@@ -600,8 +598,6 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         <button className={toggle(dock === 'permissions')} onClick={() => onToggleDock('permissions')} title="Permissions — what this session's Claude can do">Permissions</button>
         <button className={toggle(dock === 'sandbox')} onClick={() => onToggleDock('sandbox')} title="Sandbox — filesystem confinement + mounts for this session">Sandbox</button>
         <button className={toggle(termOpen)} onClick={onToggleTerm} title="Terminal">Terminal</button>
-        <SoundToggle notif={notif} />
-        <NotifyBell notif={notif} />
       </div>
     </div>
   )
@@ -681,7 +677,7 @@ function Empty() {
   )
 }
 
-function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void; width: number }) {
+function Sidebar({ open, onClose, width, notif }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi }) {
   const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
   const { transcriptFor, tasksFor } = useChat()   // per-session running-agent count for the row badge
   const [showNew, setShowNew] = useState(false)
@@ -700,10 +696,14 @@ function Sidebar({ open, onClose, width }: { open: boolean; onClose: () => void;
         <div className="px-4 h-12 flex items-center gap-2.5 border-b border-ctp-surface0 shrink-0">
           <Mark className="w-5 h-5 text-ctp-accent" />
           <span className="text-sm font-semibold tracking-tight text-ctp-text">Claudette</span>
-          <span className={`ml-auto inline-flex items-center gap-1.5 text-[10px] ${connected ? 'text-ctp-green' : 'text-ctp-red'}`} title={connected ? 'Connected to server' : 'Disconnected'}>
-            <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-ctp-green' : 'bg-ctp-red'}`} />
-            {connected ? 'online' : 'offline'}
-          </span>
+          <div className="ml-auto flex items-center gap-1">
+            <SoundToggle notif={notif} />
+            <NotifyBell notif={notif} />
+            <span className={`ml-1 inline-flex items-center gap-1.5 text-[10px] ${connected ? 'text-ctp-green' : 'text-ctp-red'}`} title={connected ? 'Connected to server' : 'Disconnected'}>
+              <span className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-ctp-green' : 'bg-ctp-red'}`} />
+              {connected ? 'online' : 'offline'}
+            </span>
+          </div>
           <button onClick={onClose} className="md:hidden ml-1 text-ctp-overlay hover:text-ctp-text text-sm" aria-label="Close">✕</button>
         </div>
 
