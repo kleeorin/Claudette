@@ -1,5 +1,6 @@
 import { spawn, execFile, type ChildProcess } from 'child_process'
 import { randomBytes } from 'crypto'
+import { createServer } from 'net'
 import { access } from 'fs/promises'
 import { constants } from 'fs'
 import { homedir } from 'os'
@@ -38,6 +39,28 @@ export async function findNearestPython(startDir: string, sandbox?: JupyterSandb
     if (parent === d) return null   // reached '/'
     d = parent
   }
+}
+
+// Reserve an ephemeral TCP port by briefly binding one on 127.0.0.1 and reading it
+// back, then releasing it. This is the source of truth for the server URL: jupyter_server
+// ≥2 echoes the *configured* --port literally in its startup banner, so launching with
+// --port=0 makes the banner say ":0" while the OS actually binds some real port — we'd
+// then build `http://127.0.0.1:0` and every fetch to it throws the bare undici
+// "fetch failed" (surfaced upstream as KernelStartError). So Node picks the port and we
+// pass it explicitly with --ServerApp.port_retries=0, forcing Jupyter to bind exactly
+// this port or die loudly. A tiny TOCTOU window exists between release and Jupyter's
+// bind; if the port is stolen the server exits (visible via proc 'exit') rather than
+// silently serving a wrong-port URL. The banner is then only a readiness signal.
+function allocatePort(): Promise<number> {
+  return new Promise((res, rej) => {
+    const srv = createServer()
+    srv.on('error', rej)
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      srv.close(() => (port ? res(port) : rej(new Error('could not allocate a port'))))
+    })
+  })
 }
 
 // Poll GET /api/status until Jupyter answers (any HTTP response = socket accepting),
@@ -96,12 +119,17 @@ export class JupyterManager {
     return this.infoPromise
   }
 
-  private _spawnLocal(): Promise<JupyterInfo | null> {
+  private async _spawnLocal(): Promise<JupyterInfo | null> {
     const token = randomBytes(24).toString('hex')
+    const port = await allocatePort()
     const jupyterArgv = [
       '-m', 'jupyter', 'server',
       '--no-browser',
-      '--port=0',
+      // Node picked `port`; pin it and forbid retries so Jupyter binds exactly this
+      // port (or exits) — the banner's echoed port then always matches reality. See
+      // allocatePort() for why we don't let Jupyter choose via --port=0.
+      `--port=${port}`,
+      '--ServerApp.port_retries=0',
       '--ip=127.0.0.1',
       `--ServerApp.token=${token}`,
       '--ServerApp.disable_check_xsrf=True',
@@ -115,7 +143,7 @@ export class JupyterManager {
     const proc = this.sandbox && sandboxAvailable()
       ? this._spawnSandboxed(jupyterArgv)
       : spawn(this.pythonPath, jupyterArgv, { env: this._launchEnv() })
-    return this._await(proc, token)
+    return this._await(proc, token, port)
   }
 
   // `python -m jupyter server` finds the `jupyter-server` subcommand by scanning PATH,
@@ -165,10 +193,12 @@ export class JupyterManager {
     return spawn(command, args, { env: process.env as Record<string, string> })
   }
 
-  // Jupyter prints its listening URL to stderr; the first such line means it's up.
-  private _await(proc: ChildProcess, token: string): Promise<JupyterInfo | null> {
+  // We already know the URL (Node chose `port`); Jupyter's first banner line is only a
+  // readiness signal — the moment it prints one the server is coming up.
+  private _await(proc: ChildProcess, token: string, port: number): Promise<JupyterInfo | null> {
     return new Promise((resolve) => {
       this.server = proc
+      const url = `http://127.0.0.1:${port}`
       let resolved = false
       const done = (val: JupyterInfo | null) => {
         if (resolved) return
@@ -178,15 +208,13 @@ export class JupyterManager {
       const onData = (data: Buffer) => {
         const text = data.toString()
         process.stderr.write('[jupyter] ' + text)
-        const m = text.match(/https?:\/\/[^:]+:(\d+)/)
-        if (!m) return
+        if (!/https?:\/\//.test(text)) return   // wait for any startup URL line = "up"
         proc.stdout?.off('data', onData)
         proc.stderr?.off('data', onData)
-        const url = `http://127.0.0.1:${m[1]}`
         // The banner is logged just BEFORE tornado's IOLoop starts accepting, so a
-        // fetch fired the instant we parse it can hit ECONNREFUSED. Poll /api/status
+        // fetch fired the instant we see it can hit ECONNREFUSED. Poll /api/status
         // until the server truly answers, then resolve — every caller gets a server
-        // that's actually reachable.
+        // that's actually reachable, at the port we chose (not the banner's echoed :0).
         void waitReachable(url, token).then(() => done({ url, token }))
       }
       proc.stdout?.on('data', onData)
