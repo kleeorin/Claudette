@@ -1,5 +1,6 @@
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, symlinkSync, rmSync,
+  lstatSync, copyFileSync, chmodSync,
 } from 'fs'
 import { homedir } from 'os'
 import path from 'path'
@@ -141,6 +142,27 @@ function writeScrubbedSettings(src: string, dest: string): void {
   writeFileSync(dest, text, 'utf8')
 }
 
+// Before the mirror is wiped, salvage a credentials file that a token refresh turned into
+// a REAL file here (an atomic-rename write breaks the symlink, so the fresh token lives in
+// the mirror rather than the shared dir). Copy it back to the real config dir so the
+// refresh survives the rebuild. Only .credentials.json is reconciled: nothing else writes
+// the real creds during a host-mode run, so copying back is always a strict improvement.
+// .claude.json is deliberately NOT reconciled — the app writes trust/prefs straight to the
+// real file, and clobbering it with a session's mirror copy could lose those edits.
+function reconcileCredsBack(mirror: string, real: string): void {
+  const name = '.credentials.json'
+  try {
+    const m = path.join(mirror, name)
+    // An intact symlink means no refresh happened; only a real file is a salvaged token.
+    if (!existsSync(m) || lstatSync(m).isSymbolicLink()) return
+    const dest = path.join(real, name)
+    copyFileSync(m, dest)
+    chmodSync(dest, 0o600)   // creds are 0600; keep it that way even if dest was freshly created
+  } catch (e) {
+    console.warn(`[sandbox] could not reconcile ${name} back to the config dir (${errMessage(e)}); a refreshed token may be lost`)
+  }
+}
+
 // Build (fresh each call) a mirror of the user config dir for a host-mode session:
 // every entry symlinked back to the real dir so creds/history/.claude.json stay SHARED,
 // except settings.json / settings.local.json, which become scrubbed real copies. Point
@@ -153,10 +175,17 @@ function writeScrubbedSettings(src: string, dest: string): void {
 // session run against an exposed config. Directory state (projects/, todos/, history)
 // is symlinked at the dir level, so files created within persist normally. This only
 // affects the opt-in host-mode-vs-exposed-config path; every other launch is untouched.
+//
+// For CREDENTIALS specifically that caveat manifested as "Not logged in": an OAuth token
+// refresh atomic-renames a real .credentials.json into the mirror, then the NEXT launch's
+// rmSync below deleted it and re-symlinked to a now-stale real file — so sessions reverted
+// to an expired token and could never self-heal. reconcileCredsBack (called before the
+// wipe) salvages a refreshed creds file back to the shared dir so refreshes persist.
 export function scrubbedHostConfigDir(): string | null {
   const real = path.resolve(claudeConfigDir())
   const mirror = path.join(dataDir(), 'host-scrubbed-config')
   try {
+    if (existsSync(mirror)) reconcileCredsBack(mirror, real)
     rmSync(mirror, { recursive: true, force: true })
     mkdirSync(mirror, { recursive: true })
     const scrubbed = new Set(['settings.json', 'settings.local.json'])
