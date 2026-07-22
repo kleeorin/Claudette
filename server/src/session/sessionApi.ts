@@ -7,9 +7,10 @@ import type {
   SetAgentRequest, RenameSessionRequest, ListAgentsResponse,
   PermissionsResponse, EditRuleRequest, WriteResult,
   RewindPointsResponse, RewindPreviewResponse, RewindRequest, RewindResponse,
-  TaskRecord,
+  TaskRecord, TrustQueryResponse, TrustFolderRequest,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
+import { isTrusted, setTrusted } from '../claude/trust'
 import { listAgents } from '../claude/agents'
 import { getEffective, addRule, removeRule } from '../claude/permissions'
 import { listConversations, readConversation, listRewindPoints, forkConversationBefore } from '../claude/conversations'
@@ -79,6 +80,20 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     '/api/session/setSandbox', async (req): Promise<OkResponse> => ({
       ok: sessions.setSandbox(req.body.id, req.body.sandbox, /* trusted */ true),
     }))
+
+  // Workspace trust (see claude/trust.ts). A folder whose .claude/settings.local.json
+  // grants permissions is honoured only once trusted; the New Session dialog checks this
+  // and prompts before creating. Both routes are auth-gated → the operator.
+  app.get<{ Querystring: { cwd?: string } }>(
+    '/api/session/trust', async (req): Promise<TrustQueryResponse> => ({
+      trusted: typeof req.query.cwd === 'string' ? isTrusted(req.query.cwd) : false,
+    }))
+
+  app.post<{ Body: TrustFolderRequest }>(
+    '/api/session/trust', async (req): Promise<OkResponse> => {
+      if (req.body?.cwd) setTrusted(req.body.cwd)
+      return { ok: true }
+    })
 
   app.get('/api/session/list', async (): Promise<ListSessionsResponse> => ({
     sessions: sessions.list(),

@@ -918,6 +918,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [browsing, setBrowsing] = useState(false)
+  const [pendingTrust, setPendingTrust] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -927,18 +928,39 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  const submit = async () => {
-    if (busy) return
-    if (!cwd.trim()) { setErr('Working directory is required.'); return }
-    setBusy(true); setErr(null)
+  // The actual session creation, once the cwd is known-trusted. Assumes busy is set.
+  const doCreate = async (dir: string) => {
     try {
-      await create(name.trim() || basename(cwd.trim()) || 'session', cwd.trim(), { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, cwd.trim()) })
+      await create(name.trim() || basename(dir) || 'session', dir, { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, dir) })
       ;(onCreated ?? onClose)()
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Failed to create session.')
       setBusy(false)
+      setPendingTrust(false)
     }
   }
+
+  const submit = async () => {
+    if (busy) return
+    const dir = cwd.trim()
+    if (!dir) { setErr('Working directory is required.'); return }
+    setBusy(true); setErr(null)
+    // Mirror Claude's native trust gate: an untrusted folder has its .claude/settings.local
+    // permissions ignored. Ask before creating; fail-open if the check itself errors so a
+    // transient failure never blocks session creation.
+    let trusted = true
+    try { trusted = await api.http.checkTrust(dir) } catch { /* fail-open */ }
+    if (!trusted) { setPendingTrust(true); return }   // busy stays set; the trust modal drives the next step
+    await doCreate(dir)
+  }
+
+  const confirmTrust = async () => {
+    setPendingTrust(false)
+    const dir = cwd.trim()
+    try { await api.http.trustFolder(dir) } catch { /* proceed anyway; worst case the warning persists */ }
+    await doCreate(dir)
+  }
+  const cancelTrust = () => { setPendingTrust(false); setBusy(false) }
   const onEnter = (e: React.KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }
 
   return createPortal(
@@ -979,6 +1001,23 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
       </div>
       {browsing && (
         <FileBrowser mode="folder" initialPath={cwd.trim() || homeDir} onPick={(path) => { setCwd(path); setBrowsing(false) }} onClose={() => setBrowsing(false)} />
+      )}
+      {pendingTrust && (
+        <ConfirmDialog
+          title="Trust this folder?"
+          body={
+            <>
+              You haven’t trusted <span className="font-mono text-ctp-text">{prettyPath(cwd.trim())}</span> yet.
+              Trusting it lets its <span className="font-mono">.claude/settings.local.json</span> grant tool
+              permissions to sessions running here. Until then, Claude ignores those permission entries.
+              Only trust folders whose contents you recognise.
+            </>
+          }
+          confirmLabel="Trust folder"
+          cancelLabel="Cancel"
+          onConfirm={confirmTrust}
+          onCancel={cancelTrust}
+        />
       )}
     </div>,
     document.body,

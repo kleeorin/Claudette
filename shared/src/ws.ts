@@ -130,6 +130,11 @@ export interface ListSessionsResponse { sessions: SessionInfo[] }
 export interface SessionIdRequest { id: string }
 export interface OkResponse { ok: boolean }
 
+// GET /api/session/trust?cwd=… → is this working dir trusted (its .claude/settings.local
+// permissions honoured)?  POST /api/session/trust { cwd } → mark it trusted.
+export interface TrustQueryResponse { trusted: boolean }
+export interface TrustFolderRequest { cwd: string }
+
 // POST /api/session/setMode { id, mode } → SetModeResult
 export interface SetModeRequest { id: string; mode: PermissionMode }
 export type { SetModeResult }
