@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import type { FilePreview } from '@claudette/shared'
 import { CodeEditor } from './CodeEditor'
 import { MilkdownEditor } from './MilkdownEditor'
+import { CsvTableView } from './CsvTableView'
 import { basename } from '../lib/paths'
 
 // A file-editor tab: fetches the file and dispatches by kind — Milkdown (WYSIWYG)
@@ -14,6 +15,7 @@ interface Props {
 }
 
 const isMarkdown = (p: string) => /\.(md|markdown|mdx)$/i.test(p)
+const isCsv = (p: string) => /\.(csv|tsv)$/i.test(p)
 
 export function FileEditorView({ path }: Props) {
   const [preview, setPreview] = useState<FilePreview | null>(null)
@@ -126,6 +128,8 @@ export function FileEditorView({ path }: Props) {
           <div className="h-full flex items-center justify-center text-xs text-ctp-red px-4 text-center">{preview.message}</div>
         ) : isMarkdown(path) && editable ? (
           <MilkdownEditor key={path} initialDoc={preview.text} readOnly={false} onChange={onChange} />
+        ) : isCsv(path) ? (
+          <CsvTableView key={path} initialText={preview.text} filename={name} readOnly={!editable} onChange={onChange} />
         ) : (
           <CodeEditor
             key={path}

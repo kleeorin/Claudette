@@ -95,3 +95,31 @@ code, pre {
   --crepe-font-code: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .milkdown-host .milkdown .ProseMirror { outline: none; }
+
+/* react-data-grid (CSV table view). The library themes via --rdg-* custom
+   properties; we remap them to the app's ctp palette so the grid, its header,
+   selection and hover states match the rest of Claudette. */
+.claudette-rdg .rdg {
+  --rdg-color: #e7e8ea;                          /* ctp-text */
+  --rdg-background-color: #17181c;               /* ctp-base */
+  --rdg-header-background-color: #1d1e23;        /* ctp-mantle */
+  --rdg-row-hover-background-color: #1e1f24;
+  --rdg-row-selected-background-color: rgba(224, 138, 95, 0.16);
+  --rdg-row-selected-hover-background-color: rgba(224, 138, 95, 0.22);
+  --rdg-border-color: #24262c;                   /* ctp-surface0 */
+  --rdg-summary-border-color: #31343b;           /* ctp-surface1 */
+  --rdg-selection-color: #e08a5f;                /* coral accent */
+  --rdg-font-size: 12px;
+  block-size: 100%;
+  border: none;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.claudette-rdg .rdg-row-index {
+  background-color: #1d1e23;                      /* ctp-mantle — frozen index col */
+  text-align: right;
+  user-select: none;
+}
+.claudette-rdg .rdg input {
+  color: #e7e8ea;
+  background-color: #17181c;
+}
