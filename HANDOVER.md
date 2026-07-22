@@ -1,5 +1,160 @@
 # Claudette — Handover
-_Last updated: 2026-07-18_
+_Last updated: 2026-07-22_
+
+## 2026-07-22 (later) — FIX: "/clear sometimes does nothing, had to do it twice" ✅ UNCOMMITTED (web-only)
+**Bug:** `/clear` empties the transcript — which is EXACTLY the auto-resume trigger. For a RESTORED
+session, an auto-resume started on mount could still be **in-flight** (fetching its latest conversation)
+when you `/clear`; it then completes its `await` and reloads the old conversation **over** the clear, so
+`/clear` looks like it did nothing. The second `/clear` worked because the first attempt's auto-resume
+had finished (session now in `autoResumed`), so nothing re-pulled. (Created/"fresh" sessions were never
+affected — `isFresh` is permanent, so their auto-resume never runs.)
+- **Fix (`web/src/components/ChatView.tsx`):** a module-level `resumeAborted` Set. `/clear`, `/resume`
+  (pickResume) and `/rewind` (pickRewind) add the session to it (and to `autoResumed`); the auto-resume
+  async now **fetches before mutating** and re-checks `resumeAborted` after each `await`, bailing rather
+  than clobbering the user's action. Also blocks the future-effect-refire path.
+- **Verified:** `scratchpad/clear-race-test.mjs` (4/4 — REAL headless Chrome; the proxy DELAYS
+  readConversation so `/clear` lands mid-fetch; asserts the old conversation does NOT come back).
+  Confirmed the test genuinely catches it: neutering the abort check makes the marker reappear (3/4).
+  Web bundle rebuilt → live on `:4319` after reload.
+
+## 2026-07-22 (later) — Active-pane awareness for CODE files ("edit this file") — BUILT + VERIFIED ✅ UNCOMMITTED, needs server restart
+**Ask:** "Claude doesn't know what the active-pane code file is" — so "edit this file" / "the current
+file" had Claude guessing a path. Notebooks already had path-less MCP steering; native Edit/Write need
+an absolute path, so code files had nothing. **Fix:** append an ambient `<editor-context>` block naming
+the open code file to the user turn **sent to the CLI**, so Claude can resolve "this file" to it.
+- **New:** `server/src/claude/editorContext.ts` — `buildEditorContext(path)` (the block) +
+  `stripEditorContext(text)` (removes it on read-back).
+- **`sessionManager.ts`:** new `SessionManagerOpts.activePane(sid)` resolver; `sendUserTurn` sends the
+  engine `text + buildEditorContext(pane.path)` ONLY when the active pane is a **code file**
+  (`!isNotebook`). The buffer, the `userTurn` broadcast, and the pre-turn snapshot all keep the **raw**
+  text — so the block never shows in the live UI and never perturbs `/rewind` keying.
+- **`index.ts`:** wires `activePane: (sid) => activePanes.get(sid) ?? null` (the registry the web client
+  already publishes on tab/session switch).
+- **`conversations.ts`:** strips the block on every persisted read-back — `contentText` (titles + the
+  isNoise check), `readConversation` (resume-replay bubble), `listRewindPoints` (point text, so it
+  still equals the pre-turn snapshot's `text`). Live path was already clean (`buffer()` drops the CLI's
+  user-prompt echo; live user events aren't re-rendered client-side).
+- **Verified:** `scratchpad/editor-context-test.mts` (13/13 — strip round-trip; resume/title/rewind
+  read-backs clean; rewind text still matches; **stubbed-engine sendUserTurn**: engine gets text+context
+  for a code file, broadcast stays clean, notebook/no-pane → NO injection). Typecheck clean (all 3).
+- ⚠ **SERVER change → needs a server RESTART to go live** (the running server is `tsx src/index.ts`,
+  no watch). Web is unaffected.
+
+## 2026-07-22 (later) — Cursor-style inline diff review ("super editor") — BUILT + VERIFIED ✅ UNCOMMITTED
+Implemented the design below. Claude's pending **Edit/MultiEdit/Write** for a (non-notebook)
+file **auto-opens that file's tab** in the calling session and renders the change as an inline
+**+/- diff INSIDE the file's own CodeMirror editor** (`@codemirror/merge` `unifiedMergeView`)
+with **per-hunk Accept/Reject** controls. A review bar adds **Apply accepted** / **Reject all**.
+Only the hunks the user keeps land on disk — the flow rides the mandatory permission checkpoint;
+**no server changes** (piggybacks `session:permission`, exactly as the design predicted).
+- **New:** `web/src/lib/proposals.ts` (apply tool input → proposed text; reconstruct the permission
+  decision from the accepted result), `web/src/components/DiffEditor.tsx` (the unified-merge view).
+- **Changed:** `web/src/components/FileEditorView.tsx` (takes `sessionId`; flips to review mode when
+  a matching pending permission exists — reads fresh disk as the diff base; **block-while-dirty** →
+  save first), `web/src/App.tsx` (auto-open+focus the target file tab on an edit permission; passes
+  `sessionId`). Added dep `@codemirror/merge@^6.12.2`.
+- **Reconstruction trick (the correctness core):** since the diff base is the *exact current disk
+  text*, ANY subset of accepted hunks maps to a single whole-file replacement — Edit → `{old_string:
+  disk, new_string: acceptedResult}`, MultiEdit → one such edit, Write → `content: result`. Always a
+  valid, unique match; no per-hunk bookkeeping. All-rejected (result===base) → `deny`.
+- **Fallbacks:** an un-applyable edit (a match went missing) or a dirty buffer keeps the plain
+  chat permission card working — both UIs answer the SAME `pending`, so resolving either clears both.
+  Markdown/CSV edits render the raw-source diff (not Milkdown/table) during review. `.ipynb` never
+  reaches this (NOTEBOOK_DENY). bypass/acceptEdits modes auto-allow before it engages — correct.
+- **Live-apply fix (2026-07-22, after first report):** applying/allowing now (a) resolves the chat
+  permission and (b) updates the editor **live** — `FileEditorView` optimistically swaps to the
+  accepted text on its own Apply, and a disk-reconcile effect (`reviewedRef`/`handledRef` + brief
+  poll) reflects a chat-card Allow/Deny too. Before this, the view stayed on the stale load after the
+  edit landed on disk. Editor `key` now carries a `reloadKey` so it remounts with fresh bytes.
+- **Auto-commit fix (2026-07-22, after second report):** CodeMirror's own per-hunk ✓/✗ only STAGE a
+  hunk in the doc — they don't answer the permission, so the chat card persisted. Now `DiffEditor`
+  watches `getChunks(state)`; when every hunk has been decided (count → 0) it fires `onAllResolved`,
+  which commits the decision (reconstructed from the resulting doc) — so acting on the last hunk in
+  the editor RELEASES the permission everywhere. Rejecting all hunks → doc === base → auto-**deny**.
+  (The explicit **Apply accepted** button still commits with undecided hunks treated as accepted.)
+  NB: CM binds the control to `onmousedown`, not click — matters for tests.
+- **Auto-open toggle (2026-07-22):** a sidebar-header button (pencil icon, by the sound/bell toggles;
+  `EditPopupToggle` in `App.tsx`, persisted `localStorage 'claudette.autoOpenEdits'`, default ON) gates
+  whether a **closed** file's edit pops its editor open. OFF → a closed file's edit stays in the chat
+  permission card (no popup). An **already-open** file ALWAYS shows its inline diff regardless (the
+  permission auto-open effect focuses an open tab, but only opens a closed one when the toggle is on —
+  read via `autoOpenEditsRef`). FileEditorView renders the diff purely off the pending permission, so
+  the toggle only affects tab-popping, never whether an open file shows edits.
+- **Verified:** `scratchpad/proposals-test.mts` (21/21 — apply + reconstruct + disk round-trip) and
+  `scratchpad/super-editor-test.mjs` (19/19 — REAL headless Chrome: file auto-opens, inline diff +
+  merge controls render, **the CM per-hunk ✓ auto-resolves** the chat permission + updates the editor
+  live, disk is correct, chat-card **Allow** reloads the editor live, **Reject all** sends DENY).
+- ⚠ **Sandbox note (this session):** the running server was restarted with the hardened sandbox, so
+  in THIS agent session `web/dist`, `node_modules`, `server/`, `shared/` are **read-only** (only
+  `web/src`, `scratchpad`, `.claude` writable). I therefore **could not rebuild `web/dist`** to make
+  `:4319` live, and the e2e now builds to a temp dir + serves it via a thin proxy to the backend.
+  To go live: rebuild `web/dist` from a NORMAL (non-sandboxed) shell — `npm run build -w
+  @claudette/web` — or just use dev `:5273` (Vite hot-reload). All source changes are saved in `web/src`.
+
+## 2026-07-22 — Cursor-style inline diff review ("editor +/-") — DESIGNED, NOT BUILT 🟡 (superseded — now BUILT, see above)
+**Goal:** Claude proposes a code change that renders as inline **+/- hunks INSIDE the file's
+own CodeMirror editor** (not a separate panel/tab), and the user **accepts/declines per hunk**;
+only accepted hunks land on disk. This entry is a *design* checkpoint — **no code written yet**.
+The design was worked out this session; the key finding is that Claudette is already wired for it.
+
+**Why it fits (the crucial mechanism — verify line #s with grep, captured 2026-07-22):**
+- The embedded CLI runs with `--permission-prompt-tool stdio` (`server/src/claude/claudeEngine.ts`
+  ~line 37), so **every** `Edit`/`Write`/`MultiEdit` routes to `handlePermission`
+  (`claudeEngine.ts` ~338) **before touching disk**, and the CLI **blocks** until Claudette responds.
+- `PermissionDecision` already supports `{ behavior:'allow'; updatedInput?: Record<string,unknown> }`
+  (`shared/src/types.ts:121`), and `handlePermission` returns `updatedInput: decision.updatedInput
+  ?? req.input` (`claudeEngine.ts` ~388). **So returning a MODIFIED input makes the CLI write YOUR
+  version.** Partial-accept = reconstruct `new_string` from the accepted hunks and hand it back as
+  `updatedInput`. Reject-all = `{ behavior:'deny' }`.
+- The decision channel is **already wired end-to-end and already carries `updatedInput`**:
+  server→web WS `session:permission` (`sessionApi.ts:30` broadcast → web `client.ts:93`);
+  web→server `api.respondPermission(id, requestId, decision)` sends WS `session:permission`
+  (`client.ts:205`) → `sessionApi.ts:222` → `sessionManager.respondPermission` (~532) →
+  `engine.respondPermission` (~235). **⇒ partial-apply needs NO new server plumbing** — piggyback
+  the existing permission request (it already carries `toolName` + `input`) and just enrich the UI
+  + build the decision's `updatedInput` from accepted hunks. (New WS messages are optional polish.)
+
+**Frontend enabler:** `@codemirror/merge`'s `unifiedMergeView` renders inline green `+`/red `−`
+hunks **with per-chunk Accept/Reject buttons in the same editor**. NOT yet a dependency (we're
+already on CodeMirror 6). Plugs into `web/src/components/CodeEditor.tsx` (its extensions list). To
+show a proposal: set the editor doc = **proposed** text and pass `original:` = **base** (disk/buffer) text.
+
+**Per-tool mapping:** MultiEdit = cleanest (each `edits[]` entry is a hunk → keep/drop in the
+`updatedInput` array). Edit = one `old_string→new_string` → split into sub-hunks with a line diff
+(add the `diff` npm pkg). Write = whole-file diff (disk vs `content`).
+
+**Token cost:** ~zero — rides the mandatory permission checkpoint; no new MCP tools/schemas.
+
+**Caveats / decisions:**
+- **Unsaved buffer:** a proposal diffs vs **disk**, not the live CodeMirror buffer (there's no
+  server-side live text-doc for code files — same gap flagged for the "live-editor MCP" idea).
+  v1: **block-while-dirty** (or diff vs the buffer text).
+- **File not open:** auto-open+focus it to show the diff (reuse the notebook `onFocus`/active-pane
+  pattern; `App.tsx:257` already publishes `activePane` for code files with `isNotebook:false`).
+- **bypassPermissions / acceptEdits modes auto-allow without prompting** (`claudeEngine.ts` bypass
+  branch ~371) → the review flow only engages in **default/prompting** mode. Correct/expected.
+- **Multi-file change = a SEQUENCE of gated Edit calls**, reviewed one file at a time in v1
+  (Cursor batches into one review — a later refinement).
+- `.ipynb` native edits are already denied + funnelled to the notebook MCP (`NOTEBOOK_DENY`,
+  `claudeEngine.ts:75`), so this is for **non-notebook files only** — fine.
+
+**Scoped v1:** MultiEdit + Edit · single-file · prompting-mode only · block-while-dirty · `@codemirror/merge` UI.
+
+**Next steps (ordered):**
+1. Add `@codemirror/merge`; wire `unifiedMergeView` into `CodeEditor` so a passed-in `{base, proposed}`
+   renders inline +/- with accept/reject (**UI-first, with mock data** so you see it in-editor).
+2. Server: add a line-diff util + hunk→`new_string` reconstruction (add `diff`). In `handlePermission`,
+   for `Edit`/`MultiEdit`, surface the tool input to the web as a proposal — reusing `session:permission`
+   is enough (web detects `toolName ∈ {Edit,Write,MultiEdit}` and renders the diff UI instead of the plain card).
+3. Web: on Apply, build `updatedInput` (Edit → reconstructed `new_string`; MultiEdit → filtered `edits[]`)
+   and call `api.respondPermission(id, requestId, {behavior:'allow', updatedInput})`; reject-all → `deny`.
+4. Handle file-not-open (auto-focus) + block-while-dirty.
+5. Later: `Write`, multi-file batching, diff-vs-buffer.
+
+**Repo state (this session, on `master`, ahead of `origin/master`, UNPUSHED):** committed —
+CSV editable table view `c91af3d`, OAuth-creds reconcile fix `e6fa8cc`, workspace-trust gate
+`1471258`. Untracked throwaway scratch `_sbx_{fix,probe,probe2,run,test}.mts` left in the tree
+(unrelated; safe to delete). Nothing for the editor +/- feature exists yet.
 
 ## 2026-07-18 (latest) — ALL KNOWN SANDBOX ESCAPES CLOSED (code) ✅ UNCOMMITTED, needs restart
 Implemented fixes for every documented escape vector. All typecheck clean; verified by

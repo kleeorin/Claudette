@@ -18,6 +18,10 @@ import type { UsageWindow } from '@claudette/shared'
 // Resets on a full page reload (module re-eval), which is exactly when we DO want
 // to resume again. Module-level so it survives ChatView remounts.
 const autoResumed = new Set<string>()
+// Sessions whose conversation was explicitly reset (/clear) or re-pointed (/resume,
+// /rewind) — an in-flight auto-resume for one of these must abort rather than reload
+// the old conversation over the user's action.
+const resumeAborted = new Set<string>()
 
 // Dismissed agent-tray cards, keyed by session id, kept OUTSIDE the component so it
 // survives ChatView unmounting on a session switch (App keys ChatView by session id).
@@ -207,9 +211,14 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       try {
         const list = await api.http.listConversations(cwd)
         const latest = list[0]
-        if (!latest) return
+        if (!latest || resumeAborted.has(sessionId)) return
+        // Fetch BEFORE mutating, and re-check the abort flag after each await: a
+        // /clear|/resume|/rewind may fire while we're fetching, and this in-flight
+        // pull must not clobber it (the "/clear did nothing" race).
+        const events = await api.http.readConversation(cwd, latest.id)
+        if (resumeAborted.has(sessionId)) return
         clearTranscript(sessionId)
-        loadTranscript(sessionId, await api.http.readConversation(cwd, latest.id))
+        loadTranscript(sessionId, events)
         await api.http.resumeInto(sessionId, latest.id)
       } catch { /* best-effort; the user can still /resume manually */ }
     })()
@@ -230,7 +239,10 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // conversation + wipes the transcript; /resume opens the conversation picker;
   // /rewind opens the turn picker (fork the transcript to an earlier point).
   const handleSlash = (t: string): boolean => {
-    if (t === '/clear') { clearTranscript(sessionId); void api.http.restartFresh(sessionId); return true }
+    // Mark as auto-resumed FIRST: emptying the transcript below is exactly the
+    // auto-resume trigger, so without this the once-per-load effect would race in and
+    // re-pull the old conversation — the "/clear did nothing, had to do it twice" bug.
+    if (t === '/clear') { autoResumed.add(sessionId); resumeAborted.add(sessionId); clearTranscript(sessionId); void api.http.restartFresh(sessionId); return true }
     if (t === '/resume') { setShowResume(true); return true }
     if (t === '/rewind') { setShowRewind(true); return true }
     return false
@@ -252,6 +264,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const pickResume = async (meta: ConversationMeta) => {
     setShowResume(false)
     if (!session) return
+    autoResumed.add(sessionId); resumeAborted.add(sessionId)   // explicit pick — supersede any in-flight auto-resume
     clearTranscript(sessionId)
     loadTranscript(sessionId, await api.http.readConversation(session.cwd, meta.id))
     await api.http.resumeInto(sessionId, meta.id)
@@ -267,6 +280,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
     const res = await api.http.rewind(sessionId, point.uuid, mode, deleteNewer)
     if (!res.ok) return   // point vanished or restore failed — leave the pane as-is
     if (res.newId) {
+      autoResumed.add(sessionId); resumeAborted.add(sessionId)   // explicit rewind — supersede any in-flight auto-resume
       clearTranscript(sessionId)
       loadTranscript(sessionId, await api.http.readConversation(session.cwd, res.newId))
     }
