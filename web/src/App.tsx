@@ -16,6 +16,7 @@ import { FileBrowser } from './components/FileBrowser'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { AuthGate } from './components/AuthGate'
 import { api } from './api/client'
+import { isEditTool, filePathOf, isNotebookPath } from './lib/proposals'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
 import { basename, prettyPath } from './lib/paths'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
@@ -87,6 +88,20 @@ function Shell() {
 
   // Background-session signals: sound (default on) + optional desktop notifications.
   const notif = useNotifications(sessions, activeId, setActive)
+
+  // Auto-open a file's editor to show Claude's proposed edit when the file is closed
+  // (default on). An already-open file always shows its diff regardless — this only
+  // gates popping a new tab for a closed one. Persisted; read via a ref in the
+  // permission effect (subscribed once).
+  const [autoOpenEdits, setAutoOpenEdits] = useState(() => {
+    try { return localStorage.getItem('claudette.autoOpenEdits') !== '0' } catch { return true }
+  })
+  const autoOpenEditsRef = useRef(autoOpenEdits); autoOpenEditsRef.current = autoOpenEdits
+  const toggleAutoOpenEdits = () => setAutoOpenEdits((v) => {
+    const n = !v
+    try { localStorage.setItem('claudette.autoOpenEdits', n ? '1' : '0') } catch { /* private mode */ }
+    return n
+  })
 
   // Content panes per session — switching sessions swaps the whole tab set + focus.
   // Hydrate FILE tabs synchronously from the saved layout; notebook tabs are reopened
@@ -283,6 +298,28 @@ function Shell() {
     })
   }, [])
 
+  // Claude asked to Edit/MultiEdit/Write a (non-notebook) file: surface its inline +/-
+  // diff for review. If the file is ALREADY open in the calling session, we focus that
+  // tab so the diff shows. If it's CLOSED, we only auto-open it when "auto-open edits"
+  // is on (autoOpenEditsRef) — otherwise it's left to the chat permission card, so
+  // background edits don't keep popping editor tabs. FileEditorView reads the same
+  // pending permission and renders the diff either way.
+  useEffect(() => {
+    return api.on.permission((sid, req) => {
+      if (!isEditTool(req.toolName)) return
+      const fp = filePathOf(req.input)
+      if (!fp || isNotebookPath(fp)) return
+      const tab: Content = { kind: 'file', path: fp }
+      setBySession((prev) => {
+        const p = prev[sid] ?? EMPTY_PANE
+        const isOpen = p.tabs.some((t) => t.kind === 'file' && t.path === fp)
+        if (!isOpen && !autoOpenEditsRef.current) return prev  // closed + toggle off → chat card only
+        const tabs = isOpen ? p.tabs : [...p.tabs, tab]
+        return { ...prev, [sid]: { tabs, active: tab } }
+      })
+    })
+  }, [])
+
   const addTerm = (cwd: string) => {
     if (!activeId) return
     const key = `t${++termSeq.current}`   // globally unique across sessions
@@ -443,12 +480,12 @@ function Shell() {
   const contentNode = active?.kind === 'notebook'
     ? <NotebookView key={active.id} notebookId={active.id} />
     : active?.kind === 'file'
-      ? <FileEditorView key={active.path} path={active.path} />
+      ? <FileEditorView key={active.path} path={active.path} sessionId={activeId ?? undefined} />
       : null
 
   return (
     <div className="flex h-full bg-ctp-base overflow-hidden">
-      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} />
+      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} />
       <div
         {...dividerProps({ axis: 'x', get: () => sidebarW, set: setSidebarW, sign: 1, min: 200, max: () => 560 })}
         title="Drag to resize"
@@ -761,6 +798,30 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
 
 // Completion-sound toggle (on by default; no permission needed). A background
 // session finishing / needing input chimes unless muted here.
+// Toggle: auto-open a file's editor to show Claude's proposed edit when the file is
+// CLOSED. Off → a closed file's edit stays in the chat permission card (no popup);
+// an already-open file always shows its inline diff regardless.
+function EditPopupToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      title={on
+        ? 'Auto-open the editor to review Claude\'s edits — click to stop popping tabs for closed files'
+        : 'Not auto-opening editors for edits — closed files stay in the chat prompt; click to auto-open'}
+      aria-label={on ? 'Disable auto-open editor for edits' : 'Enable auto-open editor for edits'}
+      aria-pressed={on}
+      className={`w-6 h-6 flex items-center justify-center rounded transition-colors hover:bg-ctp-surface0 ${on ? 'text-ctp-accent' : 'text-ctp-overlay hover:text-ctp-subtext'}`}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        {/* pencil (edit) */}
+        <path d="M12 20h9" />
+        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+        {!on && <path d="M2 2l20 20" />}
+      </svg>
+    </button>
+  )
+}
+
 function SoundToggle({ notif }: { notif: NotificationsApi }) {
   const on = notif.soundOn
   return (
@@ -833,7 +894,7 @@ function Empty() {
   )
 }
 
-function Sidebar({ open, onClose, width, notif }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi }) {
+function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void }) {
   const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
   const { transcriptFor, tasksFor } = useChat()   // per-session running-agent count for the row badge
   const [showNew, setShowNew] = useState(false)
@@ -853,6 +914,7 @@ function Sidebar({ open, onClose, width, notif }: { open: boolean; onClose: () =
           <Mark className="w-5 h-5 text-ctp-accent" />
           <span className="text-sm font-semibold tracking-tight text-ctp-text">Claudette</span>
           <div className="ml-auto flex items-center gap-1">
+            <EditPopupToggle on={autoOpenEdits} onToggle={onToggleAutoOpenEdits} />
             <SoundToggle notif={notif} />
             <NotifyBell notif={notif} />
             <span className={`ml-1 inline-flex items-center gap-1.5 text-[10px] ${connected ? 'text-ctp-green' : 'text-ctp-red'}`} title={connected ? 'Connected to server' : 'Disconnected'}>
