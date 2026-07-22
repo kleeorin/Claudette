@@ -321,12 +321,17 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
     { path: path.join(cwd, '.claude'), mode: 'rw' },   // local .claude (skipped below if absent)
   ]
   // User mounts as-is. cwd is NO LONGER force-added, so it's fully optional — rw (the
-  // default a new session seeds), ro, or removed. De-dupe by path (last wins).
+  // default a new session seeds), ro, or removed. De-dupe baseline+user TOGETHER by path
+  // (rw wins over ro for the same folder, see dedupeMounts): this keeps the obligatory
+  // rw config dirs writable even if the user also lists them ro, and — crucially — makes
+  // the emitted box identical to what sessionDataMounts()/sandboxPathAccess() authorize
+  // (that path also dedupes baseline+user together), so the out-of-band authorizer never
+  // diverges from the real mount set.
   // Layer 1: make the user-scope settings.json a real `{}` when absent so the ro-bind
   // below actually pins it (closes create-after-launch for ~/.claude). Must run BEFORE
   // hookSettingsProtections, which only ro-binds files that exist.
   ensureUserSettingsPinnable()
-  const args = bwrapBaseArgs(cwd, [...baseline, ...dedupeMounts(cfg.mounts), ...hookSettingsProtections(cwd)])
+  const args = bwrapBaseArgs(cwd, [...dedupeMounts([...baseline, ...cfg.mounts]), ...hookSettingsProtections(cwd)])
 
   // Claude's main config lives at $HOME/.claude.json — a FILE next to the config
   // dir, NOT inside it. We can't bind that file directly (it's saved via write-tmp
@@ -560,13 +565,21 @@ export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
 
 // --- helpers -----------------------------------------------------------------
 
-// De-dupe mounts by path, later entries winning (so an explicit rw cwd overrides a
-// broader ro of the same path). Preserves the winning entry's mode.
+// De-dupe mounts by path. When the SAME path is mounted more than once, the MORE
+// PERMISSIVE mode wins — rw beats ro — regardless of list order, so a folder mounted
+// both read-only and read-write ends up WRITABLE (a union over the request). This is a
+// deliberate "most-permissive" rule, NOT positional: adding an ro then an rw mount of
+// one folder (or the reverse) always yields rw, so the box behaves the same however the
+// mounts accumulate across a session. It reconciles only entries in THIS list; the
+// security ro overlays (appSourceProtections / hookSettingsProtections) are applied
+// separately at emission and are NOT weakened by this — they still layer ro on top of
+// the broader rw bind (bwrap's deeper/later bind wins there).
 function dedupeMounts(mounts: SandboxMount[]): SandboxMount[] {
   const byPath = new Map<string, SandboxMount>()
   for (const m of mounts) {
     const p = path.resolve(m.path)
-    byPath.set(p, { path: p, mode: m.mode })
+    const mode: SandboxMount['mode'] = byPath.get(p)?.mode === 'rw' || m.mode === 'rw' ? 'rw' : 'ro'
+    byPath.set(p, { path: p, mode })
   }
   return [...byPath.values()]
 }
