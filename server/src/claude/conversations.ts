@@ -4,6 +4,7 @@ import { homedir } from 'os'
 import crypto from 'crypto'
 import type { ConversationMeta, ClaudeEvent, RewindPoint } from '@claudette/shared'
 import { snapshottedUuids } from '../git/shadowSnapshots'
+import { stripEditorContext } from './editorContext'
 
 // Claude stores each conversation as a JSONL transcript under
 // ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. The dir name is the absolute
@@ -15,7 +16,9 @@ export function projectDir(cwd: string): string {
 }
 
 function contentText(content: unknown): string {
-  if (typeof content === 'string') return content
+  // Strip any ambient editor-context block we appended before sending to the CLI, so
+  // it never surfaces in titles / resume replay / rewind points (see editorContext.ts).
+  if (typeof content === 'string') return stripEditorContext(content)
   if (Array.isArray(content)) {
     return content.map((b) => (b && typeof b === 'object' && (b as { type?: string }).type === 'text'
       ? String((b as { text?: unknown }).text ?? '') : '')).join('')
@@ -78,13 +81,16 @@ export async function readConversation(cwd: string, id: string): Promise<ClaudeE
     try { o = JSON.parse(line) } catch { continue }
     const t = o.type as string
     if ((t === 'assistant' || t === 'user') && !o.isMeta && !o.isSidechain) {
+      let message = o.message as Record<string, unknown>
       if (t === 'user') {
-        const txt = contentText((o.message as { content?: unknown })?.content)
-        const hasToolResult = Array.isArray((o.message as { content?: unknown })?.content)
-          && ((o.message as { content?: unknown[] }).content!).some((b) => (b as { type?: string })?.type === 'tool_result')
+        const txt = contentText(message?.content)
+        const hasToolResult = Array.isArray(message?.content)
+          && (message.content as unknown[]).some((b) => (b as { type?: string })?.type === 'tool_result')
         if (!hasToolResult && txt.trim() && isNoise(txt)) continue
+        // Drop the appended editor-context block from the replayed prompt bubble.
+        if (typeof message?.content === 'string') message = { ...message, content: stripEditorContext(message.content) }
       }
-      events.push({ type: t, message: (o.message as Record<string, unknown>) } as ClaudeEvent)
+      events.push({ type: t, message } as ClaudeEvent)
     }
   }
   return events
@@ -110,7 +116,9 @@ export async function listRewindPoints(cwd: string, id: string): Promise<RewindP
     const content = (o.message as { content?: unknown })?.content
     if (typeof content !== 'string' || !content.trim() || isNoise(content)) continue
     const ts = typeof o.timestamp === 'string' ? Date.parse(o.timestamp) : NaN
-    points.push({ uuid: o.uuid, text: content.trim(), mtimeMs: Number.isNaN(ts) ? 0 : ts, ordinal: points.length + 1, hasSnapshot: false })
+    // Strip the appended editor-context block so the point text is the user's original
+    // prompt — both for display and so it matches the pre-turn snapshot's `text`.
+    points.push({ uuid: o.uuid, text: stripEditorContext(content).trim(), mtimeMs: Number.isNaN(ts) ? 0 : ts, ordinal: points.length + 1, hasSnapshot: false })
   }
   // Mark which turns have a working-tree snapshot (one batch lookup for the whole list).
   const snapped = await snapshottedUuids(cwd)

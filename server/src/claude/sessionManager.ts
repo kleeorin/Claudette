@@ -14,6 +14,7 @@ import {
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
 import { listRewindPoints } from './conversations'
+import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
 import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir } from './configProtection'
@@ -69,6 +70,10 @@ const TRANSCRIPT_CAP = 4000
 // (the app-control server); undefined skips it.
 export interface SessionManagerOpts {
   mcpConfig?: (sessionId: string) => string | undefined
+  // What the session is currently viewing (its active content tab), so a user turn
+  // can carry ambient "edit this file" context for the open CODE file. Notebooks are
+  // steered separately via the path-less app-control tools, so they're ignored here.
+  activePane?: (sessionId: string) => { path: string; isNotebook: boolean } | null | undefined
 }
 
 export class SessionManager extends EventEmitter {
@@ -424,7 +429,12 @@ export class SessionManager extends EventEmitter {
     const commit = await snapshot(session.cwd).catch(() => null)
     if (commit) session.pendingSnapshot = { commit, text }
     if (!session.engine) return   // engine may have exited during the await
-    session.engine.sendUserTurn(text)
+    // Send the CLI the user's text plus ambient editor context for the open code file
+    // (so "edit this file" resolves) — but ONLY the raw text is buffered/broadcast/
+    // snapshotted above, so the block never shows in the UI or perturbs rewind keying.
+    const pane = this.opts.activePane?.(id)
+    const engineText = pane && !pane.isNotebook ? text + buildEditorContext(pane.path) : text
+    session.engine.sendUserTurn(engineText)
   }
 
   // Key a turn's pending pre-turn snapshot to the uuid of its user message, so a rewind

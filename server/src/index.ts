@@ -79,7 +79,10 @@ registerNotebookTools(mcp, notebooks, kernels, activePanes, turnNotebooks, (sess
   notebooks.cancelClose(doc.notebookId)         // re-focusing a mid-close notebook keeps it open
   hub.broadcast({ type: 'session:focusPane', id: sessionId, notebookId: doc.notebookId, path: doc.path })
 }, confinement)
-const sessions = new SessionManager({ mcpConfig: (sid) => mcp.configFor(sid) })
+const sessions = new SessionManager({
+  mcpConfig: (sid) => mcp.configFor(sid),
+  activePane: (sid) => activePanes.get(sid) ?? null,
+})
 // Terminal panes are confined to their owning session's box (SANDBOX.md
 // "Terminal-pane escape") — through the same `confinement` seam as kernels/notebook tools.
 const panes = new PaneManager(confinement)
