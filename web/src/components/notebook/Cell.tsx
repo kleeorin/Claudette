@@ -175,7 +175,7 @@ export function Cell(props: Props) {
 
   return (
     <div
-      className={`group flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50 bg-ctp-accent/[0.06]' : ''}`}
+      className={`group relative flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50 bg-ctp-accent/[0.06]' : ''}`}
       onMouseDown={onSelect}
       onFocus={onSelect}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
@@ -184,6 +184,12 @@ export function Cell(props: Props) {
         if (!Number.isNaN(from)) { e.preventDefault(); onReorder(from) }
       }}
     >
+      {/* Faint 0-based cell index in the top-right — the same number the MCP tools
+          (and Claude) use to address this cell. Fades out on hover to hand the
+          corner over to the ⋯ actions button, which lives in the same spot. */}
+      <div className="absolute top-1 right-1.5 z-10 text-[10px] leading-none font-mono tabular-nums text-ctp-overlay select-none pointer-events-none opacity-70 group-hover:opacity-0 transition-opacity">
+        {index}
+      </div>
       {/* Gutter: collapse caret (heading cells) / execution label + lock badge + drag handle */}
       <div
         draggable
