@@ -175,7 +175,7 @@ export function Cell(props: Props) {
 
   return (
     <div
-      className={`group relative flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50 bg-ctp-accent/[0.06]' : ''}`}
+      className={`group flex gap-2 rounded ${selected ? 'ring-1 ring-ctp-accent/50 bg-ctp-accent/[0.06]' : ''}`}
       onMouseDown={onSelect}
       onFocus={onSelect}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move' }}
@@ -184,12 +184,6 @@ export function Cell(props: Props) {
         if (!Number.isNaN(from)) { e.preventDefault(); onReorder(from) }
       }}
     >
-      {/* Faint 0-based cell index in the top-right — the same number the MCP tools
-          (and Claude) use to address this cell. Fades out on hover to hand the
-          corner over to the ⋯ actions button, which lives in the same spot. */}
-      <div className="absolute top-1 right-1.5 z-10 text-[10px] leading-none font-mono tabular-nums text-ctp-overlay select-none pointer-events-none opacity-70 group-hover:opacity-0 transition-opacity">
-        {index}
-      </div>
       {/* Gutter: collapse caret (heading cells) / execution label + lock badge + drag handle */}
       <div
         draggable
@@ -277,12 +271,16 @@ export function Cell(props: Props) {
       {/* Cell actions live behind this ⋯ button (copy/cut/paste, move, convert, pin,
           delete…). Right-clicking the cell is left as the native browser menu so
           selecting + copying text inside a cell works normally. */}
-      <div className="w-5 shrink-0 self-start mt-1.5 flex flex-col items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-ctp-overlay">
+      <div className="w-5 shrink-0 self-start mt-1.5 flex flex-col items-center gap-0.5 text-ctp-overlay">
+        {/* Faint 0-based cell index — the same number the MCP tools (and Claude)
+            use to address this cell. Always visible; the ⋯ actions button sits
+            below it and appears on hover. */}
+        <span className="text-[10px] leading-none font-mono tabular-nums opacity-70 select-none">{index}</span>
         <button
           onClick={(e) => { e.stopPropagation(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); onMenu(r.right, r.bottom + 2) }}
           title="Cell actions (copy, cut, move, delete…)"
           aria-label="Cell actions"
-          className="text-[11px] leading-none px-0.5 py-0.5 rounded hover:bg-ctp-surface0 hover:text-ctp-text"
+          className="text-[11px] leading-none px-0.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:bg-ctp-surface0 hover:text-ctp-text"
         >⋯</button>
       </div>
     </div>
