@@ -63,11 +63,17 @@ interface Pane {
   sessionId?: string
   buf: string[]     // chunks of recent output
   bufBytes: number  // running total, trimmed to BUF_CAP
+  born: number      // Date.now() at spawn — protects a fresh pty from the sweep
 }
 
 // How much recent output we retain per pane for replay-on-attach. Enough for a couple
 // of full screens of scrollback without letting a chatty process grow unbounded.
 const BUF_CAP = 256 * 1024
+
+// A pane younger than this is never swept, whoever prunes. A tab that just spawned a
+// pty hasn't had time to claim it yet (create resolves, THEN the claim posts), and
+// another tab pruning in that window would kill a terminal the user is looking at.
+const SWEEP_GRACE_MS = 30_000
 
 // What `list()` exposes to the client for reconcile (which saved terminals still map
 // to a live pty; which live ptys are orphans to prune).
@@ -75,6 +81,9 @@ export interface PaneInfo { id: string; cwd: string; sessionId?: string }
 
 export class PaneManager extends EventEmitter {
   private panes = new Map<string, Pane>()
+  // clientId → the pane ids that client currently has a tab for. The sweep only kills
+  // panes in NO claim set, so one device can never reap another's terminals.
+  private claims = new Map<string, Set<string>>()
 
   // `confinement` resolves a session's box so its terminal is confined to match (see
   // SANDBOX.md). A pane created with NO sessionId is a deliberate operator terminal
@@ -98,7 +107,7 @@ export class PaneManager extends EventEmitter {
       cwd: spec.cwd,
       env: spec.env,
     })
-    const pane: Pane = { proc, cwd, sessionId, buf: [], bufBytes: 0 }
+    const pane: Pane = { proc, cwd, sessionId, buf: [], bufBytes: 0, born: Date.now() }
     this.panes.set(id, pane)
     proc.onData((data) => { this.append(pane, data); this.emit('output', id, data) })
     proc.onExit(() => { this.panes.delete(id); this.emit('exit', id) })
@@ -132,10 +141,26 @@ export class PaneManager extends EventEmitter {
   // Buffered scrollback for a reattaching client to write into its fresh xterm before
   // it subscribes to live output. Empty string for an unknown/dead pane.
   snapshot(id: string): string { return this.panes.get(id)?.buf.join('') ?? '' }
-  // Kill every pane whose id is NOT in `keep` — the client calls this on load with the
-  // ids it restored, so ptys with no surviving tab (orphans from past refreshes) die.
-  prune(keep: string[]): void {
-    const keepSet = new Set(keep)
-    for (const id of [...this.panes.keys()]) if (!keepSet.has(id)) this.destroy(id)
+
+  // Record a client's claim, then sweep. `client` is a stable per-tab id; `keep` is the
+  // set of panes that tab currently shows. A pane dies only when NO client claims it and
+  // it's past the grace window — so a phone opening the app with an empty saved layout
+  // no longer reaps the desktop's terminals, while a tab that reloads and drops a
+  // terminal still releases it (its new claim replaces its old one).
+  prune(client: string, keep: string[]): void {
+    this.claims.set(client, new Set(keep))
+    const claimed = new Set<string>()
+    for (const ids of this.claims.values()) for (const id of ids) claimed.add(id)
+    const now = Date.now()
+    for (const [id, p] of [...this.panes]) {
+      if (claimed.has(id) || now - p.born < SWEEP_GRACE_MS) continue
+      this.destroy(id)
+    }
+    // Drop claims on panes that no longer exist, so the map can't grow without bound
+    // across a long-lived server (a tab id is only ever re-used by that same tab).
+    for (const [c, ids] of this.claims) {
+      for (const id of [...ids]) if (!this.panes.has(id)) ids.delete(id)
+      if (ids.size === 0 && c !== client) this.claims.delete(c)
+    }
   }
 }

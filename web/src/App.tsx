@@ -134,6 +134,8 @@ function Shell() {
   // restored one. Ref mirror lets the reconcile effect read current terms synchronously.
   const termSeq = useRef<number>(INITIAL?.seq ?? 0)
   const termsRef = useRef(termsBySession); termsRef.current = termsBySession
+  // Last pane-id set this tab claimed, so the claim effect only posts on real changes.
+  const claimedRef = useRef<string | null>(null)
 
   // Companion orientation for the content split (phones default to stacked).
   const [layout, setLayout] = useState<'side' | 'stack'>(
@@ -379,9 +381,14 @@ function Shell() {
   // --- refresh survival: reconcile, persist, restore notebooks ----------------
   // ONCE on load: reconcile the restored terminal layout against the ptys the server
   // actually still has. Drop terminals whose pty is gone (e.g. the server restarted and
-  // cleared them), then PRUNE every server pty that isn't in a restored tab — this is
-  // what sweeps the "headless" orphans left by past refreshes. (Single-user local tool:
-  // a second open tab would prune this tab's fresh panes; acceptable.)
+  // cleared them), then CLAIM the rest — which also sweeps ptys no tab claims (the
+  // "headless" orphans left by past refreshes).
+  //
+  // `keep` is built from termsRef, NOT inside the setTermsBySession updater. React may
+  // defer an updater past the call that follows it, and this one had a side effect
+  // (pushing into `keep`) that the prune below depended on: whenever the updater ran
+  // late, prune posted an EMPTY keep-set and the server killed every terminal — the
+  // "shell exited" that struck at random on reload. Updaters must stay pure.
   const reconciled = useRef(false)
   useEffect(() => {
     if (reconciled.current) return
@@ -389,19 +396,30 @@ function Shell() {
     void api.pane.list().then(({ panes }) => {
       const live = new Set(panes.map((p) => p.id))
       const keep: string[] = []
-      setTermsBySession((prev) => {
-        const next: Record<string, TermPane> = {}
-        for (const [sid, st] of Object.entries(prev)) {
-          const terms = st.terms.filter((t) => t.paneId == null || live.has(t.paneId))
-          for (const t of terms) if (t.paneId) keep.push(t.paneId)
-          const active = terms.some((t) => t.key === st.active) ? st.active : (terms[terms.length - 1]?.key ?? null)
-          next[sid] = { open: terms.length > 0 ? st.open : false, terms, active }
-        }
-        return next
-      })
+      const next: Record<string, TermPane> = {}
+      for (const [sid, st] of Object.entries(termsRef.current)) {
+        const terms = st.terms.filter((t) => t.paneId == null || live.has(t.paneId))
+        for (const t of terms) if (t.paneId) keep.push(t.paneId)
+        const active = terms.some((t) => t.key === st.active) ? st.active : (terms[terms.length - 1]?.key ?? null)
+        next[sid] = { open: terms.length > 0 ? st.open : false, terms, active }
+      }
+      setTermsBySession(next)
       void api.pane.prune(keep)
     }).catch(() => { /* server not up yet; nothing to reconcile */ })
   }, [])
+
+  // Keep the claim current: every time this tab's terminal set changes, re-post the ids
+  // it holds. Without this, a pane spawned after load is claimed by nobody and the next
+  // tab to load would sweep it. Runs only after the initial reconcile, so it can't race
+  // the restore with a half-built claim.
+  useEffect(() => {
+    if (!reconciled.current) return
+    const ids = allTerms.map((t) => t.paneId).filter((id): id is string => !!id)
+    const key = ids.join(',')
+    if (key === claimedRef.current) return
+    claimedRef.current = key
+    void api.pane.prune(ids)
+  }, [allTerms])
 
   // ONCE on load: reopen the notebooks that were open per session (by path → fresh id),
   // rebuilding each session's content tabs in their saved order. Reopening reconnects

@@ -30,10 +30,10 @@ export function registerPaneRoutes(app: FastifyInstance, panes: PaneManager): vo
     return { panes: panes.list() }
   })
   app.post<{ Body: AttachPaneRequest }>('/api/pane/attach', async (req): Promise<AttachPaneResponse> => {
-    return { data: panes.snapshot(req.body.id) }
+    return { data: panes.snapshot(req.body.id), alive: panes.has(req.body.id) }
   })
   app.post<{ Body: PrunePanesRequest }>('/api/pane/prune', async (req) => {
-    panes.prune(req.body.keep)
+    panes.prune(req.body.client, req.body.keep)
     return { ok: true }
   })
 }

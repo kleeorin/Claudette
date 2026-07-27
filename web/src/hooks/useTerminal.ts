@@ -51,7 +51,7 @@ export interface TerminalAPI {
 export function useTerminal(
   containerRef: React.RefObject<HTMLDivElement | null>,
   api: TerminalAPI,
-): { fit: () => void; focus: () => void; getSize: () => { cols: number; rows: number } | null } {
+): { fit: () => void; focus: () => void; getSize: () => { cols: number; rows: number } | null; reset: () => void } {
   const fitRef = useRef<FitAddon | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const apiRef = useRef(api)
@@ -95,5 +95,11 @@ export function useTerminal(
     const t = termRef.current
     return t ? { cols: t.cols, rows: t.rows } : null
   }, [])
-  return { fit, focus, getSize }
+  // Wipe screen + scrollback back to a virgin terminal. Used before replaying a
+  // server-side snapshot on reconnect, so the replay doesn't append to stale content.
+  const reset = useCallback(() => {
+    termRef.current?.reset()
+    termRef.current?.clear()
+  }, [])
+  return { fit, focus, getSize, reset }
 }

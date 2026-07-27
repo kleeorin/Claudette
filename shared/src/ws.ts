@@ -197,11 +197,17 @@ export interface PaneInfo { id: string; cwd: string; sessionId?: string }
 export interface ListPanesResponse { panes: PaneInfo[] }
 // POST /api/pane/attach { id } → the pane's buffered scrollback, written into the
 // fresh xterm before it subscribes to live `pane:output`.
+// `alive` distinguishes "this pane is running and its buffer happens to be empty"
+// from "this pane is gone" — a client reattaching after a WS reconnect missed the
+// `pane:exit` broadcast and can only learn the pty died from this flag.
 export interface AttachPaneRequest { id: string }
-export interface AttachPaneResponse { data: string }
-// POST /api/pane/prune { keep } → kill every live pane whose id is NOT in `keep` (the
-// ids the client restored), sweeping ptys that no longer have a tab.
-export interface PrunePanesRequest { keep: string[] }
+export interface AttachPaneResponse { data: string; alive: boolean }
+// POST /api/pane/prune { client, keep } → `keep` is this client's CLAIM: the pane ids
+// it currently has a tab for. The server records it under `client` (a stable per-tab
+// id) and kills only panes claimed by NO client — a second device/tab, whose saved
+// layout knows nothing of this tab's terminals, must not reap them. A client re-claims
+// whenever its terminal set changes, so ids it drops become unclaimed and get swept.
+export interface PrunePanesRequest { client: string; keep: string[] }
 
 // GET /api/notebook/kernelspecs → the kernels the user can pick, + Jupyter's default.
 export interface KernelSpecsResponse { specs: KernelSpec[]; default: string }

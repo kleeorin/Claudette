@@ -48,7 +48,7 @@ export function TerminalView(
     },
   }).current
 
-  const { fit, focus, getSize } = useTerminal(containerRef, termApi)
+  const { fit, focus, getSize, reset } = useTerminal(containerRef, termApi)
 
   // Kept mounted-but-hidden across tab switches (so scrollback survives); a hidden
   // container fits to 0, so re-fit + focus whenever we become visible again — and
@@ -64,6 +64,47 @@ export function TerminalView(
     })
   }, [visible, fit, focus, getSize])
 
+  // Pull the pane's server-side buffer into a blank xterm, then flush anything that
+  // streamed in while the request was in flight. Used for the initial attach AND after a
+  // WS reconnect — `fresh` distinguishes them: a reconnect must wipe the stale screen
+  // first, since the snapshot is the whole buffer, not a delta.
+  const replayRef = useRef<((id: string, fresh: boolean) => void) | null>(null)
+  replayRef.current = (id, fresh) => {
+    void api.pane.attach(id).then(({ data, alive }) => {
+      if (paneIdRef.current !== id) return
+      if (fresh) reset()
+      if (data) writeToTerm.current?.(data)
+      for (const chunk of queueRef.current) writeToTerm.current?.(chunk)
+      queueRef.current = []
+      readyRef.current = true
+      // A pty that died while we were disconnected never delivered its `pane:exit`;
+      // `alive` is the only way back to the truth.
+      setExited(!alive)
+      requestAnimationFrame(() => {
+        fit(); focus()
+        const size = getSize()
+        if (size) api.pane.resize(id, size.cols, size.rows)
+      })
+    }).catch(() => { readyRef.current = true })
+  }
+
+  // A dropped WS (phone sleeping, laptop suspend, network hop) silently costs the pane
+  // every frame emitted while it was down: input still works, but the screen is frozen
+  // mid-scrollback — the "stuck terminal". Nothing used to re-sync it. On the way back
+  // up, re-queue live output and replay the server's buffer over a cleared screen.
+  useEffect(() => {
+    let wasDown = false
+    return api.on.connected((up) => {
+      if (!up) { wasDown = true; return }
+      if (!wasDown) return
+      wasDown = false
+      const id = paneIdRef.current
+      if (!id) return
+      readyRef.current = false
+      replayRef.current?.(id, true)
+    })
+  }, [])
+
   useEffect(() => {
     let disposed = false
     let createdId: string | null = null
@@ -71,20 +112,9 @@ export function TerminalView(
 
     if (paneId) {
       // ATTACH: paneIdRef is already this id, so live output starts queueing at once.
-      // Pull the buffered scrollback, write it, flush the queue, then go live. Re-fit +
-      // resize so the pty matches this (possibly new) window size.
-      void api.pane.attach(paneId).then(({ data }) => {
-        if (disposed) return
-        if (data) writeToTerm.current?.(data)
-        for (const chunk of queueRef.current) writeToTerm.current?.(chunk)
-        queueRef.current = []
-        readyRef.current = true
-        requestAnimationFrame(() => {
-          fit(); focus()
-          const size = getSize()
-          if (size) api.pane.resize(paneId, size.cols, size.rows)
-        })
-      }).catch(() => { readyRef.current = true })
+      // Pull the buffered scrollback, write it, flush the queue, then go live. (The
+      // unmount path nulls paneIdRef, which is what makes a late reply a no-op.)
+      replayRef.current?.(paneId, false)
     } else {
       // CREATE: fit BEFORE create so the pty spawns at the terminal's real size — the
       // shell draws its first prompt at the right width (typed chars don't overwrite the

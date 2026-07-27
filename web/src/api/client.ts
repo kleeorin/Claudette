@@ -35,6 +35,24 @@ async function get<T>(path: string): Promise<T> {
   return (await fetch(path)).json()
 }
 
+// A stable id for THIS TAB, used to claim terminal panes (see pane.prune). sessionStorage
+// is the right store: unique per tab (so a phone can't speak for the desktop) yet it
+// survives a reload (so a refreshed tab re-claims its own ptys instead of orphaning
+// them). Not crypto.randomUUID — that's undefined outside a secure context, and Claudette
+// is routinely opened over plain http on a LAN.
+let clientKey: string | null = null
+function clientId(): string {
+  if (clientKey) return clientKey
+  const fresh = `tab-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`
+  try {
+    clientKey = sessionStorage.getItem('claudette.clientId') ?? fresh
+    sessionStorage.setItem('claudette.clientId', clientKey)
+  } catch {
+    clientKey = fresh   // storage blocked (private mode) — a per-load id still claims fine
+  }
+  return clientKey
+}
+
 export async function getHealth(): Promise<HealthResponse> {
   return get<HealthResponse>('/api/health')
 }
@@ -337,6 +355,8 @@ export const api = {
     resize: (id: string, cols: number, rows: number) => send({ type: 'pane:resize', id, cols, rows }),
     list: () => get<ListPanesResponse>('/api/pane/list'),
     attach: (id: string) => post<AttachPaneResponse>('/api/pane/attach', { id }),
-    prune: (keep: string[]) => post<OkResponse>('/api/pane/prune', { keep }),
+    // Claim + sweep: tell the server which panes THIS tab holds. Anything no tab claims
+    // is an orphan and dies; another device's terminals are untouched (see ws.ts).
+    prune: (keep: string[]) => post<OkResponse>('/api/pane/prune', { client: clientId(), keep }),
   },
 }
