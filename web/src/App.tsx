@@ -541,7 +541,7 @@ function Shell() {
         />
 
         <div className="flex-1 min-h-0 flex">
-          {/* Main column: (Claude | content) + terminal dock. */}
+          {/* Main column: Claude (with the terminal dock under it) | content. */}
           <div className="flex-1 min-w-0 flex flex-col">
             {/* Upper region: Claude, plus content beside it when a tab is active. */}
             <div ref={splitRef} className={`flex-1 min-h-0 relative flex ${active && layout === 'side' ? 'flex-row' : 'flex-col'}`}>
@@ -561,75 +561,85 @@ function Shell() {
                 />
               )}
 
-              {/* Claude — always present. Full width alone; fixed-size companion when a tab is open. */}
+              {/* Claude — always present. Full width alone; fixed-size companion when a
+                  tab is open. The terminal dock lives INSIDE this column (below), so it
+                  tracks Claude's width rather than spanning the window. */}
               <div
-                className={active ? `shrink-0 min-h-0 min-w-0 ${layout === 'side' ? 'border-r order-1' : 'border-t'} border-ctp-surface0` : 'flex-1 min-h-0 min-w-0'}
-                style={active ? (layout === 'side' ? { width: sideW } : { height: stackH }) : undefined}
+                className={`flex flex-col ${active ? `shrink-0 min-h-0 min-w-0 ${layout === 'side' ? 'border-r order-1' : 'border-t'} border-ctp-surface0` : 'flex-1 min-h-0 min-w-0'}`}
+                style={active
+                  // In 'stack' the column is a fixed height, and it now carries the dock
+                  // too — so add the dock's height on top, leaving the chat its full
+                  // stackH (the content area absorbs the difference, as before).
+                  ? (layout === 'side' ? { width: sideW } : { height: stackH + (dockShown ? termH + 1 : 0) })
+                  : undefined}
               >
-                {activeId ? <ChatView key={activeId} sessionId={activeId} isActive /> : <Empty />}
-              </div>
-            </div>
+                <div className="flex-1 min-h-0">
+                  {activeId ? <ChatView key={activeId} sessionId={activeId} isActive /> : <Empty />}
+                </div>
 
-            {/* Bottom dock: tabbed terminals for the ACTIVE session (span the main
-                column). Every session's terminals stay mounted (see the bodies
-                below) so ptys + scrollback survive session switches; the tab strip
-                and sizing only apply to the active session's dock. */}
-            {dockShown && (
-              <div
-                {...dividerProps({ axis: 'y', get: () => termH, set: setTermH, sign: -1, min: 120, max: () => 700 })}
-                title="Drag to resize"
-                className="shrink-0 h-1 cursor-row-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
-              />
-            )}
-            {allTerms.length > 0 && (
-              <div className={dockShown ? 'shrink-0 flex flex-col border-t border-ctp-surface0' : 'hidden'} style={dockShown ? { height: termH } : undefined}>
-                {/* Tab strip: one tab per terminal in the ACTIVE session (× to close), + to add, hide on the right. */}
-                <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
-                  {terms.map((t, i) => (
-                    <div
-                      key={t.key}
-                      onClick={() => selectTerm(t.key)}
-                      title={t.cwd}
-                      className={`group flex items-center gap-1.5 pl-2 pr-1 shrink-0 cursor-pointer text-[11px] border-b-2 ${activeTerm === t.key ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-subtext hover:text-ctp-text'}`}
-                    >
-                      <span className="text-ctp-overlay">❯</span>
-                      <span>Terminal {i + 1}</span>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); closeTerm(t.key) }}
-                        title="Close terminal"
-                        className="opacity-0 group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red p-0.5 rounded leading-none"
-                      >
-                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                {/* Bottom dock: tabbed terminals for the ACTIVE session, sized to the
+                    Claude column — with a notebook open, a terminal shouldn't run the
+                    full width of the window. Every session's terminals stay mounted (see
+                    the bodies below) so ptys + scrollback survive session switches; the
+                    tab strip and sizing only apply to the active session's dock. */}
+                {dockShown && (
+                  <div
+                    {...dividerProps({ axis: 'y', get: () => termH, set: setTermH, sign: -1, min: 120, max: () => 700 })}
+                    title="Drag to resize"
+                    className="shrink-0 h-1 cursor-row-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
+                  />
+                )}
+                {allTerms.length > 0 && (
+                  <div className={dockShown ? 'shrink-0 flex flex-col min-w-0 border-t border-ctp-surface0' : 'hidden'} style={dockShown ? { height: termH } : undefined}>
+                    {/* Tab strip: one tab per terminal in the ACTIVE session (× to close), + to add, hide on the right. */}
+                    <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
+                      {terms.map((t, i) => (
+                        <div
+                          key={t.key}
+                          onClick={() => selectTerm(t.key)}
+                          title={t.cwd}
+                          className={`group flex items-center gap-1.5 pl-2 pr-1 shrink-0 cursor-pointer text-[11px] border-b-2 ${activeTerm === t.key ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-subtext hover:text-ctp-text'}`}
+                        >
+                          <span className="text-ctp-overlay">❯</span>
+                          <span>Terminal {i + 1}</span>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); closeTerm(t.key) }}
+                            title="Close terminal"
+                            className="opacity-0 group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red p-0.5 rounded leading-none"
+                          >
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                          </button>
+                        </div>
+                      ))}
+                      <button onClick={() => addTerm(termCwd)} title="New terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text px-1.5 text-sm leading-none">+</button>
+                      <span className="ml-auto self-center text-[10px] text-ctp-overlay font-mono truncate max-w-[45%]">{prettyPath(terms.find((t) => t.key === activeTerm)?.cwd ?? termCwd)}</span>
+                      <button onClick={hideTerm} title="Hide terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text p-0.5">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
                       </button>
                     </div>
-                  ))}
-                  <button onClick={() => addTerm(termCwd)} title="New terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text px-1.5 text-sm leading-none">+</button>
-                  <span className="ml-auto self-center text-[10px] text-ctp-overlay font-mono truncate max-w-[45%]">{prettyPath(terms.find((t) => t.key === activeTerm)?.cwd ?? termCwd)}</span>
-                  <button onClick={hideTerm} title="Hide terminal" className="shrink-0 self-center text-ctp-overlay hover:text-ctp-text p-0.5">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
-                  </button>
-                </div>
-                {/* Bodies: EVERY session's terminals stay mounted here (this container
-                    persists across session switches, so ptys + scrollback survive);
-                    only the active session's active terminal is shown. */}
-                <div className="flex-1 min-h-0 relative">
-                  {allTerms.map((t) => {
-                    const show = t.sid === activeId && dockShown && activeTerm === t.key
-                    return (
-                      <div key={t.key} className={show ? 'absolute inset-0' : 'hidden'}>
-                        <TerminalView
-                          cwd={t.cwd}
-                          visible={show}
-                          sessionId={t.sid}
-                          paneId={t.paneId ?? undefined}
-                          onCreated={(pid) => setTermPaneId(t.sid, t.key, pid)}
-                        />
-                      </div>
-                    )
-                  })}
-                </div>
+                    {/* Bodies: EVERY session's terminals stay mounted here (this container
+                        persists across session switches, so ptys + scrollback survive);
+                        only the active session's active terminal is shown. */}
+                    <div className="flex-1 min-h-0 relative">
+                      {allTerms.map((t) => {
+                        const show = t.sid === activeId && dockShown && activeTerm === t.key
+                        return (
+                          <div key={t.key} className={show ? 'absolute inset-0' : 'hidden'}>
+                            <TerminalView
+                              cwd={t.cwd}
+                              visible={show}
+                              sessionId={t.sid}
+                              paneId={t.paneId ?? undefined}
+                              onCreated={(pid) => setTermPaneId(t.sid, t.key, pid)}
+                            />
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
+            </div>
           </div>
 
           {/* Right dock: Files or Git (narrow, resizable, full height). */}
