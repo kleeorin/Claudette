@@ -198,13 +198,21 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
       reverted = res.reverted; deleted = res.deleted
     }
 
-    let newId: string | undefined
+    let newId: string | undefined, cleared: boolean | undefined
     if (mode === 'conversation' || mode === 'both') {
-      newId = (await forkConversationBefore(info.cwd, claudeId, uuid)) ?? undefined
-      if (!newId) return { ok: false, error: 'rewind point not found in this conversation', reverted, deleted }
-      sessions.resumeInto(id, newId)
+      const fork = await forkConversationBefore(info.cwd, claudeId, uuid)
+      if (!fork) return { ok: false, error: 'rewind point not found in this conversation', reverted, deleted }
+      if ('empty' in fork) {
+        // Rewinding to before the first prompt = an empty conversation → start fresh
+        // rather than resume a contentless fork (which Claude rejects and can't relaunch).
+        sessions.restartFresh(id)
+        cleared = true
+      } else {
+        newId = fork.newId
+        sessions.resumeInto(id, newId)
+      }
     }
-    return { ok: true, newId, reverted, deleted }
+    return { ok: true, newId, cleared, reverted, deleted }
   })
 }
 

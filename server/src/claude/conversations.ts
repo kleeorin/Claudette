@@ -126,29 +126,40 @@ export async function listRewindPoints(cwd: string, id: string): Promise<RewindP
   return points
 }
 
+// Result of forking before a turn: the new fork's id, or `{ empty: true }` when there is
+// no resumable conversation before that turn (rewinding to the very first prompt) — the
+// caller must restart fresh in that case rather than resume an empty transcript, or
+// `null` when `uuid` isn't a line in this transcript.
+export type ForkResult = { newId: string } | { empty: true } | null
+
 // Fork a conversation to JUST BEFORE the user turn `uuid`: copy every transcript line
 // preceding that one into a NEW conversation (fresh claude session id, stamped through
 // each line's sessionId) and return the new id. The original transcript is left intact —
-// a rewind is itself a fork, so resuming the original undoes it. Returns null if `uuid`
-// isn't a line in this transcript.
-export async function forkConversationBefore(cwd: string, id: string, uuid: string): Promise<string | null> {
+// a rewind is itself a fork, so resuming the original undoes it.
+//
+// Rewinding to the FIRST turn leaves only pre-conversation noise (queue-operation lines,
+// etc.) before the cut — no user/assistant message. Claude's --resume rejects such a
+// transcript ("No conversation found") and exits, so we signal `{ empty: true }` and
+// write no fork file (which would also collide with the resume-fallback's --session-id).
+export async function forkConversationBefore(cwd: string, id: string, uuid: string): Promise<ForkResult> {
   const dir = projectDir(cwd)
   let raw: string
   try { raw = await readFile(join(dir, `${id}.jsonl`), 'utf8') } catch { return null }
   const lines = raw.split('\n').filter((l) => l.trim())
-  const cut = lines.findIndex((l) => {
-    try { return (JSON.parse(l) as { uuid?: unknown }).uuid === uuid } catch { return false }
-  })
+  const parsed = lines.map((l) => { try { return JSON.parse(l) as Record<string, unknown> } catch { return null } })
+  const cut = parsed.findIndex((o) => o?.uuid === uuid)
   if (cut < 0) return null
+  // A conversation is resumable only if some real message precedes the cut; queue-operation /
+  // attachment / mode / title lines alone are not a conversation Claude can --resume into.
+  const hasMessage = parsed.slice(0, cut).some((o) => o?.type === 'user' || o?.type === 'assistant')
+  if (!hasMessage) return { empty: true }
   const newId = crypto.randomUUID()
-  const kept = lines.slice(0, cut).map((l) => {
-    try {
-      const o = JSON.parse(l) as Record<string, unknown>
-      if ('sessionId' in o) o.sessionId = newId   // re-key the prefix to the fork
-      return JSON.stringify(o)
-    } catch { return l }
+  const kept = parsed.slice(0, cut).map((o, i) => {
+    if (!o) return lines[i]
+    if ('sessionId' in o) o.sessionId = newId   // re-key the prefix to the fork
+    return JSON.stringify(o)
   })
   // Trailing newline keeps the file line-framed like the CLI writes it.
-  await writeFile(join(dir, `${newId}.jsonl`), kept.length ? kept.join('\n') + '\n' : '')
-  return newId
+  await writeFile(join(dir, `${newId}.jsonl`), kept.join('\n') + '\n')
+  return { newId }
 }

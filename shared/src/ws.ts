@@ -180,7 +180,7 @@ export interface RewindPreviewResponse { preview: RewindPreview | null }
 // restores the working tree to the turn's snapshot (`reverted`/`deleted` = file counts);
 // 'both' does both. deleteNewer removes untracked files created since (code/both only).
 export interface RewindRequest { id: string; uuid: string; mode: RewindMode; deleteNewer?: boolean }
-export interface RewindResponse { ok: boolean; newId?: string; error?: string; reverted?: number; deleted?: number }
+export interface RewindResponse { ok: boolean; newId?: string; cleared?: boolean; error?: string; reverted?: number; deleted?: number }
 
 // POST /api/pane/create { cwd, cols?, rows?, sessionId? } → { id }   |   POST /api/pane/destroy { id }
 // cols/rows let the client spawn the pty at the terminal's real size so the shell's

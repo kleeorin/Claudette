@@ -13,7 +13,7 @@ import {
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
-import { listRewindPoints } from './conversations'
+import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
@@ -305,6 +305,14 @@ export class SessionManager extends EventEmitter {
           && /no conversation found/i.test(session.stderrTail)) {
         session.resumeFallbackTried = true
         session.resume = false
+        // Reusing the id via --session-id only works if no transcript file exists for it.
+        // A file DOES exist when the resume target was a contentless fork (e.g. rewind to
+        // the first turn) — then --session-id errors "already in use" and bricks the
+        // session. Take a fresh id in that case so the fallback can always relaunch.
+        if (existsSync(path.join(projectDir(session.cwd), `${session.claudeSessionId}.jsonl`))) {
+          session.claudeSessionId = crypto.randomUUID()
+          this.emit('changed')   // claudeSessionId changed → re-persist
+        }
         this.launch(session)
         this.emit('stateChange', id, session.state)
         return

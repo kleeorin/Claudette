@@ -283,7 +283,16 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       autoResumed.add(sessionId); resumeAborted.add(sessionId)   // explicit rewind — supersede any in-flight auto-resume
       clearTranscript(sessionId)
       loadTranscript(sessionId, await api.http.readConversation(session.cwd, res.newId))
+    } else if (res.cleared) {
+      // Rewound to before the first prompt: the server started a fresh conversation, so
+      // empty the pane (same as /clear). Mark auto-resumed first so it isn't re-pulled.
+      autoResumed.add(sessionId); resumeAborted.add(sessionId)
+      clearTranscript(sessionId)
     }
+    // The conversation moved (forked or cleared) → drop the rewound-to prompt back into
+    // the composer so it can be edited and re-sent, like Claude Code's /rewind. Code-only
+    // rewinds leave the turn in the transcript, so don't duplicate it into the draft.
+    if (res.newId || res.cleared) { setDraft(point.text); caretToEnd() }
   }
 
   if (!session) {
