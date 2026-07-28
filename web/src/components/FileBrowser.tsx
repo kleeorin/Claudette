@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
@@ -15,9 +15,14 @@ interface Props {
   onPick: (path: string, create?: boolean) => void
   onClose: () => void
   error?: string | null   // an open/create failure from the caller, shown in the footer
+  // Caller-owned controls in the action row, so a picker can carry a decision that
+  // belongs WITH the pick (e.g. the sandbox's rw/ro mode) instead of making the user
+  // set it afterwards. The caller reads its own state in onPick.
+  accessory?: ReactNode
+  confirmLabel?: string
 }
 
-export function FileBrowser({ mode, initialPath, onPick, onClose, error }: Props) {
+export function FileBrowser({ mode, initialPath, onPick, onClose, error, accessory, confirmLabel }: Props) {
   const [dir, setDir] = useState(initialPath)
   const [entries, setEntries] = useState<DirEntry[]>([])
   const [err, setErr] = useState<string | null>(null)
@@ -146,9 +151,10 @@ export function FileBrowser({ mode, initialPath, onPick, onClose, error }: Props
             </div>
           )}
           <div className="flex items-center gap-2 px-5 py-3.5">
-            <span className="text-[11px] text-ctp-overlay font-mono truncate flex-1" title={mode === 'folder' ? dir : selected ?? dir}>
+            <span className="text-[11px] text-ctp-overlay font-mono truncate flex-1 min-w-0" title={mode === 'folder' ? dir : selected ?? dir}>
               {mode === 'folder' ? dir : selected ?? '—'}
             </span>
+            {accessory}
             <button onClick={onClose} className="text-xs px-3.5 py-1.5 rounded-md text-ctp-subtext hover:bg-ctp-surface0 transition-colors">
               Cancel
             </button>
@@ -157,7 +163,7 @@ export function FileBrowser({ mode, initialPath, onPick, onClose, error }: Props
               disabled={mode === 'notebook' && !selected}
               className="text-xs font-medium px-4 py-1.5 rounded-md bg-ctp-accent text-ctp-base hover:brightness-110 active:brightness-95 disabled:opacity-40 transition"
             >
-              {mode === 'folder' ? 'Use this folder' : 'Open'}
+              {confirmLabel ?? (mode === 'folder' ? 'Use this folder' : 'Open')}
             </button>
           </div>
         </div>

@@ -16,6 +16,9 @@ import { FileBrowser } from './FileBrowser'
 export function SandboxEditor({ session, compact = false }: { session: SessionInfo; compact?: boolean }) {
   const { sandboxAvailable, setSandbox } = useSessions()
   const [picking, setPicking] = useState(false)   // folder-picker modal open
+  // Access for the folder about to be added, chosen INSIDE the picker. Defaults to the
+  // safe 'ro' each time it opens, so granting write is always a deliberate click.
+  const [pickMode, setPickMode] = useState<'rw' | 'ro'>('ro')
 
   // The requested config, defaulting to enabled + the session cwd (rw) — mirrors the
   // server's normalizeSandbox so a session with no stored config still shows sensibly.
@@ -102,7 +105,7 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
             ))}
           </div>
           <button
-            onClick={() => setPicking(true)}
+            onClick={() => { setPickMode('ro'); setPicking(true) }}
             className="w-full rounded border border-dashed border-ctp-surface2 text-ctp-subtext hover:text-ctp-text hover:border-ctp-overlay py-1"
           >
             + Add a folder…
@@ -159,11 +162,31 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
           mode="folder"
           initialPath={session.cwd}
           onClose={() => setPicking(false)}
+          confirmLabel={`Mount ${pickMode}`}
+          // Pick the access alongside the folder — mounting a drive you intend to write
+          // to shouldn't mean adding it read-only and then hunting for the toggle.
+          accessory={
+            <div className="flex items-center gap-1 shrink-0" title="Read-only, or writable by Claude">
+              <span className="text-[11px] text-ctp-overlay">Access</span>
+              {(['ro', 'rw'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setPickMode(m)}
+                  className={`px-2 py-1 rounded text-[11px] font-mono transition-colors ${
+                    pickMode === m
+                      ? m === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface1 text-ctp-text'
+                      : 'text-ctp-overlay hover:text-ctp-text'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          }
           onPick={(p) => {
             setPicking(false)
-            // Added folders default to read-only (the safe default for a reference
-            // dir); flip to rw with the per-mount toggle. Skip exact duplicates.
-            if (!cfg.mounts.some((m) => m.path === p)) void addMount({ path: p, mode: 'ro' })
+            // Skip exact duplicates; the per-mount toggle still changes access later.
+            if (!cfg.mounts.some((m) => m.path === p)) void addMount({ path: p, mode: pickMode })
           }}
         />
       )}
