@@ -26,8 +26,13 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
   const pending = !!session.sandboxPending
   const running = session.state === 'running' || session.state === 'waiting'
 
+  // Terminals are host shells unless opted IN per session — this box confines Claude,
+  // not the pty the operator drives from the browser (see SandboxConfig).
+  const termsConfined = cfg.sandboxTerminals === true
+
   const push = async (next: SandboxConfig) => { await setSandbox(session.id, next) }
   const toggleEnabled = () => push({ ...cfg, enabled: !enabled })
+  const toggleTerminals = () => push({ ...cfg, sandboxTerminals: !termsConfined })
   const setMode = (i: number, mode: 'rw' | 'ro') =>
     push({ ...cfg, mounts: cfg.mounts.map((m, j) => (j === i ? { ...m, mode } : m)) })
   const removeMount = (i: number) => push({ ...cfg, mounts: cfg.mounts.filter((_, j) => j !== i) })
@@ -102,6 +107,32 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
           >
             + Add a folder…
           </button>
+
+          {/* Terminals are host shells by DEFAULT (this box only confines Claude);
+              ticking this confines them too. Either way it binds at spawn, so it can
+              only ever change the NEXT terminal you open — hence the standing note. */}
+          <label className="flex items-start gap-2 cursor-pointer select-none pt-0.5">
+            <input
+              type="checkbox"
+              checked={termsConfined}
+              onChange={toggleTerminals}
+              className="accent-ctp-accent mt-[1px]"
+            />
+            <span className="leading-snug">
+              <span className="text-ctp-text">Sandbox terminals too</span>
+              {!compact && (
+                <span className="text-ctp-overlay">
+                  {' — '}by default a terminal is a <b>full host shell</b> even here:
+                  only Claude is confined. Tick this to run shells inside these same
+                  mounts.
+                </span>
+              )}
+            </span>
+          </label>
+          <div className={termsConfined ? 'text-ctp-yellow/90 leading-snug' : 'text-ctp-overlay leading-snug'}>
+            Applies to terminals opened <b>from now on</b> — ones already open stay
+            {termsConfined ? ' unconfined' : ' as they are'}; close and reopen them.
+          </div>
         </>
       )}
 

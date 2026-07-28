@@ -20,6 +20,13 @@ export interface SandboxMount {
 export interface SandboxConfig {
   enabled: boolean
   mounts: SandboxMount[]
+  // Do this session's TERMINAL panes run inside the box too? Undefined/false = NO —
+  // a terminal is a plain (env-scrubbed) host shell even when Claude is confined,
+  // because it's the operator's own shell: only the authenticated browser can open
+  // or type into a pane, and the box holds no token, so a confined session can't
+  // reach one (SANDBOX.md "Terminal-pane escape"). Set true to confine terminals to
+  // the same mounts as Claude. Applies to panes opened AFTER the change.
+  sandboxTerminals?: boolean
 }
 
 // A selectable session role (agent): its id, display name, and a one-line summary.

@@ -35,18 +35,27 @@ function sanitizedEnv(): Record<string, string> {
 
 // Decide how to spawn a pane's shell from the session's confinement decision:
 //   host     → a bare host shell (matching an unconfined session), env-scrubbed.
-//   confined → the shell wrapped in the SESSION's box (wrapCommand — the same
-//              confinement as its Jupyter kernels, minus Claude's creds).
-//   deny     → a data-mount-less box: the shell runs but reaches nothing. We cannot
-//              confine an unresolved session without a working sandbox, so refuse
-//              rather than silently drop it to a host shell.
+//   confined → a host shell TOO, unless the session opted its terminals in
+//              (sandbox.sandboxTerminals === true, the checkbox in the sandbox pane),
+//              in which case the shell is wrapped in the SESSION's box (wrapCommand —
+//              the same confinement as its Jupyter kernels, minus Claude's creds).
+//              A pane is the operator's own shell: opening or typing into one needs
+//              the app token over HTTP+WS, and no box ever holds that token, so a
+//              confined session can't reach a pane whichever way this is set.
+//   deny     → a data-mount-less box: the shell runs but reaches nothing. There is no
+//              operator behind an unresolved session to have opted anything in, so
+//              this branch NEVER takes the host path — it fails closed.
 // The terminal's own cwd is honored as the box-internal --chdir (per-terminal UX); if it
 // falls outside the mounts, wrapCommand presents it as an empty read-only dir —
 // confinement is from the mounts, never the chdir. Exported for unit testing the argv.
 export function paneSpawnSpec(cwd: string, c: Confinement): PaneSpawn {
   const shell = process.env.SHELL || '/bin/bash'
   const env = sanitizedEnv()
-  if (c.mode === 'host') return { command: shell, args: [], cwd: cwd || homedir(), env }
+  // A confined session's terminal is a host shell (still env-scrubbed) unless the
+  // operator ticked "Sandbox terminals too". `deny` is never let through here.
+  const boxTerminal = c.mode === 'confined' && c.cfg.sandboxTerminals === true
+  if (c.mode === 'host' || (c.mode === 'confined' && !boxTerminal))
+    return { command: shell, args: [], cwd: cwd || homedir(), env }
   if (c.mode === 'deny' && !sandboxAvailable())
     throw new Error('pane: refusing to spawn a shell for an unresolved session (host cannot sandbox)')
   const box = c.mode === 'confined' ? { cfg: c.cfg, cwd: c.cwd } : { cfg: DENY_ALL_SANDBOX, cwd: cwd || homedir() }

@@ -758,7 +758,11 @@ export class SessionManager extends EventEmitter {
 export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string, trusted = false): SandboxConfig {
   const cfg: SandboxConfig = !sandbox
     ? { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
-    : { enabled: sandbox.enabled, mounts: sandbox.mounts }
+    : { enabled: sandbox.enabled, mounts: sandbox.mounts, sandboxTerminals: sandbox.sandboxTerminals }
+  // `sandboxTerminals` needs no trust gate: it only ever RAISES confinement (terminals
+  // are host shells by default), and a confined session can't drive a pane anyway —
+  // that needs the app token, which never enters a box (SANDBOX.md "Terminal-pane
+  // escape").
   // Confinement must NOT be lowerable by an UNTRUSTED request. A sandboxed session
   // that reaches the loopback control API (SANDBOX.md "Control-plane escape") could
   // otherwise ask for enabled:false and get an unconfined session — but it can't

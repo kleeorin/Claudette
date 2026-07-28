@@ -385,6 +385,28 @@ one HTTP POST + one WS frame away. It also gives an *interactive shell* (network
   **mounts**, never the chdir (an out-of-mount cwd becomes an empty ro dir), so a
   caller-chosen cwd can't widen visibility.
 
+**Revised default (`sandbox.sandboxTerminals`, 2026-07-28).** Boxing every pane made the
+terminal useless for the ordinary host work an operator opens it for, so a sandboxed
+session's panes are now **host shells by default** and the sandbox pane carries a
+`Sandbox terminals too` checkbox that opts them back into the session's box
+(`paneSpawnSpec` wraps only when `sandboxTerminals === true`).
+
+What that does *not* give back is the escape above. That vector was a **confined session**
+driving a pane over the control plane; it needs the app auth token on `POST
+/api/pane/create` + the WS, and `--clearenv` (fix A) means no box ever holds
+`CLAUDETTE_TOKEN`. So the shell an unchecked box spawns is reachable only by the
+authenticated operator — the same person who could open a terminal outside the app. Every
+pane is still `sanitizedEnv()`-scrubbed of `CLAUDETTE_*`, and `deny` (an unresolved
+session) still **fails closed** into a data-mount-less box: only a resolved session with a
+real operator behind it takes the host path. Claude and the Jupyter kernels are unaffected
+— they are confined by the mounts regardless of this flag.
+
+Two consequences worth knowing: the flag is deliberately **not** part of `sandboxKey`
+(it changes no box Claude runs in, so toggling it triggers no relaunch), and confinement
+binds at `pty.spawn`, so a change only affects terminals opened **after** it — an open
+pty keeps the box it was born in until it's closed and reopened. The UI says so
+permanently next to the checkbox rather than only after a toggle.
+
 **Still worth doing (defense-in-depth, not blocking):** owner-scope panes on the WS
 (`pane:input`/`pane:output` check the creating session) so one box can't drive/read
 another session's terminal — currently any authed client can, but the token is required
