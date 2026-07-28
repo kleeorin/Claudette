@@ -6,6 +6,7 @@ import { DiffEditor } from './DiffEditor'
 import { MilkdownEditor } from './MilkdownEditor'
 import { CsvTableView } from './CsvTableView'
 import { basename } from '../lib/paths'
+import { useScrollMemory } from '../lib/scrollMemory'
 import { useChat } from '../store/chat'
 import { applyProposal, filePathOf, isEditTool, isNotebookPath, reconstructDecision } from '../lib/proposals'
 
@@ -189,6 +190,14 @@ export function FileEditorView({ path, sessionId }: Props) {
   const editable = preview?.kind === 'text' && !preview.truncated
   const showSave = preview?.kind === 'text' && !reviewing
 
+  // Only the active tab of the active session is mounted, so leaving this file (or
+  // this session) unmounts the editor. Key its scroll offset by path so coming back
+  // lands where you left off instead of at the top. `reloadKey` is deliberately NOT
+  // part of the key: a reload should keep your place too.
+  const scrollKey = `file:${path}`
+  const imgRef = useRef<HTMLDivElement>(null)
+  useScrollMemory(preview?.kind === 'image' ? scrollKey : null, () => imgRef.current)
+
   return (
     <div className="flex flex-col h-full bg-ctp-base" onKeyDown={onKeyDown}>
       {/* Header */}
@@ -265,7 +274,7 @@ export function FileEditorView({ path, sessionId }: Props) {
         ) : loading || !preview ? (
           <div className="h-full flex items-center justify-center text-xs text-ctp-overlay">Loading…</div>
         ) : preview.kind === 'image' ? (
-          <div className="h-full overflow-auto p-4 flex items-start justify-center">
+          <div ref={imgRef} className="h-full overflow-auto p-4 flex items-start justify-center">
             <img src={preview.dataUrl} alt={preview.name} className="max-w-full h-auto rounded border border-ctp-surface0" />
           </div>
         ) : preview.kind === 'pdf' ? (
@@ -275,9 +284,9 @@ export function FileEditorView({ path, sessionId }: Props) {
         ) : preview.kind === 'error' ? (
           <div className="h-full flex items-center justify-center text-xs text-ctp-red px-4 text-center">{preview.message}</div>
         ) : isMarkdown(path) && editable ? (
-          <MilkdownEditor key={`${path}#${reloadKey}`} initialDoc={preview.text} readOnly={false} onChange={onChange} />
+          <MilkdownEditor key={`${path}#${reloadKey}`} initialDoc={preview.text} readOnly={false} onChange={onChange} scrollKey={scrollKey} />
         ) : isCsv(path) ? (
-          <CsvTableView key={`${path}#${reloadKey}`} initialText={preview.text} filename={name} readOnly={!editable} onChange={onChange} />
+          <CsvTableView key={`${path}#${reloadKey}`} initialText={preview.text} filename={name} readOnly={!editable} onChange={onChange} scrollKey={scrollKey} />
         ) : (
           <CodeEditor
             key={`${path}#${reloadKey}`}
@@ -286,6 +295,7 @@ export function FileEditorView({ path, sessionId }: Props) {
             readOnly={!editable}
             onChange={onChange}
             onSave={() => void save()}
+            scrollKey={scrollKey}
           />
         )}
       </div>

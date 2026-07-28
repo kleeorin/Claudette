@@ -17,6 +17,7 @@ import {
 import { toggleStrikethroughCommand } from '@milkdown/kit/preset/gfm'
 import '@milkdown/crepe/theme/common/style.css'
 import '@milkdown/crepe/theme/nord-dark.css'
+import { useScrollMemory } from '../lib/scrollMemory'
 
 // WYSIWYG markdown editor — Milkdown "Crepe", the batteries-included build. Crepe
 // ships CONTEXTUAL controls (a floating selection toolbar, a slash (/) menu, a block
@@ -31,9 +32,10 @@ interface Props {
   initialDoc: string
   readOnly: boolean
   onChange: (markdown: string) => void
+  scrollKey?: string   // remembers where you were when this file reopens
 }
 
-export function MilkdownEditor({ initialDoc, readOnly, onChange }: Props) {
+export function MilkdownEditor({ initialDoc, readOnly, onChange, scrollKey }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const crepeRef = useRef<Crepe | null>(null)
   // Keep onChange fresh without rebuilding the editor.
@@ -58,6 +60,11 @@ export function MilkdownEditor({ initialDoc, readOnly, onChange }: Props) {
 
   // Reflect readOnly changes without rebuilding the editor.
   useEffect(() => { crepeRef.current?.setReadonly(readOnly) }, [readOnly])
+
+  // The host is the scroller; remember its offset so reopening the file lands where
+  // you left it (create() is async, so the restore keeps re-applying until content
+  // exists — see useScrollMemory).
+  useScrollMemory(scrollKey ?? null, () => hostRef.current)
 
   // Dispatch a command against the live editor. Commands act on the editor's CURRENT
   // selection (ProseMirror keeps it even while a button is focused); the buttons'

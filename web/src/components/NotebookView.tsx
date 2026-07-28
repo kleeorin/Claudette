@@ -6,6 +6,7 @@ import { useNotebooks } from '../store/notebooks'
 import { api } from '../api/client'
 import { setCellMatches, type CellMatch } from '../lib/cellSearch'
 import { basename } from '../lib/paths'
+import { useScrollMemory } from '../lib/scrollMemory'
 import { Cell } from './notebook/Cell'
 
 const STATUS_DOT: Record<KernelStatus, string> = {
@@ -312,6 +313,12 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   // Fetch specs when the notebook opens so the header can name the real kernel
   // (not a hardcoded guess) even before anything has run.
   useEffect(() => { loadSpecs() }, [loadSpecs])
+
+  // Remember how far down the notebook you were. Only the active tab of the active
+  // session is mounted, so switching file/tab/session tears this view down; without
+  // this, every return jumped back to cell 1. Keyed by path (stable across reopens);
+  // must stay above the `if (!doc)` return — see the note on loadSpecs.
+  useScrollMemory(doc ? `nb:${doc.path}` : null, () => listRef.current)
 
   if (!doc) {
     return <div className="flex-1 flex items-center justify-center text-xs text-ctp-overlay">Loading…</div>

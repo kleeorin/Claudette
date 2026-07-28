@@ -1,7 +1,8 @@
-import { useMemo, useState, useCallback } from 'react'
+import { useMemo, useRef, useState, useCallback } from 'react'
 import DataGrid, { textEditor, type Column } from 'react-data-grid'
 import Papa from 'papaparse'
 import 'react-data-grid/lib/styles.css'
+import { useScrollMemory } from '../lib/scrollMemory'
 
 // A dedicated table view for CSV/TSV files. Cells are edited in place (double-click
 // or start typing), and every change is serialized straight back to CSV text and
@@ -16,6 +17,7 @@ interface Props {
   filename: string
   readOnly: boolean
   onChange: (text: string) => void
+  scrollKey?: string   // remembers where you were when this file reopens
 }
 
 type Row = { __id: number; [col: string]: string | number }
@@ -37,8 +39,12 @@ function serialize(matrix: string[][], delimiter: string): string {
   return Papa.unparse(matrix, { delimiter, newline: '\n' })
 }
 
-export function CsvTableView({ initialText, filename, readOnly, onChange }: Props) {
+export function CsvTableView({ initialText, filename, readOnly, onChange, scrollKey }: Props) {
   const delimiter = /\.tsv$/i.test(filename) ? '\t' : ','
+  // react-data-grid owns its scroller (`.rdg`), so we look it up under our wrapper
+  // rather than holding a ref to it.
+  const wrapRef = useRef<HTMLDivElement>(null)
+  useScrollMemory(scrollKey ?? null, () => wrapRef.current?.querySelector<HTMLElement>('.rdg') ?? null)
 
   // Parse once for this mount. FileEditorView remounts us via key={path} per file,
   // so we don't need to re-parse on prop changes.
@@ -138,7 +144,7 @@ export function CsvTableView({ initialText, filename, readOnly, onChange }: Prop
           >+ Column</button>
         </div>
       )}
-      <div className="flex-1 min-h-0 claudette-rdg">
+      <div ref={wrapRef} className="flex-1 min-h-0 claudette-rdg">
         <DataGrid
           columns={columns}
           rows={rows}

@@ -9,6 +9,7 @@ import { bracketMatching, indentOnInput, foldGutter, foldKeymap } from '@codemir
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 import { editorTheme, editorHighlight } from '../lib/editorTheme'
 import { languageForFilename } from '../lib/codeLanguages'
+import { useScrollMemory } from '../lib/scrollMemory'
 
 interface Props {
   initialDoc: string
@@ -16,12 +17,13 @@ interface Props {
   readOnly: boolean
   onChange: (text: string) => void
   onSave: () => void
+  scrollKey?: string     // remembers where you were when this file reopens
 }
 
 // A CodeMirror editor for file editing: syntax-highlighted by filename, editable
 // (unless readOnly), with Cmd/Ctrl-S save, undo/redo, find & replace (Cmd/Ctrl-F),
 // bracket matching + auto-close, and code folding. Ported from ClaudeMaster.
-export function CodeEditor({ initialDoc, filename, readOnly, onChange, onSave }: Props) {
+export function CodeEditor({ initialDoc, filename, readOnly, onChange, onSave, scrollKey }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   // Keep callbacks in a ref so the editor is built once, not on every render.
@@ -73,6 +75,11 @@ export function CodeEditor({ initialDoc, filename, readOnly, onChange, onSave }:
     return () => { view.destroy(); viewRef.current = null }
     // Build once per mounted file; initialDoc/filename are stable per open file.
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The host div is the scroller (CodeMirror grows to fit) — remember where the file
+  // was left so switching tab/session and back doesn't jump to line 1. Declared after
+  // the build effect so the view exists before we restore.
+  useScrollMemory(scrollKey ?? null, () => hostRef.current)
 
   return <div ref={hostRef} className="h-full overflow-auto text-[13px]" />
 }
