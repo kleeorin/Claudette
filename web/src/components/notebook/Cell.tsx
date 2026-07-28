@@ -66,7 +66,12 @@ export function Cell(props: Props) {
   // A markdown cell shows the CodeMirror editor only while being edited; otherwise
   // its rendered output. Code/raw cells always show the editor.
   const showEditor = !isMarkdown || !rendered
-  const [outputCollapsed, setOutputCollapsed] = useState(false)
+  // Output height has three states, cycled by clicking the bar to the left of the
+  // output: 'full' (natural height, the default), 'limited' (capped box with its own
+  // scrollbar, for taming a long stream/traceback) and 'collapsed' (hidden).
+  const [outputView, setOutputView] = useState<'full' | 'limited' | 'collapsed'>('full')
+  const nextOutputView = outputView === 'full' ? 'limited' : outputView === 'limited' ? 'collapsed' : 'full'
+  const outputViewLabel = { full: 'Show output in full', limited: 'Limit output height (scroll)', collapsed: 'Hide output' }[nextOutputView]
   const [minimized, setMinimized] = useState(false)
   const outputs = cell.outputs ?? []
 
@@ -248,17 +253,17 @@ export function Cell(props: Props) {
         {isCode && outputs.length > 0 && (
           <div className="flex gap-1.5">
             <button
-              onClick={() => setOutputCollapsed((v) => !v)}
-              title={outputCollapsed ? 'Show output' : 'Hide output (click this bar)'}
-              aria-label={outputCollapsed ? 'Show output' : 'Hide output'}
-              className="shrink-0 w-2.5 self-stretch rounded-sm bg-ctp-surface1 hover:bg-ctp-accent/70 transition-colors"
+              onClick={() => setOutputView(nextOutputView)}
+              title={`${outputViewLabel} (click this bar to cycle: full → limited → hidden)`}
+              aria-label={outputViewLabel}
+              className={`shrink-0 w-2.5 self-stretch rounded-sm transition-colors hover:bg-ctp-accent/70 ${outputView === 'limited' ? 'bg-ctp-accent/40' : 'bg-ctp-surface1'}`}
             />
-            {outputCollapsed ? (
-              <button onClick={() => setOutputCollapsed(false)} className="text-[10px] text-ctp-overlay hover:text-ctp-text py-0.5">
+            {outputView === 'collapsed' ? (
+              <button onClick={() => setOutputView('full')} className="text-[10px] text-ctp-overlay hover:text-ctp-text py-0.5">
                 {outputs.length} output{outputs.length > 1 ? 's' : ''} hidden — show
               </button>
             ) : (
-              <div className="min-w-0 flex-1 space-y-1 pb-1 max-h-96 overflow-auto">
+              <div className={`min-w-0 flex-1 space-y-1 pb-1 ${outputView === 'limited' ? 'max-h-96 overflow-auto' : ''}`}>
                 {outputs.map((o, i) => <Output key={i} output={o} />)}
               </div>
             )}
