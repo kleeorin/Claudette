@@ -240,7 +240,7 @@ export function registerNotebookTools(
 
   mcp.register({
     name: 'edit_cell',
-    description: "Replace the source of a cell (0-based `index`) in a notebook (the active pane unless `path` is given). If that notebook is open it updates live; if not, it's written to disk. Clears the cell's outputs.",
+    description: "Replace the source of a cell (0-based `index`) in a notebook (the active pane unless `path` is given). If that notebook is open it updates live; if not, it's written to disk. The cell KEEPS its existing outputs and execution count (they now describe the previous source) until it is re-run.",
     inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' }, source: { type: 'string' } }, required: ['index', 'source'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc

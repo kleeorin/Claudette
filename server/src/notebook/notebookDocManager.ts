@@ -202,7 +202,12 @@ export class NotebookDocManager extends EventEmitter {
       case 'editCell': {
         const i = idx(op.cellId)
         if (i < 0) return notFound(op.cellId)
-        doc.cells[i] = { ...doc.cells[i], source: op.source, outputs: [], executionCount: null }
+        // Outputs + executionCount SURVIVE an edit (Jupyter's behaviour): they're the
+        // record of the last run, and wiping them on every keystroke threw away a plot
+        // or a traceback the user was editing against. They're replaced when the cell
+        // is actually re-run (see startRun) — the stale [n] is the signal that the
+        // output predates the current source.
+        doc.cells[i] = { ...doc.cells[i], source: op.source }
         focusId = op.cellId
         break
       }
@@ -299,9 +304,10 @@ export class NotebookDocManager extends EventEmitter {
         if (i < 0) return notFound(op.cellId)
         const c = doc.cells[i]
         const off = clamp(op.offset, 0, c.source.length)
-        // Head keeps the cell's id (and thus its place); tail becomes a new cell. A
-        // split invalidates outputs, so clear them on the (now-shorter) head.
-        doc.cells[i] = { ...c, source: c.source.slice(0, off), outputs: [], executionCount: null }
+        // Head keeps the cell's id (and thus its place) AND its outputs — like an edit,
+        // a split doesn't discard the last run's record; the tail is a new cell, so it
+        // starts with none.
+        doc.cells[i] = { ...c, source: c.source.slice(0, off) }
         const tail = makeCell(c.cellType, c.source.slice(off))
         doc.cells.splice(i + 1, 0, tail)
         focusId = tail.id
@@ -314,7 +320,9 @@ export class NotebookDocManager extends EventEmitter {
         const first = inOrder[0]
         const merged = inOrder.map((c) => c.source).join('\n')
         const drop = new Set(inOrder.slice(1).map((c) => c.id))
-        doc.cells[idx(first.id)] = { ...first, source: merged, outputs: [], executionCount: null }
+        // The survivor keeps its own outputs (the merged-away cells' go with them) —
+        // same rule as edit/split: only a re-run replaces a cell's output.
+        doc.cells[idx(first.id)] = { ...first, source: merged }
         doc.cells = doc.cells.filter((c) => !drop.has(c.id))
         this.dropLocks(nb, drop)
         focusId = first.id
