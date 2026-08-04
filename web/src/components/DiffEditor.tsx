@@ -67,7 +67,19 @@ export function DiffEditor({ original, proposed, filename, onDoc, onAllResolved 
     cbRef.current.onDoc(view.state.doc.toString())
     const init = getChunks(view.state)
     if (init && init.chunks.length > 0) sawChunks = true
-    return () => { view.destroy() }
+    // Open ON the change rather than at line 1: an edit deep in a long file would
+    // otherwise land you in untouched code with no hint where it went. We centre the
+    // FIRST hunk (later ones are a scroll away). Deferred a frame so CodeMirror has
+    // measured the deletion widgets — scrolling before that targets a stale height.
+    let raf = 0
+    const first = init?.chunks[0]
+    if (first) {
+      raf = requestAnimationFrame(() => {
+        const pos = Math.min(first.fromB, view.state.doc.length)
+        view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'center' }) })
+      })
+    }
+    return () => { if (raf) cancelAnimationFrame(raf); view.destroy() }
     // Rebuilt per proposal via the caller's `key` — original/proposed are stable.
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
