@@ -295,11 +295,22 @@ export const api = {
     createFile: (path: string) => post<WriteResult>('/api/fs/createFile', { path }),
     // Upload one file into `dir`: stream its bytes as the raw request body (no JSON
     // base64 bloat / body cap). Server names it after `file.name` inside `dir`.
+    // Always RESOLVES to a WriteResult — never throws. The failures that matter here
+    // (an expired cookie's 401, a proxy's HTML 413/502, the network dropping mid-file)
+    // all produce a body `res.json()` rejects on, and a rejection from this one call
+    // would abort the caller's whole batch loop with nothing shown to the user.
     upload: async (dir: string, file: File): Promise<WriteResult> => {
-      const res = await fetch(`/api/fs/upload?dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`, {
-        method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file,
-      })
-      return res.json()
+      try {
+        const res = await fetch(`/api/fs/upload?dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(file.name)}`, {
+          method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: file,
+        })
+        const body = await res.json().catch(() => null) as { ok?: unknown; error?: unknown } | null
+        if (typeof body?.ok === 'boolean') return body as WriteResult
+        const why = typeof body?.error === 'string' ? body.error : `upload failed (HTTP ${res.status})`
+        return { ok: false, error: why }
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : 'upload failed' }
+      }
     },
     mkdir: (path: string) => post<WriteResult>('/api/fs/mkdir', { path }),
     rename: (from: string, to: string) => post<WriteResult>('/api/fs/rename', { from, to }),

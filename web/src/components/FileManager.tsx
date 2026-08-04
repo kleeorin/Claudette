@@ -115,20 +115,26 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   // Upload the picked files into the current folder, one at a time so a big file
   // doesn't starve the rest and progress advances predictably. Collect per-file
   // failures (e.g. name collisions) into opErr, then refresh the listing.
-  const uploadFiles = async (files: FileList | null) => {
-    const list = files ? Array.from(files) : []
+  // Takes a plain File[] the caller has already snapshotted off the input — see the
+  // onChange below for why a live FileList must never be passed in here.
+  // The finally is load-bearing: without it a thrown upload left `uploading` set, which
+  // disables the "+ New" button — the dock got stuck on "↑ 0/1" with no way back.
+  const uploadFiles = async (list: File[]) => {
     if (list.length === 0) return
     setOpErr(null)
     setUploading({ done: 0, total: list.length })
     const errors: string[] = []
-    for (let i = 0; i < list.length; i++) {
-      const r = await api.fs.upload(dir, list[i])
-      if (!r.ok) errors.push(`${list[i].name}: ${r.error}`)
-      setUploading({ done: i + 1, total: list.length })
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const r = await api.fs.upload(dir, list[i])
+        if (!r.ok) errors.push(`${list[i].name}: ${r.error}`)
+        setUploading({ done: i + 1, total: list.length })
+      }
+    } finally {
+      setUploading(null)
+      if (errors.length) setOpErr(errors.join(' · '))
+      await load(dir)
     }
-    setUploading(null)
-    if (errors.length) setOpErr(errors.join(' · '))
-    await load(dir)
   }
 
   const download = (e: DirEntry) => {
@@ -233,7 +239,14 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
             type="file"
             multiple
             className="hidden"
-            onChange={(e) => { const f = e.target.files; e.target.value = ''; void uploadFiles(f) }}
+            // Snapshot the picked files into a real array BEFORE resetting the input.
+            // `e.target.files` is the input's LIVE FileList, and clearing `value` empties
+            // that same object in place (Blink's FileInputType::SetValue calls
+            // file_list_->clear()) — so the previous "capture the reference, then reset"
+            // order handed uploadFiles an already-empty list and every upload silently
+            // did nothing. The reset itself has to stay: without it, re-picking the same
+            // file fires no change event.
+            onChange={(e) => { const picked = Array.from(e.target.files ?? []); e.target.value = ''; void uploadFiles(picked) }}
           />
           {fileClipboard && (
             <button
