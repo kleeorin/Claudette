@@ -95,9 +95,13 @@ interface AssistantBlock { index: number; kind: 'text' | 'thinking' | 'tool_use'
 let seq = 0
 const nextId = () => `i${++seq}`
 
-// Stable empty-array identity so a session with no subagents doesn't hand consumers a
-// fresh [] each render (which would defeat memoization in the tray).
+// Stable empty identities, so a session with nothing yet doesn't hand consumers a
+// fresh []/{} on every call — that defeats the `useMemo`s keyed on these (the agents
+// tray, the MetaBar) and makes them recompute each render for no reason.
 const EMPTY_TASKS: TaskRecord[] = []
+const EMPTY_ITEMS: TranscriptItem[] = []
+const EMPTY_SLASH: string[] = []
+const EMPTY_META: SessionMeta = {}
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -724,12 +728,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'CLEAR', sessionId })
   }, [])
 
-  const transcriptFor = useCallback((sessionId: string) => state.transcripts[sessionId] ?? [], [state.transcripts])
+  const transcriptFor = useCallback((sessionId: string) => state.transcripts[sessionId] ?? EMPTY_ITEMS, [state.transcripts])
   // The prompt to show now = head of the session's queue (answering it reveals the
   // next). Kept as a single-value API so callers render one card at a time.
   const pendingFor = useCallback((sessionId: string) => state.pending[sessionId]?.[0], [state.pending])
-  const slashCommandsFor = useCallback((sessionId: string) => state.slash[sessionId] ?? [], [state.slash])
-  const metaFor = useCallback((sessionId: string) => state.meta[sessionId] ?? {}, [state.meta])
+  const slashCommandsFor = useCallback((sessionId: string) => state.slash[sessionId] ?? EMPTY_SLASH, [state.slash])
+  const metaFor = useCallback((sessionId: string) => state.meta[sessionId] ?? EMPTY_META, [state.meta])
   const tasksFor = useCallback((sessionId: string) => state.tasks[sessionId] ?? EMPTY_TASKS, [state.tasks])
 
   // Memoize the context value so a streamed token (which re-renders ChatProvider)
