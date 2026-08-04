@@ -181,11 +181,19 @@ export class NotebookDocManager extends EventEmitter {
       return { ok: false, error: `${op.op} is executed via the kernel client, not applyOp` }
     }
 
-    // Lock gate: Claude may not mutate a cell the human holds.
-    const targetId = 'cellId' in op ? op.cellId : undefined
-    if (origin === 'claude' && targetId && nb.locks.has(targetId)) {
-      const reason = nb.locks.get(targetId)!.reason
-      return { ok: false, error: `cell ${targetId} is locked by the user (${reason}); edit refused`, code: 'locked' }
+    // Lock gate: Claude may not mutate a cell the human holds. This MUST cover the
+    // multi-cell ops (`cellIds`) as well as the single-cell ones (`cellId`) —
+    // deleteCells/moveCells/mergeCells each remove or relocate every cell they name, so
+    // gating on `cellId` alone let a bulk call delete a pinned cell out from under the
+    // user, silently and with no denial. Refuse if ANY target is held: these ops are
+    // atomic (one undo step), so a partial application isn't a coherent alternative.
+    if (origin === 'claude') {
+      const targets = 'cellId' in op ? [op.cellId] : 'cellIds' in op ? op.cellIds : []
+      const held = targets.find((id) => nb.locks.has(id))
+      if (held) {
+        const reason = nb.locks.get(held)!.reason
+        return { ok: false, error: `cell ${held} is locked by the user (${reason}); edit refused`, code: 'locked' }
+      }
     }
 
     const idx = (cellId: string) => doc.cells.findIndex((c) => c.id === cellId)
