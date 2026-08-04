@@ -43,6 +43,12 @@ interface Props {
   collapsed: boolean
   hiddenCount: number         // cells folded under it while collapsed
   onToggleCollapse: () => void
+  // Minimized-to-its-annotation state. Owned by NotebookView (like `rendered` and
+  // `collapsed`) rather than held locally, because the find bar has to be able to
+  // EXPAND a cell to reach a match inside it — a minimized cell renders no editor
+  // and no `data-cell-id` anchor, so a match in one was counted but unreachable.
+  minimized: boolean
+  onToggleMinimize: () => void
 }
 
 // How long after the last keystroke we commit the buffer to the server (an
@@ -51,7 +57,7 @@ interface Props {
 const COMMIT_DEBOUNCE_MS = 500
 
 export function Cell(props: Props) {
-  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, onSelect, onReorder, onBeginEdit, onToggleCollapse, onMenu } = props
+  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, minimized, onSelect, onReorder, onBeginEdit, onToggleCollapse, onToggleMinimize, onMenu } = props
   const editorRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const cbRef = useRef(props)
@@ -72,7 +78,6 @@ export function Cell(props: Props) {
   const [outputView, setOutputView] = useState<'full' | 'limited' | 'collapsed'>('full')
   const nextOutputView = outputView === 'full' ? 'limited' : outputView === 'limited' ? 'collapsed' : 'full'
   const outputViewLabel = { full: 'Show output in full', limited: 'Limit output height (scroll)', collapsed: 'Hide output' }[nextOutputView]
-  const [minimized, setMinimized] = useState(false)
   const outputs = cell.outputs ?? []
 
   // An "annotation" is a comment line at the very top of the cell — a Python `#`
@@ -86,9 +91,9 @@ export function Cell(props: Props) {
   const isMinimized = minimized && canMinimize
 
   // Only send an editCell when the buffer actually differs from the server's current
-  // source. A blur (click away, Ctrl+click another cell) flushes unconditionally, and
-  // the server clears a cell's outputs on every editCell — so committing an unchanged
-  // buffer would wipe the output for no reason. Guarding here keeps output intact.
+  // source. A blur (click away, Ctrl+click another cell) flushes unconditionally, so
+  // without this guard every focus-and-leave would bump the doc version, mark it dirty,
+  // and push a no-op onto the undo stack.
   const commit = (code: string) => {
     if (code === cbRef.current.cell.source) return
     cbRef.current.onCodeChange(code)
@@ -193,7 +198,7 @@ export function Cell(props: Props) {
       <div
         draggable
         onDragStart={(e) => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('application/x-cell-index', String(index)) }}
-        onDoubleClick={(e) => { if (canMinimize) { e.stopPropagation(); setMinimized((v) => !v) } }}
+        onDoubleClick={(e) => { if (canMinimize) { e.stopPropagation(); onToggleMinimize() } }}
         title={canMinimize ? (isMinimized ? 'Double-click to expand' : 'Drag to reorder · double-click to minimize') : 'Drag to reorder'}
         className="w-12 shrink-0 text-right pt-1.5 text-xs text-ctp-overlay font-mono select-none cursor-grab active:cursor-grabbing"
       >
@@ -212,7 +217,7 @@ export function Cell(props: Props) {
       <div className="flex-1 min-w-0 space-y-1">
         {isMinimized ? (
           <button
-            onClick={() => setMinimized(false)}
+            onClick={onToggleMinimize}
             title="Minimized — click to expand (or double-click the gutter)"
             className="w-full flex items-center gap-1.5 text-left px-3 py-1 text-[13px] text-ctp-subtext italic truncate border border-dashed border-ctp-surface1 rounded hover:bg-ctp-surface0/40"
           >

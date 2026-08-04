@@ -53,11 +53,14 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const anchorRef = useRef<string | null>(null)
-  // Markdown cells being edited (all others show their rendered output) and the set
-  // of collapsed heading cells. Both are ephemeral view state, reset per notebook.
+  // Markdown cells being edited (all others show their rendered output), the set of
+  // collapsed heading cells, and the set of cells minimized to their annotation line.
+  // All ephemeral view state, reset per notebook. `minimized` lives here rather than
+  // in Cell so the find bar can expand a cell to reach a match inside it.
   const [mdEditing, setMdEditing] = useState<Set<string>>(new Set())
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
-  // The open cell context menu (right-click / the ⋯ button): which cell + where.
+  const [minimized, setMinimized] = useState<Set<string>>(new Set())
+  // The open cell context menu (the ⋯ button): which cell + where.
   const [cellMenu, setCellMenu] = useState<{ cellId: string; x: number; y: number } | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const lastD = useRef(0)
@@ -70,6 +73,9 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   }, [])
   const toggleCollapse = useCallback((id: string) => {
     setCollapsed((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }, [])
+  const toggleMinimize = useCallback((id: string) => {
+    setMinimized((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
   }, [])
 
   // Toolbar/overlay UI state.
@@ -90,6 +96,13 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   const [query, setQuery] = useState('')
   const [matchIdx, setMatchIdx] = useState(0)
   const findInputRef = useRef<HTMLInputElement>(null)
+  // Where a search starts from: the cell/offset at the top of the visible area when
+  // the find bar was opened. Matches before it are skipped on the first hop, so
+  // searching moves you DOWN from what you're looking at instead of yanking the view
+  // to the notebook's first occurrence. `seekRef` marks a match index as a fresh
+  // reset that still needs that hop (vs. one the user navigated to with ↑/↓).
+  const findAnchorRef = useRef<{ cellId: string; offset: number } | null>(null)
+  const seekRef = useRef(false)
   // Registry of each cell's CodeMirror view, so the find bar can highlight matches
   // and scroll to the exact occurrence inside a cell.
   const cellViews = useRef(new Map<string, EditorView>())
@@ -127,14 +140,17 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     })
   }, [notebookId, revealCell])
 
-  // Ctrl/Cmd+S saves.
+  // Ctrl/Cmd+S saves. The store value changes identity on every notebook event (a
+  // streaming run fires many), so read it through a ref — otherwise this effect had no
+  // dep array at all and tore down + re-registered the window listener on every render.
+  const nbRef = useRef(nb); nbRef.current = nb
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); nb.save(notebookId) }
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); nbRef.current.save(notebookId) }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  })
+  }, [notebookId])
 
   // Focus the find field when the bar opens.
   useEffect(() => { if (findOpen) findInputRef.current?.focus() }, [findOpen])
@@ -198,6 +214,38 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     return { hidden, foldCount, headingLevel: level }
   }, [cells, collapsed])
 
+  // Pin the search start to what's on screen right now. Called as the find bar opens
+  // (each Ctrl+F re-anchors), before anything has scrolled. Folded-away cells have no
+  // box, so the first cell still on screen wins; if the fold cuts through a cell we
+  // anchor at the character nearest the fold, so a match in that cell's visible tail
+  // isn't passed over for one just above the edge.
+  const captureFindAnchor = () => {
+    const list = listRef.current
+    findAnchorRef.current = null
+    if (!list) return
+    const top = list.getBoundingClientRect().top
+    for (const c of cells) {
+      const el = document.querySelector(`[data-cell-id="${c.id}"]`) as HTMLElement | null
+      if (!el) continue
+      const r = el.getBoundingClientRect()
+      if (r.bottom <= top) continue
+      const view = cellViews.current.get(c.id)
+      // `false` = clamp to the nearest position, so the cell's chrome (gutter, margin)
+      // at those coords still resolves instead of returning null.
+      const pos = r.top < top && view ? view.posAtCoords({ x: r.left + 1, y: top }, false) : null
+      findAnchorRef.current = { cellId: c.id, offset: pos ?? 0 }
+      return
+    }
+  }
+
+  // Open the find bar for a fresh search, starting from the current viewport. When the
+  // bar is ALREADY open (a second Ctrl+F from inside a cell) the mount effect below
+  // won't re-fire, so pull focus back to the field and select the query for a retype.
+  const openFind = () => {
+    captureFindAnchor(); seekRef.current = true; setFindOpen(true); setMatchIdx(0)
+    findInputRef.current?.select()
+  }
+
   // Cross-cell search: a flat, ordered list of matches (one per occurrence), each
   // with its offset range within the cell source. Returns a stable empty array when
   // there's no query so the paint effect below doesn't re-fire on every doc change.
@@ -234,6 +282,25 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       activeKeyRef.current = null
       return
     }
+    // A fresh query (or a just-opened bar) lands on the first match at or after the
+    // find anchor rather than match #1, so the view scrolls down to the next hit
+    // instead of jumping to the top of the notebook. Wraps to match #1 when nothing
+    // follows the anchor. Left pending while a query has no matches yet, so the hop
+    // still happens once the user types something that hits.
+    if (seekRef.current && matches.length) {
+      seekRef.current = false
+      const anchor = findAnchorRef.current
+      const order = new Map(cells.map((c, i) => [c.id, i]))
+      const ai = anchor ? order.get(anchor.cellId) : undefined
+      const found = anchor && ai !== undefined
+        ? matches.findIndex((m) => {
+            const mi = order.get(m.cellId) ?? -1
+            return mi > ai || (mi === ai && m.from >= anchor.offset)
+          })
+        : -1
+      const seek = found === -1 ? 0 : found
+      if (seek !== matchIdx) { setMatchIdx(seek); return }
+    }
     const active = matches.length ? matches[Math.min(matchIdx, matches.length - 1)] : null
     // Never let a match hide inside a collapsed section — un-collapse only the
     // heading(s) whose section contains it (not every fold in the notebook), then the
@@ -255,6 +322,14 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
         }
         return next
       })
+      return
+    }
+    // Nor inside a MINIMIZED cell: minimized renders only the annotation line — no
+    // editor to highlight in and no `data-cell-id` to scroll to — so its matches were
+    // counted in "n/m" but stepping to one appeared to do nothing. Expand it and let
+    // the effect re-run against the now-mounted editor (same shape as the fold above).
+    if (active && minimized.has(active.cellId)) {
+      setMinimized((prev) => { const n = new Set(prev); n.delete(active.cellId); return n })
       return
     }
     const byCell = new Map<string, CellMatch[]>()
@@ -289,7 +364,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       })
     }
     activeKeyRef.current = activeKey
-  }, [findOpen, matches, matchIdx, revealCell, hidden, cells, headingLevel, mdEditing, beginEdit])
+  }, [findOpen, matches, matchIdx, revealCell, hidden, cells, headingLevel, mdEditing, beginEdit, minimized])
 
   const stepMatch = (dir: 1 | -1) => {
     if (matches.length === 0) return
@@ -435,7 +510,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   // Escape to close the find bar.
   const onNotebookKey = (e: React.KeyboardEvent) => {
     const mod = e.ctrlKey || e.metaKey
-    if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); setFindOpen(true); setMatchIdx(0) }
+    if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openFind() }
     else if (e.key === 'Escape' && findOpen && !(e.target as HTMLElement).closest('.cm-editor')) { setFindOpen(false) }
   }
 
@@ -566,7 +641,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
         <TB onClick={() => nb.addCell(notebookId, 'code', selectedId ?? undefined)} title="Add code cell">+ code</TB>
         <TB onClick={() => nb.addCell(notebookId, 'markdown', selectedId ?? undefined)} title="Add markdown cell">+ md</TB>
         <Sep />
-        <TB onClick={() => { setFindOpen(true); setMatchIdx(0) }} title="Find in notebook (Ctrl+F)">⌕</TB>
+        <TB onClick={openFind} title="Find in notebook (Ctrl+F)">⌕</TB>
         <TB onClick={() => setHelpOpen(true) } title="Keyboard shortcuts (?)">?</TB>
         <button onClick={() => nb.save(notebookId)} disabled={!dirty} title="Save (Ctrl/Cmd+S)" className="shrink-0 text-xs px-2 h-6 rounded bg-ctp-surface0 text-ctp-text hover:bg-ctp-surface1 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">Save</button>
       </div>
@@ -591,10 +666,13 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       {findOpen && (
         <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 bg-ctp-surface0/60 border-b border-ctp-surface0">
           <span className="text-ctp-overlay text-xs">⌕</span>
+          {/* Typing re-seeks from the SAME anchor: refining the query re-picks the
+              nearest match below where the search started, rather than creeping up
+              the notebook from wherever the last match happened to land. */}
           <input
             ref={findInputRef}
             value={query}
-            onChange={(e) => { setQuery(e.target.value); setMatchIdx(0) }}
+            onChange={(e) => { setQuery(e.target.value); setMatchIdx(0); seekRef.current = true }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') { e.preventDefault(); stepMatch(e.shiftKey ? -1 : 1) }
               else if (e.key === 'Escape') { e.preventDefault(); setFindOpen(false) }
@@ -644,8 +722,10 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
               collapsible={(headingLevel.get(cell.id) ?? 0) > 0}
               collapsed={collapsed.has(cell.id)}
               hiddenCount={foldCount[cell.id] ?? 0}
+              minimized={minimized.has(cell.id)}
               onBeginEdit={() => { beginEdit(cell.id); selectOnly(cell.id); focusCell(cell.id) }}
               onToggleCollapse={() => toggleCollapse(cell.id)}
+              onToggleMinimize={() => toggleMinimize(cell.id)}
               onSelect={() => selectOnly(cell.id)}
               onCodeChange={(code) => nb.updateSource(notebookId, cell.id, code)}
               onEditorFocus={() => { if (!pinned) nb.claim(notebookId, cell.id, 'focus') }}
@@ -699,8 +779,10 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   )
 }
 
-// Per-cell context menu (⋯ button or right-click). Portal to body so the notebook's
-// scroll never clips it; closes on outside click / Escape. `Paste` only shows when
+// Per-cell context menu, opened from the cell's ⋯ button. (Right-click is deliberately
+// left as the NATIVE browser menu — see Cell.tsx — so selecting and copying text inside
+// a cell still works.) Portal to body so the notebook's scroll never clips it; closes
+// on outside click / Escape. `Paste` only shows when
 // the cell clipboard has content; `Split`/`Merge below` only when they're meaningful.
 function CellContextMenu({
   x, y, isCode, hasClipboard, canSplit, hasBelow, pinned,
