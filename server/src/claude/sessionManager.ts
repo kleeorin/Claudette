@@ -696,14 +696,17 @@ export class SessionManager extends EventEmitter {
   saved(): SavedSession[] {
     const list = [...this.sessions.values()]
     const indexOf = new Map(list.map((s, i) => [s.id, i]))
-    return list.map((s) => ({
-      name: s.name, cwd: s.cwd, rootDir: s.rootDir,
-      parentIndex: s.parentId != null ? indexOf.get(s.parentId) : undefined,
-      agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
-      sandbox: s.sandbox,
-      claudeSessionId: s.claudeSessionId,
-      tasks: this.tasksOf(s.id).length ? this.tasksOf(s.id) : undefined,
-    }))
+    return list.map((s) => {
+      const tasks = this.tasksOf(s.id)
+      return {
+        name: s.name, cwd: s.cwd, rootDir: s.rootDir,
+        parentIndex: s.parentId != null ? indexOf.get(s.parentId) : undefined,
+        agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
+        sandbox: s.sandbox,
+        claudeSessionId: s.claudeSessionId,
+        tasks: tasks.length ? tasks : undefined,
+      }
+    })
   }
 
   // Recreate saved sessions, each resumed into its conversation (--resume). Called
@@ -781,7 +784,10 @@ export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string
   // (CLAUDETTE_ALLOW_UNSANDBOXED=1), a capability an in-box caller can't grant itself.
   if (!cfg.enabled && !trusted && !unsandboxedAllowed()) {
     console.warn('[sandbox] ignoring untrusted sandbox.enabled=false — set CLAUDETTE_ALLOW_UNSANDBOXED=1 to permit unconfined sessions')
-    return { enabled: true, mounts: cfg.mounts }
+    // Carry `sandboxTerminals` through. Per the note above it only ever RAISES
+    // confinement, so dropping it here would have this forced-on branch — which exists
+    // purely to refuse a downgrade — quietly perform a different downgrade of its own.
+    return { enabled: true, mounts: cfg.mounts, sandboxTerminals: cfg.sandboxTerminals }
   }
   return cfg
 }
