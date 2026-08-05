@@ -40,8 +40,31 @@ export const DENY_ALL_SANDBOX: SandboxConfig = { enabled: true, mounts: [] }
 // (the operator's own view); `{ session }` = a real session, resolved via the seam.
 export type Owner = { session: string } | { host: true }
 
+// How strongly a confinement constrains the work done under it, for comparing a CURRENT
+// owner against a proposed one (see lowersConfinement). Note `deny` is NOT the top of
+// this scale even though it is the most restrictive *branch*: it means "nothing valid
+// claims this", i.e. there is no confinement to preserve. Ranking it lowest keeps a
+// stale/unresolvable owner replaceable — otherwise a session that died without cleanup
+// would brick its notebooks forever, which protects nothing (a `deny` notebook has no
+// running kernel; the kernel was refused).
+function strength(c: Confinement): number {
+  return c.mode === 'confined' ? 1 : c.mode === 'host' ? 0 : -1
+}
+
 export class SessionConfinement {
   constructor(private lookup: (sessionId: string) => SessionBox | undefined) {}
+
+  // Would handing this work from `current` to `next` REDUCE its confinement? Ownership is
+  // last-claimer-wins, so without this a notebook a *confined* session owns could be
+  // silently downgraded to an unconfined kernel — most sharply by the operator opening it
+  // session-lessly (`/api/notebook/open` with no sessionId → `{host:true}`), which flips
+  // the owner and makes the next run restart the kernel on the unconfined `off:` server.
+  // Raising confinement (host → confined) and swapping between boxes stay allowed; only
+  // the downgrade is refused, and the explicit takeover is to shut the kernel down first
+  // (KernelManager.shutdown clears the owner, so the next claim starts from `deny`).
+  lowersConfinement(current: Owner | undefined, next: Owner | undefined): boolean {
+    return strength(this.resolveOwner(next)) < strength(this.resolveOwner(current))
+  }
 
   // Map a sessionId to its confinement. A missing id or an unknown session is `deny`
   // (fail closed); a resolved-but-not-sandboxed session (or a non-sandbox host) is

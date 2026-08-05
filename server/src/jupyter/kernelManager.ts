@@ -8,6 +8,12 @@ import { KernelClient, type KernelStatus } from './kernelClient'
 import { sandboxKey } from '../claude/sandbox'
 import type { Confinement, Owner, SessionConfinement } from '../claude/sessionConfinement'
 
+// Human-readable owner, for the downgrade-refusal warning (the only place we print one).
+function describeOwner(owner: Owner | undefined): string {
+  if (!owner) return 'nobody'
+  return 'host' in owner ? 'the host (no session)' : `session ${owner.session}`
+}
+
 // Sentinel owner for a notebook opened OUTSIDE any session — the operator's own view via
 // the token-gated HTTP route with no sessionId. Its kernel runs on the host, deliberately.
 // Distinct from NO owner at all (a notebook nothing claimed → fail closed: refuse to start
@@ -345,9 +351,25 @@ export class KernelManager extends EventEmitter {
   }
 
   // Record which session a notebook was opened in — closing that session kills its
-  // kernel (see shutdownForSession). Last opener wins.
-  setOwner(notebookId: string, owner: Owner): void {
+  // kernel (see shutdownForSession). Last opener wins, EXCEPT that a claim which would
+  // LOWER the notebook's confinement is refused (SANDBOX.md "Ownership downgrade"):
+  // handing a notebook a sandboxed session owns to a host owner would make the next
+  // ensureKernel discard the confined kernel and restart it on the unconfined `off:`
+  // server — a silent un-sandboxing of live notebook execution. Not box-reachable (both
+  // downgrade paths need the app token), but it's one careless click from the operator's
+  // own UI, and the kernel layer gave no sign it had happened.
+  //
+  // Returns whether the claim took, so a caller can surface the refusal; the deliberate
+  // takeover is `shutdown(notebookId)` first (it clears the owner AND the kernel, so
+  // nothing keeps running in the box being handed off).
+  setOwner(notebookId: string, owner: Owner): boolean {
+    const current = this.owner.get(notebookId)
+    if (this.confinement.lowersConfinement(current, owner)) {
+      console.warn(`[sandbox] refusing to lower confinement of notebook ${notebookId}: it is owned by ${describeOwner(current)} and the claim from ${describeOwner(owner)} would run its kernel less confined — shut the kernel down first to take it over`)
+      return false
+    }
     this.owner.set(notebookId, owner)
+    return true
   }
 
   // The owner of a notebook (whose box confines its kernel), or undefined if none.

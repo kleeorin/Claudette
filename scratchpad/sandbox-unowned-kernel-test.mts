@@ -52,6 +52,7 @@ const handlers = new Map<string, McpTool['handler']>()
 const fakeMcp = { register: (t: McpTool) => handlers.set(t.name, t.handler) } as unknown as AppControlMcpServer
 registerNotebookTools(fakeMcp, docs, kernels, panes, turns,
   (sid, doc) => { kernels.setOwner(doc.notebookId, { session: sid }) },   // mirrors index.ts onFocus→setOwner
+  () => {},                                                              // onFocusFile (open_file) — unused here
   confinement,
 )
 const call = (name: string, args: Record<string, unknown>): Promise<McpToolResult> => handlers.get(name)!(SID, args)
@@ -110,6 +111,42 @@ await (async () => {
   try { await kernels.ensureKernel(nbId(nb5)!) }
   catch (e) { refused = /no resolvable owning session/.test(String(e)) }
   check('unowned notebook: ensureKernel REFUSES (never falls to the off: server)', refused)
+
+  // --- 6. Ownership DOWNGRADE is refused (SANDBOX.md "Ownership downgrade") ----
+  // Last-claimer-wins used to let a host claim take a notebook a CONFINED session owns —
+  // the operator opening it session-lessly (`/api/notebook/open` with no sessionId) — and
+  // the next run then restarted the kernel on the unconfined `off:` server. The claim is
+  // now refused: the confined owner stands.
+  const nb6 = path.join(proj, 'downgrade.ipynb')
+  await docs.createPath(nb6)
+  kernels.shutdown(nbId(nb6)!)
+  check('setOwner: first claim by a confined session takes',
+    kernels.setOwner(nbId(nb6)!, { session: SID }) === true)
+  check('setOwner: host claim on a CONFINED notebook is REFUSED',
+    kernels.setOwner(nbId(nb6)!, { host: true }) === false)
+  check('setOwner: the confined owner still stands after the refused claim',
+    (kernels.ownerOf(nbId(nb6)!) as { session: string } | undefined)?.session === SID,
+    `owner=${JSON.stringify(kernels.ownerOf(nbId(nb6)!))}`)
+  check('setOwner: a claim from an UNRESOLVABLE session is refused too (deny < confined)',
+    kernels.setOwner(nbId(nb6)!, { session: 'session-GONE' }) === false)
+  // The deliberate takeover: shut the kernel down first, then claim.
+  kernels.shutdown(nbId(nb6)!)
+  check('takeover: after shutdown() the host CAN claim it',
+    kernels.setOwner(nbId(nb6)!, { host: true }) === true &&
+    'host' in (kernels.ownerOf(nbId(nb6)!) ?? {}))
+
+  // --- 7. RAISING confinement still works (the fix must not block the safe way) -
+  // A host-owned notebook that a confined session writes to becomes confined — this is
+  // the path that makes a box-reachable notebook run in its box, so it must stay open.
+  check('raise: a confined session CAN claim a host-owned notebook',
+    kernels.setOwner(nbId(nb6)!, { session: SID }) === true,
+    `owner=${JSON.stringify(kernels.ownerOf(nbId(nb6)!))}`)
+  // A stale/unclaimed notebook is claimable by anyone (a dead owner must not brick it).
+  const nb7 = path.join(proj, 'stale.ipynb')
+  await docs.createPath(nb7)
+  kernels.shutdown(nbId(nb7)!)
+  check('stale: an unowned notebook accepts a host claim (deny is replaceable)',
+    kernels.setOwner(nbId(nb7)!, { host: true }) === true)
 })()
 
 kernels.destroy()

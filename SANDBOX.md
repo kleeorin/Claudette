@@ -594,6 +594,55 @@ that session's box:
   `read_notebook` claims nothing). Existing sandbox tests still pass (server typecheck
   clean).
 
+## Ownership downgrade (a later claim un-sandboxes a live notebook)
+
+The unowned-kernel fix made *every* open/write claim ownership, and ownership decides the
+kernel's box. But `setOwner` was **last-claimer-wins**, and `ensureKernel` faithfully
+re-homes the kernel onto whatever server the *current* owner requires — including
+downward. So a notebook a **confined session owns** could be handed to a host owner, and
+the next run would shut the confined kernel down and restart it on the unconfined `off:`
+server (server user, full env, `root_dir=/`). Two ways in:
+
+- `POST /api/notebook/open` (or `/create`) with **no `sessionId`** → `{host:true}`
+  (`notebook/notebookApi.ts`) — the operator opening, from their own UI, a notebook a
+  sandboxed session is working in. One click, no warning, kernel silently unconfined.
+- a claim from a session that resolves to `host` (operator opted it out, or the host
+  can't sandbox).
+
+Not box-reachable — both need the app auth token, which `--clearenv` keeps out of every
+box — so this is not an escape a confined Claude can drive. It is a **silent
+un-sandboxing of live execution by the operator**, and the kernel layer gave no sign it
+had happened, which is the same class of dishonesty the "honest badge" rule exists to
+prevent.
+
+**FIXED (2026-08-04).** `setOwner` refuses a claim that would **lower** confinement:
+- `SessionConfinement.lowersConfinement(current, next)` (`claude/sessionConfinement.ts`)
+  ranks the two owners' resolved confinement — `confined` (1) > `host` (0) > `deny` (-1) —
+  and `KernelManager.setOwner` drops the claim (returning `false`, logging
+  `[sandbox] refusing to lower confinement of notebook …`) when the new owner ranks lower.
+  The existing owner stands, so the kernel keeps running in the box it was started in.
+- **`deny` ranks lowest, deliberately.** It means "nothing valid claims this", not "maximally
+  confined": ranking it top would let a session that died without cleanup **brick** its
+  notebooks forever while protecting nothing (a `deny` notebook has no kernel — it was
+  refused). So a stale owner is replaceable; a *live* confined one is not.
+- **Raising still works** (`host` → `confined`), which is the path that matters for safety:
+  a confined session writing to a host-owned notebook takes it into its box, and
+  `ensureKernel`'s server check restarts the kernel there.
+- **Explicit takeover** = `shutdown(notebookId)` first (the `/api/notebook/kernel/shutdown`
+  route): it clears the owner *and* kills the kernel, so nothing keeps running in the box
+  being handed off. The refusal message says so.
+- Verified in `scratchpad/sandbox-unowned-kernel-test.mts` (16/16): host claim on a confined
+  notebook refused and the confined owner stands; a claim from an unresolvable session
+  refused too; takeover-after-shutdown works; `host → confined` raise still allowed; an
+  unowned notebook still claimable.
+
+**Residual (documented).** The rule is a rank comparison, so a `confined → confined` handoff
+between two sessions with *different* mounts is allowed even when the new box is broader.
+Comparing mount sets would refuse legitimate handoffs (two sandboxed sessions on one
+project) for a case that is already token-gated and still confined. Also unaddressed: the
+refusal is server-side only — the operator sees a log line, not a UI notice, so a notebook
+they opened may run in another session's box with no on-screen explanation.
+
 ## The confinement seam (fail-closed, one place) — holistic hardening
 
 Every escape above is the same shape: a server-side actor doing work **on behalf of a
