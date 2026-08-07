@@ -206,6 +206,30 @@ export class ClaudeEngine extends EventEmitter {
     this.write({ type: 'control_request', request_id: this.controlId(), request: { subtype: 'interrupt' } })
   }
 
+  // Stop ONE running subagent by the CLI's task id. Unlike interrupt() (which stops the
+  // whole turn), this leaves the parent conversation running — the CLI settles the task
+  // and delivers the usual terminal task_notification, so the tray card settles through
+  // the normal path with no special-casing here.
+  //
+  // The CLI answers a stop for an unknown or already-finished task as SUCCESS, so racing
+  // the agent's own completion is harmless — the button never needs to be disabled to
+  // stay correct. Same request_id/resolver plumbing as setPermissionMode below.
+  stopTask(taskId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (!this.child) return Promise.resolve({ ok: false, error: 'session not running' })
+    const requestId = `stop-task-${this.controlId()}`
+    return new Promise((resolve) => {
+      const done = (r: { ok: true } | { ok: false; error: string }): void => {
+        if (!this.pendingControl.has(requestId)) return
+        this.pendingControl.delete(requestId)
+        clearTimeout(timer)
+        resolve(r)
+      }
+      const timer = setTimeout(() => done({ ok: false, error: 'timed out waiting for CLI' }), 5000)
+      this.pendingControl.set(requestId, done)
+      this.write({ type: 'control_request', request_id: requestId, request: { subtype: 'stop_task', task_id: taskId } })
+    })
+  }
+
   // Live mid-session permission-mode switch (the SDK's onSetPermissionMode path;
   // the TUI's Shift-Tab equivalent). Resolves ok:true if the CLI accepts it, or
   // ok:false with the CLI's error (e.g. the callback isn't registered in this

@@ -58,6 +58,34 @@ export function parseSystemTaskNotification(e: ClaudeEvent): TaskNotification | 
   return { toolUseId: o.tool_use_id, isError: status !== '' && status !== 'completed' && status !== 'done', summary: summary || `Agent ${status || 'finished'}` }
 }
 
+// The CLI announces a task the moment it starts, as `system` / subtype 'task_started',
+// carrying its OWN task id plus (optionally) the tool_use id that spawned it:
+//   { type:'system', subtype:'task_started', task_id, tool_use_id?, description, … }
+//
+// That `task_id` is the ONLY handle the CLI's `stop_task` control request accepts — it is
+// NOT the Task tool-use id the tray is keyed by, which is why both appear on the wire. We
+// pair them here so a tray card can name the task it wants stopped. `tool_use_id` is
+// optional in the schema; without it we can't attach the id to a card, so the stop button
+// simply stays hidden rather than guessing.
+export interface TaskStarted { taskId: string; toolUseId?: string }
+export function parseTaskStarted(e: ClaudeEvent): TaskStarted | null {
+  const o = e as unknown as { type?: string; subtype?: string; task_id?: unknown; tool_use_id?: unknown }
+  if (o.type !== 'system' || o.subtype !== 'task_started') return null
+  if (typeof o.task_id !== 'string' || !o.task_id) return null
+  return { taskId: o.task_id, toolUseId: typeof o.tool_use_id === 'string' && o.tool_use_id ? o.tool_use_id : undefined }
+}
+
+// `task_notification` carries the same pair, so a card whose task_started was missed (an
+// agent already running when we attached) can still pick the id up at settle time. Useless
+// for stopping by then, but it keeps the record complete.
+export function taskIdOfNotification(e: ClaudeEvent): { taskId: string; toolUseId: string } | null {
+  const o = e as unknown as { type?: string; subtype?: string; task_id?: unknown; tool_use_id?: unknown }
+  if (o.type !== 'system' || o.subtype !== 'task_notification') return null
+  if (typeof o.task_id !== 'string' || !o.task_id) return null
+  if (typeof o.tool_use_id !== 'string' || !o.tool_use_id) return null
+  return { taskId: o.task_id, toolUseId: o.tool_use_id }
+}
+
 // --- raw stream-json extractors (server-side) --------------------------------
 // The client parses events into TranscriptItems first; the server holds raw events,
 // so these pull the same tool_use / tool_result / content shapes straight off a

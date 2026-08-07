@@ -1,6 +1,6 @@
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, symlinkSync, rmSync,
-  lstatSync, copyFileSync, chmodSync,
+  lstatSync, copyFileSync, chmodSync, statSync, renameSync, unlinkSync,
 } from 'fs'
 import { homedir } from 'os'
 import path from 'path'
@@ -151,15 +151,138 @@ function writeScrubbedSettings(src: string, dest: string): void {
 // real file, and clobbering it with a session's mirror copy could lose those edits.
 function reconcileCredsBack(mirror: string, real: string): void {
   const name = '.credentials.json'
+  const dest = path.join(real, name)
+  const tmp = `${dest}.claudette-${process.pid}.tmp`
   try {
     const m = path.join(mirror, name)
     // An intact symlink means no refresh happened; only a real file is a salvaged token.
     if (!existsSync(m) || lstatSync(m).isSymbolicLink()) return
-    const dest = path.join(real, name)
-    copyFileSync(m, dest)
-    chmodSync(dest, 0o600)   // creds are 0600; keep it that way even if dest was freshly created
+    // ONLY MOVE A TOKEN FORWARD IN TIME. Several mirrors can hold salvaged tokens at once
+    // (one per host-mode session, plus whatever a crash stranded), and nothing orders the
+    // reconciles — session A can exit after B and carry an older token. An unconditional
+    // copy therefore lets a STALE token overwrite a fresh one, which is the "Not logged in"
+    // loop this whole mechanism exists to prevent. The same guard protects a token the user
+    // obtained via `claude login` in a terminal while the server was down.
+    // Ties SALVAGE. mtime has millisecond granularity, so a mirror refresh and a shared-dir
+    // write in the same tick compare equal — and refusing there would strand a token the
+    // salvage exists to rescue. A genuinely stale mirror is stale by seconds-to-days (the
+    // failure is "session A refreshed on Monday, exits after B refreshed on Tuesday"), so
+    // the guard bites where it matters while back-to-back operations still work. Equal
+    // timestamps fall back to the old copy-anyway behaviour: no regression, just no fix.
+    const mirrorMtime = statSync(m).mtimeMs
+    let destMtime = -Infinity
+    try { destMtime = statSync(dest).mtimeMs } catch { /* absent: any salvaged token is an improvement */ }
+    if (mirrorMtime < destMtime) return
+    // Atomically. Readers of the shared creds (a sandboxed session, `claude` in a terminal,
+    // usageApi) must never observe a half-written file, and a crash mid-copy must not leave
+    // the shared token truncated. Stage beside the destination, then rename over it — the
+    // same atomic-rename discipline Claude itself uses for this file.
+    copyFileSync(m, tmp)
+    chmodSync(tmp, 0o600)   // creds are 0600; keep it that way even if dest was freshly created
+    renameSync(tmp, dest)
   } catch (e) {
+    try { if (existsSync(tmp)) unlinkSync(tmp) } catch { /* nothing else to try */ }
     console.warn(`[sandbox] could not reconcile ${name} back to the config dir (${errMessage(e)}); a refreshed token may be lost`)
+  }
+}
+
+// Root holding the per-session mirrors (one subdir per host-mode session).
+function mirrorRoot(): string { return path.join(dataDir(), 'host-scrubbed-config') }
+
+// A session id is used as a directory name — keep it to a safe charset so it can't
+// escape the root (ids are UUIDs today; this only guards a future format).
+function mirrorFor(sessionId: string): string {
+  return path.join(mirrorRoot(), sessionId.replace(/[^A-Za-z0-9._-]/g, '_'))
+}
+
+// Would mirroring `entry` (an absolute path under the real config dir) swallow our own
+// state dir? The mirror lives at <dataDir>/host-scrubbed-config and dataDir() defaults to
+// ~/.claude/claudette — i.e. INSIDE the dir being mirrored. Symlinking `claudette` into
+// the mirror therefore creates a cycle (mirror/claudette/host-scrubbed-config/claudette/…)
+// that any recursive walk of CLAUDE_CONFIG_DIR can spin on. Claude has no reason to read
+// Claudette's state, so the entry containing it is skipped entirely.
+function containsDataDir(entry: string): boolean {
+  const data = path.resolve(dataDir())
+  return data === entry || data.startsWith(entry + path.sep)
+}
+
+// Which server process owns a mirror. Written at build time so the boot sweep can tell
+// "stranded by a crash" (owner gone) from "in active use by another Claudette" (owner
+// alive) — a dev `tsx watch` restart overlaps the old process by design, and the two
+// share CLAUDETTE_DATA_DIR.
+const OWNER_FILE = '.claudette-owner'
+
+function markMirrorOwner(mirror: string): void {
+  try { writeFileSync(path.join(mirror, OWNER_FILE), String(process.pid), 'utf8') } catch { /* sweep just falls back to reclaiming it */ }
+}
+
+// Is this mirror owned by a still-running process? `kill(pid, 0)` only probes existence.
+// OUR OWN pid counts as live too: the sweep runs at boot, when this process owns no
+// mirrors yet, so nothing is wrongly protected — but if it is ever called later, deleting
+// the config dir of one of our own running sessions is precisely the bug being fixed here.
+// Pid reuse could in principle make a dead owner look alive; the cost is a mirror left on
+// disk until the next boot, versus deleting a live session's config dir — so this
+// deliberately errs toward keeping. A mirror is normally removed by releaseHostConfigDir
+// at session exit; the sweep is only the crash backstop.
+function mirrorHeldByLiveProcess(mirror: string): boolean {
+  try {
+    const pid = Number(readFileSync(path.join(mirror, OWNER_FILE), 'utf8').trim())
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false   // no owner file, unparseable, or ESRCH → free to reclaim
+  }
+}
+
+// Salvage a refreshed token out of a mirror and remove it. Called when a host-mode session
+// exits (the stranding window this closes) and at boot for anything a crash left behind.
+//
+// Fully guarded: this runs from the engine's `exit` listener, BEFORE the relaunch and
+// cleanup branches. An escaping throw (EPERM/EBUSY/ENOTEMPTY from a just-SIGKILLed child
+// still writing into the mirror) would skip the relaunch, skip cleanup(), leave the
+// session wedged at state 'running' with a dead engine — and an unhandled throw inside an
+// EventEmitter callback takes the process down with it. The boot sweep is the backstop for
+// anything we fail to remove here.
+export function releaseHostConfigDir(sessionId: string): void {
+  try {
+    const mirror = mirrorFor(sessionId)
+    if (!existsSync(mirror)) return
+    reconcileCredsBack(mirror, path.resolve(claudeConfigDir()))
+    rmSync(mirror, { recursive: true, force: true })
+  } catch (e) {
+    console.warn(`[sandbox] could not release the host-mode config mirror for ${sessionId} (${errMessage(e)}); the boot sweep will retry`)
+  }
+}
+
+// Boot sweep: reconcile + clear every mirror left over from a previous run. Without this a
+// hard kill (crash, reboot, `pkill node`) strands a refreshed token in a mirror that no
+// session will ever reopen — the "Not logged in" failure returns and cannot self-heal.
+// Also migrates the LEGACY single shared mirror (the root itself was the mirror before
+// mirrors became per-session), salvaging its creds before the layout changes underneath it.
+export function reclaimStrandedHostConfigs(): void {
+  const root = mirrorRoot()
+  if (!existsSync(root)) return
+  const real = path.resolve(claudeConfigDir())
+  try {
+    // Legacy layout: the root held the symlinks directly instead of session subdirs.
+    if (existsSync(path.join(root, '.credentials.json'))) reconcileCredsBack(root, real)
+    for (const name of readdirSync(root)) {
+      const dir = path.join(root, name)
+      try {
+        if (!lstatSync(dir).isDirectory()) continue
+        // Reclaim PER MIRROR, and never touch one another live process still has mounted.
+        // This used to rmSync the whole root: on a `tsx watch` restart (or any second
+        // instance sharing CLAUDETTE_DATA_DIR) that deleted the live CLAUDE_CONFIG_DIR out
+        // from under host-mode sessions in the old process — the cross-process form of the
+        // very clobber per-session mirrors were introduced to eliminate.
+        if (mirrorHeldByLiveProcess(dir)) continue
+        reconcileCredsBack(dir, real)
+        rmSync(dir, { recursive: true, force: true })
+      } catch { /* skip this mirror; the next boot retries it */ }
+    }
+  } catch (e) {
+    console.warn(`[sandbox] could not reclaim stranded host-mode config mirrors (${errMessage(e)})`)
   }
 }
 
@@ -169,6 +292,11 @@ function reconcileCredsBack(mirror: string, real: string): void {
 // the host-mode child's CLAUDE_CONFIG_DIR here. Returns the mirror path, or null on any
 // failure (caller logs and falls back to the real dir rather than bricking the launch).
 //
+// PER SESSION (`<root>/<sessionId>`), deliberately. It used to be ONE shared dir that every
+// host-mode launch rmSync'd and rebuilt — so starting a second unsandboxed session deleted
+// the first one's live CLAUDE_CONFIG_DIR out from under it, and a token that session then
+// refreshed landed in a directory already scheduled for deletion.
+//
 // Caveat (documented): a top-level file Claude rewrites by atomic rename (.claude.json,
 // possibly refreshed creds) replaces its symlink with a real file in the mirror, so
 // THOSE writes may not flow back to the shared dir for the duration of a host-mode
@@ -177,21 +305,29 @@ function reconcileCredsBack(mirror: string, real: string): void {
 // affects the opt-in host-mode-vs-exposed-config path; every other launch is untouched.
 //
 // For CREDENTIALS specifically that caveat manifested as "Not logged in": an OAuth token
-// refresh atomic-renames a real .credentials.json into the mirror, then the NEXT launch's
-// rmSync below deleted it and re-symlinked to a now-stale real file — so sessions reverted
-// to an expired token and could never self-heal. reconcileCredsBack (called before the
-// wipe) salvages a refreshed creds file back to the shared dir so refreshes persist.
-export function scrubbedHostConfigDir(): string | null {
+// refresh atomic-renames a real .credentials.json into the mirror, so the fresh token lives
+// there and the shared dir keeps an expired one. reconcileCredsBack salvages it back — now
+// at session EXIT (releaseHostConfigDir) and at BOOT (reclaimStrandedHostConfigs), not only
+// on the next host-mode launch as before. That last-launch-only timing was the residual
+// hole: refresh, then no further host-mode session, and every OTHER reader (sandboxed
+// sessions, a plain `claude` in a terminal) went on reading the stale token.
+export function scrubbedHostConfigDir(sessionId: string): string | null {
   const real = path.resolve(claudeConfigDir())
-  const mirror = path.join(dataDir(), 'host-scrubbed-config')
+  const mirror = mirrorFor(sessionId)
   try {
+    // Belt-and-braces: a mirror for this id should already have been released at exit and
+    // swept at boot, but if one survived (same id relaunched in-process) its token is
+    // salvaged before the rebuild. Safe to run unconditionally now that reconcileCredsBack
+    // only moves a token forward in time.
     if (existsSync(mirror)) reconcileCredsBack(mirror, real)
     rmSync(mirror, { recursive: true, force: true })
     mkdirSync(mirror, { recursive: true })
+    markMirrorOwner(mirror)
     const scrubbed = new Set(['settings.json', 'settings.local.json'])
     for (const name of readdirSync(real)) {
       const from = path.join(real, name)
       const to = path.join(mirror, name)
+      if (containsDataDir(from)) continue          // never mirror our own state dir (cycle)
       if (scrubbed.has(name)) writeScrubbedSettings(from, to)
       else symlinkSync(from, to)
     }

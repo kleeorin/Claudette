@@ -18,6 +18,10 @@ export type WsClientMessage =
   // Native turn I/O for a session (lifecycle create/list/destroy/… is HTTP).
   | { type: 'session:send'; id: string; text: string; turnId?: string }
   | { type: 'session:interrupt'; id: string }
+  // Stop ONE running subagent, without touching the turn that spawned it (which is what
+  // session:interrupt does). `toolId` is the Task tool-use id the tray already holds; the
+  // server maps it to the CLI's own task id, the only thing `stop_task` accepts.
+  | { type: 'session:stopTask'; id: string; toolId: string }
   | { type: 'session:permission'; id: string; requestId: string; decision: PermissionDecision }
   // What a session is currently viewing (its active content tab), published on tab/
   // session switch. `pane` is null when the Claude tab is focused. Backs the
@@ -89,6 +93,10 @@ export type WsServerMessage =
   // the one the user is looking at (in that same session). The doc itself arrives
   // via a `notebook:update`; this only moves focus.
   | { type: 'session:focusPane'; id: string; notebookId: string; path: string }
+  // The same steering for a NON-notebook file — emitted by the app-control
+  // `open_file` tool. There's no doc/notebookId behind a text file: the tab is
+  // identified by path alone and FileEditorView fetches its contents.
+  | { type: 'session:focusFile'; id: string; path: string }
   | { type: 'pane:output'; id: string; data: string }
   | { type: 'pane:exit'; id: string }
 

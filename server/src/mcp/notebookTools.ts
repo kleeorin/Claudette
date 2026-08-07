@@ -1,6 +1,6 @@
-import { extname, resolve, dirname, basename } from 'path'
+import { extname, resolve, dirname, basename, isAbsolute } from 'path'
 import { errMessage } from '../util/errMessage'
-import { realpath } from 'fs/promises'
+import { realpath, stat } from 'fs/promises'
 import { nbText as asText } from '@claudette/shared'
 import type { NbCell, NbCellType, NbOutput, NotebookDoc, NotebookOp } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
@@ -10,10 +10,13 @@ import type { TurnNotebookRegistry } from './turnNotebookRegistry'
 import type { AppControlMcpServer, McpToolResult } from './appControlServer'
 import type { SessionConfinement } from '../claude/sessionConfinement'
 
-// One place the "must be a .ipynb" check lives. Returns a Claude-facing error result
-// when the path isn't a notebook, else null.
+// One place the "must be a .ipynb" check lives. `requireIpynb` returns a Claude-facing
+// error result when the path isn't a notebook, else null.
+function isIpynb(p: string): boolean {
+  return extname(p).toLowerCase() === '.ipynb'
+}
 function requireIpynb(p: string): McpToolResult | null {
-  return extname(p).toLowerCase() === '.ipynb' ? null : { error: `${p} is not a .ipynb notebook` }
+  return isIpynb(p) ? null : { error: `${p} is not a .ipynb notebook` }
 }
 
 // AppControl notebook tools. The KEY ClaudeMaster fix: handlers mutate the
@@ -51,6 +54,9 @@ export function registerNotebookTools(
   // Steer the calling session's UI to focus a notebook (open_notebook). The doc is
   // already open server-side; this only moves the user's focus onto it.
   onFocus: (sessionId: string, doc: NotebookDoc) => void,
+  // The same steering for a plain file (open_file). No doc exists for one — the tab is
+  // keyed by path and the client fetches the contents itself.
+  onFocusFile: (sessionId: string, path: string) => void,
   // The confinement seam (SANDBOX.md): gates the tools' UNSANDBOXED file I/O to the
   // calling session's own mounts. A session that can't be resolved fails closed (deny),
   // so the tools can't be tricked into acting for an unknown session.
@@ -139,10 +145,11 @@ export function registerNotebookTools(
     const g = await gate(sessionId, resolve(t), need)
     if (isGateErr(g)) return g
     const already = docs.getByPath(t)
-    if (already) { claimOwnership(sessionId, already, need); return already }
+    if (already) return claimOwnership(sessionId, already, need) ?? already
     const doc = await openByPath(t, g.guard)
     if (isErr(doc)) return doc
-    claimOwnership(sessionId, doc, need)
+    const refused = claimOwnership(sessionId, doc, need)
+    if (refused) return refused
     if (focus) onFocus(sessionId, doc)
     return doc
   }
@@ -156,8 +163,16 @@ export function registerNotebookTools(
   // make it the owner: the kernel that later executes is then confined to THAT session's
   // box. Read-only access never claims ownership — it executes nothing and shouldn't
   // steal a live kernel from the session that owns it.
-  function claimOwnership(sessionId: string, doc: NotebookDoc, need: 'read' | 'write'): void {
-    if (need === 'write') kernels.setOwner(doc.notebookId, { session: sessionId })
+  //
+  // The claim can be REFUSED: setOwner rejects one that would lower a notebook's
+  // confinement (a less-confined session grabbing a notebook owned by a tighter box).
+  // Returns that refusal as a tool error so the write/run doesn't proceed reporting `ok`
+  // while the kernel stays confined to somebody else's box — the invariant above says a
+  // mutation makes you the owner, so if we can't own it we must not mutate it.
+  function claimOwnership(sessionId: string, doc: NotebookDoc, need: 'read' | 'write'): McpToolResult | undefined {
+    if (need !== 'write') return undefined
+    if (kernels.setOwner(doc.notebookId, { session: sessionId })) return undefined
+    return { error: `${doc.path} is owned by a more-confined session, so its kernel would execute there rather than in this one. Refusing to modify or run it. Shut that notebook's kernel down (or close the owning session) to take it over.` }
   }
 
   // Resolve a 0-based index against the doc → cellId (with a clear out-of-range error).
@@ -214,8 +229,16 @@ export function registerNotebookTools(
     description: 'Open a notebook (absolute .ipynb `path`) and FOCUS it in the calling session, so it becomes the notebook the user is looking at. Use this to show the user a notebook before working on it — and as the way to switch focus when you must edit a notebook other than the one currently visible (the edit tools refuse a different notebook otherwise).',
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Absolute path to the .ipynb notebook.' } }, required: ['path'] },
     handler: async (sid, args) => {
-      const p = String(args.path ?? '')
-      const g = p ? await gate(sid, resolve(p), 'read') : { guard: undefined }
+      const raw = String(args.path ?? '')
+      if (!raw) return { error: 'path is required (absolute .ipynb path)' }
+      // Same contract open_file already enforces. Without it a relative path resolved
+      // against the SERVER process's cwd (the Claudette checkout), so a host-mode session
+      // silently opened <claudette-repo>/foo.ipynb and a confined one got a baffling
+      // "outside this session's sandbox". Resolve ONCE and use that everywhere below —
+      // gating on resolve(p) while opening the raw p let the two disagree.
+      if (!isAbsolute(raw)) return { error: `path must be absolute (got ${raw})` }
+      const p = resolve(raw)
+      const g = await gate(sid, p, 'read')
       if (isGateErr(g)) return g
       const doc = await openByPath(p, g.guard)
       if (isErr(doc)) return doc
@@ -224,6 +247,39 @@ export function registerNotebookTools(
       // working notebook (overriding any earlier pin), so path-unset tools follow it.
       turns.set(sid, doc.path)
       return { text: `Opened and focused ${doc.path} in the current session.` }
+    },
+  })
+
+  mcp.register({
+    name: 'open_file',
+    description: "Open a file (absolute `path`) and FOCUS it in the calling session, so it becomes what the user is looking at in the pane beside Claude. Use this when the user asks to SEE or OPEN a file — showing it in their editor is the point; reading it into your own context is not the same thing (use the Read tool for that, and only when you actually need the contents). A .ipynb path opens as a live notebook, exactly as open_notebook would.",
+    inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Absolute path to the file to show the user.' } }, required: ['path'] },
+    handler: async (sid, args) => {
+      const raw = String(args.path ?? '')
+      if (!raw) return { error: 'path is required (absolute path to the file)' }
+      if (!isAbsolute(raw)) return { error: `path must be absolute (got ${raw})` }
+      const path = resolve(raw)
+      const g = await gate(sid, path, 'read')
+      if (isGateErr(g)) return g
+      // A notebook has to open AS a notebook (live doc, cells, kernel) rather than as
+      // raw JSON text, so hand .ipynb to the notebook path — pin included, since Claude
+      // choosing a notebook to show is the same explicit choice open_notebook makes.
+      if (isIpynb(path)) {
+        const doc = await openByPath(path, g.guard)
+        if (isErr(doc)) return doc
+        onFocus(sid, doc)
+        turns.set(sid, doc.path)
+        return { text: `Opened and focused notebook ${doc.path} in the current session.` }
+      }
+      // Check it exists and isn't a directory first: better a clear error here than a tab
+      // that pops open only to render "not found" at the user. (Not a readability check —
+      // stat succeeds on a file the server can't read; that surfaces when the tab loads.)
+      try {
+        const st = await stat(path)
+        if (st.isDirectory()) return { error: `${path} is a directory — open_file shows one file. Name a file inside it.` }
+      } catch (e) { return { error: `cannot open ${path}: ${errMessage(e)}` } }
+      onFocusFile(sid, path)
+      return { text: `Opened and focused ${path} in the current session.` }
     },
   })
 
@@ -309,17 +365,25 @@ export function registerNotebookTools(
     description: "Create a new, empty .ipynb at an absolute `path` (fails if it already exists). Populate it with the cell tools, then run cells with run_cell / run_all. To also bring it into the user's view, open_notebook it.",
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Absolute path ending in .ipynb' } }, required: ['path'] },
     handler: async (sid, args) => {
-      const path = String(args.path ?? '')
-      if (!path) return { error: 'path is required' }
-      { const bad = requireIpynb(path); if (bad) return bad }
-      const g = await gate(sid, resolve(path), 'write')
+      const raw = String(args.path ?? '')
+      if (!raw) return { error: 'path is required' }
+      { const bad = requireIpynb(raw); if (bad) return bad }
+      // Absolute, and resolved once — as in open_notebook/open_file. A relative path here
+      // created the notebook under the server process's cwd (the Claudette checkout),
+      // nowhere near the session's working directory.
+      if (!isAbsolute(raw)) return { error: `path must be absolute (got ${raw})` }
+      const path = resolve(raw)
+      const g = await gate(sid, path, 'write')
       if (isGateErr(g)) return g
       try {
         const doc = await docs.createPath(path, g.guard)
         // Own it for THIS session now (SANDBOX.md "Unowned-kernel escape"): a freshly
         // created notebook has no owner, so a later run_cell would spawn its kernel on
         // the UNCONFINED server. Claiming it here confines that kernel to this box.
-        kernels.setOwner(doc.notebookId, { session: sid })
+        // A brand-new notebook has no owner to lower confinement against, so this can't
+        // refuse in practice — but an unowned notebook is exactly the escape above, so
+        // report it rather than leave the caller believing the kernel is confined here.
+        { const refused = claimOwnership(sid, doc, 'write'); if (refused) return refused }
         // Claude just made this notebook to populate it → pin it as the turn's working
         // notebook so the following path-unset cell tools land here, not in whatever
         // the user happens to be viewing.

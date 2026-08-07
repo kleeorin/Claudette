@@ -93,6 +93,11 @@ export interface SavedSession {
 // tool_result ever reached the client — the fix for sticky "running" cards.
 export interface TaskRecord {
   toolId: string            // Task/Agent tool_use id (pairs with <tool-use-id>)
+  // The CLI's OWN id for the task, off `system/task_started` — the only handle its
+  // `stop_task` control request accepts, and deliberately NOT the same value as toolId.
+  // Absent until that event arrives (and forever for a conversation resumed from disk,
+  // which never replays it), which is exactly when the tray's stop button stays hidden.
+  taskId?: string
   type: string              // subagent_type
   description: string
   prompt?: string

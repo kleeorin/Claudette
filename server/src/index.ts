@@ -8,6 +8,7 @@ import type { WsClientMessage, HealthResponse } from '@claudette/shared'
 import { SessionManager } from './claude/sessionManager'
 import { sandboxAvailable } from './claude/sandbox'
 import { SessionConfinement } from './claude/sessionConfinement'
+import { reclaimStrandedHostConfigs } from './claude/configProtection'
 import { WsHub } from './ws/hub'
 import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage, sendSessionSnapshots } from './session/sessionApi'
 import { loadState, saveState } from './session/sessionPersistence'
@@ -75,9 +76,17 @@ kernels.onJupyterStart = (info) => jupyterProxy.setTarget(info)
 // per-session --mcp-config is injected into each Claude launch via the hook below.
 const mcp = new AppControlMcpServer()
 registerNotebookTools(mcp, notebooks, kernels, activePanes, turnNotebooks, (sessionId, doc) => {
-  kernels.setOwner(doc.notebookId, { session: sessionId })   // Claude opened it in this session → dies with it
+  // Claude opened it in this session → dies with it. The refusal is deliberately ignored
+  // here: focusing a notebook executes nothing, so a claim declined for lowering
+  // confinement just means it keeps its tighter owner — which is the safe outcome. Writes
+  // and runs go through claimOwnership, which does surface the refusal.
+  void kernels.setOwner(doc.notebookId, { session: sessionId })
   notebooks.cancelClose(doc.notebookId)         // re-focusing a mid-close notebook keeps it open
   hub.broadcast({ type: 'session:focusPane', id: sessionId, notebookId: doc.notebookId, path: doc.path })
+}, (sessionId, path) => {
+  // open_file on a plain file: nothing to own or keep alive server-side (no doc, no
+  // kernel) — just move the calling session's view onto it.
+  hub.broadcast({ type: 'session:focusFile', id: sessionId, path })
 }, confinement)
 const sessions = new SessionManager({
   mcpConfig: (sid) => mcp.configFor(sid),
@@ -233,6 +242,11 @@ wss.on('connection', (ws: WebSocket) => {
 })
 
 async function start(): Promise<void> {
+  // Salvage any OAuth token a previous run stranded in a host-mode config mirror, before
+  // restore() below can relaunch sessions (and rebuild mirrors) on top of it. A hard kill
+  // used to leave a refreshed token orphaned there forever, so every other reader kept the
+  // expired one and Claude asked to log in again (configProtection.ts).
+  reclaimStrandedHostConfigs()
   // Start the MCP server first so `configFor` has a real port before any session
   // launches with its --mcp-config.
   const mcpPort = await mcp.start()

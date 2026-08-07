@@ -92,6 +92,7 @@ const nbRunning = channel<[string, string[]]>()          // [notebookId, running
 const paneOutputs = channel<[string, string]>()
 const paneExits = channel<[string]>()
 const focusPanes = channel<[string, string, string]>()   // [sessionId, notebookId, path]
+const focusFiles = channel<[string, string]>()           // [sessionId, path]
 
 let ws: WebSocket | null = null
 let backoff = 500
@@ -122,6 +123,7 @@ function dispatch(msg: WsServerMessage): void {
     case 'pane:output': paneOutputs.emit(msg.id, msg.data); break
     case 'pane:exit': paneExits.emit(msg.id); break
     case 'session:focusPane': focusPanes.emit(msg.id, msg.notebookId, msg.path); break
+    case 'session:focusFile': focusFiles.emit(msg.id, msg.path); break
     // 'hello' / 'pong' are connection-liveness only.
   }
 }
@@ -192,7 +194,7 @@ export const api = {
   on: {
     event: (fn: Fn<[string, ClaudeEvent]>) => events.on(fn),
     snapshot: (fn: Fn<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined]>) => snapshots.on(fn),
-    // Live subagent-registry updates (session:tasks) — the durable tray-card fallback.
+    // Live subagent-registry updates (session:tasks) — the durable agent-card fallback.
     tasks: (fn: Fn<[string, TaskRecord[]]>) => tasks.on(fn),
     permission: (fn: Fn<[string, PermissionRequest]>) => permissions.on(fn),
     // A user turn mirrored from the server (any device); turnId de-dupes the sender's echo.
@@ -215,11 +217,15 @@ export const api = {
     paneExit: (fn: Fn<[string]>) => paneExits.on(fn),
     // Claude asked (via open_notebook) to focus a notebook in a given session.
     focusPane: (fn: Fn<[string, string, string]>) => focusPanes.on(fn),
+    // Claude asked (via open_file) to focus a plain file in a given session.
+    focusFile: (fn: Fn<[string, string]>) => focusFiles.on(fn),
   },
   // Turn I/O over WS.
   session: {
     sendTurn: (id: string, text: string, turnId?: string) => send({ type: 'session:send', id, text, turnId }),
     interrupt: (id: string) => send({ type: 'session:interrupt', id }),
+    // Stop one subagent, leaving the parent turn running.
+    stopTask: (id: string, toolId: string) => send({ type: 'session:stopTask', id, toolId }),
     respondPermission: (id: string, requestId: string, decision: PermissionDecision) =>
       send({ type: 'session:permission', id, requestId, decision }),
     // Publish what a session is currently viewing (its active content tab, or null

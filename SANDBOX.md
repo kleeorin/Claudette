@@ -496,8 +496,9 @@ deliberately don't write into the user's repo to seed it, and Layer 2 does not s
 scope in host mode (Claude reads it relative to cwd with no redirect). Its neutralization
 relies on the same project being reused in host mode. (2) A host-mode session run against an
 exposed config uses a scrubbed config *mirror*; top-level files rewritten by atomic rename
-(`.claude.json`, refreshed creds) may not flow back to the shared dir for that run
-(directory state — projects/todos/history — is symlinked and persists). Both are the price of
+(`.claude.json`) may not flow back to the shared dir for that run (directory state —
+projects/todos/history — is symlinked and persists). **Credentials are excepted** — see
+"Stranded OAuth token" below, since for them that caveat meant a recurring login prompt. Both are the price of
 keeping the shared-dir rw bind; full closure is per-session config isolation. Verified in an
 ad-hoc harness: a bwrap `--ro-bind` over `settings.json` blocks in-box writes (EROFS);
 `wrapSandbox` emits `--ro-bind` for the user `settings.json` (rw `--bind` for the config dir,
@@ -593,6 +594,47 @@ that session's box:
   leave the notebook owned by the calling session → its kernel takes the confined server;
   `read_notebook` claims nothing). Existing sandbox tests still pass (server typecheck
   clean).
+
+## Stranded OAuth token ("Claude keeps asking me to log in")
+
+Not a confinement hole — a **durability** bug in the Layer 2 mirror, but it looks like the
+sandbox is eating your login, so it belongs here. A host-mode session's
+`CLAUDE_CONFIG_DIR` points at a mirror whose entries are symlinks back to the real
+`~/.claude`. Claude writes a refreshed OAuth token by **atomic rename**, which *replaces
+the symlink with a real file inside the mirror* — so the fresh token lives in the mirror
+while the shared dir keeps the expired one. Every other reader (sandboxed sessions, a
+plain `claude` in a terminal) then reads the stale token and prompts for login.
+
+`reconcileCredsBack` already salvaged this, but **only on the next host-mode launch**.
+Three holes remained; all fixed 2026-08-05 in `claude/configProtection.ts`:
+
+- **Session exit.** `releaseHostConfigDir(sessionId)` now salvages + drops the mirror when
+  the engine exits (`sessionManager`'s `engine.on('exit')`, before the relaunch branches).
+  Previously, a refresh followed by *no further host-mode session* left the good token
+  parked indefinitely.
+- **Crash.** `reclaimStrandedHostConfigs()` runs at boot (`index.ts`, before
+  `sessions.restore()`), reconciling every mirror a hard kill left behind — including the
+  **legacy** single-shared-dir layout. Without it a stranded token could never self-heal.
+- **Concurrent clobber.** Mirrors are now **per session** (`<root>/<sessionId>`). One shared
+  dir meant a second host-mode launch `rmSync`'d the first session's *live*
+  `CLAUDE_CONFIG_DIR` out from under it, taking any token it had refreshed with it.
+
+Also fixed: the mirror symlinked **Claudette's own state dir** into itself. `dataDir()`
+defaults to `~/.claude/claudette`, i.e. inside the dir being mirrored, so
+`mirror/claudette/host-scrubbed-config/claudette/…` was an unbounded path cycle inside a
+live `CLAUDE_CONFIG_DIR`. The entry containing `dataDir()` is now skipped. (The boot sweep's
+recursive delete is safe across the legacy cycle: `rmSync` unlinks symlinks rather than
+following them — verified, the pointed-at state survives.)
+
+Verified in `scratchpad/host-config-mirror-test.mts` (19/19): a simulated rename-refresh is
+salvaged at exit, at boot, and from the legacy layout; mode stays 0600; two sessions get
+distinct mirrors and a third launch leaves an earlier session's intact; an *un*refreshed
+mirror never overwrites a newer shared token; releasing a session with no mirror is a no-op.
+
+**Residual.** `.claude.json` is still deliberately not reconciled (the app writes trust/prefs
+straight to the real file; copying a session's mirror copy back could lose them). And this is
+all still the opt-in host-mode-against-exposed-config path — a sandboxed session binds the
+real `~/.claude` rw and writes creds straight through, so it was never affected.
 
 ## Ownership downgrade (a later claim un-sandboxes a live notebook)
 

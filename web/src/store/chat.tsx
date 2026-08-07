@@ -60,7 +60,7 @@ interface State {
   open: Record<string, Record<number, string>>
   meta: Record<string, SessionMeta>
   // The server's authoritative subagent registry per session (connect snapshot +
-  // live session:tasks). The durable fallback that settles a tray card when its
+  // live session:tasks). The durable fallback that settles an agent card when its
   // terminal signal never reached the transcript.
   tasks: Record<string, TaskRecord[]>
 }
@@ -96,8 +96,8 @@ let seq = 0
 const nextId = () => `i${++seq}`
 
 // Stable empty identities, so a session with nothing yet doesn't hand consumers a
-// fresh []/{} on every call — that defeats the `useMemo`s keyed on these (the agents
-// tray, the MetaBar) and makes them recompute each render for no reason.
+// fresh []/{} on every call — that defeats the `useMemo`s keyed on these (the sidebar
+// agent lists, the MetaBar) and makes them recompute each render for no reason.
 const EMPTY_TASKS: TaskRecord[] = []
 const EMPTY_ITEMS: TranscriptItem[] = []
 const EMPTY_SLASH: string[] = []
@@ -307,7 +307,7 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
   const parentId = (() => { const p = (e as { parent_tool_use_id?: unknown }).parent_tool_use_id; return typeof p === 'string' && p ? p : undefined })()
   // The current CLI signals a background agent's completion as a `system` event
   // (subtype task_notification), not a <task-notification> user turn. Synthesize the
-  // terminal tool_result its Task is still waiting on so the tray card settles even if
+  // terminal tool_result its Task is still waiting on so the agent card settles even if
   // the authoritative task-registry broadcast is missed.
   const sysNotif = parseSystemTaskNotification(e)
   if (sysNotif) {
@@ -319,7 +319,7 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
     for (const b of content as Array<Record<string, unknown>>) {
       if (b.type === 'tool_use') out.push({ kind: 'tool_use', id: nextId(), name: String(b.name), input: b.input, toolId: typeof b.id === 'string' ? b.id : undefined, parentId })
       // A SUBAGENT's text/thinking (parentId set) is always captured — it's the agent's
-      // chain of thought, shown in its tray card. The MAIN agent's live text/thinking
+      // chain of thought, shown in its agent card. The MAIN agent's live text/thinking
       // arrives via the stream path (reconciled by ASSISTANT), so here it's replay-only.
       else if ((fromReplay || parentId) && b.type === 'text' && b.text) out.push({ kind: 'text', id: nextId(), text: String(b.text), parentId })
       else if ((fromReplay || parentId) && b.type === 'thinking' && b.thinking) out.push({ kind: 'thinking', id: nextId(), text: String(b.thinking), parentId })
@@ -328,7 +328,7 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
     const content = (e as { message?: { content?: unknown } }).message?.content
     // A <task-notification> is a background agent's completion signal. Synthesize the
     // terminal tool_result its Task tool_use is still waiting on, so collectAgents can
-    // settle the tray card to done/failed. Handled before the branches below because
+    // settle the agent card to done/failed. Handled before the branches below because
     // the notification can arrive as either string or block content.
     const notif = parseTaskNotification(userContentText(content))
     if (notif) {
@@ -463,17 +463,36 @@ function metaFromReplay(events: ClaudeEvent[]): Partial<SessionMeta> {
 }
 
 // One subagent, assembled from a transcript: its `Task` call + its own nested
-// activity (steps) + its final result. Drives the Agents tray — the Task no longer
-// renders inline in the conversation.
+// activity (steps) + its final result. Drives the sidebar's per-session agent list
+// and the agent detail tab — the Task no longer renders inline in the conversation.
 export interface AgentView {
   id: string          // the Task item's local id (stable React key)
   toolId?: string     // the anthropic tool id (pairs result + child activity)
+  taskId?: string     // the CLI's task id, when known — the handle `stop_task` needs
   type: string        // subagent_type
   description: string
   prompt?: string
   steps: TranscriptItem[]                                   // the agent's own calls/results
   launched: boolean                                         // a background agent whose launch was acked (runs detached from the parent turn)
   result?: Extract<TranscriptItem, { kind: 'tool_result' }> // final output (present ⇒ finished); excludes the async-launch ack
+}
+
+// Stable identity for an agent across transcript rebuilds: the anthropic tool id when
+// we have it (survives collectAgents re-runs), else the local item id. Used as the
+// clear-key, the sidebar list key, and the agent tab's handle on its agent.
+export function agentKey(a: AgentView): string {
+  return a.toolId ?? a.id
+}
+
+// Is this agent still going? A background agent (launch acked, no result yet) runs
+// detached from the parent turn; a foreground one only lives while the turn does.
+// THE single definition — the sidebar's live count, its "clear finished" predicate, the
+// row's spinner, the status dot, and the detail view all read it from here. It used to be
+// written out at each of those sites, and they had already drifted: the sidebar counted a
+// 'stopped' agent (no result, not launched, turn idle) as finished but refused to clear
+// it, so "Clear finished" rendered a button that did nothing and never went away.
+export function isAgentLive(a: AgentView, turnActive: boolean): boolean {
+  return !a.result && (a.launched || turnActive)
 }
 
 // Pull every subagent out of a transcript. Groups each subagent's calls/results
@@ -516,6 +535,7 @@ export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): Ag
     const stale = !txResult && !rec && pastTurn ? staleResult(it.toolId ?? it.id) : undefined
     agents.push({
       id: it.id, toolId: it.toolId,
+      taskId: rec?.taskId,   // present ⇒ the CLI gave us a handle we can stop it by
       type: input.subagent_type || 'agent',
       description: input.description || 'Subagent task',
       prompt: input.prompt,
@@ -528,8 +548,8 @@ export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): Ag
   return agents
 }
 
-// A settled (done/failed) registry record → the synthetic tool_result the tray uses to
-// mark a card finished. A still-running record yields nothing (the card stays running).
+// A settled (done/failed) registry record → the synthetic tool_result the agent views
+// use to mark a card finished. A still-running record yields nothing (the card stays running).
 function terminalFromRecord(rec: TaskRecord | undefined): Extract<TranscriptItem, { kind: 'tool_result' }> | undefined {
   if (!rec || rec.status === 'running') return undefined
   return { kind: 'tool_result', id: `reg-${rec.toolId}`, toolUseId: rec.toolId, isError: rec.status === 'failed', content: rec.summary ?? '' }
@@ -541,38 +561,6 @@ function staleResult(key: string): Extract<TranscriptItem, { kind: 'tool_result'
   return { kind: 'tool_result', id: `stale-${key}`, toolUseId: key, isError: false, content: 'Ended in an earlier turn.' }
 }
 
-// How many subagents are still in flight. A BACKGROUND agent (launch acked, no
-// terminal result yet) runs detached, so it counts regardless of the parent turn. A
-// FOREGROUND agent (no ack, no result) is only in flight while the parent turn is
-// active — gating on `turnActive` keeps an interrupted Task from latching on forever.
-// Drives the sidebar dot + the MetaBar chip.
-export function countRunningAgents(items: TranscriptItem[], turnActive: boolean, tasks?: TaskRecord[]): number {
-  const finished = new Set<string>()   // has a terminal (non-ack) result
-  const launched = new Set<string>()   // background agent, launch acked
-  for (const it of items) {
-    if (it.kind !== 'tool_result') continue
-    if (isAsyncLaunchAck(it.content)) launched.add(it.toolUseId)
-    else finished.add(it.toolUseId)
-  }
-  // Fold in the authoritative registry: a settled record counts as finished (so a lost
-  // completion no longer keeps the count stuck), a launched one as a live background agent.
-  const hasRec = new Set<string>()
-  for (const t of tasks ?? []) {
-    hasRec.add(t.toolId)
-    if (t.status !== 'running') finished.add(t.toolId)
-    else if (t.launched) launched.add(t.toolId)
-  }
-  // Past-turn agents (Task call precedes the last user turn) with no live registry record
-  // are leftovers, not in flight — mirror collectAgents' stale rule so the count matches.
-  let lastUserIndex = -1
-  for (let i = 0; i < items.length; i++) if (items[i].kind === 'user') lastUserIndex = i
-  return items.reduce((n, it, i) => {
-    if (it.kind !== 'tool_use' || !isSubagentTool(it.name) || it.toolId == null || finished.has(it.toolId)) return n
-    if (i < lastUserIndex && !hasRec.has(it.toolId)) return n   // stale leftover
-    return n + (launched.has(it.toolId) || turnActive ? 1 : 0)
-  }, 0)
-}
-
 interface ContextValue {
   transcriptFor: (sessionId: string) => TranscriptItem[]
   pendingFor: (sessionId: string) => PermissionRequest | undefined
@@ -581,6 +569,7 @@ interface ContextValue {
   tasksFor: (sessionId: string) => TaskRecord[]
   sendTurn: (sessionId: string, text: string) => void
   interrupt: (sessionId: string) => void
+  stopTask: (sessionId: string, toolId: string) => void
   respond: (sessionId: string, requestId: string, decision: PermissionDecision) => void
   loadTranscript: (sessionId: string, events: ClaudeEvent[]) => void
   clearTranscript: (sessionId: string) => void
@@ -602,9 +591,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         if (typeof model === 'string') dispatch({ type: 'SET_META', sessionId: id, meta: { model } })
         return
       }
-      // Token-level streaming of text/thinking blocks.
+      // Token-level streaming of text/thinking blocks — MAIN AGENT ONLY.
+      // The engine runs with --include-partial-messages, and a subagent's partials carry
+      // parent_tool_use_id just like its completed message does. Feeding them to
+      // handleStreamEvent put the subagent's prose straight into the main transcript
+      // (STREAM_START has no parentId, so ChatView's subagent filter can't drop it), then
+      // appended the same text a SECOND time when the completed subagent `assistant` event
+      // landed with a parentId. Worse, the open-block map is keyed by block index alone, so
+      // two agents running in parallel both stream index 0 and their deltas interleave into
+      // one garbled item — and a subagent's message_start wiped the main agent's index map,
+      // re-materializing its text as a duplicate. Subagent text is captured in full from the
+      // completed event below, so skipping the partials here loses nothing.
       if (e.type === 'stream_event') {
-        handleStreamEvent(dispatch, id, (e as { event?: Record<string, unknown> }).event)
+        if (!isSubagentEvent(e)) handleStreamEvent(dispatch, id, (e as { event?: Record<string, unknown> }).event)
         return
       }
       // App-control channel status (surfaced as a notice; conversation unaffected).
@@ -666,7 +665,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       }
       dispatch({ type: 'SET_PENDING', sessionId: id, reqs: pending ?? [] })
     })
-    // Live subagent-registry updates — the durable fallback that settles a tray card
+    // Live subagent-registry updates — the durable fallback that settles an agent card
     // even when its terminal <task-notification> was evicted / never buffered / lost.
     const offTasks = api.on.tasks((id, tks) => {
       dispatch({ type: 'SET_TASKS', sessionId: id, tasks: tks })
@@ -709,6 +708,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     api.session.interrupt(sessionId)
   }, [])
 
+  // Stop one subagent. Deliberately no optimistic state change: the card settles when the
+  // CLI's task_notification lands, the same path a self-finishing agent takes, so a stop
+  // that doesn't take can't leave a card stuck showing "stopped" while it keeps working.
+  const stopTask = useCallback((sessionId: string, toolId: string) => {
+    api.session.stopTask(sessionId, toolId)
+  }, [])
+
   const respond = useCallback((sessionId: string, requestId: string, decision: PermissionDecision) => {
     api.session.respondPermission(sessionId, requestId, decision)
     dispatch({ type: 'REMOVE_PENDING', sessionId, requestId })   // reveal the next queued prompt, if any
@@ -739,8 +745,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   // Memoize the context value so a streamed token (which re-renders ChatProvider)
   // doesn't hand every consumer a fresh object identity and re-render them all.
   const value = useMemo(
-    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript }),
-    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript],
+    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, stopTask, respond, loadTranscript, clearTranscript }),
+    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, stopTask, respond, loadTranscript, clearTranscript],
   )
   return (
     <ChatContext.Provider value={value}>

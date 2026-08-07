@@ -227,6 +227,14 @@ export function handleSessionClientMessage(sessions: SessionManager, msg: WsClie
     case 'session:interrupt':
       sessions.interrupt(msg.id)
       return true
+    case 'session:stopTask':
+      // Fire-and-forget: the outcome the user cares about is the card settling, which
+      // arrives on the normal task_notification path. A rejection here (stale card, dead
+      // session) is logged, not surfaced — there's nothing for them to act on.
+      void sessions.stopTask(msg.id, msg.toolId).then((r) => {
+        if (!r.ok) console.warn(`[session] stop_task for ${msg.toolId} declined: ${r.error}`)
+      })
+      return true
     case 'session:permission':
       sessions.respondPermission(msg.id, msg.requestId, msg.decision)
       return true

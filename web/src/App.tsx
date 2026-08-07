@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { SessionsProvider, useSessions } from './store/sessions'
-import { ChatProvider, useChat, countRunningAgents } from './store/chat'
+import { ChatProvider, useChat, collectAgents, agentKey, isAgentLive, type AgentView } from './store/chat'
+import { useDismissedAgents, dismissAgents, pruneDismissed } from './store/agentDismiss'
 import { NotebooksProvider, useNotebooks } from './store/notebooks'
 import { ChatView, SidebarUsage } from './components/ChatView'
 import { NotebookView } from './components/NotebookView'
@@ -12,6 +13,7 @@ import { KernelsPanel } from './components/KernelsPanel'
 import { PermissionsPanel } from './components/PermissionsPanel'
 import { SandboxPanel } from './components/SandboxPanel'
 import { FileEditorView } from './components/FileEditorView'
+import { AgentDetail, agentTabLabel, AgentStatusDot } from './components/AgentDetail'
 import { FileBrowser } from './components/FileBrowser'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { AuthGate } from './components/AuthGate'
@@ -39,8 +41,13 @@ export function App() {
   )
 }
 
-// A content tab opened beside Claude: an open notebook or a file editor.
-type Content = { kind: 'notebook'; id: string } | { kind: 'file'; path: string }
+// A content tab opened beside Claude: an open notebook, a file editor, or one
+// subagent's full thought process. An agent tab carries the label it was opened with
+// so the tab strip never has to re-derive it from the streaming transcript.
+type Content =
+  | { kind: 'notebook'; id: string }
+  | { kind: 'file'; path: string }
+  | { kind: 'agent'; id: string; label: string }
 // The set of content tabs + the focused one, tracked PER SESSION so panes travel
 // with the session you switch to.
 type Pane = { tabs: Content[]; active: Content | null }
@@ -204,6 +211,15 @@ function Shell() {
       active: { kind: 'notebook', id },
     }))
   }
+  // Open (or focus) a subagent's thought-process tab. Panes are per session, so
+  // clicking an agent belonging to a background session switches to that session first.
+  const openAgent = (sid: string, id: string, label: string) => {
+    setActive(sid)
+    setPane(sid, (p) => ({
+      tabs: p.tabs.some((t) => t.kind === 'agent' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'agent', id, label }],
+      active: { kind: 'agent', id, label },
+    }))
+  }
   const selectChat = () => { if (activeId) setPane(activeId, (p) => ({ ...p, active: null })) }
   const selectTab = (t: Content) => {
     if (!activeId) return
@@ -221,6 +237,14 @@ function Shell() {
       return
     }
     if (!activeId) return
+    if (t.kind === 'agent') {
+      setPane(activeId, (p) => {
+        const tabs = p.tabs.filter((x) => !(x.kind === 'agent' && x.id === t.id))
+        const nextActive = p.active?.kind === 'agent' && p.active.id === t.id ? (tabs[tabs.length - 1] ?? null) : p.active
+        return { tabs, active: nextActive }
+      })
+      return
+    }
     setPane(activeId, (p) => {
       const tabs = p.tabs.filter((x) => !(x.kind === 'file' && x.path === t.path))
       const nextActive = p.active?.kind === 'file' && p.active.path === t.path ? (tabs[tabs.length - 1] ?? null) : p.active
@@ -296,6 +320,20 @@ function Shell() {
         const tabs = p.tabs.some((t) => t.kind === 'notebook' && t.id === notebookId)
           ? p.tabs : [...p.tabs, nb]
         return { ...prev, [sid]: { tabs, active: nb } }
+      })
+    })
+  }, [])
+
+  // Claude asked (open_file) to focus a plain file in a specific session: open a tab
+  // for it there and make it active. Unlike the edit-proposal effect below, this is an
+  // explicit "show the user this file", so it always opens — no auto-open setting.
+  useEffect(() => {
+    return api.on.focusFile((sid, path) => {
+      const tab: Content = { kind: 'file', path }
+      setBySession((prev) => {
+        const p = prev[sid] ?? EMPTY_PANE
+        const tabs = p.tabs.some((t) => t.kind === 'file' && t.path === path) ? p.tabs : [...p.tabs, tab]
+        return { ...prev, [sid]: { tabs, active: tab } }
       })
     })
   }, [])
@@ -376,6 +414,21 @@ function Shell() {
       }
       return changed ? next : prev
     })
+    // Same for its content tabs. This effect cleaned terminals and dismissed-agent keys
+    // but skipped the pane map, so a closed session's file/notebook tabs stayed in memory
+    // AND were re-persisted to the layout key on every layout change, forever.
+    setBySession((prev) => {
+      let changed = false
+      const next: Record<string, Pane> = {}
+      for (const [sid, p] of Object.entries(prev)) {
+        if (ids.has(sid)) next[sid] = p
+        else { changed = true; delete publishedRef.current[sid] }   // its last-published active pane goes too
+      }
+      return changed ? next : prev
+    })
+    // Same for the cleared-agent keys it owned — a closed session's list is gone, so
+    // its clears would otherwise sit in localStorage forever.
+    pruneDismissed([...ids])
   }, [sessions])
 
   // --- refresh survival: reconcile, persist, restore notebooks ----------------
@@ -465,6 +518,9 @@ function Shell() {
       const out: PersistContentTab[] = []
       let pending = false
       for (const t of p.tabs) {
+        // Agent tabs are NOT persisted: they point into a live transcript, which a
+        // reload may not have (a session only replays once its conversation resumes).
+        if (t.kind === 'agent') continue
         if (t.kind === 'file') { out.push({ kind: 'file', path: t.path }); continue }
         const doc = notebooks.open.find((o) => o.notebookId === t.id)
         if (!doc) { pending = true; break }
@@ -492,6 +548,7 @@ function Shell() {
       const d = notebooks.open.find((o) => o.notebookId === t.id)
       return { key: `nb:${t.id}`, kind: 'notebook', id: t.id, label: d ? basename(d.path) : 'notebook', path: d?.path ?? '', dirty: d?.dirty ?? false }
     }
+    if (t.kind === 'agent') return { key: `a:${t.id}`, kind: 'agent', id: t.id, label: t.label, path: t.label, dirty: false }
     return { key: `f:${t.path}`, kind: 'file', id: '', label: basename(t.path), path: t.path, dirty: false }
   })
 
@@ -499,11 +556,13 @@ function Shell() {
     ? <NotebookView key={active.id} notebookId={active.id} />
     : active?.kind === 'file'
       ? <FileEditorView key={active.path} path={active.path} sessionId={activeId ?? undefined} />
-      : null
+      : active?.kind === 'agent' && activeId
+        ? <AgentDetail key={active.id} sessionId={activeId} agentId={active.id} />
+        : null
 
   return (
     <div className="flex h-full bg-ctp-base overflow-hidden">
-      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} />
+      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} onOpenAgent={openAgent} />
       <div
         {...dividerProps({ axis: 'x', get: () => sidebarW, set: setSidebarW, sign: 1, min: 200, max: () => 560 })}
         title="Drag to resize"
@@ -529,8 +588,8 @@ function Shell() {
           tabs={tabs}
           active={active}
           onSelectChat={selectChat}
-          onSelectTab={(t) => selectTab(t.kind === 'notebook' ? { kind: 'notebook', id: t.id } : { kind: 'file', path: t.path })}
-          onCloseTab={(t) => closeTab(t.kind === 'notebook' ? { kind: 'notebook', id: t.id } : { kind: 'file', path: t.path })}
+          onSelectTab={(t) => selectTab(tabToContent(t))}
+          onCloseTab={(t) => closeTab(tabToContent(t))}
           layout={layout}
           onSetLayout={setLayout}
           showLayout={active !== null}
@@ -754,7 +813,14 @@ function CloseNotebookDialog({ target, onChoose }: {
   )
 }
 
-type Tab = { key: string; kind: 'notebook' | 'file'; id: string; label: string; path: string; dirty: boolean }
+type Tab = { key: string; kind: 'notebook' | 'file' | 'agent'; id: string; label: string; path: string; dirty: boolean }
+
+// A strip tab back to the pane entry it stands for.
+function tabToContent(t: Tab): Content {
+  if (t.kind === 'notebook') return { kind: 'notebook', id: t.id }
+  if (t.kind === 'agent') return { kind: 'agent', id: t.id, label: t.label }
+  return { kind: 'file', path: t.path }
+}
 
 // Tab strip: Chat + one tab per open content item, then the dock toggles (Files /
 // Git / Terminal) and the companion-orientation control.
@@ -773,7 +839,9 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
       on ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-overlay hover:text-ctp-subtext'}`
   const isOn = (t: Tab) => {
     if (!active) return false
-    return t.kind === 'notebook' ? active.kind === 'notebook' && active.id === t.id : active.kind === 'file' && active.path === t.path
+    if (t.kind === 'notebook') return active.kind === 'notebook' && active.id === t.id
+    if (t.kind === 'agent') return active.kind === 'agent' && active.id === t.id
+    return active.kind === 'file' && active.path === t.path
   }
   const toggle = (on: boolean) =>
     `px-2.5 h-6 rounded text-[11px] transition-colors ${on ? 'bg-ctp-surface1 text-ctp-text' : 'text-ctp-overlay hover:text-ctp-subtext hover:bg-ctp-surface0'}`
@@ -801,7 +869,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         )}
         {tabs.map((t) => (
           <span key={t.key} className={tab(isOn(t))}>
-            <span className="shrink-0">{t.kind === 'notebook' ? '📓' : '📄'}</span>
+            <span className={`shrink-0 ${t.kind === 'agent' ? 'text-ctp-mauve' : ''}`}>{t.kind === 'notebook' ? '📓' : t.kind === 'agent' ? '◈' : '📄'}</span>
             <button onClick={() => onSelectTab(t)} className="truncate max-w-[150px]" title={t.path}>
               {t.label}{t.dirty && <span className="text-ctp-yellow"> ●</span>}
             </button>
@@ -922,12 +990,15 @@ function Empty() {
   )
 }
 
-function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void }) {
+function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits, onOpenAgent }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void; onOpenAgent: (sid: string, id: string, label: string) => void }) {
   const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
-  const { transcriptFor, tasksFor } = useChat()   // per-session running-agent count for the row badge
   const [showNew, setShowNew] = useState(false)
   const [confirmClose, setConfirmClose] = useState<SessionInfo | null>(null)
   const pick = (id: string) => { setActive(id); onClose() }
+  // A subsession belongs UNDER its parent, not at the bottom of the list: order the
+  // flat server list into parent → its children (recursively), keeping each level in
+  // creation order. An orphan (parent already closed) stays a top-level row.
+  const ordered = useMemo(() => orderSessions(sessions), [sessions])
 
   return (
     <>
@@ -963,11 +1034,11 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
         </div>
         <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
           {sessions.length === 0 && <div className="px-2 py-2 text-xs text-ctp-overlay">No sessions yet.</div>}
-          {sessions.map((s) => (
+          {ordered.map(({ session: s, depth }) => (
             <SessionRow
-              key={s.id} session={s} active={s.id === activeId} attention={attention.has(s.id)}
-              runningAgents={countRunningAgents(transcriptFor(s.id), s.state === 'running', tasksFor(s.id))}
+              key={s.id} session={s} depth={depth} active={s.id === activeId} attention={attention.has(s.id)}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
+              onOpenAgent={(id, label) => { onOpenAgent(s.id, id, label); onClose() }}
             />
           ))}
         </div>
@@ -1212,17 +1283,64 @@ function SandboxFields({ value, onChange, cwd, available }: { value: SbState; on
   )
 }
 
-function SessionRow({ session, active, attention, runningAgents, onSelect, onClose }: { session: SessionInfo; active: boolean; attention: boolean; runningAgents: number; onSelect: () => void; onClose: () => void }) {
+// Flatten the server's session list into display order: every subsession sits
+// directly under its parent (nested to any depth), each level keeping the order the
+// server sent. A session whose parent isn't in the list (closed, or not yet loaded)
+// is treated as top-level so it can never vanish from the sidebar.
+function orderSessions(sessions: SessionInfo[]): { session: SessionInfo; depth: number }[] {
+  const byParent = new Map<string, SessionInfo[]>()
+  const ids = new Set(sessions.map((s) => s.id))
+  const roots: SessionInfo[] = []
+  for (const s of sessions) {
+    const pid = s.parentId && ids.has(s.parentId) && s.parentId !== s.id ? s.parentId : null
+    if (!pid) { roots.push(s); continue }
+    const kids = byParent.get(pid) ?? []; kids.push(s); byParent.set(pid, kids)
+  }
+  const out: { session: SessionInfo; depth: number }[] = []
+  const seen = new Set<string>()
+  const walk = (s: SessionInfo, depth: number) => {
+    if (seen.has(s.id)) return   // guards a parentId cycle from recursing forever
+    seen.add(s.id)
+    out.push({ session: s, depth })
+    for (const k of byParent.get(s.id) ?? []) walk(k, depth + 1)
+  }
+  for (const r of roots) walk(r, 0)
+  for (const s of sessions) if (!seen.has(s.id)) out.push({ session: s, depth: 0 })   // cycle leftovers
+  return out
+}
+
+function SessionRow({ session, depth, active, attention, onSelect, onClose, onOpenAgent }: { session: SessionInfo; depth: number; active: boolean; attention: boolean; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void }) {
   const { sessions, agents, setAgent, rename } = useSessions()
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const [subOpen, setSubOpen] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [renameVal, setRenameVal] = useState(session.name)
   const [info, setInfo] = useState(false)
+  const [agentsOpen, setAgentsOpen] = useState(false)
   // Guards the Enter→blur double-fire and a cancel-on-Escape from saving twice/at all.
   const renameDone = useRef(false)
 
-  const isSub = !!session.parentId
+  // This session's subagents, nested under its name. Collapsed by default — the ◈
+  // badge is the toggle. Cleared cards are filtered out (see store/agentDismiss), so
+  // the badge only appears while there's something left to look at.
+  const { transcriptFor, tasksFor, stopTask } = useChat()
+  const items = transcriptFor(session.id)
+  const tasks = tasksFor(session.id)
+  const dismissed = useDismissedAgents(session.id)
+  const myAgents = useMemo(() => {
+    const cleared = new Set(dismissed)
+    return collectAgents(items, tasks).filter((a) => !cleared.has(agentKey(a)))
+  }, [items, tasks, dismissed])
+  const turnActive = session.state === 'running' || session.state === 'waiting'
+  const liveAgents = myAgents.filter((a) => isAgentLive(a, turnActive)).length
+  const finishedAgents = myAgents.length - liveAgents
+
+  // Nested-looking iff it is actually nested IN THIS LIST. Deriving this from
+  // `session.parentId` instead disagreed with `depth` for an orphan — close a parent while
+  // its subsession lives on and orderSessions treats the child as a root (depth 0), so the
+  // row got neither the root's pl-2.5 (suppressed by parentId) nor an indent (suppressed
+  // by depth), and the ↳ landed at left:8 on top of the state dot. One source of truth.
+  const isSub = depth > 0
   const roleId = session.agentId ?? 'general'
   const roleName = agents.find((a) => a.id === roleId)?.name ?? roleId
   const roleBadge = roleId !== 'general' ? roleName : null
@@ -1242,61 +1360,139 @@ function SessionRow({ session, active, attention, runningAgents, onSelect, onClo
   }
   const cancelRename = () => { renameDone.current = true; setRenaming(false) }
 
-  return (
-    <div onClick={onSelect} className={`group relative rounded-md pr-1 py-2 cursor-pointer flex items-center gap-2.5 transition-colors ${isSub ? 'pl-5' : 'pl-2.5'} ${active ? 'bg-ctp-surface0' : 'hover:bg-ctp-surface0/50'}`}>
-      {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-ctp-accent" />}
-      {isSub && <span className="absolute left-2 text-ctp-overlay text-[11px] leading-none" title="Subsession">↳</span>}
-      {/* A finished/errored background session gets a red attention light until viewed. */}
-      {attention
-        ? <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-ctp-red shadow-[0_0_8px_2px] shadow-ctp-red/60 animate-pulse" title="Finished — needs your attention" />
-        : <StateDot state={session.state} />}
-      <div className="min-w-0 flex-1">
-        {renaming ? (
-          <input
-            autoFocus
-            value={renameVal}
-            onClick={(e) => e.stopPropagation()}
-            onChange={(e) => setRenameVal(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitRename() } else if (e.key === 'Escape') { e.preventDefault(); cancelRename() } }}
-            onBlur={submitRename}
-            className="w-full bg-ctp-base border border-ctp-surface1 rounded px-1.5 py-0.5 text-sm text-ctp-text outline-none focus:border-ctp-accent/60"
-          />
-        ) : (
-          <div className="flex items-center gap-1.5 min-w-0">
-            <span className={`truncate text-sm ${attention ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
-            {roleBadge && <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide px-1 py-0.5 rounded bg-ctp-accent/15 text-ctp-accent" title={`Role: ${roleBadge}`}>{roleBadge}</span>}
-            {runningAgents > 0 && (
-              <span className="shrink-0 flex items-center gap-1 text-[9px] text-ctp-mauve" title={`${runningAgents} subagent${runningAgents > 1 ? 's' : ''} running`}>
-                <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />◈{runningAgents}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-      {/* Live status word — hidden while hovering so it doesn't fight the actions. */}
-      <span className="md:group-hover:hidden">{attention ? <span className="text-[10px] text-ctp-red">done</span> : <StateLabel state={session.state} />}</span>
-      <button onClick={openMenu} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text text-sm leading-none transition-opacity px-1 py-1" title="Session actions" aria-label="Session actions">⋯</button>
-      <button onClick={(e) => { e.stopPropagation(); onClose() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red text-xs transition-opacity px-1 py-1" title="Close session">✕</button>
+  // Nesting indent: subsessions sit under their parent, one step per level (the ↳ mark
+  // is drawn at the row's own left edge, so the indent moves with it).
+  const indent = depth > 0 ? { paddingLeft: 20 + (depth - 1) * 12 } : undefined
 
-      {menu && (
-        <SessionMenu
-          x={menu.x} y={menu.y} session={session} agents={agents}
-          onClose={() => setMenu(null)}
-          onSubsession={() => setSubOpen(true)}
-          onInfo={() => setInfo(true)}
-          onRename={beginRename}
-          onPickRole={(id) => { if (id !== roleId) void setAgent(session.id, id) }}
-        />
+  return (
+    <div>
+      <div onClick={onSelect} style={indent} className={`group relative rounded-md pr-1 py-2 cursor-pointer flex items-center gap-2.5 transition-colors ${isSub ? '' : 'pl-2.5'} ${active ? 'bg-ctp-surface0' : 'hover:bg-ctp-surface0/50'}`}>
+        {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-ctp-accent" />}
+        {isSub && <span style={{ left: (indent?.paddingLeft ?? 20) - 12 }} className="absolute text-ctp-overlay text-[11px] leading-none" title="Subsession">↳</span>}
+        {/* A finished/errored background session gets a red attention light until viewed. */}
+        {attention
+          ? <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-ctp-red shadow-[0_0_8px_2px] shadow-ctp-red/60 animate-pulse" title="Finished — needs your attention" />
+          : <StateDot state={session.state} />}
+        <div className="min-w-0 flex-1">
+          {renaming ? (
+            <input
+              autoFocus
+              value={renameVal}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => setRenameVal(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitRename() } else if (e.key === 'Escape') { e.preventDefault(); cancelRename() } }}
+              onBlur={submitRename}
+              className="w-full bg-ctp-base border border-ctp-surface1 rounded px-1.5 py-0.5 text-sm text-ctp-text outline-none focus:border-ctp-accent/60"
+            />
+          ) : (
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className={`truncate text-sm ${attention ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
+              {roleBadge && <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide px-1 py-0.5 rounded bg-ctp-accent/15 text-ctp-accent" title={`Role: ${roleBadge}`}>{roleBadge}</span>}
+              {/* The agents bullet: count of this session's subagents, and the toggle for
+                  the list below. Only here while at least one card is uncleared. */}
+              {myAgents.length > 0 && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setAgentsOpen((v) => !v) }}
+                  title={`${myAgents.length} subagent${myAgents.length > 1 ? 's' : ''}${liveAgents > 0 ? ` · ${liveAgents} running` : ''} — click to ${agentsOpen ? 'collapse' : 'expand'}`}
+                  aria-expanded={agentsOpen}
+                  className={`shrink-0 flex items-center gap-1 text-[9px] rounded px-1 py-0.5 transition-colors ${agentsOpen ? 'bg-ctp-mauve/15 text-ctp-mauve' : 'text-ctp-mauve hover:bg-ctp-mauve/10'}`}
+                >
+                  {liveAgents > 0 && <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />}
+                  ◈{myAgents.length}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+        {/* Live status word — hidden while hovering so it doesn't fight the actions. */}
+        <span className="md:group-hover:hidden">{attention ? <span className="text-[10px] text-ctp-red">done</span> : <StateLabel state={session.state} />}</span>
+        <button onClick={openMenu} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text text-sm leading-none transition-opacity px-1 py-1" title="Session actions" aria-label="Session actions">⋯</button>
+        <button onClick={(e) => { e.stopPropagation(); onClose() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red text-xs transition-opacity px-1 py-1" title="Close session">✕</button>
+
+        {menu && (
+          <SessionMenu
+            x={menu.x} y={menu.y} session={session} agents={agents}
+            onClose={() => setMenu(null)}
+            onSubsession={() => setSubOpen(true)}
+            onInfo={() => setInfo(true)}
+            onRename={beginRename}
+            onPickRole={(id) => { if (id !== roleId) void setAgent(session.id, id) }}
+          />
+        )}
+        {info && (
+          <SessionInfoDialog
+            session={session}
+            roleName={roleName}
+            parentName={session.parentId ? (sessions.find((s) => s.id === session.parentId)?.name ?? '—') : null}
+            onClose={() => setInfo(false)}
+          />
+        )}
+        {subOpen && <SubsessionDialog parent={session} onClose={() => setSubOpen(false)} />}
+      </div>
+
+      {/* Expanded: this session's subagents, one line each. Click opens the agent's full
+          thought process as a content tab; × clears a finished card from the list. */}
+      {agentsOpen && myAgents.length > 0 && (
+        <div style={{ marginLeft: (indent?.paddingLeft ?? 10) + 8 }} className="mt-0.5 mb-1 pl-2 border-l border-ctp-surface1 space-y-px animate-fade-in">
+          {myAgents.map((a) => (
+            <AgentLine
+              key={agentKey(a)} agent={a} turnActive={turnActive}
+              onOpen={() => onOpenAgent(agentKey(a), agentTabLabel(a))}
+              onClear={() => dismissAgents(session.id, [agentKey(a)])}
+              onStop={() => { if (a.toolId) stopTask(session.id, a.toolId) }}
+            />
+          ))}
+          {finishedAgents > 0 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); dismissAgents(session.id, myAgents.filter((a) => !isAgentLive(a, turnActive)).map(agentKey)) }}
+              className="mt-0.5 text-[10px] text-ctp-overlay hover:text-ctp-text transition-colors"
+              title="Clear every finished agent from this list"
+            >
+              Clear finished
+            </button>
+          )}
+        </div>
       )}
-      {info && (
-        <SessionInfoDialog
-          session={session}
-          roleName={roleName}
-          parentName={session.parentId ? (sessions.find((s) => s.id === session.parentId)?.name ?? '—') : null}
-          onClose={() => setInfo(false)}
-        />
+    </div>
+  )
+}
+
+// One subagent in the sidebar list: status dot, its type, what it was asked to do, and —
+// depending on whether it's running — a ■ to stop it or a × to clear it. Only a FINISHED
+// agent can be cleared (clearing a running one would hide it while it kept working, with
+// no way back), and only a RUNNING one can be stopped.
+function AgentLine({ agent, turnActive, onOpen, onClear, onStop }: { agent: AgentView; turnActive: boolean; onOpen: () => void; onClear: () => void; onStop: () => void }) {
+  const active = isAgentLive(agent, turnActive)
+  // Stoppable only with a task id from the CLI. A conversation resumed from disk replays
+  // the Task tool_use but never its task_started, so those cards can't be stopped —
+  // hide the button rather than offer one that always fails.
+  const stoppable = active && !!agent.taskId
+  return (
+    <div className="group/agent flex items-center gap-1.5 rounded pr-0.5 hover:bg-ctp-surface0/60">
+      <button onClick={(e) => { e.stopPropagation(); onOpen() }} className="min-w-0 flex-1 flex items-center gap-1.5 py-0.5 text-left" title={`${agent.type}: ${agent.description} — open its thought process`}>
+        <AgentStatusDot agent={agent} turnActive={turnActive} />
+        <span className="shrink-0 text-[9px] font-mono text-ctp-mauve/90">{agent.type}</span>
+        <span className="min-w-0 truncate text-[11px] text-ctp-subtext">{agent.description}</span>
+      </button>
+      {stoppable && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onStop() }}
+          title="Stop this agent (the turn keeps running)"
+          aria-label={`Stop agent: ${agent.description}`}
+          className="shrink-0 opacity-100 md:opacity-0 md:group-hover/agent:opacity-100 text-ctp-overlay hover:text-ctp-red text-[9px] leading-none px-0.5 transition-opacity"
+        >
+          ■
+        </button>
       )}
-      {subOpen && <SubsessionDialog parent={session} onClose={() => setSubOpen(false)} />}
+      {!active && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onClear() }}
+          title="Clear"
+          className="shrink-0 opacity-100 md:opacity-0 md:group-hover/agent:opacity-100 text-ctp-overlay hover:text-ctp-red text-[11px] leading-none px-0.5 transition-opacity"
+        >
+          ×
+        </button>
+      )}
     </div>
   )
 }

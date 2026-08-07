@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode, RewindPoint, RewindMode, SessionInfo } from '@claudette/shared'
-import { useChat, collectAgents, isSubagentTool, type TranscriptItem, type AgentView, type SessionMeta, type RateLimitInfo } from '../store/chat'
+import { useChat, isSubagentTool, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
 import { prettyPath } from '../lib/paths'
@@ -22,11 +22,6 @@ const autoResumed = new Set<string>()
 // /rewind) — an in-flight auto-resume for one of these must abort rather than reload
 // the old conversation over the user's action.
 const resumeAborted = new Set<string>()
-
-// Dismissed agent-tray cards, keyed by session id, kept OUTSIDE the component so it
-// survives ChatView unmounting on a session switch (App keys ChatView by session id).
-// A cleared card therefore stays cleared when you return to the session.
-const dismissedBySession = new Map<string, Set<string>>()
 
 // Shell-like composer history (Up/Down recall the messages you've sent), persisted
 // per session in localStorage so it survives a page reload AND a /clear — unlike the
@@ -50,7 +45,7 @@ function saveHist(id: string, h: string[]): void {
 // (P1.14); other slash commands pass through as a turn. Permission-mode switch
 // lives in the MetaBar (P1.4).
 export function ChatView({ sessionId, isActive }: { sessionId: string; isActive: boolean }) {
-  const { transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
+  const { transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
   const { sessions, setMode, isFresh, markBusy } = useSessions()
   const session = sessions.find((s) => s.id === sessionId)
   const [showResume, setShowResume] = useState(false)
@@ -96,43 +91,22 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       return next
     })
   }, [sessionId])
-  // Live subagent count = Task tool_uses with no matching tool_result yet. Only while
-  // the turn is active, so an interrupted (never-completed) Task doesn't latch on.
-  // Subagents live in the pinned Agents tray (below), NOT inline in the conversation.
-  const tasks = tasksFor(sessionId)
-  const agents = useMemo(() => collectAgents(items, tasks), [items, tasks])
-  // Dismissed agent cards (view-only). Agents are derived from the immutable
-  // transcript each render, so there's nothing to delete — we filter by a stable
-  // key instead. App keys ChatView by session id, so switching sessions unmounts
-  // this component; persist the set per-session in a module map (see below) so a
-  // card you cleared stays cleared when you come back.
-  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => dismissedBySession.get(sessionId) ?? new Set())
-  const updateDismissed = useCallback((fn: (prev: ReadonlySet<string>) => Set<string>) => {
-    setDismissed((prev) => { const next = fn(prev); dismissedBySession.set(sessionId, next); return next })
-  }, [sessionId])
-  const visibleAgents = useMemo(() => agents.filter((a) => !dismissed.has(agentKey(a))), [agents, dismissed])
-  const dismissAgent = (a: AgentView) => updateDismissed((prev) => new Set(prev).add(agentKey(a)))
-  const dismissFinished = () =>
-    updateDismissed((prev) => {
-      const next = new Set(prev)
-      for (const a of agents) if (a.result) next.add(agentKey(a))
-      return next
-    })
   // The rendered transcript, memoized on `items` so composer keystrokes (which
   // re-render ChatView via `draft`) don't re-filter and re-build the whole list.
   const rendered = useMemo(() => {
     // Everything about a subagent (its `Task` call, its own nested activity, and its
-    // result) is pulled OUT of the conversation and shown in the Agents tray instead.
+    // result) is pulled OUT of the conversation — subagents live in the sidebar, under
+    // their session's name, and open as their own tab (see AgentDetail).
     const taskToolIds = new Set<string>()
     for (const it of items) if (it.kind === 'tool_use' && isSubagentTool(it.name) && it.toolId) taskToolIds.add(it.toolId)
     const shown = items.filter((it) => {
       // Drop signature-only "thinking" blocks (no readable body → empty toggle/gap).
       if (it.kind === 'thinking' && !it.streaming && !it.text.trim()) return false
-      if (it.kind === 'tool_use' && isSubagentTool(it.name)) return false                     // → tray
+      if (it.kind === 'tool_use' && isSubagentTool(it.name)) return false                     // → sidebar
       // A subagent's own activity — tool calls/results AND its text/thinking (chain of
-      // thought) — is tagged with parentId and belongs in the tray, not inline.
+      // thought) — is tagged with parentId and belongs to its agent, not inline.
       if ((it.kind === 'tool_use' || it.kind === 'tool_result' || it.kind === 'text' || it.kind === 'thinking') && it.parentId) return false
-      if (it.kind === 'tool_result' && taskToolIds.has(it.toolUseId)) return false             // Task result → tray
+      if (it.kind === 'tool_result' && taskToolIds.has(it.toolUseId)) return false             // Task result → sidebar
       return true
     })
     return shown.map((it, i) => (
@@ -368,15 +342,6 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
         </div>
       </div>
 
-      {visibleAgents.length > 0 && (
-        <AgentsTray
-          agents={visibleAgents}
-          running={running}
-          onDismiss={dismissAgent}
-          onDismissFinished={dismissFinished}
-        />
-      )}
-
       <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
         <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3 relative">
           {showJump && (
@@ -568,7 +533,7 @@ const Item = memo(function Item({ item }: { item: TranscriptItem }) {
 // Compact, collapsed-by-default tool call — a dim one-liner (`⏺ Read(client.ts)`)
 // that expands to the full ToolDetail on click. Keeps tool chatter subordinate to
 // the assistant's prose, matching the Claude Code CLI's hierarchy.
-function ToolRow({ name, input }: { name: string; input: unknown }) {
+export function ToolRow({ name, input }: { name: string; input: unknown }) {
   const [open, setOpen] = useState(false)
   const arg = toolArg(name, (input ?? {}) as Record<string, unknown>)
   return (
@@ -594,7 +559,7 @@ function ToolRow({ name, input }: { name: string; input: unknown }) {
 
 // Compact tool result — an indented `⎿` summary line (first line + line count),
 // expandable to the full output. Errors surface in red but stay one line until opened.
-function ResultRow({ content, isError }: { content: string; isError: boolean }) {
+export function ResultRow({ content, isError }: { content: string; isError: boolean }) {
   const [open, setOpen] = useState(false)
   const lines = content.split('\n')
   const firstLine = lines.find((l) => l.trim().length > 0) ?? ''
@@ -629,144 +594,6 @@ function Collapsible({ label, body, tone }: { label: string; body: string; tone:
       <pre className="mt-1 whitespace-pre-wrap font-mono text-[11px] pl-4 opacity-90">
         {open ? body : preview}
       </pre>
-    </div>
-  )
-}
-
-// Stable identity for a tray card across transcript rebuilds: the anthropic tool
-// id when we have it (survives collectAgents re-runs), else the local item id.
-function agentKey(a: AgentView): string {
-  return a.toolId ?? a.id
-}
-
-// The pinned Agents tray: a docked strip between the transcript and the composer that
-// collects every subagent for this session (out of the conversation flow, so it's easy
-// to find and never scrolls away). Collapsible; header shows total + live count.
-function AgentsTray({ agents, running, onDismiss, onDismissFinished }: {
-  agents: AgentView[]
-  running: boolean
-  onDismiss: (a: AgentView) => void
-  onDismissFinished: () => void
-}) {
-  const [open, setOpen] = useState(true)
-  const active = agents.filter((a) => !a.result && (a.launched || running)).length
-  const finished = agents.length - active
-  return (
-    <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-mantle/60">
-      <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-2">
-        <div className="flex items-center gap-2 w-full text-[11px] text-ctp-subtext">
-          <button onClick={() => setOpen((v) => !v)} className="flex items-center gap-2 min-w-0 flex-1 text-left">
-            <span className="text-ctp-mauve" aria-hidden>◈</span>
-            <span className="font-medium">Agents</span>
-            <span className="text-ctp-overlay">{agents.length}</span>
-            {active > 0 && (
-              <span className="flex items-center gap-1 text-ctp-mauve">
-                <span className="w-1.5 h-1.5 rounded-full bg-ctp-mauve animate-pulse" />{active} running
-              </span>
-            )}
-          </button>
-          {finished > 0 && (
-            <button
-              onClick={onDismissFinished}
-              title="Dismiss all finished agents"
-              className="shrink-0 text-ctp-overlay hover:text-ctp-text transition-colors"
-            >
-              Clear finished
-            </button>
-          )}
-          <button onClick={() => setOpen((v) => !v)} className="shrink-0 text-ctp-surface2" title={open ? 'Collapse' : 'Expand'}>
-            {open ? '▾' : '▸'}
-          </button>
-        </div>
-        {open && (
-          <div className="mt-1.5 space-y-1.5 max-h-64 overflow-y-auto">
-            {agents.map((a) => <AgentCard key={a.id} agent={a} running={running} onDismiss={() => onDismiss(a)} />)}
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// A subagent, rendered as a first-class card in the tray: it shows the agent's
-// EXISTENCE (type + task), STATUS (running / done / failed, live), and PROGRESS (its
-// own tool calls, nested). Collapsed by default — a one-line "N steps · last action"
-// ticker keeps it glanceable; expand for the full activity + result.
-function AgentCard({ agent, running, onDismiss }: { agent: AgentView; running: boolean; onDismiss: () => void }) {
-  const [open, setOpen] = useState(false)
-  const { type, description: desc, prompt, steps, result, launched } = agent
-  const calls = steps.filter((s): s is Extract<TranscriptItem, { kind: 'tool_use' }> => s.kind === 'tool_use')
-  const done = !!result
-  const failed = result?.isError === true
-  // A background agent (launched, no result yet) runs detached from the parent turn,
-  // so it stays "running" even after the turn goes idle; a foreground agent tracks the turn.
-  const active = !done && (launched || running)
-  const status = failed ? { label: 'failed', text: 'text-ctp-red', dot: 'bg-ctp-red' }
-    : done ? { label: 'done', text: 'text-ctp-green', dot: 'bg-ctp-green' }
-    : active ? { label: 'running', text: 'text-ctp-mauve', dot: 'bg-ctp-mauve animate-pulse' }
-    : { label: 'stopped', text: 'text-ctp-overlay', dot: 'bg-ctp-overlay' }
-  const last = calls[calls.length - 1]
-  const lastArg = last ? toolArg(last.name, (last.input ?? {}) as Record<string, unknown>) : ''
-  const border = active ? 'border-ctp-mauve/50' : failed ? 'border-ctp-red/40' : 'border-ctp-surface1'
-  return (
-    <div className={`animate-fade-in rounded-lg border ${border} bg-ctp-surface0/30 overflow-hidden`}>
-      <div className="flex items-center gap-2 px-2.5 py-1.5 hover:bg-ctp-surface0/50">
-        <button onClick={() => setOpen((v) => !v)} className="flex-1 min-w-0 flex items-center gap-2 text-left">
-          <span className="shrink-0 text-ctp-mauve" aria-hidden>◈</span>
-          <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-ctp-mauve/15 text-ctp-mauve">{type}</span>
-          <span className="min-w-0 truncate text-[13px] font-medium text-ctp-text">{desc}</span>
-          <span className={`ml-auto shrink-0 flex items-center gap-1 text-[10px] ${status.text}`}>
-            <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />{status.label}
-          </span>
-          <span className="shrink-0 text-ctp-surface2 text-[10px]">{open ? '▾' : '▸'}</span>
-        </button>
-        {/* Only a finished agent can be dismissed. Dismissing a still-running one used to
-            hide it while it kept running detached — with no way to bring the card back,
-            so you'd lose its live progress and its eventual result for good. */}
-        {!active && (
-          <button
-            onClick={onDismiss}
-            title="Dismiss"
-            className="shrink-0 text-ctp-overlay hover:text-ctp-red px-0.5 leading-none"
-          >
-            ×
-          </button>
-        )}
-      </div>
-
-      {/* Collapsed ticker: step count + the agent's most recent action. */}
-      {!open && (calls.length > 0 || active) && (
-        <div className="px-2.5 pb-1.5 -mt-0.5 text-[10px] text-ctp-overlay truncate">
-          {calls.length} step{calls.length === 1 ? '' : 's'}
-          {last && <span className="text-ctp-subtext"> · {last.name}{lastArg ? ` ${lastArg}` : ''}</span>}
-          {active && !last && <span className="text-ctp-mauve"> · starting…</span>}
-        </div>
-      )}
-
-      {open && (
-        <div className="px-2.5 pb-2 pt-1.5 space-y-2 border-t border-ctp-surface0">
-          {prompt && <Collapsible label="Task prompt" tone="overlay" body={prompt} />}
-          {steps.length > 0 && (
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-ctp-overlay">Activity</div>
-              {steps.map((s) => s.kind === 'tool_use'
-                ? <ToolRow key={s.id} name={s.name} input={s.input} />
-                : s.kind === 'tool_result' ? <ResultRow key={s.id} content={s.content} isError={s.isError} />
-                : s.kind === 'thinking' ? <Collapsible key={s.id} label="Thinking" tone="overlay" body={s.text} />
-                : s.kind === 'text' ? <div key={s.id} className="text-xs text-ctp-subtext"><Markdown text={s.text} /></div>
-                : null)}
-            </div>
-          )}
-          {result && (
-            <div className="space-y-0.5">
-              <div className={`text-[10px] uppercase tracking-wide ${failed ? 'text-ctp-red/80' : 'text-ctp-overlay'}`}>{failed ? 'Error' : 'Result'}</div>
-              <div className={`text-xs max-h-72 overflow-y-auto ${failed ? 'text-ctp-red' : 'text-ctp-subtext'}`}>
-                <Markdown text={result.content} />
-              </div>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   )
 }

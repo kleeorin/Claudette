@@ -9,6 +9,7 @@ import type {
 } from '@claudette/shared'
 import {
   isSubagentTool, isAsyncLaunchAck, parseTaskNotification, parseSystemTaskNotification,
+  parseTaskStarted, taskIdOfNotification,
   assistantToolUses, userToolResults, userEventText,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
@@ -17,7 +18,7 @@ import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
-import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir } from './configProtection'
+import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir, releaseHostConfigDir } from './configProtection'
 
 // Owns the set of Claude sessions and their engines. Ported from
 // ClaudeMaster's main-process SessionManager, minus the remote/SSH spawn path
@@ -115,6 +116,15 @@ export class SessionManager extends EventEmitter {
       const content = (e as { message?: { content?: unknown } }).message?.content
       if (typeof content === 'string' && !content.includes('<task-notification>')) return
     }
+    // Never buffer token-level partials. --include-partial-messages emits ONE stream_event
+    // per token, so a single busy turn could push several thousand of them through a
+    // TRANSCRIPT_CAP of 4000 and evict the events that actually carry state — assistant
+    // messages, tool results, task notifications — leaving a reconnecting device with a
+    // snapshot of the last message or two. They're also redundant: the completed
+    // `assistant` event that follows re-materializes the same text, which is exactly how a
+    // device joining mid-turn catches up today. Dropping them costs nothing and gives the
+    // cap back to meaningful history.
+    if (e.type === 'stream_event') return
     const buf = this.transcripts.get(id) ?? []
     buf.push(e)
     if (buf.length > TRANSCRIPT_CAP) buf.splice(0, buf.length - TRANSCRIPT_CAP)
@@ -214,8 +224,22 @@ export class SessionManager extends EventEmitter {
     if (canSandbox) {
       markConfigExposed(runCwd)
     } else if (isConfigExposed(runCwd)) {
-      const scrubbed = scrubbedHostConfigDir()
-      if (scrubbed) launchEnv = { ...process.env, CLAUDE_CONFIG_DIR: scrubbed } as Record<string, string>
+      const scrubbed = scrubbedHostConfigDir(id)
+      if (!scrubbed) {
+        // FAIL CLOSED. Falling back to the real config dir here used to keep the launch
+        // alive — but this branch is, by definition, host-mode against a config a confined
+        // session could have written hooks into, and `--setting-sources user` below would
+        // then point the unsandboxed child at the UNSCRUBBED settings. That is the exact
+        // execution the scrub exists to prevent, so a scrub we couldn't build refuses the
+        // launch (same shape as the wrapSandbox refusal above) instead of quietly running
+        // it unprotected. Re-sandboxing the session, or clearing the exposure, unblocks it.
+        session.engine = null
+        session.state = 'exited'
+        this.emit('stateChange', id, 'exited')
+        this.emit('exit', id, true, 'Could not build a scrubbed config for this unsandboxed session, and its config dir has been exposed to a sandboxed session. Refusing to launch rather than risk running hooks on the host — enable the sandbox for this session, or check the server log.')
+        return
+      }
+      launchEnv = { ...process.env, CLAUDE_CONFIG_DIR: scrubbed } as Record<string, string>
       // Single host-execution chokepoint: an exposed config can carry hooks/MCP a confined
       // session wrote at ANY scope. Read only the (scrubbed) user config, ignore project +
       // local entirely — so create-after-launch project settings, settings.local.json, and
@@ -287,6 +311,13 @@ export class SessionManager extends EventEmitter {
       // The engine (and its in-process subagents) just died — settle any task still
       // marked running so no tray card is stranded, whatever exit path we take below.
       this.settleOpenTasks(id)
+      // If this was a host-mode session on a scrubbed config mirror, salvage a token it
+      // refreshed into that mirror back to the shared config dir and drop the mirror
+      // (configProtection.ts: an atomic-rename creds write replaces the symlink, so the
+      // fresh token would otherwise be stranded there while every other reader keeps the
+      // stale one — the "Not logged in" loop). No-op for a sandboxed session, which has no
+      // mirror. Must run BEFORE the relaunch branches below, which rebuild it.
+      releaseHostConfigDir(id)
       // A resumeInto() kill: relaunch straight into the chosen conversation
       // rather than treating the exit as a crash/close.
       if (session.replacing) {
@@ -507,6 +538,23 @@ export class SessionManager extends EventEmitter {
         changed = true
       }
     } else if (e.type === 'system') {
+      // task_started pairs the CLI's own task id with the tool_use id we key cards by.
+      // That pairing is what makes a subagent stoppable: stop_task accepts only the
+      // former, the tray only ever sees the latter. Recorded on whichever card is already
+      // registered from the Task tool_use (the assistant event always precedes the start).
+      const started = parseTaskStarted(e)
+      if (started?.toolUseId) {
+        const rec = m.get(started.toolUseId)
+        if (rec && rec.taskId !== started.taskId) { rec.taskId = started.taskId; changed = true }
+      }
+      // Late pickup: an agent already running when we attached has no task_started on our
+      // stream, but its terminal notification carries the pair too. Too late to stop it,
+      // and only worth recording while it could still matter.
+      const settled = taskIdOfNotification(e)
+      if (settled) {
+        const rec = m.get(settled.toolUseId)
+        if (rec && !rec.taskId) { rec.taskId = settled.taskId; changed = true }
+      }
       // The current CLI delivers that same terminal signal as a `system` event
       // (subtype task_notification) instead — settle the background card off it, else
       // a completed background agent hangs "running" until the engine exits/restarts.
@@ -545,6 +593,19 @@ export class SessionManager extends EventEmitter {
 
   interrupt(id: string): void {
     this.sessions.get(id)?.engine?.interrupt()
+  }
+
+  // Stop one subagent of a session, addressed by the Task tool-use id the tray holds.
+  // Translates to the CLI's own task id here so no client has to know both exist.
+  // Resolves ok:false (never throws) when the session is gone, the card is unknown, or
+  // no task_started was ever seen for it — the UI hides the button in that last case, but
+  // a stale click from another device must not take the process down.
+  async stopTask(id: string, toolId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const session = this.sessions.get(id)
+    if (!session?.engine) return { ok: false, error: 'session not running' }
+    const taskId = this.tasks.get(id)?.get(toolId)?.taskId
+    if (!taskId) return { ok: false, error: 'this agent has no stoppable task id (it started before this server attached, or was replayed from a resumed conversation)' }
+    return session.engine.stopTask(taskId)
   }
 
   respondPermission(id: string, requestId: string, decision: PermissionDecision): void {
