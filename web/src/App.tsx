@@ -19,6 +19,7 @@ import { ConfirmDialog } from './components/ConfirmDialog'
 import { AuthGate } from './components/AuthGate'
 import { api } from './api/client'
 import { isEditTool, filePathOf, isNotebookPath } from './lib/proposals'
+import { pruneDrafts } from './lib/drafts'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
 import { basename, prettyPath } from './lib/paths'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
@@ -429,6 +430,7 @@ function Shell() {
     // Same for the cleared-agent keys it owned — a closed session's list is gone, so
     // its clears would otherwise sit in localStorage forever.
     pruneDismissed([...ids])
+    pruneDrafts([...ids])   // and the composer text it never sent
   }, [sessions])
 
   // --- refresh survival: reconcile, persist, restore notebooks ----------------

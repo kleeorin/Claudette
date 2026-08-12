@@ -7,6 +7,7 @@ import { MilkdownEditor } from './MilkdownEditor'
 import { CsvTableView } from './CsvTableView'
 import { basename } from '../lib/paths'
 import { useScrollMemory } from '../lib/scrollMemory'
+import { peekBuffer, setBuffer } from '../lib/buffers'
 import { useChat } from '../store/chat'
 import { applyProposal, filePathOf, isEditTool, isNotebookPath, reconstructDecision } from '../lib/proposals'
 
@@ -51,10 +52,18 @@ export function FileEditorView({ path, sessionId }: Props) {
     setLoading(true); setDirty(false); dirtyRef.current = false; setSaveErr(null)
     api.fs.read(path).then((p) => {
       if (cancelled) return
-      setPreview(p)
-      const text = p.kind === 'text' ? p.text : ''
+      const disk = p.kind === 'text' ? p.text : ''
+      loadedRef.current = disk
+      // Edits made earlier and never saved come back with the file — this view is
+      // unmounted whenever another tab or session is on screen, so without the buffer
+      // a glance elsewhere discarded them. The baseline stays DISK text, so the dirty
+      // marker and the save-time overwrite check still measure against reality.
+      const kept = p.kind === 'text' ? peekBuffer(path) : undefined
+      const text = kept ?? disk
       textRef.current = text
-      loadedRef.current = text
+      dirtyRef.current = text !== disk
+      setDirty(text !== disk)
+      setPreview(p.kind === 'text' ? { ...p, text } : p)
       setLoading(false)
     })
     return () => { cancelled = true }
@@ -67,8 +76,9 @@ export function FileEditorView({ path, sessionId }: Props) {
     textRef.current = text
     loadedRef.current = text
     dirtyRef.current = false; setDirty(false)
+    setBuffer(path, null)
     setReloadKey((k) => k + 1)
-  }, [])
+  }, [path])
 
   // Dirty is a real difference from disk, not "was ever edited" — so Milkdown's
   // initial (re-normalized) emit on load, or typing back to the saved text, doesn't
@@ -77,7 +87,8 @@ export function FileEditorView({ path, sessionId }: Props) {
     textRef.current = text
     const nowDirty = text !== loadedRef.current
     if (nowDirty !== dirtyRef.current) { dirtyRef.current = nowDirty; setDirty(nowDirty) }
-  }, [])
+    setBuffer(path, nowDirty ? text : null)   // survive the unmount a tab/session switch causes
+  }, [path])
 
   const save = useCallback(async () => {
     if (savingRef.current || !dirtyRef.current) return
@@ -96,8 +107,9 @@ export function FileEditorView({ path, sessionId }: Props) {
     if (r.ok) {
       loadedRef.current = snapshot
       // Only clear dirty if no edits landed during the await — otherwise those
-      // keystrokes would be marked saved and lost on close.
-      if (textRef.current === snapshot) { dirtyRef.current = false; setDirty(false) }
+      // keystrokes would be marked saved and lost on close. Same for the buffer:
+      // it's dropped only when what's on disk is what the editor holds.
+      if (textRef.current === snapshot) { dirtyRef.current = false; setDirty(false); setBuffer(path, null) }
     } else setSaveErr(r.error)
   }, [path])
 

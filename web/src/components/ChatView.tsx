@@ -10,6 +10,7 @@ import { RewindPicker } from './RewindPicker'
 import { SandboxControl } from './SandboxControl'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { useMentionComplete } from '../hooks/useMentionComplete'
+import { loadDraft, saveDraft } from '../lib/drafts'
 import { api } from '../api/client'
 import type { UsageWindow } from '@claudette/shared'
 
@@ -54,7 +55,10 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   const items = transcriptFor(sessionId)
   const pending = pendingFor(sessionId)
   const meta = metaFor(sessionId)
-  const [draft, setDraft] = useState('')
+  // Unsent text, seeded from what this session had in flight. ChatView is keyed by
+  // session id, so a switch remounts it — without the seed + the persist effect below,
+  // stepping away mid-sentence threw the sentence away.
+  const [draft, setDraft] = useState(() => loadDraft(sessionId))
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -91,6 +95,18 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       return next
     })
   }, [sessionId])
+
+  // Persist the unsent draft. Debounced — a localStorage write per keystroke is a
+  // synchronous main-thread hit — with a flush on teardown, which is exactly when a
+  // session switch happens (and lands well inside the debounce window).
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  useEffect(() => {
+    const t = setTimeout(() => saveDraft(sessionId, draft), 300)
+    return () => clearTimeout(t)
+  }, [draft, sessionId])
+  useEffect(() => () => saveDraft(sessionId, draftRef.current), [sessionId])
+
   // The rendered transcript, memoized on `items` so composer keystrokes (which
   // re-render ChatView via `draft`) don't re-filter and re-build the whole list.
   const rendered = useMemo(() => {
