@@ -250,6 +250,9 @@ export const api = {
     rename: (id: string, name: string) => post<OkResponse>('/api/session/rename', { id, name }),
     listAgents: async (): Promise<AgentInfo[]> => (await get<ListAgentsResponse>('/api/agents')).agents,
     setSandbox: (id: string, sandbox: SandboxConfig) => post<OkResponse>('/api/session/setSandbox', { id, sandbox }),
+    // Grant/revoke a session's right to hire teammates. Only this auth-gated route can:
+    // the server refuses an untrusted grant so a confined session can't hire itself a team.
+    setTeamEmploy: (id: string, teamEmploy: boolean) => post<OkResponse>('/api/session/setTeamEmploy', { id, teamEmploy }),
     restartFresh: (id: string) => post<OkResponse>('/api/session/restartFresh', { id }),
     resumeInto: (id: string, claudeSessionId: string) => post<OkResponse>('/api/session/resumeInto', { id, claudeSessionId }),
     listConversations: async (cwd: string): Promise<ConversationMeta[]> =>

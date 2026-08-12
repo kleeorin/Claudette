@@ -266,6 +266,163 @@ deny the box `127.0.0.1:<control-port>` while keeping DNS + Anthropic + the MCP 
 easy to break MCP+internet and hard to test without the operator; it closes enabler (1)
 but no longer gates a known escape.
 
+**E. Teams: hiring is a privileged move, messaging isn't — DONE (2026-08-07).** Team
+orchestration (`mcp/teamTools.ts`) lets one session create another via `employ_teammate`,
+which is a session-creation primitive reachable from inside a box — the same shape as the
+escape C closes. Two things keep it shut:
+
+- **The employment gate.** `SessionInfo.teamEmploy` is off by default, and
+  `SessionManager.setTeamEmploy` **refuses an untrusted grant** exactly as
+  `normalizeSandbox` refuses an untrusted `enabled:false`. A confined session that reaches
+  the loopback control API cannot grant *itself* hiring rights, and without them
+  `employ_teammate` and `dismiss_teammate` refuse. Note the gate is on `setTeamEmploy`
+  only — `register()`/`restore()` write the flag unchecked, which is safe **because** the
+  persisted file is now out of every mount (see the data-dir section); it was not safe
+  before. Revoking (`value === false`) is deliberately ungated: it only ever removes a
+  capability.
+- **Hiring is capped.** `MAX_TEAM_SIZE` (6) bounds a coordinator's roster. The message
+  budget bounds chatter, not headcount, and a hire with no first task sends no message at
+  all — so without a cap a prompt-injected coordinator could spawn claude processes until
+  the machine ran out, and every one would be persisted and relaunched at next boot.
+- Only roster management is gated: `list_team`, `send_to_session` and `report_to_parent`
+  are always available. But note what messaging *is*: a cross-context channel where content
+  from one session's context arrives in another's. The star's designed flow relays a
+  member's content through the coordinator to another member, and members are told to treat
+  a directive as their assignment — so **injected content laundered through a relaying
+  coordinator arrives correctly signed**. No forgery is needed for that; it is the feature.
+  What the framing does prevent is *forgery*: `escapeAttr` closes attribute breakout, and
+  `escapeBody` neutralises harness tags (`team-message`, `task-notification`,
+  `system-reminder`, `command-name`) in a body, so a member cannot fabricate a
+  coordinator-attributed directive or a fake harness notification.
+- **A teammate can only inherit confinement, never shed it.** `employ_teammate` passes no
+  sandbox config at all, so `create()` takes the coordinator's — see *Sandbox inheritance*
+  below. There is no argument through which a caller could ask for a weaker box, and an
+  explicit config from an in-process caller still meets `normalizeSandbox`'s refusal.
+
+Verified in `scratchpad/team-test.mts` (105/105 — including an untrusted `setTeamEmploy`
+being refused while the trusted route succeeds, a member being unable to hire at all, the
+roster cap, a forged nested `<team-message>` leaving only one live tag pair on the wire, and
+a teammate of a confined coordinator coming up confined with the same mounts).
+
+**What does NOT survive a restart.** The mailbox, its queues, the loop budget and the
+pending-dismissal marks are all in memory. `saved()` persists `teamEmploy` and parentage,
+never mail. So after a server restart: queued messages are silently gone, and a teammate
+that was mid-exit-interview comes back an ordinary member — the coordinator believes it
+dismissed someone who is still on the payroll and will never file a handover. That is a
+deliberate v1 limit rather than an oversight, but it is a real one: re-issue the dismissal
+after a restart.
+
+## Sandbox inheritance (teams share one box by default)
+
+A session created with **no** sandbox config of its own normally gets the seeded default,
+`{ enabled: true, mounts: [cwd rw] }`. A **teammate** is the exception: `create()` copies
+its coordinator's config instead (mounts deep-copied, so a later edit to one session's
+mounts can't alias the other's). A team shares one workspace, so a teammate that couldn't
+see the docs tree or sibling repo the operator mounted for the coordinator would hit
+baffling "missing file" errors on exactly the work it was hired for.
+
+The copy is treated as **trusted** even when the caller isn't, which is safe and is worth
+being explicit about: it is a config the operator already approved for the parent, and the
+parent's own claude is what asks. A coordinator can therefore hand a teammate the
+confinement it already has — never less. Per-teammate divergence is a deliberate operator
+action through the ordinary auth-gated `setSandbox`.
+
+**Role handover notes are server-mediated.** A dismissed teammate's exit interview is filed
+under `<data dir>/team-notes/<mangled-cwd>/<role>.md` (`mcp/teamNotes.ts`) and injected by
+the server into a new hire's first turn; sessions never read or write these files
+themselves. A teammate can only write its OWN note, via `report_to_parent`, and only once
+its coordinator has actually asked. Note the keying is `(cwd, role)` with no team scoping:
+two teams in the same working directory share a role's notes by design (that inheritance is
+the point), so treat a note as advisory context for the same operator, not as a boundary.
+
+**This paragraph previously claimed the notes were "outside every sandbox mount" and that a
+teammate "cannot forge or tamper with a predecessor's handover". Both were FALSE when
+written** — see the data-dir note below, which is what makes them true now.
+
+One consequence to know when reading test failures: asking for a box calls
+`markConfigExposed`, which taints the **user** scope globally (`configProtection.ts`
+`userKey`), after which host-mode sessions contend for a single scrubbed-config mirror and
+the losers are refused a launch. That is working as intended, but it means mixing confined
+and host-mode sessions in one process is order-sensitive.
+
+## Data-dir escape (Claudette's own state sat inside a mounted tree) — CRITICAL, fixed 2026-08-11
+
+Found by adversarial review of the teams feature; **pre-existing, and broader than teams.**
+
+Every box rw-binds `claudeConfigDir()` (`~/.claude`) so claude can write its config and
+credentials at runtime (`sandbox.ts` `bwrapBaseArgs` / `sessionDataMounts`). A bind carries
+the **whole subtree** — and Claudette's own state dir was `~/.claude/claudette`. Only
+`settings.json` files get a ro overlay (`hookSettingsProtections`); nothing pinned the data
+dir. `configProtection.ts` asserted the opposite in a comment (*"all OUTSIDE every session
+mount by construction"*), which is how it went unnoticed.
+
+Everything in that dir was therefore readable and writable from inside every sandbox:
+
+- **`sessions.json`** — replayed at boot by `restore()` as **trusted**. A box that edited
+  its own entry could set `teamEmploy: true`, or `sandbox: {enabled:false}`, and come back
+  after a restart with hiring rights or **no confinement at all** — straight through the
+  refusals in `setTeamEmploy` and `normalizeSandbox` that exist to prevent exactly that.
+  This makes section C's *"single choke point for create / setSandbox / restore, so no path
+  yields an unconfined session without the launch flag"* **false as written**: `restore` was
+  a choke point that trusted a box-writable file.
+- **`exposed-configs.json`** — the Layer-2 taint ledger. A box that poisoned
+  `settings.local.json` could delete its own entry, so the next host-mode session got the
+  REAL config instead of the scrubbed mirror, re-opening the cross-session hook→host-exec
+  path this document marks FIXED.
+- **`team-notes/`** — injected verbatim into a new teammate's first turn, so a box could
+  plant instructions for a future session in another team, persistently and invisibly.
+
+**Fix: the data dir moved to `~/.config/claudette`** (`util/dataDir.ts`), beside the
+loopback auth token — which already lived there, deliberately, because *"~/.config is never
+bind-mounted into a session sandbox"* (`auth.ts`). The precedent existed; the state dir just
+hadn't followed it. Existing state is **moved** (not copied — a readable duplicate left
+inside the mount would preserve the exposure) on first boot, logged, and best-effort so a
+failed migration can't stop the server starting. `CLAUDETTE_DATA_DIR` still overrides.
+
+Note this needed no change to `sandbox.ts` **for the default mount set**: the mounts were
+right, the state was in the wrong place. (A user-added mount of `~` or `~/.config` still
+exposes it — see the residual below.)
+
+**The migration is itself an attack surface, and was initially got wrong.** The legacy dir
+was writable from inside every box, so a confined session could leave `sessions.json` as a
+*symlink* to a file it still controlled. `renameSync` moves the link, not its target, and
+`existsSync` follows links and cannot see the difference — so the first version of the
+migration installed attacker-controlled indirection at the new **trusted** location,
+carrying the exposure across instead of ending it. Worse, it never removed the legacy dir
+and ran on **every** boot, so a box could plant links at any time and wait for a restart.
+The three worthwhile targets were `host-scrubbed-config/` (a host-mode session's
+`CLAUDE_CONFIG_DIR` — own it and you write hooks that run unsandboxed), `sessions.json`
+(trusted restore), and `team-notes/` (injected into a new hire's first turn).
+
+Now: entries are `lstat`ed and symlinks are **refused** with a loud warning and left in
+place for the operator to inspect; the legacy dir is removed once it is genuinely empty;
+and a marker in the new dir makes the whole thing a strictly **one-time** step, so that path
+is never consulted again. `EXDEV` (a symlinked `~/.claude`, separate filesystems) falls back
+to copy-then-remove instead of silently moving nothing, and the success line reports what
+actually moved — the first version logged success unconditionally, so a migration that moved
+zero bytes told the operator their state was safe.
+
+Covered by `scratchpad/data-dir-test.mts` (18/18: refusal, retry-after-cleanup, re-plant
+ignored, never clobbering existing state, override behaviour). It is a **separate file
+because `team-test.mts` sets `CLAUDETTE_DATA_DIR`**, which short-circuits migration — an
+earlier version of this section claimed the migration was covered when nothing tested it.
+
+**Residual — real, and not closed by this fix:**
+
+- `restore()` applies persisted `sandbox` and `teamEmploy` as trusted, and `register()`
+  validates neither. Sound only *because* the file is now out of reach. Note the escalation
+  is not limited to `enabled:false`: `{enabled:true, mounts:[{path:'/',mode:'rw'}]}` is just
+  as total and does not trip the refusal that section C leans on. If that trust should stop
+  being positional, `register()` is where to gate it.
+- **`~/.config` is not out of reach *by construction*** — it is out of reach of the default
+  mount set, which is not the same claim. An operator mount of `~` or `~/.config` exposes
+  the data dir and the auth token; `XDG_CONFIG_HOME` is honoured unvalidated; and
+  `runtimeInstallMounts` ro-binds the directory containing the `node` binary, which for a
+  hand-installed `$HOME/bin/node` is `$HOME` itself. The codebase already has the pattern to
+  fix this (`appSourceProtections`, `hookSettingsProtections`): a `dataDirProtections()`
+  overlay plus a boot assertion that neither the data dir nor the token dir lies inside any
+  session's mount set would close all three at once. Not done.
+
 ## Self-modification escape (rw-mounted server source + hot reload)
 
 The sharpest escape doesn't touch the API at all: **a session can rewrite the code of

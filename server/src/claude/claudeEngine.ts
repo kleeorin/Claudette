@@ -193,11 +193,17 @@ export class ClaudeEngine extends EventEmitter {
   }
 
   // Send a user turn (text, and later blocks). Marks the turn active → 'running'.
-  sendUserTurn(text: string): void {
-    if (!this.child) return
-    this.write({ type: 'user', message: { role: 'user', content: text } })
+  //
+  // Returns whether the turn actually reached the process. Callers that queue work for
+  // later redelivery (the team mailbox) need the truth: `this.child` is nulled only when
+  // Node delivers the exit event, so between the process dying and that event the stdin
+  // write is silently discarded and a void return looked exactly like success.
+  sendUserTurn(text: string): boolean {
+    if (!this.child) return false
+    if (!this.write({ type: 'user', message: { role: 'user', content: text } })) return false
     this._turnActive = true
     this.setState('running')
+    return true
   }
 
   // Client→server interrupt control request (replaces sending ESC to a pty).
@@ -301,10 +307,15 @@ export class ClaudeEngine extends EventEmitter {
 
   private controlId(): string { return `cm-${this.nextControlId++}` }
 
-  private write(obj: unknown): void {
+  private write(obj: unknown): boolean {
     const stdin = this.child?.stdin
-    if (!stdin || stdin.destroyed) return  // process gone; the write would EPIPE
-    stdin.write(JSON.stringify(obj) + '\n')
+    if (!stdin || stdin.destroyed || stdin.writableEnded) return false  // process gone; the write would EPIPE
+    try {
+      stdin.write(JSON.stringify(obj) + '\n')
+      return true
+    } catch {
+      return false   // raced the close; the 'error' handler above swallows it either way
+    }
   }
 
   private setState(s: 'idle' | 'running' | 'waiting'): void {

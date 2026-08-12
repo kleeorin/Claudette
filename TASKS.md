@@ -94,7 +94,8 @@ Claude edits *and* runs cells, cell locks). File browser / git / permissions are
 
 - **Phase 2** — file browser + previews, git panel, permissions center, docs/wiki,
   notifications (web), production build/bundling + `start` scripts.
-- **Phase 3** — agent roles, subsessions + `report_to_parent`, full MCP surface,
-  SSH remotes (sessions/fs/git/jupyter + MCP reverse tunnel), optional TUI frontend.
+- **Phase 3** — agent roles + teams (star topology, message mailbox, gated hiring,
+  exit-interview handover notes) ✅ **done**; full MCP surface, SSH remotes
+  (sessions/fs/git/jupyter + MCP reverse tunnel), optional TUI frontend still open.
 - **Phase 4** — Jupyter Contents API / server terminals / multi-kernel; optional
   **option-2 upgrade** (Yjs co-editing via `@jupyter/ydoc` + `y-websocket`).

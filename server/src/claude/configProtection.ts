@@ -2,10 +2,10 @@ import {
   existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, symlinkSync, rmSync,
   lstatSync, copyFileSync, chmodSync, statSync, renameSync, unlinkSync,
 } from 'fs'
-import { homedir } from 'os'
 import path from 'path'
 import { claudeConfigDir } from './sandbox'
 import { errMessage } from '../util/errMessage'
+import { dataDir } from '../util/dataDir'
 
 // Cross-session hook poisoning (SANDBOX.md): `settings.json` / `settings.local.json`
 // at BOTH the user scope (~/.claude) and the project scope (<cwd>/.claude) can define
@@ -33,12 +33,16 @@ import { errMessage } from '../util/errMessage'
 // exists) — Layer 2 does not scrub project scope in host mode, since Claude reads it
 // relative to cwd with no redirect. Full closure there needs config isolation.
 
-// Claudette's own state dir (mirrors sessionPersistence.ts). Holds the seed file, the
-// exposed-config ledger, and the scrubbed host-mode config mirror — all OUTSIDE every
-// session mount by construction (nothing binds ~/.claude/claudette).
-function dataDir(): string {
-  return process.env.CLAUDETTE_DATA_DIR || path.join(homedir(), '.claude', 'claudette')
-}
+// Claudette's own state dir — see util/dataDir.ts. Holds the seed file, the exposed-config
+// ledger, and the scrubbed host-mode config mirror.
+//
+// This comment used to claim the dir was "OUTSIDE every session mount by construction
+// (nothing binds ~/.claude/claudette)". That was FALSE while the dir lived under
+// ~/.claude: wrapSandbox rw-binds claudeConfigDir() and a bind carries the whole subtree,
+// so every box could read and rewrite the ledger below — deleting its own taint entry to
+// get the next host-mode session the REAL config instead of a scrubbed mirror, which is
+// exactly the hook→host-exec path Layer 2 exists to close. The dir now lives under
+// ~/.config (never bound), which is what actually makes the claim true.
 
 // Close the user-scope create-after-launch hole deterministically: materialize a valid
 // `{}` ~/.claude/settings.json when absent, so wrapSandbox can ro-bind a REAL file over

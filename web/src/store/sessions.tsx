@@ -34,6 +34,8 @@ interface ContextValue {
   // Update a session's bwrap sandbox config (enable/disable, mounts). Applies on the
   // next launch; the caller relaunches to bring it into force.
   setSandbox: (id: string, sandbox: SandboxConfig) => Promise<void>
+  // Grant/revoke this session's right to hire teammates itself (employ_teammate).
+  setTeamEmploy: (id: string, teamEmploy: boolean) => Promise<void>
   // Was this session created in THIS app load (vs restored from persistence)? A
   // fresh session stays fresh; a restored one auto-resumes its latest conversation.
   isFresh: (id: string) => boolean
@@ -118,7 +120,9 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // A subsession shares its parent's working directory + root, carries parentId, and
-  // gets its own role. Name defaults to "<parent> · sub".
+  // gets its own role. Name defaults to "<parent> · sub". Passing no `sandbox` is the
+  // normal case and is meaningful: the server then gives the teammate its coordinator's
+  // confinement rather than the generic default ("sandboxed together" — see SANDBOX.md).
   const spawnSubsession = useCallback(async (parentId: string, opts?: { name?: string; agentId?: string; sandbox?: SandboxConfig }): Promise<string | null> => {
     const parent = sessions.find((s) => s.id === parentId)
     if (!parent) return null
@@ -165,6 +169,14 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     await api.http.setSandbox(id, sandbox)
   }, [patch])
 
+  // "Employ team allowed": may this session hire/dismiss teammates on its own? Off by
+  // default. Messaging between existing sessions never depends on this — only roster
+  // management does, because that is the part that spends money without being asked.
+  const setTeamEmploy = useCallback(async (id: string, teamEmploy: boolean): Promise<void> => {
+    patch(id, { teamEmploy })   // optimistic; session:list reconciles
+    await api.http.setTeamEmploy(id, teamEmploy)
+  }, [patch])
+
   const isFresh = useCallback((id: string) => freshRef.current.has(id), [])
 
   // Viewing a session clears its attention flag (however it became active: click,
@@ -182,8 +194,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // Memoize so unrelated session-state churn doesn't hand every consumer a new
   // context object identity and re-render them all.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, isFresh, markBusy, attention }),
-    [sessions, activeId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, isFresh, markBusy, attention],
+    () => ({ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention }),
+    [sessions, activeId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention],
   )
   return (
     <SessionsContext.Provider value={value}>

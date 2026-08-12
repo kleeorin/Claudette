@@ -1,8 +1,9 @@
 import {
   createContext, useContext, useReducer, useEffect, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
-import type { ClaudeEvent, PermissionRequest, PermissionDecision, TaskRecord } from '@claudette/shared'
+import type { ClaudeEvent, PermissionRequest, PermissionDecision, TaskRecord, TeamMessageKind } from '@claudette/shared'
 import { isSubagentTool, isAsyncLaunchAck, userContentText, parseTaskNotification, parseSystemTaskNotification } from '@claudette/shared'
+import { hasTeamMessage, parseTeamMessages, stripTeamMessages } from '@claudette/shared'
 import { api } from '../api/client'
 
 // Re-export the subagent-parsing helpers (now owned by @claudette/shared, so server
@@ -30,6 +31,11 @@ export type TranscriptItem =
   | { kind: 'tool_result'; id: string; toolUseId: string; isError: boolean; content: string; parentId?: string }
   | { kind: 'result'; id: string; isError: boolean; costUsd?: number; durationMs?: number; errorText?: string }
   | { kind: 'notice'; id: string; text: string }
+  // A message from another session on this team. It arrives on the wire as an ordinary
+  // user turn (that is how the mailbox injects it), so without this it would render as
+  // though the USER had typed a teammate's report — the one thing the transcript must
+  // never lie about. Split out here so the UI can attribute it.
+  | { kind: 'team'; id: string; from: string; role: string; messageKind: TeamMessageKind; text: string }
 
 export interface RateLimitInfo {
   status?: string
@@ -300,6 +306,29 @@ function parseAssistantBlocks(e: ClaudeEvent): AssistantBlock[] {
 }
 
 // Turn one raw stream-json event into transcript items.
+// A user turn the team mailbox injected carries one or more <team-message> blocks (a
+// flush coalesces a whole backlog into one turn, so there can be several). Turn each
+// into its own attributed item, and keep any surrounding prose as a normal user bubble.
+// Returns null when this is an ordinary turn, so callers fall through unchanged.
+function teamItemsFrom(text: string): TranscriptItem[] | null {
+  if (!hasTeamMessage(text)) return null
+  const msgs = parseTeamMessages(text)
+  // FAIL CLOSED. If the turn carries an envelope we couldn't parse (a malformed or
+  // truncated one — MESSAGE_RE needs attributes after the tag name, for instance),
+  // returning null would attribute the whole thing to the HUMAN's own bubble. Attributing
+  // machine traffic to the user is the one mistake the transcript must never make, so
+  // surface it as an unattributed teammate message instead.
+  if (!msgs.length) {
+    return [{ kind: 'team', id: nextId(), from: 'unknown', role: 'unknown', messageKind: 'report', text }]
+  }
+  const out: TranscriptItem[] = msgs.map((m) => ({
+    kind: 'team' as const, id: nextId(), from: m.from, role: m.role, messageKind: m.kind, text: m.body,
+  }))
+  const rest = stripTeamMessages(text)
+  if (rest) out.unshift({ kind: 'user', id: nextId(), text: rest })
+  return out
+}
+
 function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
   const out: TranscriptItem[] = []
   // On a subagent's own events this is the parent Task's tool id — tag its items so
@@ -336,6 +365,14 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
       return out
     }
     if (typeof content === 'string') {
+      // REPLAY ONLY, exactly like the user branch below. Live, a team message already
+      // arrives through the userTurn mirror (the mailbox injects it via sendUserTurn,
+      // which emits 'userTurn'), while bridgeSessionEvents ALSO broadcasts the CLI's raw
+      // echo of the same turn — so parsing it here unconditionally rendered every
+      // teammate's message twice. buffer() drops that echo from the snapshot and
+      // sendUserTurn records the turn itself, so replay sees it exactly once.
+      const team = fromReplay ? teamItemsFrom(content) : null
+      if (team) { out.push(...team); return out }
       // A resumed conversation records your prompts as string-content user turns;
       // surface them as user bubbles (replay only — live turns are echoed locally).
       if (fromReplay && content.trim()) out.push({ kind: 'user', id: nextId(), text: content })
@@ -521,7 +558,13 @@ export function collectAgents(items: TranscriptItem[], tasks?: TaskRecord[]): Ag
   // running flag. Without this, any resultless old Task re-shows "running…starting…"
   // whenever the session is busy again.
   let lastUserIndex = -1
-  for (let i = 0; i < items.length; i++) if (items[i].kind === 'user') lastUserIndex = i
+  // A TURN START is either the human typing or a teammate's message being injected —
+  // both begin a new turn for the session. Counting only 'user' meant a member session
+  // (whose work always arrives as 'team') never advanced this, so subagent cards from
+  // an earlier turn were never treated as past and re-lit as "running" forever.
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].kind === 'user' || items[i].kind === 'team') lastUserIndex = i
+  }
   const agents: AgentView[] = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
@@ -677,7 +720,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     // optimistic echo (already appended in sendTurn under this turnId).
     const offUserTurn = api.on.userTurn((id, text, turnId) => {
       if (turnId && stateRef.current.transcripts[id]?.some((it) => it.id === turnId)) return
-      dispatch({ type: 'APPEND', sessionId: id, items: [{ kind: 'user', id: turnId ?? nextId(), text }] })
+      // The mailbox injects a teammate's message through this same channel, so attribute
+      // it rather than showing a teammate's report as something the user typed.
+      const team = teamItemsFrom(text)
+      dispatch({
+        type: 'APPEND', sessionId: id,
+        items: team ?? [{ kind: 'user', id: turnId ?? nextId(), text }],
+      })
     })
     // A permission prompt was resolved (answered on any device / auto-denied). Clear
     // it here so a non-answering client isn't stuck on a dead prompt. Match on

@@ -13,7 +13,7 @@ import {
   assistantToolUses, userToolResults, userEventText,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
-import { getAgent, isAgent, SUBSESSION_REPORT_INSTRUCTION } from './agents'
+import { getAgent, isAgent, COORDINATOR_INSTRUCTION, MEMBER_INSTRUCTION } from './agents'
 import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
@@ -40,7 +40,17 @@ interface Session extends SessionInfo {
   engine: ClaudeEngine | null   // null once the Claude process has exited (relaunchable)
   // sandbox / sandboxed come from SessionInfo (see SANDBOX.md; sandboxed = EFFECTIVE)
   appliedSandboxKey?: string    // sandbox state actually in force at last launch (pending detection)
-  sandboxApplyTimer?: ReturnType<typeof setTimeout>  // debounce for auto-apply-when-idle
+  applyTimer?: ReturnType<typeof setTimeout>  // debounce for auto-apply-when-idle (sandbox AND charter)
+  // Was the COORDINATOR charter in the system prompt at the last launch? A session
+  // becomes a coordinator the moment it gains its first member and stops being one when
+  // it loses its last, so this tracks what's actually in force vs. what should be —
+  // exactly the appliedSandboxKey pattern, and applied by the same idle-debounced relaunch.
+  appliedCoordinator?: boolean
+  // …and whether the MEMBER charter was. Needed as its own field because membership is
+  // read off `parentId`, which cleanup() clears when a coordinator is destroyed — without
+  // this, launchStale had no term that noticed, so a promoted orphan kept being told to
+  // report to a coordinator that no longer exists.
+  appliedMember?: boolean
   claudeSessionId: string       // claude's own session id (for --resume)
   startedAt: number             // last launch time, for the fast-failure heuristic
   resume: boolean               // whether Claude was launched with --resume
@@ -150,19 +160,79 @@ export class SessionManager extends EventEmitter {
     // Only an auth-gated HTTP caller (the operator) or boot-restore may pass a
     // sandbox with enabled:false; an untrusted/in-process caller can't lower it.
     trusted = false,
+    teamEmploy?: boolean,
   ): string {
+    const session = this.register(
+      name, cwd, rootDir, parentId, resume, claudeSessionId,
+      agentId, model, permissionMode, sandbox, trusted, teamEmploy,
+    )
+    this.launch(session)
+    // This session's parent may have just gained its first member and become a
+    // coordinator — bring the coordinator charter into force (idle-debounced, so no
+    // turn is killed for it).
+    if (parentId) this.scheduleApply(parentId)
+    this.emit('changed')   // persist the new set (P1.19) — claudeSessionId exists upfront
+    return session.id
+  }
+
+  // Build and register a session WITHOUT launching it. Split out of create() for boot
+  // restore, which must have the whole set in the map before anything spawns: launch()
+  // decides the coordinator charter from childrenOf(), so a parent launched before its
+  // members were registered would come up as a plain session and then need a relaunch
+  // to gain its charter — an extra spawn per coordinator on every boot, racing the
+  // startup fast-fail grace window.
+  private register(
+    name: string,
+    cwd: string,
+    rootDir = cwd,
+    parentId?: string,
+    resume = false,
+    claudeSessionId?: string,
+    agentId?: string,
+    model?: string,
+    permissionMode?: PermissionMode,
+    sandbox?: SandboxConfig,
+    trusted = false,
+    teamEmploy?: boolean,
+  ): Session {
     const id = crypto.randomUUID()
+    // SANDBOXED TOGETHER BY DEFAULT: a teammate created without an explicit config
+    // inherits its coordinator's, so extra mounts the operator granted the coordinator
+    // (a docs tree, a sibling repo) reach the team too — rather than the teammate
+    // getting the generic cwd-only default and finding half the workspace missing.
+    // Mounts are cloned so a later edit to one session's config can't alias the other's.
+    //
+    // The inherited config counts as TRUSTED even from an in-process caller, and that is
+    // not a hole: it is a copy of a config the operator already approved for the parent,
+    // and the parent's own claude is what asks. A coordinator can therefore only ever
+    // hand a teammate the confinement it already has — never less. An EXPLICIT config
+    // from an untrusted caller still goes through the normal refusal in normalizeSandbox.
+    const inherited = !sandbox && parentId ? this.sessions.get(parentId)?.sandbox : undefined
+    const requested: SandboxConfig | undefined = sandbox
+      ?? (inherited ? { ...inherited, mounts: inherited.mounts.map((m) => ({ ...m })) } : undefined)
     const session: Session = {
-      id, name, cwd, rootDir, parentId, agentId, model, permissionMode,
-      sandbox: normalizeSandbox(sandbox, cwd, trusted),
+      id, name, cwd, rootDir, parentId, agentId, model, permissionMode, teamEmploy,
+      sandbox: normalizeSandbox(requested, cwd, trusted || !!inherited),
       state: 'idle', engine: null, startedAt: 0, resume,
       claudeSessionId: claudeSessionId ?? crypto.randomUUID(),
       stderrTail: '',
     }
     this.sessions.set(id, session)
-    this.launch(session)
-    this.emit('changed')   // persist the new set (P1.19) — claudeSessionId exists upfront
-    return id
+    return session
+  }
+
+  // A session's team members: the sessions carrying its id as parentId. The star has
+  // exactly two levels, so a member's own children are always empty.
+  childrenOf(id: string): SessionInfo[] {
+    return [...this.sessions.values()].filter((s) => s.parentId === id).map((s) => this.toInfo(s))
+  }
+
+  // Cheap "does it lead a team?" — runs on every idle transition of every session via
+  // scheduleApply, where childrenOf's map through toInfo() (which recomputes sandboxKey
+  // per child) would be wasted work.
+  private hasChildren(id: string): boolean {
+    for (const s of this.sessions.values()) if (s.parentId === id) return true
+    return false
   }
 
   // (Re)spawn the Claude engine for a session and wire it up. Called on create
@@ -177,16 +247,22 @@ export class SessionManager extends EventEmitter {
     // session is told what it can see — see sandboxSystemPrompt).
     const runCwd = cwd || homedir()
     const canSandbox = !!session.sandbox?.enabled && sandboxAvailable()
-    // Per-session model override wins over the role's default model. Every
-    // subsession (has a parentId) also gets the "report back when done" instruction
-    // appended, so the orchestration loop closes even if the role charter doesn't
-    // mention it. A sandboxed session also gets a note describing its mounts so it
-    // treats hidden paths as "outside the sandbox", not "missing".
+    // Per-session model override wins over the role's default model. The team charters
+    // make a session aware of its place in the star: a member (has a parentId) learns it
+    // reports upward and talks to nobody else; a session that HAS members learns it is
+    // the coordinator. Neither carries the roster — that changes as teammates come and
+    // go, so it's served live by list_team instead of forcing a relaunch. A sandboxed
+    // session also gets a note describing its mounts so it treats hidden paths as
+    // "outside the sandbox", not "missing".
+    const isCoordinator = this.hasChildren(id)
     const systemPrompt = [
       agent.systemPrompt,
-      session.parentId ? SUBSESSION_REPORT_INSTRUCTION : undefined,
+      session.parentId ? MEMBER_INSTRUCTION : undefined,
+      isCoordinator ? COORDINATOR_INSTRUCTION : undefined,
       canSandbox ? sandboxSystemPrompt(session.sandbox!, runCwd) : undefined,
     ].filter(Boolean).join('\n\n') || undefined
+    session.appliedCoordinator = isCoordinator
+    session.appliedMember = !!session.parentId
     const args = claudeArgs({
       sessionId: claudeSessionId, resume, mcpConfig: this.opts.mcpConfig?.(id),
       model: session.model ?? agent.model,
@@ -415,6 +491,11 @@ export class SessionManager extends EventEmitter {
     this.transcripts.delete(id)          // rebinding to another conversation → drop old buffer
     this.pendingPerms.delete(id)
     this.tasks.delete(id)                // different conversation → its subagents are irrelevant
+    // The conversation is being swapped out from under this session, so any per-conversation
+    // team state (e.g. "this teammate has been asked for its handover") no longer applies to
+    // what comes back. Emitted BEFORE the kill: the `replacing` branch of the exit handler
+    // returns without emitting 'exit', so listeners hanging off that would never hear.
+    this.emit('restarted', id)
     if (session.engine) {
       session.replacing = true
       session.engine.kill()
@@ -435,6 +516,7 @@ export class SessionManager extends EventEmitter {
     this.transcripts.delete(id)          // fresh conversation → drop the old snapshot buffer
     this.pendingPerms.delete(id)
     this.tasks.delete(id)                // fresh conversation → no carried-over subagents
+    this.emit('restarted', id)           // see resumeInto: per-conversation team state is void
     if (session.engine) {
       session.replacing = true
       session.engine.kill()
@@ -447,13 +529,39 @@ export class SessionManager extends EventEmitter {
 
   // --- turn I/O (replaces keystroke sendInput) -------------------------------
 
-  async sendUserTurn(id: string, text: string, turnId?: string): Promise<void> {
+  // `origin` distinguishes a turn the HUMAN typed from one the team mailbox injected.
+  // Both are user turns as far as the CLI is concerned, but they must not be treated
+  // alike upstream: the mailbox's loop budget is reset by human input, so if an injected
+  // message counted as human, every team message would refill the very budget meant to
+  // bound it and the runaway protection would be worthless.
+  // Resolves TRUE only if the turn was actually handed to a live engine. The team mailbox
+  // depends on that answer: it must not consider a queued message delivered when the write
+  // silently went nowhere.
+  async sendUserTurn(id: string, text: string, turnId?: string, origin: 'user' | 'team' = 'user'): Promise<boolean> {
     const session = this.sessions.get(id)
-    if (!session?.engine) return
+    if (!session?.engine || session.replacing || session.closing) return false
+    // Snapshot the working tree BEFORE the turn runs (git-only; no-op elsewhere), so
+    // /rewind can later restore code to this pre-edit state. Awaited so the capture
+    // lands before Claude can edit; keyed to the turn's uuid when the turn ends.
+    session.pendingSnapshot = undefined
+    const commit = await snapshot(session.cwd).catch(() => null)
+    // The snapshot is a git commit — on a large tree it takes long enough for a relaunch
+    // (restartFresh / relaunchApply / resumeInto) to land inside this await. Checking only
+    // `engine` is not enough: during a replace the OLD engine object is still referenced
+    // but its stdin is closed, and ClaudeEngine.write swallows the write-after-end, so the
+    // turn would vanish with no error. `replacing`/`closing` mark exactly that window.
+    //
+    // EVERYTHING WITH A SIDE EFFECT HAPPENS AFTER THIS CHECK, and that ordering is load-
+    // bearing: the mirror below is what every client renders and what a reconnect replays,
+    // so emitting it before we knew the write would land meant a turn we then reported as
+    // undelivered had already been shown to the user — and the mailbox, doing the right
+    // thing, re-queued and delivered it again, printing it twice.
+    if (!session.engine || session.replacing || session.closing) return false
+    if (commit) session.pendingSnapshot = { commit, text }
     // A new user message = a new turn: notify listeners so per-turn state (e.g. the
     // notebook "working target" pin) resets and re-binds to the user's current view,
     // AND so every client mirrors the message (text/turnId), not just the sender.
-    this.emit('userTurn', id, text, turnId)
+    this.emit('userTurn', id, text, turnId, origin)
     // Record the prompt in the snapshot buffer so a late-joining device sees the
     // question, not just the answer (the live stream carries no renderable prompt —
     // buffer() drops the CLI's string echo, so this is the single source).
@@ -461,19 +569,15 @@ export class SessionManager extends EventEmitter {
     buf.push({ type: 'user', message: { content: text } } as unknown as ClaudeEvent)
     if (buf.length > TRANSCRIPT_CAP) buf.splice(0, buf.length - TRANSCRIPT_CAP)
     this.transcripts.set(id, buf)
-    // Snapshot the working tree BEFORE the turn runs (git-only; no-op elsewhere), so
-    // /rewind can later restore code to this pre-edit state. Awaited so the capture
-    // lands before Claude can edit; keyed to the turn's uuid when the turn ends.
-    session.pendingSnapshot = undefined
-    const commit = await snapshot(session.cwd).catch(() => null)
-    if (commit) session.pendingSnapshot = { commit, text }
-    if (!session.engine) return   // engine may have exited during the await
     // Send the CLI the user's text plus ambient editor context for the open code file
     // (so "edit this file" resolves) — but ONLY the raw text is buffered/broadcast/
     // snapshotted above, so the block never shows in the UI or perturbs rewind keying.
     const pane = this.opts.activePane?.(id)
     const engineText = pane && !pane.isNotebook ? text + buildEditorContext(pane.path) : text
-    session.engine.sendUserTurn(engineText)
+    // The engine's own answer, not an assumption: a process that died microseconds ago is
+    // still non-null here (child is cleared on the exit event), and the stdin write would
+    // be discarded in silence.
+    return session.engine.sendUserTurn(engineText)
   }
 
   // Key a turn's pending pre-turn snapshot to the uuid of its user message, so a rewind
@@ -662,7 +766,7 @@ export class SessionManager extends EventEmitter {
   // survives, called just before the process exits.
   shutdown(): void {
     for (const s of this.sessions.values()) {
-      if (s.sandboxApplyTimer) clearTimeout(s.sandboxApplyTimer)
+      if (s.applyTimer) clearTimeout(s.applyTimer)
       s.closing = true
       s.engine?.kill()
     }
@@ -682,12 +786,49 @@ export class SessionManager extends EventEmitter {
   }
 
   private toInfo(s: Session): SessionInfo {
-    const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, state } = s
+    const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, teamEmploy, state } = s
     // Pending = a running engine whose applied sandbox differs from the requested one
     // (auto-applies on idle; visible only while a turn holds it off).
     const sandboxPending = !!s.engine && sandboxKey(sandbox, cwd) !== s.appliedSandboxKey
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, state }
+    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, state }
   }
+
+  // Can this session take a turn RIGHT NOW? Distinct from state, and stricter than
+  // "an engine object exists": between a kill and the relaunch that replaces it, the
+  // old engine is still referenced but its process is gone, so a turn written to it
+  // goes into a closed pipe and is lost silently. `replacing` marks exactly that window
+  // (restartFresh / relaunchApply / resumeInto all set it), and `closing` marks a
+  // session on its way out. The team mailbox relies on this to hold a cleared session's
+  // own handover until its fresh engine is really up.
+  hasEngine(id: string): boolean {
+    const s = this.sessions.get(id)
+    return !!s?.engine && !s.replacing && !s.closing
+  }
+
+  // May this session hire and dismiss teammates? Off unless the operator turned it on.
+  canEmploy(id: string): boolean {
+    return !!this.sessions.get(id)?.teamEmploy
+  }
+
+  // Flip the "employ team allowed" toggle. TRUST-GATED for the same reason
+  // normalizeSandbox refuses an untrusted `enabled:false` (SANDBOX.md "Control-plane
+  // escape"): a sandboxed session can reach the loopback control API, so without this
+  // gate it could grant ITSELF employment rights and then spawn teammates. `trusted` is
+  // set only by the auth-gated HTTP route (the operator's own browser) and by boot
+  // restore of an already-approved value — never by an in-process/MCP caller.
+  setTeamEmploy(id: string, value: boolean, trusted = false): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    if (value && !trusted) {
+      console.warn('[team] ignoring untrusted request to enable employment — only the operator may grant a session hiring rights')
+      return false
+    }
+    if (session.teamEmploy === value) return true   // no-op
+    session.teamEmploy = value
+    this.emit('changed')
+    return true
+  }
+
 
   // Change a session's role (agent). The charter/tool-scope/model are read at launch,
   // so we bring the change into force with a resume-preserving relaunch — the new
@@ -721,25 +862,43 @@ export class SessionManager extends EventEmitter {
     if (!session) return false
     session.sandbox = normalizeSandbox(sandbox, session.cwd, trusted)
     this.emit('changed')
-    this.scheduleSandboxApply(id)   // apply now if idle, else when the turn ends
+    this.scheduleApply(id)   // apply now if idle, else when the turn ends
     return true
   }
 
-  // Auto-apply a pending sandbox change (mounts differ from what's running) by a
-  // resume-preserving relaunch — but only when the session is IDLE (killing a live
-  // turn would be worse than waiting). Debounced so a burst of mount edits coalesces
-  // into one relaunch. When busy, this no-ops; setState re-invokes it on the next idle.
-  private scheduleSandboxApply(id: string): void {
+  // Does what's RUNNING differ from what the session's config now says it should be?
+  // Two independent reasons, both fixed only by relaunching: the sandbox mounts changed,
+  // or the session crossed the 0↔1 members line and so gained/lost the coordinator
+  // charter. Both are read at launch, and relaunchApply re-runs launch(), which recomputes
+  // BOTH — which is exactly why one scheduler serves both.
+  private launchStale(s: Session): boolean {
+    return sandboxKey(s.sandbox, s.cwd) !== s.appliedSandboxKey
+      || this.hasChildren(s.id) !== !!s.appliedCoordinator
+      || !!s.parentId !== !!s.appliedMember
+  }
+
+  // Auto-apply a pending config change by a resume-preserving relaunch — but only when
+  // the session is IDLE (killing a live turn would be worse than waiting). Debounced so a
+  // burst of edits, or hiring three teammates at once, coalesces into ONE relaunch. When
+  // busy this no-ops; setState re-invokes it on the next idle.
+  //
+  // This was two near-identical schedulers with a timer each. Merging them is not just
+  // tidier: independently-armed timers could both fire in the same idle window, and the
+  // second relaunch would kill the engine the first had just respawned.
+  private scheduleApply(id: string): void {
     const session = this.sessions.get(id)
-    if (!session || !session.engine) return                          // nothing running to update
-    if (sandboxKey(session.sandbox, session.cwd) === session.appliedSandboxKey) return  // already in force
-    if (session.state !== 'idle') return                             // wait; retried on idle
-    if (session.sandboxApplyTimer) clearTimeout(session.sandboxApplyTimer)
-    session.sandboxApplyTimer = setTimeout(() => {
+    if (!session || !session.engine) return        // nothing running to update
+    if (!this.launchStale(session)) return         // already in force
+    if (session.state !== 'idle') return           // wait; retried on idle
+    if (session.applyTimer) clearTimeout(session.applyTimer)
+    session.applyTimer = setTimeout(() => {
       const s = this.sessions.get(id)
       if (!s) return
-      s.sandboxApplyTimer = undefined
-      if (s.engine && s.state === 'idle' && sandboxKey(s.sandbox, s.cwd) !== s.appliedSandboxKey) {
+      s.applyTimer = undefined
+      // `replacing` matters here: a relaunch already in flight will re-read the config
+      // when it comes back up, so firing a second one would kill the fresh engine — and
+      // with it any turn just delivered into it.
+      if (s.engine && s.state === 'idle' && !s.replacing && !s.closing && this.launchStale(s)) {
         this.relaunchApply(id)
       }
     }, 700)
@@ -764,6 +923,7 @@ export class SessionManager extends EventEmitter {
         parentIndex: s.parentId != null ? indexOf.get(s.parentId) : undefined,
         agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
         sandbox: s.sandbox,
+        teamEmploy: s.teamEmploy,
         claudeSessionId: s.claudeSessionId,
         tasks: tasks.length ? tasks : undefined,
       }
@@ -774,14 +934,21 @@ export class SessionManager extends EventEmitter {
   // once at boot; returns the new ids in saved order (so parentIndex can be mapped).
   restore(saved: SavedSession[]): string[] {
     const ids: string[] = []
+    // TWO PASSES. Register the whole set first so parentage is complete before anything
+    // spawns — otherwise a restored coordinator would launch without its charter (its
+    // members not yet in the map) and have to be relaunched to get it.
+    const registered: Session[] = []
     for (const s of saved) {
       const parentId = s.parentIndex != null ? ids[s.parentIndex] : undefined
-      const id = this.create(
+      const session = this.register(
         s.name, s.cwd, s.rootDir, parentId,
         /* resume */ !!s.claudeSessionId, s.claudeSessionId,
         s.agentId, s.model, s.permissionMode, s.sandbox,
         /* trusted */ true,   // a persisted config was already operator-approved
+        s.teamEmploy,         // …including the employment grant
       )
+      registered.push(session)
+      const id = session.id
       ids.push(id)
       // Rehydrate the subagent registry. Any task persisted as 'running' can't actually
       // be — its in-process agent died with the previous server — so settle it to failed
@@ -796,6 +963,8 @@ export class SessionManager extends EventEmitter {
         this.tasks.set(id, m)
       }
     }
+    for (const session of registered) this.launch(session)
+    this.emit('changed')
     return ids
   }
 
@@ -804,17 +973,36 @@ export class SessionManager extends EventEmitter {
     if (!session || session.state === state) return
     session.state = state
     this.emit('stateChange', id, state)
-    // A turn just ended — apply any sandbox change that was waiting for idle.
-    if (state === 'idle') this.scheduleSandboxApply(id)
+    // A turn just ended — apply any sandbox or team-charter change that was waiting for idle.
+    if (state === 'idle') {
+      this.scheduleApply(id)
+    }
   }
 
   private cleanup(id: string): void {
     const s = this.sessions.get(id)
-    if (s?.sandboxApplyTimer) clearTimeout(s.sandboxApplyTimer)
+    if (s?.applyTimer) clearTimeout(s.applyTimer)
+    const parentId = s?.parentId
     this.sessions.delete(id)
+    // PROMOTE any members this session led. Left alone they'd keep a parentId pointing at
+    // a session that no longer exists, which reads as neither member nor coordinator: the
+    // team tools would tell them "you are the coordinator" while refusing every send, and
+    // they'd keep the member charter telling them to report to a parent that is gone —
+    // live Claude processes with no way to talk to anyone. Promoting makes them ordinary
+    // top-level sessions, which is both true and usable; scheduleApply drops their member
+    // charter on the next idle.
+    for (const child of this.sessions.values()) {
+      if (child.parentId !== id) continue
+      child.parentId = undefined
+      this.scheduleApply(child.id)
+    }
     this.transcripts.delete(id)   // free the snapshot buffers with the session
     this.pendingPerms.delete(id)
     this.tasks.delete(id)         // free the subagent registry with the session
+    // A coordinator that just lost its LAST member is a plain session again — drop the
+    // coordinator charter the same idle-debounced way it was applied, so a disbanded
+    // team doesn't leave a session still being told to delegate to nobody.
+    if (parentId) this.scheduleApply(parentId)
     this.emit('changed')   // set shrank → re-persist
   }
 }

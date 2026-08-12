@@ -11,8 +11,18 @@ import { stripEditorContext } from './editorContext'
 // cwd with every non-alphanumeric char replaced by '-'. This backs the native
 // /resume picker — the launch-time flow the headless stream-json channel can't
 // express. Ported from ClaudeMaster's `main/conversations.ts` (already local-only).
+// The CLI's own scheme for turning a working directory into a single path segment. Shared
+// so anything else keying state by cwd (team notes) mangles it identically instead of
+// keeping a second copy that could drift from the CLI's.
+//
+// NB it is lossy: /a/b-c and /a/b/c both become -a-b-c. Fine for a display-oriented
+// folder name; do NOT rely on it to isolate one project's state from another's.
+export function mangleCwd(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-')
+}
+
 export function projectDir(cwd: string): string {
-  return join(homedir(), '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'))
+  return join(homedir(), '.claude', 'projects', mangleCwd(cwd))
 }
 
 function contentText(content: unknown): string {

@@ -18,6 +18,8 @@ import { KernelManager } from './jupyter/kernelManager'
 import { JupyterProxy } from './jupyter/jupyterProxy'
 import { AppControlMcpServer } from './mcp/appControlServer'
 import { registerNotebookTools } from './mcp/notebookTools'
+import { registerTeamTools } from './mcp/teamTools'
+import { TeamMailbox } from './mcp/teamMailbox'
 import { ActivePaneRegistry } from './mcp/activePaneRegistry'
 import { TurnNotebookRegistry } from './mcp/turnNotebookRegistry'
 import { PaneManager } from './pane/paneManager'
@@ -92,6 +94,17 @@ const sessions = new SessionManager({
   mcpConfig: (sid) => mcp.configFor(sid),
   activePane: (sid) => activePanes.get(sid) ?? null,
 })
+// Team messaging: the mailbox injects a session-to-session message as a user turn in
+// the recipient, holding it while that session is mid-turn. It's wired from OUT HERE
+// rather than inside SessionManager so neither module imports the other — the manager
+// emits 'stateChange'/'userTurn', the mailbox listens (see the handlers below).
+const teamMailbox = new TeamMailbox({
+  info: (id) => sessions.get(id),
+  // Await the real answer rather than assuming: sendUserTurn takes a git snapshot before
+  // writing, and a relaunch landing inside that await would swallow the turn silently.
+  deliver: (id, text) => sessions.sendUserTurn(id, text, undefined, 'team'),
+})
+const team = registerTeamTools(mcp, sessions, teamMailbox)
 // Terminal panes are confined to their owning session's box (SANDBOX.md
 // "Terminal-pane escape") — through the same `confinement` seam as kernels/notebook tools.
 const panes = new PaneManager(confinement)
@@ -123,10 +136,36 @@ sessions.on('ready', persistSessions)     // claudeSessionId finalized
 sessions.on('changed', () => hub.broadcast({ type: 'session:list', sessions: sessions.list() }))
 // When a session goes away, drop its active-pane record and its MCP url tokens
 // (the latter was never released before — a small unbounded-map leak).
-sessions.on('exit', (id: string) => { activePanes.release(id); turnNotebooks.release(id); mcp.release(id) })
+sessions.on('exit', (id: string) => {
+  activePanes.release(id); turnNotebooks.release(id); mcp.release(id)
+  // The exit-interview marks are per-CONVERSATION, and an engine death makes it unknowable
+  // whether the teammate ever read the directive — so drop them and let the coordinator
+  // re-ask. Failing safe matters here: a stale mark means the teammate's next ordinary
+  // status report gets filed as the role's permanent handover and destroys it.
+  team.release(id)
+  // Queued MAIL is different: a startup fast-fail keeps the session in the map on purpose
+  // so the operator can hit Retry, and its messages are still worth delivering when it
+  // comes back. Only drop those when the session is really gone.
+  if (!sessions.get(id)) teamMailbox.release(id)
+})
+// A conversation swap (the human's /clear, or resuming into another conversation) never
+// emits 'exit' — the `replacing` branch relaunches instead. Without this, a teammate that
+// had been asked for its handover kept that mark across a clear, and the fresh context,
+// which had never been asked anything, was destroyed by its next ordinary report.
+sessions.on('restarted', (id: string) => team.release(id))
 // New user turn → drop the per-turn notebook pin so the turn's first tool call
-// re-binds to whatever the user is viewing now (see TurnNotebookRegistry).
-sessions.on('userTurn', (id: string) => turnNotebooks.clear(id))
+// re-binds to whatever the user is viewing now (see TurnNotebookRegistry). A turn the
+// mailbox injected is a real turn for that purpose, so the pin resets either way — but
+// only a turn the HUMAN typed refills the team's message budget, or every team message
+// would top up the very allowance meant to bound the team's chatter.
+sessions.on('userTurn', (id: string, _text: string, _turnId: string | undefined, origin?: 'user' | 'team') => {
+  turnNotebooks.clear(id)
+  if (origin !== 'team') teamMailbox.onHumanTurn(id)
+})
+// A session just came free → hand it anything its teammates sent while it was busy.
+sessions.on('stateChange', (id: string, state: string) => {
+  if (state === 'idle') teamMailbox.onIdle(id)
+})
 
 // Reap all Claude engines when the server goes down so bwrap/claude children don't
 // orphan and linger. Covers Ctrl-C (SIGINT), `kill`/`tsx watch` restarts (SIGTERM),
@@ -140,6 +179,9 @@ function shutdown(): void {
   // empty set would clobber the state we restore next boot. Snapshot before killing.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
   void saveState(sessions.saved())
+  // Stop the mailbox before the engines die, so its drain/retry timers can't fire during
+  // the 800ms grace and re-arm against sessions that are on their way out.
+  teamMailbox.dispose()
   sessions.shutdown()
   kernels.destroy()   // kill the Jupyter server (and with it every notebook kernel)
   panes.destroyAll()  // kill every terminal pty (don't rely on SIGHUP-on-fd-close)

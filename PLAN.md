@@ -260,7 +260,10 @@ CodeMirror/xterm, nbformat parsing (`ipynb.ts`), markdown/wikilinks, `toolFormat
 - [ ] Remotes/SSH (manage remotes, remote sessions: claude+term+fs+git+jupyter,
       `remote://` path encoding, ControlMaster, MCP reverse tunnel)
 - [ ] Docs/wiki (rich DocView, `[[wikilinks]]`, create-on-click)
-- [ ] Agent roles (11 built-ins → launch flags), subsessions + `report_to_parent`
+- [x] Agent roles (5 built-ins → launch flags), subsessions + `report_to_parent` —
+      shipped as **teams**: star topology (coordinator + members), an idle-gated message
+      mailbox, the operator-gated `employ_teammate`/`dismiss_teammate`, dismissal as an
+      exit interview whose report becomes a role handover note, and sandbox inheritance
 - [ ] MCP app-control tools (`mcp__app__*`), notebook tools rewired server-side
       (edit + insert/delete/move/type + create + **read + run**)
 
@@ -283,9 +286,10 @@ minimal path input in the MVP).
 **Phase 2 — workspace parity.** File browser + previews, git panel, permissions
 center, docs/wiki, session persistence/restore, notifications (web), slash/resume.
 
-**Phase 3 — orchestration + remotes.** Agent roles, subsessions + `report_to_parent`,
-full MCP app-control surface, SSH remotes (sessions/fs/git/jupyter, MCP tunnel),
-optional TUI frontend.
+**Phase 3 — orchestration + remotes.** Agent roles + teams **done** (see the checklist
+above; `mcp/teamTools.ts`, `mcp/teamMailbox.ts`, `mcp/teamNotes.ts`, and the team section
+of SANDBOX.md). Still open: full MCP app-control surface, SSH remotes (sessions/fs/git/
+jupyter, MCP tunnel), optional TUI frontend.
 
 **Phase 4 — Jupyter-gained extras (opt-in).** Contents API / server terminals /
 multi-kernel; and, if wanted, the **option-2 upgrade** (Yjs co-editing).

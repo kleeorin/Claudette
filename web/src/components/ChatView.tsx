@@ -473,6 +473,7 @@ function gapClass(it: TranscriptItem, prev?: TranscriptItem): string {
     case 'tool_result': return 'mt-0.5'
     case 'tool_use': return toolish(prev.kind) ? 'mt-1' : 'mt-4'
     case 'user': return 'mt-6'
+    case 'team': return 'mt-6'
     case 'text': return 'mt-4'
     case 'thinking': return 'mt-3'
     case 'notice': return 'mt-2'
@@ -493,6 +494,27 @@ const Item = memo(function Item({ item }: { item: TranscriptItem }) {
           </div>
         </div>
       )
+    case 'team': {
+      // Deliberately NOT a user bubble: this came from a teammate, and the transcript
+      // must not imply the user said it. Left-aligned with an explicit "from", so the
+      // side of the conversation it belongs to is unmistakable at a glance.
+      const label = item.messageKind === 'directive' ? 'assigned by'
+        : item.messageKind === 'handover' ? 'handover from'
+        : 'reported by'
+      return (
+        <div className="flex justify-start animate-fade-in">
+          <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-ctp-surface0/50 border border-ctp-mauve/35 px-3.5 py-2">
+            <div className="text-[10px] uppercase tracking-wide text-ctp-mauve mb-1">
+              {label} {item.from} · {item.role}
+            </div>
+            {/* Markdown, not pre-wrap: a teammate's report is Claude-authored prose with
+                headings, bullets and code fences — the same shape as assistant text, and
+                it read as raw source before. */}
+            <div className="text-ctp-text leading-relaxed break-words"><Markdown text={item.text} /></div>
+          </div>
+        </div>
+      )
+    }
     case 'text':
       return (
         <div className="leading-relaxed break-words text-ctp-text">

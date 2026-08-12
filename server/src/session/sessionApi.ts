@@ -81,6 +81,16 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
       ok: sessions.setSandbox(req.body.id, req.body.sandbox, /* trusted */ true),
     }))
 
+  // Grant or revoke a session's right to HIRE teammates (employ_teammate /
+  // dismiss_teammate). Trusted because this route is auth-gated — it is the operator's
+  // own browser. SessionManager refuses an untrusted grant precisely so a sandboxed
+  // session that reached the loopback API could not give itself a team (SANDBOX.md
+  // "Control-plane escape"). Messaging tools are never gated; only roster management is.
+  app.post<{ Body: SessionIdRequest & { teamEmploy: boolean } }>(
+    '/api/session/setTeamEmploy', async (req): Promise<OkResponse> => ({
+      ok: sessions.setTeamEmploy(req.body.id, !!req.body.teamEmploy, /* trusted */ true),
+    }))
+
   // Workspace trust (see claude/trust.ts). A folder whose .claude/settings.local.json
   // grants permissions is honoured only once trusted; the New Session dialog checks this
   // and prompts before creating. Both routes are auth-gated → the operator.

@@ -1608,11 +1608,13 @@ function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onR
   )
 }
 
-// Read-only detail panel for a session (modal). Surfaces the fields that aren't
-// otherwise visible: role, model, dirs, parent, permission mode, sandbox, id.
+// Detail panel for a session (modal). Surfaces the fields that aren't otherwise
+// visible — role, model, dirs, parent, permission mode, sandbox, id — plus the one
+// setting that has no other home: whether this session may hire its own teammates.
 function SessionInfoDialog({ session, roleName, parentName, onClose }: {
   session: SessionInfo; roleName: string; parentName: string | null; onClose: () => void
 }) {
+  const { sessions, setTeamEmploy } = useSessions()
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
@@ -1621,6 +1623,11 @@ function SessionInfoDialog({ session, roleName, parentName, onClose }: {
   const sandbox = session.sandbox?.enabled
     ? (session.sandboxed ? 'on' : 'requested — host can’t confine')
     : 'off'
+  const members = sessions.filter((s) => s.parentId === session.id)
+  // Only a top-level session leads a team: teammates are leaves, and the server refuses
+  // to let one hire, so offering the toggle there would promise something it can't do.
+  const canLead = !session.parentId
+  const employ = !!session.teamEmploy
   const rows: [string, React.ReactNode][] = [
     ['Role', roleName],
     ['Model', session.model || 'account default'],
@@ -1630,6 +1637,26 @@ function SessionInfoDialog({ session, roleName, parentName, onClose }: {
     ['Working dir', <span className="font-mono break-all">{session.cwd}</span>],
     ['Root dir', <span className="font-mono break-all">{session.rootDir}</span>],
     ['Sandbox', sandbox],
+    ...(canLead ? [['Team', (
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => { void setTeamEmploy(session.id, !employ) }}
+            className={`px-2 py-0.5 rounded text-[10px] font-medium ${employ ? 'bg-ctp-green/20 text-ctp-green' : 'bg-ctp-surface0 text-ctp-overlay'}`}
+          >
+            {employ ? 'Employ team allowed' : 'Employ team off'}
+          </button>
+          <span className="text-ctp-overlay text-[11px]">
+            {members.length ? `${members.length} teammate${members.length === 1 ? '' : 's'}` : 'no teammates'}
+          </span>
+        </div>
+        <div className="text-ctp-overlay text-[11px] leading-snug">
+          {employ
+            ? 'This session can start and dismiss its own teammates — each is a real session that costs tokens. It can already message the teammates it has either way.'
+            : 'Messaging between existing sessions always works. Turn this on only to let Claude create and dismiss teammates by itself.'}
+        </div>
+      </div>
+    )] as [string, React.ReactNode]] : []),
     ['Session id', <span className="font-mono break-all text-ctp-overlay">{session.id}</span>],
   ]
   return createPortal(
