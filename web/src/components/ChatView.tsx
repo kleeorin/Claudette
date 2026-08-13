@@ -264,11 +264,13 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
   // 'conversation'/'both' also fork the transcript before the turn (the server resumes
   // the engine into the fork) — so wipe the pane and replay the truncated history to
   // match the engine's new context. The next turn continues from that point.
-  const pickRewind = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean) => {
-    setShowRewind(false)
-    if (!session) return
+  // Resolves to an error for the picker to show (it stays open), or null on success — a
+  // failed restore that just closed the dialog was indistinguishable from a no-op.
+  const pickRewind = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean): Promise<string | null> => {
+    if (!session) return 'no session'
     const res = await api.http.rewind(sessionId, point.uuid, mode, deleteNewer)
-    if (!res.ok) return   // point vanished or restore failed — leave the pane as-is
+    if (!res.ok) return res.error || 'rewind failed'   // point vanished or restore failed — leave the pane as-is
+    setShowRewind(false)
     if (res.newId) {
       autoResumed.add(sessionId); resumeAborted.add(sessionId)   // explicit rewind — supersede any in-flight auto-resume
       clearTranscript(sessionId)
@@ -283,6 +285,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
     // the composer so it can be edited and re-sent, like Claude Code's /rewind. Code-only
     // rewinds leave the turn in the transcript, so don't duplicate it into the draft.
     if (res.newId || res.cleared) { setDraft(point.text); caretToEnd() }
+    return null
   }
 
   if (!session) {

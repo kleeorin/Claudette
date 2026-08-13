@@ -15,7 +15,10 @@ export function RewindPicker({
   sessionId, onPick, onClose,
 }: {
   sessionId: string
-  onPick: (point: RewindPoint, mode: RewindMode, deleteNewer: boolean) => void
+  // Resolves to an error message when the rewind failed, else null. The picker stays open
+  // and shows it — a code restore that fails (no snapshot, not a repo) used to close this
+  // dialog with no trace, which is indistinguishable from the feature silently not working.
+  onPick: (point: RewindPoint, mode: RewindMode, deleteNewer: boolean) => Promise<string | null>
   onClose: () => void
 }) {
   const [list, setList] = useState<RewindPoint[] | null>(null)
@@ -90,11 +93,13 @@ function RewindConfirm({
   sessionId: string
   point: RewindPoint
   onBack: () => void
-  onConfirm: (mode: RewindMode, deleteNewer: boolean) => void
+  onConfirm: (mode: RewindMode, deleteNewer: boolean) => Promise<string | null>
 }) {
   const [mode, setMode] = useState<RewindMode>('conversation')
   const [deleteNewer, setDeleteNewer] = useState(true)
   const [preview, setPreview] = useState<RewindPreview | null | 'loading'>(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
   const wantsCode = mode === 'code' || mode === 'both'
 
   // Fetch the code-restore preview whenever a code mode is active. Skipped for a plain
@@ -184,10 +189,16 @@ function RewindConfirm({
       </div>
 
       <div className="px-4 py-2.5 border-t border-ctp-surface0 flex items-center justify-end gap-2">
+        {err && <div className="mr-auto text-[11px] text-ctp-red truncate" title={err}>⚠ {err}</div>}
         <button onClick={onBack} className="px-3 py-1.5 text-xs text-ctp-subtext hover:text-ctp-text">Cancel</button>
         <button
-          onClick={() => onConfirm(mode, deleteNewer)}
-          disabled={wantsCode && (preview === 'loading' || preview === null)}
+          onClick={async () => {
+            setErr(null); setBusy(true)
+            // On success the parent closes the picker, so only a failure lands back here.
+            setErr(await onConfirm(mode, deleteNewer))
+            setBusy(false)
+          }}
+          disabled={busy || (wantsCode && (preview === 'loading' || preview === null))}
           className="px-3 py-1.5 text-xs rounded-md bg-ctp-mauve/90 text-ctp-crust font-medium hover:bg-ctp-mauve disabled:opacity-40 disabled:cursor-not-allowed"
         >
           {mode === 'conversation' ? 'Rewind chat' : mode === 'code' ? 'Restore code' : 'Rewind both'}

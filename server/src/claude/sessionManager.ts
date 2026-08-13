@@ -540,6 +540,18 @@ export class SessionManager extends EventEmitter {
   async sendUserTurn(id: string, text: string, turnId?: string, origin: 'user' | 'team' = 'user'): Promise<boolean> {
     const session = this.sessions.get(id)
     if (!session?.engine || session.replacing || session.closing) return false
+    // Last chance to key the PREVIOUS turn's snapshot before we drop it. attachPendingSnapshot
+    // normally runs on that turn's assistant/result events, but if the CLI flushed its user
+    // line only AFTER `result` — timing that varies by CLI version and disk — no event is left
+    // to retry on, and clearing here would lose the snapshot permanently and in silence. That
+    // is one of the two ways a machine ends up with /rewind's Code option greyed out forever.
+    if (session.pendingSnapshot) {
+      await this.attachPendingSnapshot(session)
+      if (session.pendingSnapshot) {
+        console.warn('[rewind] a working-tree snapshot was taken but never matched to a turn — '
+          + 'code rewind will be unavailable for it (the CLI\'s stored user line never equalled what we sent)')
+      }
+    }
     // Snapshot the working tree BEFORE the turn runs (git-only; no-op elsewhere), so
     // /rewind can later restore code to this pre-edit state. Awaited so the capture
     // lands before Claude can edit; keyed to the turn's uuid when the turn ends.

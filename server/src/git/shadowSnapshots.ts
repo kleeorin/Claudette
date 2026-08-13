@@ -18,6 +18,23 @@ import crypto from 'crypto'
 
 const REF_PREFIX = 'refs/claudette/rewind'
 
+// Every git call below is best-effort — a failure just means "no code rewind here", which
+// the UI renders as a greyed-out Code option with no explanation. That silence is fine for
+// the EXPECTED miss (cwd isn't a repo) and terrible for the machine-level faults that look
+// identical from the UI: no committer identity for commit-tree, `safe.directory` ownership
+// refusal, an unreadable file breaking `add -A`, a read-only ref store. Those get one warn
+// per distinct message so a broken machine says so in the log without spamming per turn.
+const warned = new Set<string>()
+function warnOnce(key: string, msg: string): void {
+  if (warned.has(key)) return
+  warned.add(key)
+  console.warn(`[rewind] ${msg}`)
+}
+
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 // execFile git with an optional GIT_INDEX_FILE override. Rejects with the trimmed
 // stderr on failure; `.gitCode === 128` marks "not a repo" for callers to swallow.
 function git(dir: string, args: string[], indexFile?: string): Promise<string> {
@@ -37,7 +54,13 @@ function git(dir: string, args: string[], indexFile?: string): Promise<string> {
 // (code-rewind is git-only; callers treat null as "snapshots unavailable here").
 export async function repoRoot(cwd: string): Promise<string | null> {
   try { return (await git(cwd, ['rev-parse', '--show-toplevel'])).trim() || null }
-  catch { return null }
+  catch (e) {
+    // "not a git repository" is the ordinary, expected miss — stay quiet. Anything else
+    // (dubious ownership, git not on PATH, an unreadable dir) is a fault the user can fix.
+    const msg = errText(e)
+    if (!/not a git repository/i.test(msg)) warnOnce(`root:${cwd}:${msg}`, `git unusable in ${cwd} — code rewind is off here: ${msg}`)
+    return null
+  }
 }
 
 // NUL-delimited `-z` output → string[] (drops the trailing empty field).
@@ -64,7 +87,12 @@ export async function snapshot(cwd: string): Promise<string | null> {
     const commitArgs = ['commit-tree', tree, '-m', 'claudette rewind snapshot']
     if (head) commitArgs.push('-p', head)
     return (await git(root, commitArgs, idx)).trim()
-  } catch {
+  } catch (e) {
+    // The single most common machine-level cause lands here: commit-tree with no committer
+    // identity configured ("unable to auto-detect email address"), which disables code
+    // rewind on that machine for every turn, forever, with nothing else to show for it.
+    const msg = errText(e)
+    warnOnce(`snap:${root}:${msg}`, `could not snapshot the working tree in ${root} — code rewind is off here: ${msg}`)
     return null
   } finally {
     await unlink(idx).catch(() => {})
@@ -75,7 +103,13 @@ export async function snapshot(cwd: string): Promise<string | null> {
 export async function saveRef(cwd: string, uuid: string, commit: string): Promise<void> {
   const root = await repoRoot(cwd)
   if (!root) return
-  try { await git(root, ['update-ref', `${REF_PREFIX}/${uuid}`, commit]) } catch { /* best-effort */ }
+  try { await git(root, ['update-ref', `${REF_PREFIX}/${uuid}`, commit]) }
+  catch (e) {
+    // Snapshots are being taken but can't be pinned (read-only ref store) — they'll be gc'd
+    // and every turn will show "No snapshot", so this is worth saying out loud.
+    const msg = errText(e)
+    warnOnce(`ref:${root}:${msg}`, `could not pin a snapshot ref in ${root} — code rewind is off here: ${msg}`)
+  }
 }
 
 // The snapshot commit saved for a turn uuid, or null if none exists.
