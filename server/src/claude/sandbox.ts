@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'child_process'
-import { existsSync, realpathSync, lstatSync, readlinkSync, copyFileSync, mkdirSync } from 'fs'
+import { existsSync, realpathSync, lstatSync, readlinkSync, copyFileSync, mkdirSync, readdirSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -229,6 +229,29 @@ function dnsMounts(): SandboxMount[] {
   return mounts
 }
 
+// The NVIDIA control nodes a CUDA context needs alongside the per-card nvidia<N>.
+// `nvidiactl` and `nvidia-uvm` are NOT optional — without them CUDA init fails even
+// when /dev/nvidia0 is present; the other two cover profiling and graphics.
+const NVIDIA_CONTROL_NODES = new Set(['nvidiactl', 'nvidia-modeset', 'nvidia-uvm', 'nvidia-uvm-tools'])
+
+// The host GPU device nodes handed to a `gpu: true` box — DISCOVERED from /dev, never
+// configured. The set varies by driver and card count (nvidia0..N, the MIG capability
+// nodes under nvidia-caps, /dev/dri for the DRM stack that AMD/Intel compute and any
+// GL/Vulkan work goes through, /dev/kfd for ROCm), and letting the operator type a path
+// would reintroduce exactly the arbitrary-bind surface this flag exists to bound.
+// Returns [] on a GPU-less host, which makes the toggle an honest no-op there.
+export function gpuDevicePaths(): string[] {
+  let entries: string[] = []
+  try { entries = readdirSync('/dev') } catch { return [] }
+  const out = entries
+    .filter((n) => /^nvidia\d+$/.test(n) || NVIDIA_CONTROL_NODES.has(n))
+    .map((n) => `/dev/${n}`)
+  // Bound whole (they're directories, not char devices, but --dev-bind is still what
+  // carries the device nodes inside them).
+  for (const d of ['/dev/nvidia-caps', '/dev/dri', '/dev/kfd']) if (existsSync(d)) out.push(d)
+  return out.sort()
+}
+
 // Build the full bwrap argv wrapping `claudeArgv` (the `claude …` args). `cwd` is
 // the session's working dir (chdir target + default writable mount from the caller).
 // Build the bwrap argv up to (but not including) the program: the system baseline,
@@ -236,7 +259,7 @@ function dnsMounts(): SandboxMount[] {
 // `--chdir cwd --setenv HOME`. Shared by wrapSandbox (claude) and wrapCommand (any
 // program, e.g. the Jupyter server) so both confine identically. Callers append their
 // own extra --setenv and the program+argv.
-function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[]): string[] {
+function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[], gpu = false): string[] {
   const home = homedir()
   const args: string[] = [
     // Start from an EMPTY environment (see CLAUDE_ENV_ALLOW_PREFIXES): the child must
@@ -281,6 +304,15 @@ function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[]): string[] {
     if (isUnsafeSymlinkMount(m.path, rwRoots)) continue   // escape guard (see fn)
     args.push(m.mode === 'rw' ? '--bind' : '--ro-bind', m.path, m.path)
   }
+
+  // GPU passthrough (SandboxConfig.gpu). MUST be --dev-bind: an ordinary --bind carries
+  // MS_NODEV, which leaves the node present but DEAD — nvidia-smi reports "Insufficient
+  // Permissions" and CUDA sees no device, a failure that looks like a driver problem
+  // rather than a mount one. Emitted AFTER `--dev /dev` above so these layer on top of
+  // the minimal devtmpfs bwrap puts there (argv order decides); /dev is never a data
+  // mount, so nothing in between can shadow them. The userspace half needs no work —
+  // libcuda/libnvidia live under the already ro-bound /usr.
+  if (gpu) for (const dev of gpuDevicePaths()) args.push('--dev-bind', dev, dev)
 
   // `--chdir cwd` (below) needs cwd to EXIST inside the sandbox. It does whenever a
   // mount lies on cwd's lineage: cwd itself, an ancestor (cwd sits inside it), or a
@@ -331,7 +363,7 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
   // below actually pins it (closes create-after-launch for ~/.claude). Must run BEFORE
   // hookSettingsProtections, which only ro-binds files that exist.
   ensureUserSettingsPinnable()
-  const args = bwrapBaseArgs(cwd, [...dedupeMounts([...baseline, ...cfg.mounts]), ...hookSettingsProtections(cwd)])
+  const args = bwrapBaseArgs(cwd, [...dedupeMounts([...baseline, ...cfg.mounts]), ...hookSettingsProtections(cwd)], cfg.gpu)
 
   // Claude's main config lives at $HOME/.claude.json — a FILE next to the config
   // dir, NOT inside it. We can't bind that file directly (it's saved via write-tmp
@@ -372,7 +404,9 @@ export function wrapCommand(
   argv: string[],
   opts: { extraMounts?: SandboxMount[]; extraEnv?: Record<string, string> } = {},
 ): SandboxSpawn {
-  const args = bwrapBaseArgs(cwd, [...dedupeMounts(cfg.mounts), ...(opts.extraMounts ?? [])])
+  // GPU rides along from the session's config, so a confined notebook kernel gets the
+  // same devices Claude does — that (not the CLI) is where most GPU work actually runs.
+  const args = bwrapBaseArgs(cwd, [...dedupeMounts(cfg.mounts), ...(opts.extraMounts ?? [])], cfg.gpu)
   const bin = which(program) ?? program
   // Under --clearenv, put the program's own bin dir on PATH (a venv/conda python, or
   // node) so it finds its sibling tools. Deliberately NO claude auth passthrough here
@@ -502,7 +536,9 @@ export function sandboxKey(cfg: SandboxConfig | undefined, cwd: string): string 
   // Fold in whether the obligatory local <cwd>/.claude currently EXISTS: wrapSandbox
   // binds it only when present, so its appearance/removal changes the real mount set.
   const localClaude = existsSync(path.join(cwd, '.claude')) ? '1' : '0'
-  return `on|lc${localClaude}|` + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
+  // `gpu` changes the emitted argv (the --dev-bind block), so it must be part of the key
+  // or toggling it would leave the running engine on its old devices with no pending mark.
+  return `on|lc${localClaude}|gpu${cfg.gpu ? '1' : '0'}|` + cfg.mounts.map((m) => `${m.mode}:${m.path}`).sort().join(',')
 }
 
 // A stable, empty directory to ro-bind onto cwd when the caller dropped cwd and there
@@ -560,6 +596,15 @@ export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
     'hunting for it elsewhere. It is almost certainly outside your sandbox. Say so, and',
     'ask the user to add it as a mount via the sandbox control (the lock chip in the',
     'session header) and relaunch. Network access is unrestricted.',
+    // Told explicitly because the box's /dev is otherwise minimal enough that a GPU
+    // failure reads as "this machine has no GPU" — the same misdiagnosis the mount note
+    // above prevents for files.
+    ...(cfg.gpu && gpuDevicePaths().length
+      ? ['The host GPU IS passed through to you: ' + gpuDevicePaths().join(', ') + ' are',
+         'available, so CUDA/ROCm work runs here normally.']
+      : ['You have NO GPU access: /dev holds only the basic nodes, so CUDA/ROCm find no',
+         'device even if the host has a card. Do not report this as a broken driver — ask',
+         'the user to tick "Pass through the GPU" in the sandbox control and relaunch.']),
   ].join('\n')
 }
 

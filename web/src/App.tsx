@@ -1218,13 +1218,24 @@ function RolePicker({ agents, value, onChange }: { agents: AgentInfo[]; value: s
 // The creation dialogs edit the sandbox as three fields — enabled, how the project
 // folder (cwd) is mounted (rw / ro / not at all), and a list of extra folders — rather
 // than a raw mount array, so cwd stays tied to the (possibly-edited) cwd field.
-type SbState = { enabled: boolean; projectMode: 'rw' | 'ro' | 'none'; extra: SandboxMount[] }
-const defaultSb = (): SbState => ({ enabled: true, projectMode: 'rw', extra: [] })
+// `flags` carries the non-mount switches (sandboxTerminals, gpu) through UNTOUCHED. These
+// dialogs deliberately don't edit them — they're per-session settings the sandbox control
+// owns — but a subsession seeds its state from the PARENT's config, so without this the
+// round-trip would silently strip them and hand the child a weaker/GPU-less box than the
+// parent it was spawned from.
+type SbFlags = Pick<SandboxConfig, 'sandboxTerminals' | 'gpu'>
+type SbState = { enabled: boolean; projectMode: 'rw' | 'ro' | 'none'; extra: SandboxMount[]; flags: SbFlags }
+const defaultSb = (): SbState => ({ enabled: true, projectMode: 'rw', extra: [], flags: {} })
 // Seed the fields from an existing config relative to a cwd (subsession → parent's).
 function sbFromConfig(cfg: SandboxConfig | undefined, cwd: string): SbState {
   if (!cfg) return defaultSb()
   const cwdMount = cfg.mounts.find((m) => m.path === cwd)
-  return { enabled: cfg.enabled, projectMode: cwdMount?.mode ?? 'none', extra: cfg.mounts.filter((m) => m.path !== cwd) }
+  return {
+    enabled: cfg.enabled,
+    projectMode: cwdMount?.mode ?? 'none',
+    extra: cfg.mounts.filter((m) => m.path !== cwd),
+    flags: { sandboxTerminals: cfg.sandboxTerminals, gpu: cfg.gpu },
+  }
 }
 // Build the SandboxConfig to submit (cwd folded back in per projectMode).
 function sbToConfig(sb: SbState, cwd: string): SandboxConfig {
@@ -1232,7 +1243,7 @@ function sbToConfig(sb: SbState, cwd: string): SandboxConfig {
     ...(sb.projectMode !== 'none' ? [{ path: cwd, mode: sb.projectMode } as SandboxMount] : []),
     ...sb.extra,
   ]
-  return { enabled: sb.enabled, mounts }
+  return { enabled: sb.enabled, mounts, ...sb.flags }
 }
 
 // Sandbox editor for the creation dialogs — enable toggle, project-folder access

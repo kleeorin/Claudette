@@ -28,6 +28,9 @@ interface ContextValue {
   // Whether THIS host can actually confine sessions (bwrap present + userns ok).
   // false ⇒ the sandbox controls explain it's unavailable + how to enable it.
   sandboxAvailable: boolean
+  // The host GPU device nodes a sandboxed session can be handed (SandboxConfig.gpu).
+  // Empty ⇒ no GPU here, and the sandbox controls hide the passthrough toggle.
+  gpuDevices: string[]
   // The server user's home directory — the default cwd for new sessions, terminals,
   // and the folder picker. Empty until the health probe resolves (app startup).
   homeDir: string
@@ -61,6 +64,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // Background sessions that finished / errored while unviewed — cleared on view.
   const [attention, setAttention] = useState<Set<string>>(new Set())
   const [sandboxAvailable, setSandboxAvailable] = useState(false)
+  const [gpuDevices, setGpuDevices] = useState<string[]>([])
   const [homeDir, setHomeDir] = useState('')
   const [agents, setAgents] = useState<AgentInfo[]>([])
   const prevStateRef = useRef<Map<string, SessionState>>(new Map())
@@ -159,7 +163,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   }, [patch])
 
   // Learn once whether this host can sandbox (drives the sandbox controls' messaging).
-  useEffect(() => { getHealth().then((h) => { setSandboxAvailable(!!h.sandboxAvailable); if (h.homeDir) setHomeDir(h.homeDir) }).catch(() => {}) }, [])
+  useEffect(() => { getHealth().then((h) => { setSandboxAvailable(!!h.sandboxAvailable); setGpuDevices(h.gpuDevices ?? []); if (h.homeDir) setHomeDir(h.homeDir) }).catch(() => {}) }, [])
 
   // Fetch the selectable roles once (drives the role pickers + sidebar badge).
   useEffect(() => { api.http.listAgents().then(setAgents).catch(() => {}) }, [])
@@ -194,8 +198,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // Memoize so unrelated session-state churn doesn't hand every consumer a new
   // context object identity and re-render them all.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention }),
-    [sessions, activeId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention],
+    () => ({ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention }),
+    [sessions, activeId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention],
   )
   return (
     <SessionsContext.Provider value={value}>

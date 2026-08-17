@@ -111,6 +111,10 @@ export interface HealthResponse {
   // Functional probe, not "binary exists" — see SANDBOX.md. Drives the UI's
   // "enable sandbox" affordance and the "unavailable" messaging.
   sandboxAvailable: boolean
+  // The host GPU device nodes a sandboxed session CAN be given (SandboxConfig.gpu),
+  // discovered from /dev. Empty on a GPU-less host, where the UI hides the toggle
+  // rather than offering a switch that would do nothing.
+  gpuDevices: string[]
   // The server user's home directory — the sensible default cwd for new sessions,
   // terminals, and the folder picker (the client can't read the server's $HOME).
   homeDir: string

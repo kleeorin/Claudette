@@ -6,7 +6,7 @@ import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import type { WsClientMessage, HealthResponse } from '@claudette/shared'
 import { SessionManager } from './claude/sessionManager'
-import { sandboxAvailable } from './claude/sandbox'
+import { sandboxAvailable, gpuDevicePaths } from './claude/sandbox'
 import { SessionConfinement } from './claude/sessionConfinement'
 import { reclaimStrandedHostConfigs } from './claude/configProtection'
 import { WsHub } from './ws/hub'
@@ -194,6 +194,7 @@ app.get('/api/health', async (): Promise<HealthResponse> => ({
   version: VERSION,
   ts: Date.now(),
   sandboxAvailable: sandboxAvailable(),
+  gpuDevices: gpuDevicePaths(),
   homeDir: homedir(),
 }))
 

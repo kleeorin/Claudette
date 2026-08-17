@@ -14,7 +14,7 @@ import { FileBrowser } from './FileBrowser'
 // `compact` (the meta-bar popover) trims the explanatory prose to just "what is
 // mounted"; the full panel keeps the detail.
 export function SandboxEditor({ session, compact = false }: { session: SessionInfo; compact?: boolean }) {
-  const { sandboxAvailable, setSandbox } = useSessions()
+  const { sandboxAvailable, gpuDevices, setSandbox } = useSessions()
   const [picking, setPicking] = useState(false)   // folder-picker modal open
   // Access for the folder about to be added, chosen INSIDE the picker. Defaults to the
   // safe 'ro' each time it opens, so granting write is always a deliberate click.
@@ -33,9 +33,16 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
   // not the pty the operator drives from the browser (see SandboxConfig).
   const termsConfined = cfg.sandboxTerminals === true
 
+  // GPU passthrough. Offered only where it can do something: this host actually has GPU
+  // nodes, or the session already has the flag set (so a config carried over from a GPU
+  // host can still be switched off here rather than being stuck invisibly on).
+  const gpuOn = cfg.gpu === true
+  const showGpu = gpuDevices.length > 0 || gpuOn
+
   const push = async (next: SandboxConfig) => { await setSandbox(session.id, next) }
   const toggleEnabled = () => push({ ...cfg, enabled: !enabled })
   const toggleTerminals = () => push({ ...cfg, sandboxTerminals: !termsConfined })
+  const toggleGpu = () => push({ ...cfg, gpu: !gpuOn })
   const setMode = (i: number, mode: 'rw' | 'ro') =>
     push({ ...cfg, mounts: cfg.mounts.map((m, j) => (j === i ? { ...m, mode } : m)) })
   const removeMount = (i: number) => push({ ...cfg, mounts: cfg.mounts.filter((_, j) => j !== i) })
@@ -136,6 +143,46 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
             Applies to terminals opened <b>from now on</b> — ones already open stay
             {termsConfined ? ' unconfined' : ' as they are'}; close and reopen them.
           </div>
+
+          {/* GPU devices are char nodes, not folders, so they can't come in through the
+              mount list above — hence a toggle rather than a path. Unlike every other
+              control here this one WIDENS the box, so it's styled as a warning when on. */}
+          {showGpu && (
+            <>
+              <label className="flex items-start gap-2 cursor-pointer select-none pt-0.5">
+                <input
+                  type="checkbox"
+                  checked={gpuOn}
+                  onChange={toggleGpu}
+                  className="accent-ctp-accent mt-[1px]"
+                />
+                <span className="leading-snug">
+                  <span className="text-ctp-text">Pass through the GPU</span>
+                  {!compact && (
+                    <span className="text-ctp-overlay">
+                      {' — '}without this the box has <b>no GPU at all</b> and CUDA/ROCm
+                      report no device, even though this host has one. Covers Claude and
+                      this session’s notebook kernels alike.
+                    </span>
+                  )}
+                </span>
+              </label>
+              {gpuOn && (
+                <div className="text-ctp-yellow/90 leading-snug">
+                  {gpuDevices.length === 0 ? (
+                    <>No GPU devices on this host — the passthrough is a no-op here.</>
+                  ) : (
+                    <>
+                      Bound into the box:{' '}
+                      <span className="font-mono text-ctp-text">{gpuDevices.join(' ')}</span>.
+                      This is the one setting here that <b>widens</b> confinement — GPU memory
+                      isn’t scrubbed between processes, so treat it as shared with the host.
+                    </>
+                  )}
+                </div>
+              )}
+            </>
+          )}
         </>
       )}
 

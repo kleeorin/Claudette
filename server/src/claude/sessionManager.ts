@@ -1030,7 +1030,16 @@ export class SessionManager extends EventEmitter {
 export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string, trusted = false): SandboxConfig {
   const cfg: SandboxConfig = !sandbox
     ? { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
-    : { enabled: sandbox.enabled, mounts: sandbox.mounts, sandboxTerminals: sandbox.sandboxTerminals }
+    : { enabled: sandbox.enabled, mounts: sandbox.mounts, sandboxTerminals: sandbox.sandboxTerminals, gpu: sandbox.gpu }
+  // `gpu` is the MIRROR IMAGE of the enabled:false gate below: it WIDENS the box (real
+  // device nodes, a direct kernel attack surface, and GPU memory that isn't scrubbed
+  // between contexts), so an untrusted request may not turn it ON. Same reachability
+  // argument as below — an in-box caller can hit the loopback control API but holds no
+  // CLAUDETTE_TOKEN, so this is defence in depth, not the only lock.
+  if (cfg.gpu && !trusted) {
+    console.warn('[sandbox] ignoring untrusted sandbox.gpu=true — only the operator may hand a session the host GPU devices')
+    cfg.gpu = false
+  }
   // `sandboxTerminals` needs no trust gate: it only ever RAISES confinement (terminals
   // are host shells by default), and a confined session can't drive a pane anyway —
   // that needs the app token, which never enters a box (SANDBOX.md "Terminal-pane
@@ -1048,7 +1057,7 @@ export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string
     // Carry `sandboxTerminals` through. Per the note above it only ever RAISES
     // confinement, so dropping it here would have this forced-on branch — which exists
     // purely to refuse a downgrade — quietly perform a different downgrade of its own.
-    return { enabled: true, mounts: cfg.mounts, sandboxTerminals: cfg.sandboxTerminals }
+    return { enabled: true, mounts: cfg.mounts, sandboxTerminals: cfg.sandboxTerminals, gpu: cfg.gpu }
   }
   return cfg
 }

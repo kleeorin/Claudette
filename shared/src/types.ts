@@ -27,6 +27,23 @@ export interface SandboxConfig {
   // reach one (SANDBOX.md "Terminal-pane escape"). Set true to confine terminals to
   // the same mounts as Claude. Applies to panes opened AFTER the change.
   sandboxTerminals?: boolean
+  // Hand this session's box the host's GPU character devices (/dev/nvidia*, /dev/dri,
+  // /dev/kfd — whichever exist) so CUDA/ROCm work inside it. Undefined/false = NO: the
+  // box gets bwrap's minimal `--dev` (null/zero/full/random/tty and nothing else), so a
+  // GPU job fails with "no CUDA-capable device is detected" even on a host with a card.
+  //
+  // A separate flag rather than entries in `mounts`, for two reasons that both make the
+  // mount list unable to express this. These are DEVICE nodes, not folders, so the
+  // folder picker can never surface them; and a plain `--bind` carries MS_NODEV, which
+  // leaves the node visible but dead (nvidia-smi: "Insufficient Permissions"). Only
+  // bwrap's `--dev-bind` actually grants access. The node set is discovered from /dev,
+  // never typed — see gpuDevicePaths().
+  //
+  // WIDENS the box: a GPU node is a direct kernel attack surface, and GPU memory is not
+  // scrubbed between contexts the way host RAM is. So it is trust-gated as the mirror
+  // image of `enabled:false` (normalizeSandbox) — only the auth-gated operator route may
+  // turn it ON, never an in-box caller reaching the loopback control API.
+  gpu?: boolean
 }
 
 // A selectable session role (agent): its id, display name, and a one-line summary.

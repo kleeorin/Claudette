@@ -107,6 +107,8 @@ Validated on Ubuntu 24.04 (bwrap 0.9.0):
 # dir onto cwd so --chdir resolves, the project stays invisible, AND writes to cwd fail
 # hard (EROFS) rather than silently vanishing into a writable tmpfs (as a plain --dir):
 --ro-bind <hostTmp>/.claudette-sandbox-empty <cwd>     # only when cwd is otherwise unreachable
+# GPU passthrough, ONLY when sandbox.gpu — --dev-bind (never --bind), after `--dev /dev`:
+--dev-bind /dev/nvidia0 <same>  --dev-bind /dev/nvidiactl <same>  --dev-bind /dev/nvidia-uvm <same>  …
 --chdir <cwd> --setenv HOME <home>
 # Relocate .claude.json INTO the mounted config dir (see below):
 --setenv CLAUDE_CONFIG_DIR <configDir>
@@ -149,6 +151,81 @@ project* is exposed; it does **nothing** to the global mount. Don't read "only .
 as "isolated from my secrets." Write-confinement holds (writes outside the mounts fail);
 read-secrecy of `~/.claude` does not. Future tightening: a per-session `CLAUDE_CONFIG_DIR`
 seeded with only credentials. Documented, deferred.
+
+---
+
+## GPU passthrough (`sandbox.gpu`) — opt-in, per session
+
+A sandboxed session has **no GPU**. `--dev /dev` mounts a fresh minimal devtmpfs
+(`null`, `zero`, `full`, `random`, `urandom`, `tty`), so `/dev/nvidia*` simply isn't
+there and CUDA/ROCm report *no device* on a machine with a perfectly good card. Tick
+**"Pass through the GPU"** in the sandbox control to hand the box the host's GPU nodes.
+
+**Why it can't be a mount.** Two independent reasons, which is why this is a toggle and
+not a path in the mount list:
+
+1. **They're character devices, not folders.** `/dev/nvidia0`, `/dev/nvidiactl` and
+   `/dev/nvidia-uvm` are device nodes; there is no `/dev/nvidia/` directory. The mount
+   picker lists directories (`FileBrowser mode="folder"`, backed by `isDirectory()` in
+   `fs/fsApi.ts`), so they can never appear in it. "I went looking for something to
+   mount and found nothing" is the expected experience.
+2. **A plain `--bind` of a device node does not work.** bwrap binds with `MS_NODEV`
+   unless told otherwise, so the node shows up inside the box and is **dead**. The
+   failure is quiet and misleading — it looks like a driver problem, not a mount one:
+
+   ```
+   bwrap … --bind     /dev/nvidia0 /dev/nvidia0 … nvidia-smi -L
+     → Failed to initialize NVML: Insufficient Permissions
+   bwrap … --dev-bind /dev/nvidia0 /dev/nvidia0 … nvidia-smi -L
+     → GPU 0: NVIDIA GeForce RTX 4070 Ti (UUID: GPU-1108…)
+   ```
+
+   Only **`--dev-bind`** (bwrap's `BIND_DEVICES`, which omits `MS_NODEV`) grants access.
+
+**What gets bound.** `gpuDevicePaths()` (`claude/sandbox.ts`) **discovers** the set from
+`/dev` rather than taking a configured path — the operator picking arbitrary bind sources
+is exactly what this flag exists to avoid, and the set varies by driver and card count:
+
+- `/dev/nvidia<N>` — one per card, matched `^nvidia\d+$`
+- `/dev/nvidiactl`, `/dev/nvidia-uvm` — **not optional**: CUDA init fails without them
+  even when `nvidia0` is present. Plus `nvidia-modeset` (graphics) and `nvidia-uvm-tools`
+  (profiling) when present
+- `/dev/nvidia-caps` (MIG capability nodes), `/dev/dri` (the DRM render nodes AMD/Intel
+  compute and any GL/Vulkan work goes through), `/dev/kfd` (ROCm) — bound whole when present
+
+On a GPU-less host it returns `[]`, the toggle is hidden in the UI (`HealthResponse
+.gpuDevices`), and setting the flag is an honest no-op. The **userspace** half needs no
+work: `libcuda`/`libnvidia` live under the already ro-bound `/usr`.
+
+**Ordering matters.** The `--dev-bind` lines are emitted *after* `--dev /dev`, because
+bwrap applies binds in argv order and the fresh devtmpfs would otherwise wipe them.
+`/dev` is never a data mount, so nothing in between can shadow them.
+
+**It covers kernels too.** The flag is read in `bwrapBaseArgs`, which backs both
+`wrapSandbox` (Claude) and `wrapCommand` (the session's Jupyter server, and so its
+notebook kernels) — that second path is where most GPU work actually runs.
+
+**Trust-gated ON — the mirror image of `enabled:false`.** Every other control here either
+narrows the box or is neutral; this one **widens** it. A GPU node is a direct kernel
+attack surface, and GPU memory is not scrubbed between contexts the way host RAM is, so a
+box with `/dev/nvidia0` can observe residue from other processes on the card. So
+`normalizeSandbox` refuses `gpu: true` from an **untrusted** caller exactly as it refuses
+`enabled: false`: only the auth-gated operator route (and boot restore of an
+already-approved config) may set it. As with the other gates this is defence in depth —
+an in-box caller can reach the loopback control API but holds no `CLAUDETTE_TOKEN`.
+
+`sandboxKey` folds the flag in, so toggling it marks the session pending and relaunches
+it like a mount change; the session's system prompt states plainly whether it has a GPU,
+so a GPU-less box doesn't misdiagnose itself as having a broken driver.
+
+**Residual.** `SessionConfinement`'s `confined > host > deny` rank does **not** model GPU:
+a `confined → confined` notebook handoff between a GPU session and a non-GPU one is
+allowed, the same documented gap as differing mount sets under "Ownership downgrade".
+Both are token-gated and both boxes stay confined.
+
+Verified in `scratchpad/sandbox-gpu-passthrough-test.mts` (21/21), including live
+`nvidia-smi` runs proving `--bind` fails and `--dev-bind` works, and that `wrapSandbox`'s
+own emitted argv gives the box a working GPU.
 
 ---
 
