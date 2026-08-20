@@ -79,7 +79,12 @@ code, pre {
   --crepe-color-surface-low: #191a1e;
   --crepe-color-on-surface: #e7e8ea;
   --crepe-color-on-surface-variant: #aeb3bb;  /* ctp-subtext */
-  --crepe-color-outline: #31343b;             /* ctp-surface1 — borders */
+  /* NOT just a border color: Crepe paints ICON fill, the text caret and the code-block
+     input carets straight from this, and derives hairlines by fading it to 20%
+     (color-mix(… transparent 80%)). So it has to read as a FOREGROUND grey — a
+     border-weight value here (ctp-surface1) left the floating toolbar's icons and the
+     cursor invisible against the dark surfaces. Upstream nord-dark uses #8d9199. */
+  --crepe-color-outline: #7b818b;             /* ctp-overlay — icons, carets, hairlines */
   --crepe-color-primary: #e08a5f;             /* coral accent */
   --crepe-color-secondary: #2b2e34;
   --crepe-color-on-secondary: #e7e8ea;
@@ -95,6 +100,11 @@ code, pre {
   --crepe-font-code: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .milkdown-host .milkdown .ProseMirror { outline: none; }
+/* Crepe draws the caret with prosemirror-virtual-cursor and colors it from
+   --crepe-color-outline, which is tuned above for icons and hairlines. The caret is
+   worth more contrast than that — give it the body text color so it stays easy to
+   follow while typing. */
+.milkdown-host .milkdown .ProseMirror-focused { --prosemirror-virtual-cursor-color: #e7e8ea; }
 
 /* react-data-grid (CSV table view). The library themes via --rdg-* custom
    properties; we remap them to the app's ctp palette so the grid, its header,
