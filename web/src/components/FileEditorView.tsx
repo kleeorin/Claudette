@@ -10,6 +10,8 @@ import { useScrollMemory } from '../lib/scrollMemory'
 import { peekBuffer, setBuffer } from '../lib/buffers'
 import { useChat } from '../store/chat'
 import { applyProposal, filePathOf, isEditTool, isNotebookPath, reconstructDecision } from '../lib/proposals'
+import { useFind } from '../lib/useFind'
+import { isFindKey } from './FindBar'
 
 // A file-editor tab: fetches the file and dispatches by kind — Milkdown (WYSIWYG)
 // for markdown, CodeMirror (syntax-highlighted) for other text, an inline viewer
@@ -113,10 +115,17 @@ export function FileEditorView({ path, sessionId }: Props) {
     } else setSaveErr(r.error)
   }, [path])
 
+  // Find state lives HERE, not in each editor, for two reasons: Ctrl/Cmd-F then works
+  // the moment a tab opens (no "click into the grid first" — a container keydown needs
+  // no focused editor), and the query survives the file flipping between its editor and
+  // the proposal diff below. This view is keyed by path, so each file gets its own.
+  const find = useFind()
+
   // Container-level Cmd/Ctrl-S (covers Milkdown; CodeEditor also wires it, but save
-  // is guarded + dirty-checked so a double fire is a harmless no-op).
+  // is guarded + dirty-checked so a double fire is a harmless no-op) and Cmd/Ctrl-F.
   const onKeyDown = (e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') { e.preventDefault(); void save() }
+    else if (isFindKey(e)) { e.preventDefault(); find.openFind() }
   }
 
   // --- inline proposal review -------------------------------------------------
@@ -210,8 +219,25 @@ export function FileEditorView({ path, sessionId }: Props) {
   const imgRef = useRef<HTMLDivElement>(null)
   useScrollMemory(preview?.kind === 'image' ? scrollKey : null, () => imgRef.current)
 
+  // A container keydown only fires for events inside its subtree, so the container has
+  // to hold focus when the editor it wraps doesn't take any (the CSV grid, and markdown
+  // until you click into it). It also has to RECLAIM focus when the body swaps editors
+  // — flipping into or out of proposal review unmounts whatever held the keyboard, and
+  // without this Ctrl/Cmd-F in the diff would fall through to the browser's own find.
+  // Skipped when focus is already inside, or sitting in some other text field — opening
+  // a tab shouldn't yank the caret out of the chat box.
+  const rootRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (loading) return
+    const root = rootRef.current
+    if (!root || root.contains(document.activeElement)) return
+    const ae = document.activeElement as HTMLElement | null
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return
+    root.focus({ preventScroll: true })
+  }, [loading, path, reviewing])
+
   return (
-    <div className="flex flex-col h-full bg-ctp-base" onKeyDown={onKeyDown}>
+    <div ref={rootRef} tabIndex={-1} className="flex flex-col h-full bg-ctp-base outline-none" onKeyDown={onKeyDown}>
       {/* Header */}
       <div className="h-9 shrink-0 flex items-center gap-2 px-3 bg-ctp-mantle border-b border-ctp-surface0">
         <span className="text-xs font-mono text-ctp-text truncate">{name}</span>
@@ -280,6 +306,7 @@ export function FileEditorView({ path, sessionId }: Props) {
             original={baseText}
             proposed={applied.proposed}
             filename={name}
+            find={find}
             onDoc={(t) => { resultRef.current = t }}
             onAllResolved={(t) => { resultRef.current = t; applyDecision() }}
           />
@@ -296,9 +323,9 @@ export function FileEditorView({ path, sessionId }: Props) {
         ) : preview.kind === 'error' ? (
           <div className="h-full flex items-center justify-center text-xs text-ctp-red px-4 text-center">{preview.message}</div>
         ) : isMarkdown(path) && editable ? (
-          <MilkdownEditor key={`${path}#${reloadKey}`} initialDoc={preview.text} readOnly={false} onChange={onChange} scrollKey={scrollKey} />
+          <MilkdownEditor key={`${path}#${reloadKey}`} initialDoc={preview.text} readOnly={false} onChange={onChange} scrollKey={scrollKey} find={find} />
         ) : isCsv(path) ? (
-          <CsvTableView key={`${path}#${reloadKey}`} initialText={preview.text} filename={name} readOnly={!editable} onChange={onChange} scrollKey={scrollKey} />
+          <CsvTableView key={`${path}#${reloadKey}`} initialText={preview.text} filename={name} readOnly={!editable} onChange={onChange} scrollKey={scrollKey} find={find} />
         ) : (
           <CodeEditor
             key={`${path}#${reloadKey}`}
@@ -308,6 +335,7 @@ export function FileEditorView({ path, sessionId }: Props) {
             onChange={onChange}
             onSave={() => void save()}
             scrollKey={scrollKey}
+            find={find}
           />
         )}
       </div>

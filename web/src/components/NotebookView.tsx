@@ -4,7 +4,10 @@ import { EditorView } from '@codemirror/view'
 import type { KernelStatus, KernelSpec, NbCellType } from '@claudette/shared'
 import { useNotebooks } from '../store/notebooks'
 import { api } from '../api/client'
-import { setCellMatches, type CellMatch } from '../lib/cellSearch'
+import { setSearchMatches, type HighlightRange } from '../lib/searchHighlight'
+import { findMatches, isInvalidQuery, replaceRanges, expandReplacement } from '../lib/findMatches'
+import { useFind } from '../lib/useFind'
+import { FindBar } from './FindBar'
 import { basename } from '../lib/paths'
 import { useScrollMemory } from '../lib/scrollMemory'
 import { Cell } from './notebook/Cell'
@@ -20,9 +23,12 @@ const STATUS_LABEL: Record<KernelStatus, string> = {
   none: 'no kernel', idle: 'idle', busy: 'busy', starting: 'starting…', dead: 'dead',
 }
 
+// One occurrence of the find query, somewhere in the notebook: an offset range inside
+// one cell's source, plus what matched (for `$1`-style replacements).
+interface NbMatch { cellId: string; from: number; to: number; text: string; groups?: (string | undefined)[] }
 // Stable empty search-match list — shared so the find memo keeps a constant
 // identity when there's no query (see `matches` below).
-const NO_MATCHES: { cellId: string; from: number; to: number }[] = []
+const NO_MATCHES: NbMatch[] = []
 
 // Cells copied/cut in command mode — module-level so they survive cell re-renders,
 // notebook switches, and even copying between notebooks (classic Jupyter behavior).
@@ -92,17 +98,15 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   // failed" — the latter offers a retry instead of silently showing "no kernels".
   const [specsError, setSpecsError] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
-  const [findOpen, setFindOpen] = useState(false)
-  const [query, setQuery] = useState('')
-  const [matchIdx, setMatchIdx] = useState(0)
-  const findInputRef = useRef<HTMLInputElement>(null)
+  // Query, options and current-match bookkeeping are the app-wide find state (shared
+  // with every other editor); what's notebook-specific stays here.
+  const find = useFind()
   // Where a search starts from: the cell/offset at the top of the visible area when
   // the find bar was opened. Matches before it are skipped on the first hop, so
   // searching moves you DOWN from what you're looking at instead of yanking the view
-  // to the notebook's first occurrence. `seekRef` marks a match index as a fresh
+  // to the notebook's first occurrence. `find.seekRef` marks a match index as a fresh
   // reset that still needs that hop (vs. one the user navigated to with ↑/↓).
   const findAnchorRef = useRef<{ cellId: string; offset: number } | null>(null)
-  const seekRef = useRef(false)
   // Registry of each cell's CodeMirror view, so the find bar can highlight matches
   // and scroll to the exact occurrence inside a cell.
   const cellViews = useRef(new Map<string, EditorView>())
@@ -153,7 +157,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   }, [notebookId])
 
   // Focus the find field when the bar opens.
-  useEffect(() => { if (findOpen) findInputRef.current?.focus() }, [findOpen])
+  useEffect(() => { if (find.open) find.inputRef.current?.focus() }, [find.open]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const cells = doc?.cells ?? []
 
@@ -242,24 +246,21 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   // bar is ALREADY open (a second Ctrl+F from inside a cell) the mount effect below
   // won't re-fire, so pull focus back to the field and select the query for a retype.
   const openFind = () => {
-    captureFindAnchor(); seekRef.current = true; setFindOpen(true); setMatchIdx(0)
-    findInputRef.current?.select()
+    captureFindAnchor()
+    find.openFind()
   }
 
   // Cross-cell search: a flat, ordered list of matches (one per occurrence), each
   // with its offset range within the cell source. Returns a stable empty array when
   // there's no query so the paint effect below doesn't re-fire on every doc change.
   const matches = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    if (!q) return NO_MATCHES
-    const out: { cellId: string; from: number; to: number }[] = []
+    if (!find.query) return NO_MATCHES
+    const out: NbMatch[] = []
     for (const c of cells) {
-      const s = c.source.toLowerCase()
-      let i = s.indexOf(q)
-      while (i !== -1) { out.push({ cellId: c.id, from: i, to: i + q.length }); i = s.indexOf(q, i + q.length) }
+      for (const m of findMatches(c.source, find.query, find.opts)) out.push({ cellId: c.id, ...m })
     }
     return out
-  }, [cells, query])
+  }, [cells, find.query, find.opts])
 
   // Paint every match in every cell (active one distinctly) and scroll the notebook
   // to the exact current occurrence — so stepping between matches actually moves,
@@ -274,9 +275,9 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     const views = cellViews.current
     // Find bar closed: clear any highlights once, then stay idle — don't dispatch a
     // no-op transaction into every editor on each doc change during a streaming run.
-    if (!findOpen) {
+    if (!find.open) {
       if (paintedRef.current) {
-        for (const [, view] of views) view.dispatch({ effects: setCellMatches.of({ matches: [], activeFrom: null }) })
+        for (const [, view] of views) view.dispatch({ effects: setSearchMatches.of({ matches: [], activeFrom: null }) })
         paintedRef.current = false
       }
       activeKeyRef.current = null
@@ -287,8 +288,8 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     // instead of jumping to the top of the notebook. Wraps to match #1 when nothing
     // follows the anchor. Left pending while a query has no matches yet, so the hop
     // still happens once the user types something that hits.
-    if (seekRef.current && matches.length) {
-      seekRef.current = false
+    if (find.seekRef.current && matches.length) {
+      find.seekRef.current = false
       const anchor = findAnchorRef.current
       const order = new Map(cells.map((c, i) => [c.id, i]))
       const ai = anchor ? order.get(anchor.cellId) : undefined
@@ -299,9 +300,9 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
           })
         : -1
       const seek = found === -1 ? 0 : found
-      if (seek !== matchIdx) { setMatchIdx(seek); return }
+      if (seek !== find.index) { find.setIndex(seek); return }
     }
-    const active = matches.length ? matches[Math.min(matchIdx, matches.length - 1)] : null
+    const active = matches.length ? matches[Math.min(find.index, matches.length - 1)] : null
     // Never let a match hide inside a collapsed section — un-collapse only the
     // heading(s) whose section contains it (not every fold in the notebook), then the
     // effect re-runs against the now-visible cells.
@@ -332,7 +333,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       setMinimized((prev) => { const n = new Set(prev); n.delete(active.cellId); return n })
       return
     }
-    const byCell = new Map<string, CellMatch[]>()
+    const byCell = new Map<string, HighlightRange[]>()
     for (const m of matches) {
       const arr = byCell.get(m.cellId)
       if (arr) arr.push({ from: m.from, to: m.to })
@@ -342,7 +343,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       const docLen = view.state.doc.length
       const cm = (byCell.get(id) ?? []).filter((r) => r.to <= docLen)
       const activeFrom = active && active.cellId === id && active.to <= docLen ? active.from : null
-      view.dispatch({ effects: setCellMatches.of({ matches: cm, activeFrom }) })
+      view.dispatch({ effects: setSearchMatches.of({ matches: cm, activeFrom }) })
     }
     paintedRef.current = true
     // Select + scroll ONLY when the active match actually changed (navigation / new
@@ -358,18 +359,39 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
       // Scroll the exact active-match span into view after CM paints it (cells grow
       // to fit, so it's the notebook list that scrolls). Falls back to the cell.
       requestAnimationFrame(() => {
-        const el = document.querySelector('.cm-nb-match-active')
+        const el = document.querySelector('.cm-find-match-active')
         if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' })
         else revealCell(active.cellId)
       })
     }
     activeKeyRef.current = activeKey
-  }, [findOpen, matches, matchIdx, revealCell, hidden, cells, headingLevel, mdEditing, beginEdit, minimized])
+  }, [find.open, find.index, matches, revealCell, hidden, cells, headingLevel, mdEditing, beginEdit, minimized]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const stepMatch = (dir: 1 | -1) => {
-    if (matches.length === 0) return
-    setMatchIdx((i) => (i + dir + matches.length) % matches.length)
-  }
+  // Replace goes through `updateSource` — the same server op a hand edit uses — rather
+  // than through each cell's editor: a match can sit in a cell that's collapsed,
+  // minimized or simply scrolled out of the mounted set, and those have no view to
+  // dispatch into. Mounted editors pick the new text up from the doc update.
+  const replaceOne = useCallback(() => {
+    const active = matches.length ? matches[Math.min(find.index, matches.length - 1)] : null
+    const cell = active && cells.find((c) => c.id === active.cellId)
+    if (!active || !cell) return
+    const next = cell.source.slice(0, active.from)
+      + expandReplacement(find.replacement, active, find.opts)
+      + cell.source.slice(active.to)
+    nb.updateSource(notebookId, cell.id, next)
+  }, [matches, find.index, find.replacement, find.opts, cells, nb, notebookId])
+
+  const replaceAll = useCallback(() => {
+    if (!matches.length) return
+    const touched = new Set(matches.map((m) => m.cellId))
+    for (const cell of cells) {
+      if (!touched.has(cell.id)) continue
+      const ms = findMatches(cell.source, find.query, find.opts)
+      if (!ms.length) continue
+      nb.updateSource(notebookId, cell.id, replaceRanges(cell.source, ms, find.replacement, find.opts))
+    }
+    find.setIndex(0)
+  }, [matches, cells, find.query, find.replacement, find.opts, nb, notebookId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load the available kernelspecs (+ Jupyter's default). Reset the error flag on
   // each attempt so a retry can clear a prior failure; a failure leaves specs null
@@ -511,7 +533,7 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   const onNotebookKey = (e: React.KeyboardEvent) => {
     const mod = e.ctrlKey || e.metaKey
     if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openFind() }
-    else if (e.key === 'Escape' && findOpen && !(e.target as HTMLElement).closest('.cm-editor')) { setFindOpen(false) }
+    else if (e.key === 'Escape' && find.open && !(e.target as HTMLElement).closest('.cm-editor')) { find.closeFind() }
   }
 
   // Command-mode keys (active when the list, not an editor, has focus).
@@ -662,32 +684,18 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
         </div>
       )}
 
-      {/* Find bar */}
-      {findOpen && (
-        <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 bg-ctp-surface0/60 border-b border-ctp-surface0">
-          <span className="text-ctp-overlay text-xs">⌕</span>
-          {/* Typing re-seeks from the SAME anchor: refining the query re-picks the
-              nearest match below where the search started, rather than creeping up
-              the notebook from wherever the last match happened to land. */}
-          <input
-            ref={findInputRef}
-            value={query}
-            onChange={(e) => { setQuery(e.target.value); setMatchIdx(0); seekRef.current = true }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') { e.preventDefault(); stepMatch(e.shiftKey ? -1 : 1) }
-              else if (e.key === 'Escape') { e.preventDefault(); setFindOpen(false) }
-            }}
-            placeholder="Find in cells…"
-            className="flex-1 bg-transparent text-xs text-ctp-text placeholder:text-ctp-overlay outline-none"
-          />
-          <span className="text-[11px] text-ctp-overlay tabular-nums">
-            {matches.length ? `${Math.min(matchIdx, matches.length - 1) + 1}/${matches.length}` : (query ? '0/0' : '')}
-          </span>
-          <button onClick={() => stepMatch(-1)} disabled={!matches.length} title="Previous (Shift+Enter)" className="text-xs text-ctp-overlay hover:text-ctp-text disabled:opacity-30 px-1">↑</button>
-          <button onClick={() => stepMatch(1)} disabled={!matches.length} title="Next (Enter)" className="text-xs text-ctp-overlay hover:text-ctp-text disabled:opacity-30 px-1">↓</button>
-          <button onClick={() => setFindOpen(false)} title="Close (Esc)" className="text-xs text-ctp-overlay hover:text-ctp-text px-1">✕</button>
-        </div>
-      )}
+      {/* Find bar — shared with every other editor. Typing re-seeks from the SAME
+          anchor: refining the query re-picks the nearest match below where the search
+          started, rather than creeping up the notebook from wherever the last match
+          happened to land. */}
+      <FindBar
+        find={find}
+        count={matches.length}
+        invalid={isInvalidQuery(find.query, find.opts)}
+        placeholder="Find in cells…"
+        onReplace={replaceOne}
+        onReplaceAll={replaceAll}
+      />
 
       {/* Conflict banner */}
       {conflict && (

@@ -1,8 +1,11 @@
-import { useMemo, useRef, useState, useCallback } from 'react'
-import DataGrid, { textEditor, type Column } from 'react-data-grid'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import DataGrid, { textEditor, type Column, type DataGridHandle } from 'react-data-grid'
 import Papa from 'papaparse'
 import 'react-data-grid/lib/styles.css'
 import { useScrollMemory } from '../lib/scrollMemory'
+import { expandReplacement, findMatches, isInvalidQuery, replaceRanges } from '../lib/findMatches'
+import type { FindState } from '../lib/useFind'
+import { FindBar } from './FindBar'
 
 // A dedicated table view for CSV/TSV files. Cells are edited in place (double-click
 // or start typing), and every change is serialized straight back to CSV text and
@@ -12,15 +15,30 @@ import { useScrollMemory } from '../lib/scrollMemory'
 // It uses a spreadsheet model on purpose: columns are labelled A, B, C… and *every*
 // row is data (including what may look like a header). That avoids guessing whether
 // row 0 is a header and keeps every cell — header included — editable.
+//
+// Find (Ctrl/Cmd-F) is the app's shared bar, searching cell VALUES rather than the
+// serialized CSV text: a hit is a cell you can jump to and edit, and the quoting and
+// delimiters the file happens to use never show up as false matches.
 interface Props {
   initialText: string
   filename: string
   readOnly: boolean
   onChange: (text: string) => void
   scrollKey?: string   // remembers where you were when this file reopens
+  find: FindState      // owned by the tab — the grid has no focusable root to hang keys off
 }
 
 type Row = { __id: number; [col: string]: string | number }
+
+// One occurrence of the query inside one cell. `rowIdx` is the grid position (what
+// scrolling needs); `rowId` is the row's stable key (what the cell renderer sees).
+interface CellHit {
+  rowIdx: number
+  rowId: number
+  col: number
+  from: number
+  to: number
+}
 
 // 0 -> "A", 25 -> "Z", 26 -> "AA" … spreadsheet-style column labels.
 function colLabel(i: number): string {
@@ -39,11 +57,14 @@ function serialize(matrix: string[][], delimiter: string): string {
   return Papa.unparse(matrix, { delimiter, newline: '\n' })
 }
 
-export function CsvTableView({ initialText, filename, readOnly, onChange, scrollKey }: Props) {
+const cellText = (row: Row, c: number) => String(row[String(c)] ?? '')
+
+export function CsvTableView({ initialText, filename, readOnly, onChange, scrollKey, find }: Props) {
   const delimiter = /\.tsv$/i.test(filename) ? '\t' : ','
   // react-data-grid owns its scroller (`.rdg`), so we look it up under our wrapper
   // rather than holding a ref to it.
   const wrapRef = useRef<HTMLDivElement>(null)
+  const gridRef = useRef<DataGridHandle>(null)
   useScrollMemory(scrollKey ?? null, () => wrapRef.current?.querySelector<HTMLElement>('.rdg') ?? null)
 
   // Parse once for this mount. FileEditorView remounts us via key={path} per file,
@@ -81,6 +102,80 @@ export function CsvTableView({ initialText, filename, readOnly, onChange, scroll
     return serialize(matrix, delimiter)
   }, [delimiter])
 
+  // --- find ------------------------------------------------------------------
+  // Every occurrence, scanned row-major (left to right, top to bottom) — so stepping
+  // through matches walks the sheet the way you'd read it.
+  const hits = useMemo<CellHit[]>(() => {
+    if (!find.open || !find.query) return []
+    const out: CellHit[] = []
+    for (let r = 0; r < rows.length; r++) {
+      for (let c = 0; c < colCount; c++) {
+        const text = cellText(rows[r], c)
+        if (!text) continue
+        for (const m of findMatches(text, find.query, find.opts)) {
+          out.push({ rowIdx: r, rowId: rows[r].__id, col: c, from: m.from, to: m.to })
+        }
+      }
+    }
+    return out
+  }, [find.open, find.query, find.opts, rows, colCount])
+
+  const activeHit = hits.length ? hits[Math.min(find.index, hits.length - 1)] : undefined
+
+  // Cells to tint, and the single cell holding the current match. Sets rather than a
+  // scan per cell — cellClass runs for every rendered cell on every grid render.
+  const { matchCells, activeCell } = useMemo(() => {
+    const matchCells = new Set<string>()
+    for (const h of hits) matchCells.add(`${h.rowId}:${h.col}`)
+    return { matchCells, activeCell: activeHit ? `${activeHit.rowId}:${activeHit.col}` : null }
+  }, [hits, activeHit])
+
+  // Bring the current match into view. scrollToCell (not selectCell) on purpose: the
+  // grid would take focus when a cell is selected, and typing in the find field would
+  // stop landing there after the first keystroke.
+  useEffect(() => {
+    if (!activeHit) return
+    find.seekRef.current = false
+    gridRef.current?.scrollToCell({ rowIdx: activeHit.rowIdx, idx: activeHit.col + 1 })
+  }, [activeHit?.rowIdx, activeHit?.col]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const commit = useCallback((next: Row[], cols = colCount) => {
+    setRows(next)
+    onChange(rowsToText(next, cols))
+  }, [colCount, onChange, rowsToText])
+
+  // Replace just the occurrence under the counter — the surrounding text in that cell
+  // (and every other match in it) is left alone.
+  const replaceOne = useCallback(() => {
+    if (!activeHit) return
+    const key = String(activeHit.col)
+    const next = rows.map((row, i) => {
+      if (i !== activeHit.rowIdx) return row
+      const text = cellText(row, activeHit.col)
+      const m = { from: activeHit.from, to: activeHit.to, text: text.slice(activeHit.from, activeHit.to) }
+      // Re-derive the captures from this cell so `$1` works the same as in a text editor.
+      const fresh = findMatches(text, find.query, find.opts).find((x) => x.from === activeHit.from) ?? m
+      return { ...row, [key]: text.slice(0, activeHit.from) + expandReplacement(find.replacement, fresh, find.opts) + text.slice(activeHit.to) }
+    })
+    commit(next)
+  }, [activeHit, rows, find.query, find.replacement, find.opts, commit])
+
+  const replaceAll = useCallback(() => {
+    if (!hits.length) return
+    const touched = new Set(hits.map((h) => `${h.rowIdx}:${h.col}`))
+    const next = rows.map((row, i) => {
+      let out = row
+      for (let c = 0; c < colCount; c++) {
+        if (!touched.has(`${i}:${c}`)) continue
+        const text = cellText(row, c)
+        out = { ...out, [String(c)]: replaceRanges(text, findMatches(text, find.query, find.opts), find.replacement, find.opts) }
+      }
+      return out
+    })
+    commit(next)
+    find.setIndex(0)
+  }, [hits, rows, colCount, find.query, find.replacement, find.opts, commit]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const columns = useMemo<Column<Row>[]>(() => {
     const idxCol: Column<Row> = {
       key: '__row',
@@ -98,14 +193,16 @@ export function CsvTableView({ initialText, filename, readOnly, onChange, scroll
       resizable: true,
       editable: !readOnly,
       renderEditCell: readOnly ? undefined : textEditor,
+      cellClass: (row: Row) => {
+        const key = `${row.__id}:${c}`
+        if (!matchCells.has(key)) return undefined
+        return key === activeCell ? 'rdg-find-match rdg-find-active' : 'rdg-find-match'
+      },
     }))
     return [idxCol, ...dataCols]
-  }, [colCount, readOnly])
+  }, [colCount, readOnly, matchCells, activeCell])
 
-  const onRowsChange = useCallback((newRows: Row[]) => {
-    setRows(newRows)
-    onChange(rowsToText(newRows, colCount))
-  }, [onChange, rowsToText, colCount])
+  const onRowsChange = useCallback((newRows: Row[]) => { commit(newRows) }, [commit])
 
   const addRow = useCallback(() => {
     setRows((rs) => {
@@ -135,6 +232,11 @@ export function CsvTableView({ initialText, filename, readOnly, onChange, scroll
             {rows.length} rows × {colCount} cols · double-click a cell to edit
           </span>
           <button
+            onClick={find.openFind}
+            title="Find in cells (Ctrl/Cmd+F)"
+            className="text-[11px] px-2 py-0.5 rounded bg-ctp-surface0 text-ctp-subtext hover:bg-ctp-surface1 transition"
+          >⌕ Find</button>
+          <button
             onClick={addRow}
             className="text-[11px] px-2 py-0.5 rounded bg-ctp-surface0 text-ctp-subtext hover:bg-ctp-surface1 transition"
           >+ Row</button>
@@ -144,8 +246,17 @@ export function CsvTableView({ initialText, filename, readOnly, onChange, scroll
           >+ Column</button>
         </div>
       )}
+      <FindBar
+        find={find}
+        count={hits.length}
+        invalid={isInvalidQuery(find.query, find.opts)}
+        placeholder="Find in cells…"
+        onReplace={readOnly ? undefined : replaceOne}
+        onReplaceAll={readOnly ? undefined : replaceAll}
+      />
       <div ref={wrapRef} className="flex-1 min-h-0 claudette-rdg">
         <DataGrid
+          ref={gridRef}
           columns={columns}
           rows={rows}
           onRowsChange={onRowsChange}

@@ -6,7 +6,7 @@ import { python } from '@codemirror/lang-python'
 import { markdown } from '@codemirror/lang-markdown'
 import type { NbCell } from '@claudette/shared'
 import { editorTheme, editorHighlight } from '../../lib/editorTheme'
-import { cellSearch } from '../../lib/cellSearch'
+import { searchHighlight } from '../../lib/searchHighlight'
 import { Markdown } from '../Markdown'
 import { Output } from './Output'
 
@@ -133,7 +133,7 @@ export function Cell(props: Props) {
           ...lang,
           editorTheme,
           editorHighlight,
-          cellSearch,
+          searchHighlight,
           // Per-cell undo/redo. Without this state field CodeMirror's Mod-z is a
           // no-op and the keypress falls through to the browser's flaky native
           // contentEditable undo — which only restores part of the buffer.

@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Crepe } from '@milkdown/crepe'
 import { callCommand } from '@milkdown/kit/utils'
-import type { CmdKey } from '@milkdown/kit/core'
+import { editorViewCtx, type CmdKey } from '@milkdown/kit/core'
+import type { EditorView as ProseView } from '@milkdown/kit/prose/view'
 import {
   toggleStrongCommand,
   toggleEmphasisCommand,
@@ -18,6 +19,10 @@ import { toggleStrikethroughCommand } from '@milkdown/kit/preset/gfm'
 import '@milkdown/crepe/theme/common/style.css'
 import '@milkdown/crepe/theme/nord-dark.css'
 import { useScrollMemory } from '../lib/scrollMemory'
+import { findHighlightPlugin, findInDoc, paintFind, type ProseHit } from '../lib/proseSearch'
+import { expandReplacement, isInvalidQuery } from '../lib/findMatches'
+import type { FindState } from '../lib/useFind'
+import { FindBar } from './FindBar'
 
 // WYSIWYG markdown editor — Milkdown "Crepe", the batteries-included build. Crepe
 // ships CONTEXTUAL controls (a floating selection toolbar, a slash (/) menu, a block
@@ -33,14 +38,20 @@ interface Props {
   readOnly: boolean
   onChange: (markdown: string) => void
   scrollKey?: string   // remembers where you were when this file reopens
+  find: FindState      // owned by the tab, so Ctrl/Cmd-F doesn't wait on editor focus
 }
 
-export function MilkdownEditor({ initialDoc, readOnly, onChange, scrollKey }: Props) {
+const NO_HITS: ProseHit[] = []
+
+export function MilkdownEditor({ initialDoc, readOnly, onChange, scrollKey, find }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   const crepeRef = useRef<Crepe | null>(null)
   // Keep onChange fresh without rebuilding the editor.
   const onChangeRef = useRef(onChange)
   onChangeRef.current = onChange
+
+  // Bumped whenever the document changes, to re-run the search against fresh text.
+  const [docVersion, setDocVersion] = useState(0)
 
   // Build the editor once per mount. The parent remounts via `key={path}` when the
   // file changes, so `initialDoc` is effectively mount-time input. `on()` must be
@@ -49,14 +60,84 @@ export function MilkdownEditor({ initialDoc, readOnly, onChange, scrollKey }: Pr
     if (!hostRef.current) return
     const crepe = new Crepe({ root: hostRef.current, defaultValue: initialDoc })
     crepe.on((listener) => {
-      listener.markdownUpdated((_ctx, markdown) => onChangeRef.current(markdown))
+      listener.markdownUpdated((_ctx, markdown) => { onChangeRef.current(markdown); setDocVersion((v) => v + 1) })
     })
+    // Find highlighting rides along as a ProseMirror plugin — Crepe has no find of its
+    // own, and decorations leave the document (and so the markdown we save) untouched.
+    crepe.editor.use(findHighlightPlugin)
     crepeRef.current = crepe
     // create() is async; if we unmount before it resolves, tear down once it does.
     let destroyed = false
-    void crepe.create().then(() => { if (destroyed) void crepe.destroy() })
+    void crepe.create().then(() => { if (destroyed) void crepe.destroy(); else setDocVersion((v) => v + 1) })
     return () => { destroyed = true; crepeRef.current = null; void crepe.destroy() }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The live ProseMirror view, or null before create() resolves / after teardown.
+  // Milkdown seeds `editorViewCtx` with an EMPTY OBJECT until the view exists, so a
+  // plain null check isn't enough — reaching for `.state` on that placeholder is what
+  // an unguarded call gets you.
+  const proseView = useCallback((): ProseView | null => {
+    try {
+      let v: ProseView | undefined
+      crepeRef.current?.editor.action((ctx) => { v = ctx.get(editorViewCtx) })
+      return v?.state ? v : null
+    } catch { return null }   // editor not ready
+  }, [])
+
+  const hits = useMemo(() => {
+    if (!find.open || !find.query) return NO_HITS
+    const view = proseView()
+    return view ? findInDoc(view.state.doc, find.query, find.opts) : NO_HITS
+    // docVersion is the dependency that matters — the doc itself isn't React state.
+  }, [find.open, find.query, find.opts, docVersion, proseView])
+
+  const activeHit = hits.length ? hits[Math.min(find.index, hits.length - 1)] : undefined
+
+  // Repaint the highlights and scroll the current match into view. The DOM node is the
+  // reliable scroll target here: ProseMirror positions aren't pixel offsets, and the
+  // decoration we just dispatched is exactly the element we want on screen.
+  const wasOpenRef = useRef(false)
+  useEffect(() => {
+    // Nothing to clear until the bar has actually painted something — skip the whole
+    // effect on mount rather than pushing a no-op transaction into a fresh editor.
+    if (!find.open && !wasOpenRef.current) return
+    const view = proseView()
+    if (!view) return
+    if (!find.open) {
+      wasOpenRef.current = false
+      view.dispatch(view.state.tr.setMeta(...paintFind([], null)))
+      view.focus()
+      return
+    }
+    wasOpenRef.current = true
+    find.seekRef.current = false
+    view.dispatch(view.state.tr.setMeta(...paintFind(hits, activeHit?.docFrom ?? null)))
+    if (activeHit) {
+      requestAnimationFrame(() => {
+        hostRef.current?.querySelector('.pm-find-match-active')?.scrollIntoView({ block: 'center' })
+      })
+    }
+  }, [find.open, hits, activeHit?.docFrom]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Replacements go through the editor's own transactions, so undo works and the
+  // markdown listener fires — which keeps the file's dirty ● honest.
+  const replaceOne = useCallback(() => {
+    const view = proseView()
+    if (!view || !activeHit) return
+    view.dispatch(view.state.tr.insertText(expandReplacement(find.replacement, activeHit, find.opts), activeHit.docFrom, activeHit.docTo))
+  }, [activeHit, find.replacement, find.opts, proseView])
+
+  const replaceAll = useCallback(() => {
+    const view = proseView()
+    if (!view || !hits.length) return
+    const tr = view.state.tr
+    // Back to front: an earlier replacement would otherwise shift every position after it.
+    for (let i = hits.length - 1; i >= 0; i--) {
+      tr.insertText(expandReplacement(find.replacement, hits[i], find.opts), hits[i].docFrom, hits[i].docTo)
+    }
+    view.dispatch(tr)
+    find.setIndex(0)
+  }, [hits, find.replacement, find.opts, proseView]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reflect readOnly changes without rebuilding the editor.
   useEffect(() => { crepeRef.current?.setReadonly(readOnly) }, [readOnly])
@@ -97,8 +178,18 @@ export function MilkdownEditor({ initialDoc, readOnly, onChange, scrollKey }: Pr
           <Sep />
           <TB title="Link" onClick={addLink}>🔗</TB>
           <TB title="Divider" onClick={() => run(insertHrCommand.key)}>―</TB>
+          <Sep />
+          <TB title="Find & replace (Ctrl/Cmd+F)" onClick={find.openFind}>⌕</TB>
         </div>
       )}
+      <FindBar
+        find={find}
+        count={hits.length}
+        invalid={isInvalidQuery(find.query, find.opts)}
+        placeholder="Find in document…"
+        onReplace={readOnly ? undefined : replaceOne}
+        onReplaceAll={readOnly ? undefined : replaceAll}
+      />
       <div ref={hostRef} className="milkdown-host flex-1 min-h-0 overflow-auto" />
     </div>
   )
