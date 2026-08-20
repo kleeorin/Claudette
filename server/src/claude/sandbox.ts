@@ -596,6 +596,22 @@ export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
     'hunting for it elsewhere. It is almost certainly outside your sandbox. Say so, and',
     'ask the user to add it as a mount via the sandbox control (the lock chip in the',
     'session header) and relaunch. Network access is unrestricted.',
+    // Reads outside the box fail honestly (ENOENT); WRITES do not. The box root is a
+    // private tmpfs, so `mkdir -p` at a hidden path fabricates a RAM-only directory
+    // shadowing the host one, and the write into it then succeeds — a false "done" the
+    // ENOENT note above does not cover. Observed: an agent asked to write into an
+    // unmounted folder hit ENOENT, ran mkdir -p, and reported a clean success that
+    // reached no disk — it had fabricated the folder it was writing into.
+    'Writing outside that list can still LOOK like it worked. The sandbox root is a',
+    'private tmpfs: creating a missing parent directory (e.g. mkdir -p) at a hidden path',
+    'silently fabricates a RAM-only directory shadowing the host path, and the write into',
+    'it then reports success. It reached no disk and vanishes when the session ends. So',
+    'never create a parent directory to make a write succeed — if the directory was not',
+    'already visible to you, the path is outside the sandbox and the write did NOT happen.',
+    // This note rides --append-system-prompt, which reaches the session's main loop only;
+    // subagents get their own system prompt and are otherwise blind to the confinement.
+    'Subagents you spawn do NOT inherit this note. When you delegate work that touches the',
+    'filesystem, state these limits in the subagent prompt yourself.',
     // Told explicitly because the box's /dev is otherwise minimal enough that a GPU
     // failure reads as "this machine has no GPU" — the same misdiagnosis the mount note
     // above prevents for files.
