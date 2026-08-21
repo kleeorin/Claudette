@@ -116,19 +116,28 @@ export async function saveRef(cwd: string, uuid: string, commit: string): Promis
     warnOnce(`ref:${root}:${msg}`, `could not pin a snapshot ref in ${root} — code rewind is off here: ${msg}`)
     return
   }
-  await pruneRefs(root)
+  await pruneRefs(root, `${REF_PREFIX}/${uuid}`)
 }
 
-// Drop all but the newest KEEP_REFS snapshot refs. Ordered by the snapshot commit's own
-// committer date, so "newest" means newest turn rather than whatever order the ref store
-// happens to enumerate. Best-effort: a repo we can write refs into but not delete them
-// from is unusual, and failing to prune must never fail the turn.
-async function pruneRefs(root: string): Promise<void> {
+// Drop all but the newest KEEP_REFS snapshot refs, ordered by the snapshot commit's own
+// committer date — a good approximation of turn order, but only an approximation, which
+// is why the ref just written is held out explicitly below rather than trusted to sort
+// first. Best-effort: a repo we can write refs into but not delete them from is unusual,
+// and failing to prune must never fail the turn.
+async function pruneRefs(root: string, keep: string): Promise<void> {
   try {
     const out = await git(root, ['for-each-ref', '--sort=-committerdate', '--format=%(refname)', REF_PREFIX])
     const refs = out.split('\n').map((r) => r.trim()).filter(Boolean)
     if (refs.length <= KEEP_REFS) return
-    for (const ref of refs.slice(KEEP_REFS)) await git(root, ['update-ref', '-d', ref])
+    // The ref we have just written is held out of the candidate list ENTIRELY rather than
+    // trusted to sort first. commit-tree stamps only to the second, so two turns in the
+    // same second tie, and git then falls back to refname ASCENDING — over random uuids.
+    // The newest ref is therefore not reliably at the head of this list, while the tail is
+    // exactly what gets deleted. Whatever else goes, the turn that just happened has to
+    // stay rewindable. Holding it out before the slice (rather than skipping it during
+    // one) keeps the total at KEEP_REFS instead of overshooting by one.
+    const others = refs.filter((r) => r !== keep)
+    for (const ref of others.slice(KEEP_REFS - 1)) await git(root, ['update-ref', '-d', ref])
   } catch (e) {
     const msg = errMessage(e)
     warnOnce(`prune:${root}:${msg}`, `could not prune old snapshot refs in ${root}: ${msg}`)
