@@ -191,11 +191,15 @@ export class SessionManager extends EventEmitter {
     // Only an auth-gated HTTP caller (the operator) or boot-restore may pass a
     // sandbox with enabled:false; an untrusted/in-process caller can't lower it.
     trusted = false,
-    teamEmploy?: boolean,
+    // NOTE: no `teamEmploy` here. It used to be a trailing parameter that no caller
+    // passed, and it flowed into register() with NO trust check — unlike setTeamEmploy,
+    // which refuses an untrusted grant precisely so a confined session can't hire itself
+    // a team. Boot restore reaches register() directly, so nothing needs it here; a live
+    // grant goes through the auth-gated setTeamEmploy route.
   ): string {
     const session = this.register(
       name, cwd, rootDir, parentId, resume, claudeSessionId,
-      agentId, model, permissionMode, sandbox, trusted, teamEmploy,
+      agentId, model, permissionMode, sandbox, trusted,
     )
     this.launch(session)
     // This session's parent may have just gained its first member and become a
@@ -312,13 +316,13 @@ export class SessionManager extends EventEmitter {
   // and on relaunch. Panes/notebook/etc. are independent of the engine, so a
   // session stays usable even if Claude fails to start.
   private launch(session: Session): void {
-    const { id, cwd, resume, claudeSessionId } = session
+    const { id, resume, claudeSessionId } = session
     // The session runs as its agent (role): charter + tool scope + model. `general`
     // (the default) contributes nothing, so a plain session is unchanged.
     const agent = getAgent(session.agentId)
     // Decide confinement first so it can inform the system prompt (a sandboxed
     // session is told what it can see — see sandboxSystemPrompt).
-    const runCwd = cwd || homedir()
+    const runCwd = runDirOf(session)
     const canSandbox = !!session.sandbox?.enabled && sandboxAvailable()
     // Per-session model override wins over the role's default model. The team charters
     // make a session aware of its place in the star: a member (has a parentId) learns it
@@ -451,7 +455,7 @@ export class SessionManager extends EventEmitter {
       // line, with its uuid, is on disk by the time the model replies) so the snapshot
       // ref is written early in the turn — not racing a client that opens /rewind the
       // instant the turn ends. `result` is a fallback if no assistant event appeared.
-      if (e.type === 'assistant' || e.type === 'result') void this.attachPendingSnapshot(session)
+      if (e.type === 'assistant' || e.type === 'result') void this.attachPendingSnapshot(session, e.type === 'result')
     })
     engine.on('ready', (sid: string) => {
       // claude may hand back a different id (e.g. on resume mismatch); trust it.
@@ -660,8 +664,14 @@ export class SessionManager extends EventEmitter {
     // so emitting it before we knew the write would land meant a turn we then reported as
     // undelivered had already been shown to the user — and the mailbox, doing the right
     // thing, re-queued and delivered it again, printing it twice.
-    if (!session.engine || session.replacing || session.closing) return false
-    if (commit) session.pendingSnapshot = { commit, text }
+    // `engine.alive` is part of the check, not just the return value below: `engine` is
+    // nulled only on the exit EVENT, so a claude that crashed microseconds ago is still a
+    // non-null object with a dead child. That passed this guard, ran every side effect,
+    // and then sendUserTurn returned false — so the mailbox re-queued a message every
+    // client had already rendered, and it printed twice on relaunch. Exactly the failure
+    // the paragraph above describes, reached by a path `replacing`/`closing` don't cover.
+    if (!session.engine || !session.engine.alive || session.replacing || session.closing) return false
+    if (commit) { session.pendingSnapshot = { commit, text }; session.snapshotTries = 0 }
     // A new user message = a new turn: notify listeners so per-turn state (e.g. the
     // notebook "working target" pin) resets and re-binds to the user's current view,
     // AND so every client mirrors the message (text/turnId), not just the sender.
@@ -691,16 +701,34 @@ export class SessionManager extends EventEmitter {
   // isn't on disk yet (no match), pending is left for a later call to resolve, so we
   // never mis-key this snapshot onto an earlier turn. Best effort: a non-git session or
   // a never-matching turn simply leaves no code snapshot.
-  private async attachPendingSnapshot(session: Session): Promise<void> {
+  // `force` = this is the end-of-turn attempt (a `result`, or the next turn's last
+  // chance). Those always run; mid-turn `assistant` attempts are budgeted, see below.
+  private async attachPendingSnapshot(session: Session, force = false): Promise<void> {
     const pending = session.pendingSnapshot
     if (!pending) return
+    // Each attempt reads and JSON.parses the WHOLE conversation transcript
+    // (listRewindPoints), and this is driven from the event tap — every assistant event
+    // of the turn. When the match never succeeds (the CLI stored a user line that isn't
+    // byte-equal to what we sent — the case the warning in sendUserTurn describes), a
+    // 40-tool-call turn re-parsed a multi-MB, still-growing .jsonl forty times. Worse,
+    // the calls are `void`-ed, so those reads overlapped.
+    //
+    // Two guards: one at a time, and a budget on the speculative mid-turn retries. The
+    // user line lands on disk within the first event or two, so a small budget costs
+    // nothing when the match is going to happen at all.
+    if (session.snapshotBusy) return
+    if (!force && (session.snapshotTries ?? 0) >= SNAPSHOT_MATCH_TRIES) return
+    session.snapshotBusy = true
+    session.snapshotTries = (session.snapshotTries ?? 0) + 1
     try {
       const points = await listRewindPoints(session.cwd, session.claudeSessionId)
       const match = [...points].reverse().find((p) => !p.hasSnapshot && p.text === pending.text.trim())
       if (!match) return   // user line not on disk yet — retry on a later event
       session.pendingSnapshot = undefined   // clear only once we've found the turn to key
       await saveRef(session.cwd, match.uuid, pending.commit)
-    } catch { /* leave pending; a later event (or result) retries */ }
+    } catch { /* leave pending; a later event (or result) retries */ } finally {
+      session.snapshotBusy = false
+    }
   }
 
   // Fold one raw stream-json event into the subagent registry. Runs from the same tap

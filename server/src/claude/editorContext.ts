@@ -22,7 +22,19 @@ export function buildEditorContext(path: string): string {
 
 // Remove a trailing editor-context block (with any whitespace around it) from stored
 // user text, so nothing the CLI persisted leaks back into the UI.
-const RE = new RegExp(`\\s*${OPEN}[\\s\\S]*?${CLOSE}\\s*$`)
+//
+// Cut at the LAST opening tag, not by regex. The end-anchored, lazily-quantified pattern
+// this replaces matched from the FIRST `<editor-context>` whose closing tag was followed
+// only by whitespace — so a prompt that itself contained the literal tag
+// ("fix <editor-context>x</editor-context> please") had everything from the user's own
+// tag onward swallowed, leaving "fix". Beyond mangling the displayed prompt, that broke
+// the rewind matcher: attachPendingSnapshot compares the stripped point text against the
+// raw text we sent, so the two could never agree again and the turn had no code snapshot.
+// We only ever APPEND one block at the very end, so only a trailing one is ours.
 export function stripEditorContext(text: string): string {
-  return text.replace(RE, '')
+  const i = text.lastIndexOf(OPEN)
+  if (i < 0) return text
+  // Ours only if that last block runs to the very end (trailing whitespace aside).
+  if (!text.slice(i).trimEnd().endsWith(CLOSE)) return text
+  return text.slice(0, i).trimEnd()
 }

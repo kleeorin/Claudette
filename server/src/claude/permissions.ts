@@ -11,7 +11,6 @@
 // into an effective picture (rules tagged by origin scope + the effective
 // defaultMode); addRule/removeRule read-modify-write one scope's file. Claudette is
 // local-only, so — unlike the ClaudeMaster original — there is no remote/ssh path.
-import { homedir } from 'os'
 import { join, dirname } from 'path'
 import { errMessage } from '../util/errMessage'
 import { readFile, writeFile, mkdir } from 'fs/promises'
@@ -20,6 +19,7 @@ import type {
   PermissionAction, WriteResult,
 } from '@claudette/shared'
 import { getAgent } from './agents'
+import { settingsJsonPaths } from './configProtection'
 import { NOTEBOOK_DENY } from './claudeEngine'
 
 // The modes we recognise for display; an unknown `defaultMode` string is ignored
@@ -53,11 +53,14 @@ function extract(data: Record<string, unknown> | null): { allow: string[]; deny:
 // (getEffective) and write (add/removeRule) so they always agree on where each
 // scope's file lives.
 function resolvePaths(cwd: string): Record<PermissionScope, string> {
-  return {
-    user: join(homedir(), '.claude', 'settings.json'),
-    project: join(cwd, '.claude', 'settings.json'),
-    local: join(cwd, '.claude', 'settings.local.json'),
-  }
+  // Built from settingsJsonPaths so the user + project scopes can never disagree with
+  // the config-protection layer about where a settings file lives. It also fixes the
+  // user scope under CLAUDE_CONFIG_DIR: this used to hardcode ~/.claude while every
+  // launched session honours the env var, so with it set the Permission Control Center
+  // read and wrote a settings.json no session was using — the user scope always showed
+  // empty and "add user rule" had no effect anywhere.
+  const [user, project] = settingsJsonPaths(cwd)
+  return { user, project, local: join(cwd, '.claude', 'settings.local.json') }
 }
 
 // The effective permission picture for a session's cwd and its agent role. Reads

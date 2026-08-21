@@ -1,6 +1,7 @@
 import { execFile } from 'child_process'
 import { unlink } from 'fs/promises'
 import { join } from 'path'
+import { errMessage } from '../util/errMessage'
 import { tmpdir } from 'os'
 import crypto from 'crypto'
 
@@ -31,10 +32,6 @@ function warnOnce(key: string, msg: string): void {
   console.warn(`[rewind] ${msg}`)
 }
 
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e)
-}
-
 // execFile git with an optional GIT_INDEX_FILE override. Rejects with the trimmed
 // stderr on failure; `.gitCode === 128` marks "not a repo" for callers to swallow.
 function git(dir: string, args: string[], indexFile?: string): Promise<string> {
@@ -57,7 +54,7 @@ export async function repoRoot(cwd: string): Promise<string | null> {
   catch (e) {
     // "not a git repository" is the ordinary, expected miss — stay quiet. Anything else
     // (dubious ownership, git not on PATH, an unreadable dir) is a fault the user can fix.
-    const msg = errText(e)
+    const msg = errMessage(e)
     if (!/not a git repository/i.test(msg)) warnOnce(`root:${cwd}:${msg}`, `git unusable in ${cwd} — code rewind is off here: ${msg}`)
     return null
   }
@@ -91,13 +88,21 @@ export async function snapshot(cwd: string): Promise<string | null> {
     // The single most common machine-level cause lands here: commit-tree with no committer
     // identity configured ("unable to auto-detect email address"), which disables code
     // rewind on that machine for every turn, forever, with nothing else to show for it.
-    const msg = errText(e)
+    const msg = errMessage(e)
     warnOnce(`snap:${root}:${msg}`, `could not snapshot the working tree in ${root} — code rewind is off here: ${msg}`)
     return null
   } finally {
     await unlink(idx).catch(() => {})
   }
 }
+
+// How many rewind snapshots to keep per repo. Each ref pins a whole tree plus a fresh
+// blob for every modified or untracked file at that moment, and it is gc-proof by
+// construction — that is the point of the ref. One is written per user turn, so without
+// a ceiling a busy repo with large untracked artifacts grows a full working-tree copy per
+// turn, forever. The rewind picker only ever offers recent turns, so the deep tail is
+// storage nobody can reach from the UI.
+const KEEP_REFS = 200
 
 // Protect a snapshot commit from gc and key it to a turn's message uuid.
 export async function saveRef(cwd: string, uuid: string, commit: string): Promise<void> {
@@ -107,8 +112,26 @@ export async function saveRef(cwd: string, uuid: string, commit: string): Promis
   catch (e) {
     // Snapshots are being taken but can't be pinned (read-only ref store) — they'll be gc'd
     // and every turn will show "No snapshot", so this is worth saying out loud.
-    const msg = errText(e)
+    const msg = errMessage(e)
     warnOnce(`ref:${root}:${msg}`, `could not pin a snapshot ref in ${root} — code rewind is off here: ${msg}`)
+    return
+  }
+  await pruneRefs(root)
+}
+
+// Drop all but the newest KEEP_REFS snapshot refs. Ordered by the snapshot commit's own
+// committer date, so "newest" means newest turn rather than whatever order the ref store
+// happens to enumerate. Best-effort: a repo we can write refs into but not delete them
+// from is unusual, and failing to prune must never fail the turn.
+async function pruneRefs(root: string): Promise<void> {
+  try {
+    const out = await git(root, ['for-each-ref', '--sort=-committerdate', '--format=%(refname)', REF_PREFIX])
+    const refs = out.split('\n').map((r) => r.trim()).filter(Boolean)
+    if (refs.length <= KEEP_REFS) return
+    for (const ref of refs.slice(KEEP_REFS)) await git(root, ['update-ref', '-d', ref])
+  } catch (e) {
+    const msg = errMessage(e)
+    warnOnce(`prune:${root}:${msg}`, `could not prune old snapshot refs in ${root}: ${msg}`)
   }
 }
 
@@ -118,11 +141,6 @@ async function commitFor(cwd: string, uuid: string): Promise<string | null> {
   if (!root) return null
   try { return (await git(root, ['rev-parse', '--verify', '--quiet', `${REF_PREFIX}/${uuid}`])).trim() || null }
   catch { return null }
-}
-
-// Whether a turn has a restorable code snapshot (drives the picker's Code option).
-export async function hasSnapshot(cwd: string, uuid: string): Promise<boolean> {
-  return (await commitFor(cwd, uuid)) != null
 }
 
 // The turn uuids that have a snapshot in this repo — a batch check so listRewindPoints

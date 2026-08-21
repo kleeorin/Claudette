@@ -367,7 +367,13 @@ export class ClaudeEngine extends EventEmitter {
       this.emit('ready', sid)
     } else if (type === 'result') {
       this._turnActive = false
-      this.setState('idle')
+      // Stay 'waiting' while prompts are still outstanding — the same rule
+      // respondPermission applies above, and for the same reason. A BACKGROUND subagent's
+      // can_use_tool can arrive before the main turn's result: forcing 'idle' here made
+      // SessionManager drop the session's whole pending-permission map on the idle
+      // transition, so the prompt vanished from every device's snapshot while the CLI sat
+      // blocked on a control_response that could no longer be sent.
+      this.setState(this.pending.size > 0 ? 'waiting' : 'idle')
     }
   }
 

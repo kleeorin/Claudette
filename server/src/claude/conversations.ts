@@ -1,13 +1,14 @@
 import { readdir, readFile, stat, writeFile } from 'fs/promises'
 import { join } from 'path'
-import { homedir } from 'os'
 import crypto from 'crypto'
 import type { ConversationMeta, ClaudeEvent, RewindPoint } from '@claudette/shared'
 import { snapshottedUuids } from '../git/shadowSnapshots'
+import { claudeConfigDir } from './sandbox'
 import { stripEditorContext } from './editorContext'
 
 // Claude stores each conversation as a JSONL transcript under
-// ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. The dir name is the absolute
+// <claudeConfigDir()>/projects/<encoded-cwd>/<sessionId>.jsonl (i.e. ~/.claude unless
+// CLAUDE_CONFIG_DIR overrides it). The dir name is the absolute
 // cwd with every non-alphanumeric char replaced by '-'. This backs the native
 // /resume picker — the launch-time flow the headless stream-json channel can't
 // express. Ported from ClaudeMaster's `main/conversations.ts` (already local-only).
@@ -22,7 +23,13 @@ export function mangleCwd(cwd: string): string {
 }
 
 export function projectDir(cwd: string): string {
-  return join(homedir(), '.claude', 'projects', mangleCwd(cwd))
+  // claudeConfigDir(), not ~/.claude: the CLI writes its transcripts under
+  // CLAUDE_CONFIG_DIR when that is set, and sandbox.ts sets it for every confined child.
+  // Hardcoding the home path meant that with the env var set, /resume listed nothing,
+  // listRewindPoints returned [] (so code rewind was permanently unavailable),
+  // forkConversationBefore returned null and /api/session/rewind answered "rewind point
+  // not found" — all while the transcripts sat there under the configured directory.
+  return join(claudeConfigDir(), 'projects', mangleCwd(cwd))
 }
 
 function contentText(content: unknown): string {
