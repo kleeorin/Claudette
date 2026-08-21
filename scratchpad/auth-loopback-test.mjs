@@ -81,6 +81,36 @@ const authRes = await fetch(`${APP}/api/auth?token=${token}`)
 const cookie = (authRes.headers.get('set-cookie') || '').split(';')[0]
 check('/api/auth?token= sets the auth cookie', authRes.ok && cookie.startsWith('claudette_auth='))
 check('cookie grants access', await status('/api/session/list', { headers: { cookie } }) === 200)
+
+// --- /api/health discloses NOTHING about the host before you authenticate ------
+// It is in the auth hook's OPEN set, so everything it returns is readable by anyone who
+// can reach the port. It used to answer with the host's GPU device inventory and the
+// server user's home directory — exactly what you want before guessing a ?token= or
+// naming a path under ~/.claude.
+{
+  const anon = await (await fetch(`${APP}/api/health`)).json()
+  check('unauthenticated /api/health still answers liveness', anon.ok === true && typeof anon.version === 'string')
+  check('unauthenticated /api/health keeps the sandbox capability flag', typeof anon.sandboxAvailable === 'boolean')
+  check('unauthenticated /api/health hides homeDir', anon.homeDir === undefined, `got ${JSON.stringify(anon.homeDir)}`)
+  check('unauthenticated /api/health hides gpuDevices', anon.gpuDevices === undefined, `got ${JSON.stringify(anon.gpuDevices)}`)
+
+  const authed = await (await fetch(`${APP}/api/health`, { headers: { cookie } })).json()
+  check('authenticated /api/health still serves homeDir (the UI needs it)', typeof authed.homeDir === 'string' && authed.homeDir.length > 0)
+  check('authenticated /api/health still serves gpuDevices', Array.isArray(authed.gpuDevices))
+}
+
+// --- /api/auth compares the token in constant time ----------------------------
+// The one unauthenticated, unrate-limited endpoint whose whole job is checking a token,
+// i.e. the only place a timing oracle is actually reachable. A plain !== leaks the
+// length and the position of the first wrong character.
+{
+  const rejects = async (t) => (await fetch(`${APP}/api/auth?token=${encodeURIComponent(t)}`)).status === 401
+  check('/api/auth rejects a short wrong token', await rejects('x'))
+  check('/api/auth rejects a same-length wrong token', await rejects('z'.repeat(token.length)))
+  check('/api/auth rejects a token sharing a long prefix', await rejects(token.slice(0, -1) + (token.endsWith('a') ? 'b' : 'a')))
+  check('/api/auth rejects a token that is a prefix of the real one', await rejects(token.slice(0, -1)))
+  check('/api/auth still accepts the real token', (await fetch(`${APP}/api/auth?token=${token}`)).ok)
+}
 check('WS upgrade refused without token', (await wsResult({})) === 'refused')
 check('WS upgrade accepted with cookie', (await wsResult({ cookie })) === 'open')
 await stop(s)
