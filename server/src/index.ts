@@ -26,6 +26,10 @@ import { PaneManager } from './pane/paneManager'
 import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from './pane/paneApi'
 import { registerFsRoutes } from './fs/fsApi'
 import { registerGitRoutes } from './git/gitApi'
+import { registerConnectorRoutes } from './connectors/connectorApi'
+import { ConnectorProxy } from './connectors/connectorProxy'
+import { connectorServers, connectorDenyRules } from './connectors/connectorLaunch'
+import { strictMode, defaultGrants } from './connectors/connectorStore'
 import { registerUsageRoutes } from './usage/usageApi'
 import { resolveAuth, makeAuthHook, isAuthed, authCookie, tokenFilePath } from './auth'
 
@@ -90,8 +94,26 @@ registerNotebookTools(mcp, notebooks, kernels, activePanes, turnNotebooks, (sess
   // kernel) — just move the calling session's view onto it.
   hub.broadcast({ type: 'session:focusFile', id: sessionId, path })
 }, confinement)
+// The connector proxy stands between a granted session and an HTTP connector, so the
+// credential never enters a box and a revocation bites the very next call. Its grant
+// check reads the LIVE session record (not what the engine launched with) — that is what
+// makes ungranting immediate. Constructed before SessionManager because the manager's
+// launch hooks below mint URLs from it.
+// Annotated (rather than inferred) to break a circular inference: the proxy's grant check
+// closes over `sessions`, whose options build URLs from the proxy.
+const connectorProxy: ConnectorProxy = new ConnectorProxy(
+  (sid: string, cid: string): boolean => sessions.isGranted(sid, cid),
+)
 const sessions = new SessionManager({
-  mcpConfig: (sid) => mcp.configFor(sid),
+  // Claudette's own app-control server plus whatever catalog connectors this session was
+  // granted, in ONE mcpServers object — the CLI takes a single --mcp-config.
+  mcpConfig: (sid, granted) => JSON.stringify({
+    mcpServers: { ...mcp.serversFor(sid), ...connectorServers(sid, granted, connectorProxy) },
+  }),
+  connectorDeny: (s) => connectorDenyRules(s),
+  strictMcp: () => strictMode(),
+  releaseConnectors: (sid) => connectorProxy.release(sid),
+  defaultGrants,
   activePane: (sid) => activePanes.get(sid) ?? null,
 })
 // Team messaging: the mailbox injects a session-to-session message as a user turn in
@@ -216,6 +238,7 @@ registerNotebookRoutes(app, notebooks, kernels)
 registerPaneRoutes(app, panes)
 registerFsRoutes(app)
 registerGitRoutes(app)
+registerConnectorRoutes(app, sessions)
 registerUsageRoutes(app)
 
 // Reverse-proxy the browser's Jupyter REST/asset requests through our origin, with
@@ -294,6 +317,10 @@ async function start(): Promise<void> {
   // launches with its --mcp-config.
   const mcpPort = await mcp.start()
   app.log.info(`AppControl MCP server on http://127.0.0.1:${mcpPort}`)
+  // Same ordering requirement as the MCP server: a restored session launches with its
+  // connector URLs, so the proxy needs a real port before restore() runs.
+  const proxyPort = await connectorProxy.start()
+  app.log.info(`Connector proxy on http://127.0.0.1:${proxyPort}${strictMode() ? ' (strict MCP mode ON)' : ''}`)
   // Restore persisted sessions (each re-launched with --resume) before serving.
   const restored = sessions.restore(await loadState())
   if (restored.length) app.log.info(`Restored ${restored.length} session(s) from disk`)

@@ -16,6 +16,11 @@ export interface Agent extends AgentInfo {
   model?: string               // pin a model; undefined = user default
   allowedTools?: string[]      // whitelist → --allowedTools (auto-approve)
   disallowedTools?: string[]   // blacklist → --disallowedTools (MERGED with NOTEBOOK_DENY)
+  // Is this role READ-ONLY in intent? Declared rather than inferred from disallowedTools,
+  // because the two differ: `reviewer` keeps Bash (to run git diff and tests) yet must
+  // still not gain a mutating MCP tool. Connector scoping reads this — an MCP tool is not
+  // in any of the native lists above, so nothing else would catch it.
+  readOnly?: boolean
 }
 
 // The tools that MUTATE the workspace — blocked for read-only roles so they can
@@ -41,6 +46,7 @@ export const AGENTS: Record<string, Agent> = {
       + 'You are READ-ONLY: do not modify files or run mutating commands — read, search, and reason. End with the concrete steps, the files each touches, and the risks or open questions.',
     allowedTools: RESEARCH_TOOLS,
     disallowedTools: WRITE_TOOLS,
+    readOnly: true,
   },
   reviewer: {
     id: 'reviewer',
@@ -52,6 +58,9 @@ export const AGENTS: Record<string, Agent> = {
     // A reviewer may run read-only shell (git diff, run tests) — allow Bash, block edits.
     allowedTools: [...READ_TOOLS, 'Bash'],
     disallowedTools: ['Write', 'Edit', 'NotebookEdit'],
+    // Keeps Bash, so it is NOT read-only by tool list — but it is by charter, and a
+    // mutating MCP tool would sit outside every native deny above.
+    readOnly: true,
   },
   implementer: {
     id: 'implementer',
@@ -70,6 +79,7 @@ export const AGENTS: Record<string, Agent> = {
       + 'You are READ-ONLY: do not modify files or run mutating commands. Distinguish what the sources establish from your inference, and flag uncertainty.',
     allowedTools: RESEARCH_TOOLS,
     disallowedTools: WRITE_TOOLS,
+    readOnly: true,
   },
 }
 
@@ -110,11 +120,18 @@ export const MEMBER_INSTRUCTION =
   + 'Write it for a successor who was not there — how the code is laid out, the conventions, the traps, the decisions and why — not as a status update.'
 
 export function getAgent(id?: string): Agent {
-  return (id && AGENTS[id]) || AGENTS.general
+  // Own-property lookup for the same reason isAgent uses it: `AGENTS['constructor']`
+  // resolves up the prototype chain to a truthy non-Agent, which would win over the
+  // `general` fallback.
+  return (id && Object.hasOwn(AGENTS, id) ? AGENTS[id] : undefined) || AGENTS.general
 }
 
 export function isAgent(id: string): boolean {
-  return id in AGENTS
+  // hasOwn, not `in`: `in` walks the prototype chain, so 'constructor', 'toString' and
+  // friends all validated. setAgent then stored and PERSISTED a bogus role, and
+  // getAgent('constructor') returned Object's constructor — truthy, so no fallback to
+  // `general` — and launch() read systemPrompt/allowedTools/readOnly off a Function.
+  return Object.hasOwn(AGENTS, id)
 }
 
 export function listAgents(): Array<Pick<Agent, 'id' | 'name' | 'description'>> {

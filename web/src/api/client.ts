@@ -15,6 +15,7 @@ import type {
   AgentInfo, ListAgentsResponse,
   EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
   UsageResponse,
+  ConnectorsResponse, ConnectorDef, ConnectorView, AccountConnector, StrictPreflight,
 } from '@claudette/shared'
 
 // The single place the SPA talks to the server — replaces ClaudeMaster's Electron
@@ -253,6 +254,25 @@ export const api = {
     // Grant/revoke a session's right to hire teammates. Only this auth-gated route can:
     // the server refuses an untrusted grant so a confined session can't hire itself a team.
     setTeamEmploy: (id: string, teamEmploy: boolean) => post<OkResponse>('/api/session/setTeamEmploy', { id, teamEmploy }),
+    // --- connectors (see CONNECTORS.md) --------------------------------------
+    // The CATALOG is global (one per install); the GRANT is per session. Two scopes, two
+    // surfaces: the Claudette deck edits the catalog, the sandbox panel edits a session's
+    // grants. Every write here is auth-gated, which is what makes it "trusted" server-side.
+    listConnectors: () => get<ConnectorsResponse>('/api/connectors'),
+    saveConnector: (def: ConnectorDef) =>
+      post<{ connector?: ConnectorView; error?: string }>('/api/connectors/save', def),
+    deleteConnector: (id: string) => post<OkResponse>('/api/connectors/delete', { id }),
+    setAccountConnectors: (accountConnectors: AccountConnector[]) =>
+      post<{ accountConnectors: AccountConnector[] }>('/api/connectors/account', { accountConnectors }),
+    connectorPreflight: (cwd: string) =>
+      get<StrictPreflight>(`/api/connectors/preflight?cwd=${encodeURIComponent(cwd)}`),
+    importConnectors: (cwd: string) =>
+      post<{ added: string[]; skipped: { name: string; source: string; reason: string }[] }>('/api/connectors/import', { cwd }),
+    setStrictMcp: (enabled: boolean) => post<{ strict: boolean }>('/api/connectors/strict', { enabled }),
+    // Per-session grants. Returns an error string for an unknown connector id rather than
+    // letting a typo sit inert in the grant list.
+    setSessionConnectors: (id: string, connectors: string[], accountConnectors: string[]) =>
+      post<OkResponse & { error?: string }>('/api/session/setConnectors', { id, connectors, accountConnectors }),
     restartFresh: (id: string) => post<OkResponse>('/api/session/restartFresh', { id }),
     resumeInto: (id: string, claudeSessionId: string) => post<OkResponse>('/api/session/resumeInto', { id, claudeSessionId }),
     listConversations: async (cwd: string): Promise<ConversationMeta[]> =>

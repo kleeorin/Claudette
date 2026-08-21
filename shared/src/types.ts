@@ -78,6 +78,22 @@ export interface SessionInfo {
                        // same way the sandbox is: only a trusted (auth-gated) caller may set
                        // it, so a confined session can't reach the loopback API and grant
                        // itself a team — see SANDBOX.md "Control-plane escape".
+  connectors?: string[]        // CATALOG connector ids this session may reach (see connectors.ts).
+                               // Absent/empty = none: the session's --mcp-config carries no
+                               // such entry, so it has none of those tools at all. Trust-gated
+                               // exactly like teamEmploy — a confined session must not be able
+                               // to grant itself reach it wasn't given.
+  accountConnectors?: string[] // claude.ai ACCOUNT connectors this session may use. Stored as
+                               // an ALLOW list (not a deny list) so the default — absent/empty —
+                               // is "none", and a newly created session is fail-closed rather
+                               // than silently inheriting whatever the account has connected.
+                               // Enforced by a deny rule for everything not listed, since
+                               // Claudette holds no credential and so cannot withhold one.
+  connectorsPending?: boolean  // the granted set differs from what the RUNNING engine has. The
+                               // engine reads its server list once at spawn (and ignores
+                               // tools/list_changed), so a new grant only becomes visible on
+                               // relaunch — same shape as sandboxPending. Revoking is immediate
+                               // regardless: the proxy refuses the call.
   state: SessionState
   exitError?: string // last output when state === 'exited' (why it failed to start)
 }
@@ -106,6 +122,9 @@ export interface SavedSession {
   sandbox?: SandboxConfig  // bwrap confinement config (re-applied on restore)
   teamEmploy?: boolean     // may hire teammates (re-applied on restore — a persisted
                            // value was already operator-approved, so restore is trusted)
+  connectors?: string[]        // granted catalog connectors (re-applied on restore, same
+                               // reasoning as teamEmploy: a persisted grant was operator-approved)
+  accountConnectors?: string[] // allowed account connectors (ditto)
   claudeSessionId?: string // claude's own --session-id, for --resume on restore
   tasks?: TaskRecord[]     // subagent lifecycle registry, so a restart doesn't strand tray cards
 }

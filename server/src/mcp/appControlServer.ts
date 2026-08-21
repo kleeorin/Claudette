@@ -44,9 +44,24 @@ export class AppControlMcpServer {
 
   // Per-session --mcp-config JSON string. The token in the URL attributes calls.
   configFor(sessionId: string): string {
+    return JSON.stringify({ mcpServers: this.serversFor(sessionId) })
+  }
+
+  // Just the mcpServers ENTRY, so a caller can merge it with a session's granted
+  // connectors into the single object --mcp-config takes. Split out of configFor rather
+  // than having the caller parse its JSON back apart.
+  serversFor(sessionId: string): Record<string, unknown> {
+    // Retire this session's PREVIOUS tokens first. A session is relaunched on every
+    // sandbox edit, role change, agent change and permission-mode restart, and each
+    // relaunch used to mint a token while leaving the old ones fully authorized for the
+    // process lifetime: a URL recovered from a dead engine's argv (visible in `ps`) kept
+    // driving the notebook and team tools as that session, and the map grew one entry per
+    // relaunch. The connector proxy already follows this rule — each launch gets fresh
+    // reach, and its predecessor's dies with it.
+    this.release(sessionId)
     const token = randomUUID()
     this.tokens.set(token, sessionId)
-    return JSON.stringify({ mcpServers: { app: { type: 'http', url: `http://127.0.0.1:${this.port}/mcp/${token}` } } })
+    return { app: { type: 'http', url: `http://127.0.0.1:${this.port}/mcp/${token}` } }
   }
 
   release(sessionId: string): void {

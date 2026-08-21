@@ -4,6 +4,7 @@ import { useSessions } from '../store/sessions'
 import { api } from '../api/client'
 import { prettyPath } from '../lib/paths'
 import { FileBrowser } from './FileBrowser'
+import { ConnectorGrants } from './ConnectorGrants'
 
 // The sandbox editing controls (see SANDBOX.md): enable/disable confinement, edit the
 // rw/ro mounts, add a folder, and apply pending changes. Layout-neutral so it can sit
@@ -185,6 +186,12 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
           )}
         </>
       )}
+
+      {/* Connector grants sit OUTSIDE the `enabled` block on purpose: a session's service
+          reach matters whether or not it is confined to a filesystem box, and an
+          unsandboxed session is exactly the one where you most want to see what external
+          servers it can call. The catalog they're drawn from is global (Claudette deck). */}
+      <ConnectorGrants session={session} compact={compact} />
 
       {/* Pending changes auto-apply the moment the session is idle. While a turn is
           running the relaunch waits — offer to apply now (ends the turn). */}

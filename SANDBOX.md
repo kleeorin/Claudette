@@ -326,6 +326,16 @@ honored, but the app-source rw overlay below and the default-on confinement boun
 they can widen; broadening mounts is far less dangerous than `enabled:false` once the box
 holds no token.) Verified in `scratchpad/sandbox-escape-fixes-test.mts`.
 
+**The same gate now guards three other widening moves.** `teamEmploy` (may this session
+*hire*?), `sandbox.gpu` (see "GPU passthrough" above), and **connector grants** (may this
+session reach an external MCP server? — see [CONNECTORS.md](CONNECTORS.md)) all refuse an
+untrusted request by the identical argument: an in-box caller can reach the loopback
+control API but holds no `CLAUDETTE_TOKEN`, so only the auth-gated operator route, boot
+restore of an already-approved value, or inheritance of a parent's already-approved value
+may set them. Connector grants add one wrinkle worth copying elsewhere: an untrusted call
+is **refused**, not applied-as-empty, because silently revoking everything would turn a
+rejected escalation into a denial of service against the operator's own session.
+
 Note the layered result: even under `CLAUDETTE_NO_AUTH=1` (loopback open), a box that
 reaches `/api/session/create` still can't get an unconfined session (C), can't make the app
 source writable (self-mod fix), and any pane it makes is confined (terminal-pane fix) — the

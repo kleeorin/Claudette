@@ -18,6 +18,7 @@ import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
 import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
+import { connectorKey } from '../connectors/connectorLaunch'
 import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir, releaseHostConfigDir } from './configProtection'
 
 // Owns the set of Claude sessions and their engines. Ported from
@@ -51,6 +52,10 @@ interface Session extends SessionInfo {
   // this, launchStale had no term that noticed, so a promoted orphan kept being told to
   // report to a coordinator that no longer exists.
   appliedMember?: boolean
+  // Connector grants actually in force at the last launch (connectorKey), for the same
+  // pending detection as appliedSandboxKey. Granting needs a relaunch because the engine
+  // reads its MCP server list once at spawn; REVOKING does not (the proxy refuses live).
+  appliedConnectorKey?: string
   claudeSessionId: string       // claude's own session id (for --resume)
   startedAt: number             // last launch time, for the fast-failure heuristic
   resume: boolean               // whether Claude was launched with --resume
@@ -63,7 +68,16 @@ interface Session extends SessionInfo {
   // uuid, which is known only once the turn ends — see attachPendingSnapshot. Backs
   // /rewind code-restore (Phase 2). `text` matches the snapshot to its user turn.
   pendingSnapshot?: { commit: string; text: string }
+  snapshotTries?: number        // mid-turn match attempts spent on the CURRENT pendingSnapshot
+  snapshotBusy?: boolean        // an attempt is in flight (the calls are void-ed, so they can overlap)
 }
+
+// The directory a session's engine ACTUALLY runs in. A session may be created with an
+// empty cwd, and launch() falls back to the home dir; anything that has to agree with a
+// running engine — above all sandboxKey, whose value depends on the directory — must ask
+// this rather than read `cwd` directly, or the "is the applied config still current?"
+// comparison comes out false against itself.
+function runDirOf(s: { cwd: string }): string { return s.cwd || homedir() }
 
 // A session that dies within this window of launching never really started
 // (e.g. `claude: command not found`). We report those as failures (keep the row
@@ -75,12 +89,29 @@ const TAIL_MAX = 2000
 // .jsonl holds the complete history for /resume, so this only limits the live
 // catch-up a freshly-connected device gets.
 const TRANSCRIPT_CAP = 4000
+// How many mid-turn attempts to spend matching a pending snapshot to its user turn.
+// The CLI writes the user line early, so a match that is going to happen happens within
+// the first event or two; the budget only bounds the case where it never will.
+const SNAPSHOT_MATCH_TRIES = 8
 
 // Optional hooks the app injects (kept out of SessionManager's core so it stays
 // transport-only). `mcpConfig` returns the --mcp-config string for a session
 // (the app-control server); undefined skips it.
 export interface SessionManagerOpts {
-  mcpConfig?: (sessionId: string) => string | undefined
+  // The --mcp-config JSON for a session: Claudette's own app-control server merged with
+  // whatever catalog connectors it has been granted. Takes the grants rather than reading
+  // them itself so SessionManager keeps knowing nothing about the connector catalog.
+  mcpConfig?: (sessionId: string, granted: string[]) => string | undefined
+  // Deny rules contributed by the connector layer (ungranted account connectors,
+  // read-only-role scoping, unusable tool names) — merged into --disallowedTools.
+  connectorDeny?: (s: { granted: string[]; accountAllow: string[]; readOnlyRole: boolean }) => string[]
+  // Is --strict-mcp-config in force? Operator-controlled; when on, the catalog becomes
+  // the ONLY source of MCP reach and disk-configured servers stop resolving.
+  strictMcp?: () => boolean
+  // Drop a session's minted proxy tokens (called before relaunch and on destroy).
+  releaseConnectors?: (sessionId: string) => void
+  // Connectors granted to a NEW session (the `enabledByDefault` set).
+  defaultGrants?: () => string[]
   // What the session is currently viewing (its active content tab), so a user turn
   // can carry ambient "edit this file" context for the open CODE file. Notebooks are
   // steered separately via the path-less app-control tools, so they're ignored here.
@@ -194,6 +225,8 @@ export class SessionManager extends EventEmitter {
     sandbox?: SandboxConfig,
     trusted = false,
     teamEmploy?: boolean,
+    connectors?: string[],
+    accountConnectors?: string[],
   ): Session {
     const id = crypto.randomUUID()
     // SANDBOXED TOGETHER BY DEFAULT: a teammate created without an explicit config
@@ -210,8 +243,48 @@ export class SessionManager extends EventEmitter {
     const inherited = !sandbox && parentId ? this.sessions.get(parentId)?.sandbox : undefined
     const requested: SandboxConfig | undefined = sandbox
       ?? (inherited ? { ...inherited, mounts: inherited.mounts.map((m) => ({ ...m })) } : undefined)
+    // Connector grants follow the SAME inheritance rule as the sandbox, for the same
+    // reason: a teammate created without an explicit set inherits its coordinator's, so a
+    // team can actually work on the tools it was hired to use. And as with the sandbox,
+    // the inherited set counts as trusted because it can only ever be a copy of what the
+    // operator already approved for the parent — never more.
+    const parent = parentId ? this.sessions.get(parentId) : undefined
+    const inheritedGrants = !connectors && parent ? parent.connectors : undefined
+    // The `enabledByDefault` set is operator configuration, so it is trusted wherever the
+    // create call came from — otherwise a session spawned by an in-process caller would
+    // come up without the connectors the operator explicitly marked as always-on.
+    // A READ-ONLY parent may not launder its reach through a less-restricted child.
+    // Role scoping is applied per session at launch from that session's OWN agent.readOnly,
+    // so a `reviewer` granted a connector could hire a `general` teammate, which inherited
+    // the server with ZERO deny rules — putting every write tool one hop away. Inheritance
+    // preserves WHICH SERVERS, but the read-only guarantee is stated in terms of WHICH
+    // TOOLS, so the two only agree while the roles match. Refuse the inheritance and make
+    // the operator grant it explicitly.
+    // BOTH kinds of reach ride the same hop, so both are tested together. Gating only on
+    // `inheritedGrants` let a read-only parent holding ONLY account connectors (catalog
+    // grants empty) slip through: `launders` was false, the child inherited
+    // parent.accountConnectors, and launch scoped it with readOnlyRole:false — no deny
+    // rules at all. The same escalation, through the other door.
+    const inheritedAccount = !accountConnectors && parent ? parent.accountConnectors : undefined
+    const parentReadOnly = !!(parent && getAgent(parent.agentId).readOnly)
+    const childReadOnly = !!getAgent(agentId).readOnly
+    const launders = (!!inheritedGrants || !!inheritedAccount) && parentReadOnly && !childReadOnly
+    if (launders) {
+      console.warn(`[connectors] not inheriting connector grants from a read-only ${parent?.agentId} into a ${agentId ?? 'general'} subsession — that would hand it the write tools the parent's role denies. Grant them explicitly if intended.`)
+    }
+    const effectiveInherited = launders ? undefined : inheritedGrants
+    const effectiveAccount = launders ? undefined : inheritedAccount
+    // "Defaults" means the caller asked for NEITHER kind and inherited neither — only
+    // then is the set purely operator configuration and so trusted from any caller.
+    // Testing `!connectors` alone meant an untrusted caller passing accountConnectors but
+    // no catalog grants landed here and had its account list accepted as trusted.
+    const usingDefaults = !connectors && !accountConnectors && !effectiveInherited && !effectiveAccount
+    const grantsTrusted = trusted || !!effectiveInherited || !!effectiveAccount || usingDefaults
+    const wanted = connectors ?? effectiveInherited ?? this.opts.defaultGrants?.() ?? []
+    const wantedAccount = accountConnectors ?? effectiveAccount ?? []
     const session: Session = {
       id, name, cwd, rootDir, parentId, agentId, model, permissionMode, teamEmploy,
+      ...normalizeGrants(wanted, wantedAccount, grantsTrusted),
       sandbox: normalizeSandbox(requested, cwd, trusted || !!inherited),
       state: 'idle', engine: null, startedAt: 0, resume,
       claudeSessionId: claudeSessionId ?? crypto.randomUUID(),
@@ -263,13 +336,27 @@ export class SessionManager extends EventEmitter {
     ].filter(Boolean).join('\n\n') || undefined
     session.appliedCoordinator = isCoordinator
     session.appliedMember = !!session.parentId
+    // Connector reach for this launch. Tokens minted on the previous launch are dropped
+    // first: each launch gets fresh ones, so a relaunched session can't be reached
+    // through a URL its dead predecessor was handed.
+    const granted = session.connectors ?? []
+    const accountAllow = session.accountConnectors ?? []
+    this.opts.releaseConnectors?.(id)
+    const connectorDeny = this.opts.connectorDeny?.({ granted, accountAllow, readOnlyRole: !!agent.readOnly }) ?? []
     const args = claudeArgs({
-      sessionId: claudeSessionId, resume, mcpConfig: this.opts.mcpConfig?.(id),
+      sessionId: claudeSessionId, resume, mcpConfig: this.opts.mcpConfig?.(id, granted),
       model: session.model ?? agent.model,
       permissionMode: session.permissionMode,
       appendSystemPrompt: systemPrompt,
       allowedTools: agent.allowedTools,
-      disallowedTools: agent.disallowedTools,
+      // The role's own denials and the connector layer's merge into ONE value — a second
+      // --disallowedTools flag would not reliably combine (see disallowedValue).
+      disallowedTools: [...(agent.disallowedTools ?? []), ...connectorDeny],
+      // Strict mode makes the catalog the only source of MCP reach: the CLI stops
+      // resolving .mcp.json, settings-scoped mcpServers and ~/.claude.json projects, and
+      // never fetches claude.ai account connectors. Claudette's own servers ride
+      // --mcp-config, so they survive it.
+      extra: this.opts.strictMcp?.() ? ['--strict-mcp-config'] : undefined,
     })
 
     // Confinement (see SANDBOX.md): wrap `claude …` in bwrap only when the session
@@ -322,10 +409,15 @@ export class SessionManager extends EventEmitter {
       // project-scope hooks are all inert. --strict-mcp-config keeps Claudette's own
       // app-control server (it rides --mcp-config) while dropping settings-defined MCP. No
       // per-file pin can be raced here; the pin/scrub layers become defense-in-depth.
-      spawn = { ...spawn, args: [...spawn.args, '--setting-sources', 'user', '--strict-mcp-config'] }
+      // `--strict-mcp-config` may already be present from strict mode above; passing it
+      // twice is harmless, but emitting it once keeps the argv readable in logs and in
+      // the escape tests that assert on it.
+      const strictAlready = spawn.args.includes('--strict-mcp-config')
+      spawn = { ...spawn, args: [...spawn.args, '--setting-sources', 'user', ...(strictAlready ? [] : ['--strict-mcp-config'])] }
     }
 
     session.appliedSandboxKey = sandboxKey(session.sandbox, runCwd)   // what's now actually running
+    session.appliedConnectorKey = connectorKey(session.connectors, session.accountConnectors)
 
     const engine = new ClaudeEngine({
       command: spawn.command,
@@ -761,6 +853,10 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(id)
     if (!session) return
     session.closing = true
+    // Retire this session's proxy tokens with it. Otherwise a URL handed to a session
+    // that no longer exists keeps resolving for the process lifetime, and its grant check
+    // would consult a session record that has been deleted.
+    this.opts.releaseConnectors?.(id)
     // User closed this session — tear down resources owned by it (e.g. notebook
     // kernels). Distinct from 'exit', which also fires on a crash.
     this.emit('destroyed', id)
@@ -798,23 +894,54 @@ export class SessionManager extends EventEmitter {
   }
 
   private toInfo(s: Session): SessionInfo {
-    const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, teamEmploy, state } = s
+    const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, teamEmploy, connectors, accountConnectors, state } = s
     // Pending = a running engine whose applied sandbox differs from the requested one
     // (auto-applies on idle; visible only while a turn holds it off).
-    const sandboxPending = !!s.engine && sandboxKey(sandbox, cwd) !== s.appliedSandboxKey
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, state }
+    // runDirOf, NOT s.cwd: launch() runs in `cwd || homedir()` and keys the applied
+    // sandbox on THAT, while this comparison used the raw cwd. For a session with an
+    // empty cwd the two keys could never be equal (sandboxKey folds in whether
+    // <cwd>/.claude exists, resolved relative to the SERVER's own cwd here), so the lock
+    // chip read "pending" forever and scheduleApply killed and respawned the engine at
+    // the end of every turn.
+    const sandboxPending = !!s.engine && sandboxKey(sandbox, runDirOf(s)) !== s.appliedSandboxKey
+    // Same shape for connectors, with one asymmetry worth stating: this only ever means
+    // "a grant is waiting for a relaunch". A REVOCATION is already in force — the proxy
+    // refuses the next call — so pending never means "still reachable".
+    const connectorsPending = !!s.engine && connectorKey(connectors, accountConnectors) !== s.appliedConnectorKey
+    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, state }
   }
 
-  // Can this session take a turn RIGHT NOW? Distinct from state, and stricter than
-  // "an engine object exists": between a kill and the relaunch that replaces it, the
-  // old engine is still referenced but its process is gone, so a turn written to it
-  // goes into a closed pipe and is lost silently. `replacing` marks exactly that window
-  // (restartFresh / relaunchApply / resumeInto all set it), and `closing` marks a
-  // session on its way out. The team mailbox relies on this to hold a cleared session's
-  // own handover until its fresh engine is really up.
-  hasEngine(id: string): boolean {
-    const s = this.sessions.get(id)
-    return !!s?.engine && !s.replacing && !s.closing
+  // A session's granted catalog connectors — the live set the proxy authorizes against,
+  // NOT what the running engine was launched with. That is deliberate: it is what makes
+  // revocation take effect without a relaunch.
+  grantsOf(id: string): string[] {
+    return this.sessions.get(id)?.connectors ?? []
+  }
+
+  isGranted(sessionId: string, connectorId: string): boolean {
+    return !!this.sessions.get(sessionId)?.connectors?.includes(connectorId)
+  }
+
+  // Set a session's connector grants. TRUST-GATED (see normalizeGrants) — this is the
+  // route by which reach is widened, so only the operator may drive it.
+  setConnectors(id: string, connectors: string[], accountConnectors: string[], trusted = false): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    // EVERY untrusted call is refused — not just one asking for more. An earlier version
+    // gated only on `connectors.length || accountConnectors.length`, so an untrusted
+    // caller posting two EMPTY arrays fell through and cleared the session's grants: a
+    // rejected escalation turned into sabotage of the operator's own session. Reach is
+    // the operator's to set in both directions.
+    if (!trusted) {
+      console.warn('[connectors] refusing untrusted setConnectors — grants are the operator\'s to set, in both directions')
+      return false
+    }
+    const next = normalizeGrants(connectors, accountConnectors, trusted)
+    session.connectors = next.connectors
+    session.accountConnectors = next.accountConnectors
+    this.emit('changed')
+    this.scheduleApply(id)   // relaunch when idle so a NEW grant becomes visible
+    return true
   }
 
   // May this session hire and dismiss teammates? Off unless the operator turned it on.
@@ -884,7 +1011,8 @@ export class SessionManager extends EventEmitter {
   // charter. Both are read at launch, and relaunchApply re-runs launch(), which recomputes
   // BOTH — which is exactly why one scheduler serves both.
   private launchStale(s: Session): boolean {
-    return sandboxKey(s.sandbox, s.cwd) !== s.appliedSandboxKey
+    return sandboxKey(s.sandbox, runDirOf(s)) !== s.appliedSandboxKey
+      || connectorKey(s.connectors, s.accountConnectors) !== s.appliedConnectorKey
       || this.hasChildren(s.id) !== !!s.appliedCoordinator
       || !!s.parentId !== !!s.appliedMember
   }
@@ -936,6 +1064,8 @@ export class SessionManager extends EventEmitter {
         agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
         sandbox: s.sandbox,
         teamEmploy: s.teamEmploy,
+        connectors: s.connectors,
+        accountConnectors: s.accountConnectors,
         claudeSessionId: s.claudeSessionId,
         tasks: tasks.length ? tasks : undefined,
       }
@@ -958,6 +1088,8 @@ export class SessionManager extends EventEmitter {
         s.agentId, s.model, s.permissionMode, s.sandbox,
         /* trusted */ true,   // a persisted config was already operator-approved
         s.teamEmploy,         // …including the employment grant
+        s.connectors,         // …and the connector grants (same reasoning)
+        s.accountConnectors,
       )
       registered.push(session)
       const id = session.id
@@ -1027,6 +1159,33 @@ export class SessionManager extends EventEmitter {
 // wrapSandbox, and claude's working dir stays valid via its --chdir handling there.
 // Whether the sandbox is actually in force is decided at launch (host capability) and
 // reported via `sandboxed`.
+// Connector grants are REACH, and reach is trust-gated in exactly the way sandbox.enabled
+// and teamEmploy are (SANDBOX.md "Control-plane escape"). A confined session can reach the
+// loopback control API; without this gate it could grant ITSELF a connector — a database,
+// a ticket tracker, an internal HTTP service — that the operator never gave it, which is
+// the whole property this feature exists to establish. `trusted` is set only by the
+// auth-gated HTTP route, by boot restore of an already-approved value, and by inheritance
+// of a parent's already-approved set.
+//
+// Note the asymmetry with the sandbox gate: there, the refused direction is turning
+// confinement OFF. Here it is turning reach ON. Both refuse the WIDENING move.
+export function normalizeGrants(
+  connectors: string[],
+  accountConnectors: string[],
+  trusted = false,
+): { connectors?: string[]; accountConnectors?: string[] } {
+  const clean = (v: string[]): string[] => [...new Set(v.map((s) => s.trim()).filter(Boolean))]
+  const c = clean(connectors)
+  const a = clean(accountConnectors)
+  if ((c.length || a.length) && !trusted) {
+    console.warn('[connectors] ignoring untrusted connector grant — only the operator may give a session reach it was not launched with')
+    return { connectors: undefined, accountConnectors: undefined }
+  }
+  // Store absent rather than empty: `connectors?: string[]` treats absent as "none", and
+  // an empty array round-tripping through persistence is just noise.
+  return { connectors: c.length ? c : undefined, accountConnectors: a.length ? a : undefined }
+}
+
 export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string, trusted = false): SandboxConfig {
   const cfg: SandboxConfig = !sandbox
     ? { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }

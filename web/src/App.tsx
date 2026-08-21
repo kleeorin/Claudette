@@ -12,6 +12,7 @@ import { FileManager } from './components/FileManager'
 import { KernelsPanel } from './components/KernelsPanel'
 import { PermissionsPanel } from './components/PermissionsPanel'
 import { SandboxPanel } from './components/SandboxPanel'
+import { ClaudetteDeck } from './components/ClaudetteDeck'
 import { FileEditorView } from './components/FileEditorView'
 import { AgentDetail, agentTabLabel, AgentStatusDot } from './components/AgentDetail'
 import { FileBrowser } from './components/FileBrowser'
@@ -887,7 +888,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         <button className={toggle(dock === 'files')} onClick={() => onToggleDock('files')} title="Files browser">Files</button>
         <button className={toggle(dock === 'git')} onClick={() => onToggleDock('git')} title="Git panel">Git</button>
         <button className={toggle(dock === 'permissions')} onClick={() => onToggleDock('permissions')} title="Permissions — what this session's Claude can do">Permissions</button>
-        <button className={toggle(dock === 'sandbox')} onClick={() => onToggleDock('sandbox')} title="Sandbox — filesystem confinement + mounts for this session">Sandbox</button>
+        <button className={toggle(dock === 'sandbox')} onClick={() => onToggleDock('sandbox')} title="Sandbox — what this session can reach: filesystem mounts, GPU devices, and connectors">Sandbox</button>
         <button className={toggle(termOpen)} onClick={onToggleTerm} title="Terminal">Terminal</button>
       </div>
     </div>
@@ -993,9 +994,15 @@ function Empty() {
 }
 
 function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits, onOpenAgent }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void; onOpenAgent: (sid: string, id: string, label: string) => void }) {
-  const { sessions, activeId, setActive, destroy, connected, attention } = useSessions()
+  const { sessions, activeId, setActive, destroy, connected, attention, homeDir } = useSessions()
   const [showNew, setShowNew] = useState(false)
   const [confirmClose, setConfirmClose] = useState<SessionInfo | null>(null)
+  // The global Claudette deck (app-wide config; currently connectors). State lives here
+  // rather than in App because nothing outside the sidebar opens it — the brand IS the
+  // affordance. `cwd` only scopes the strict-mode pre-flight's config scan, so the active
+  // session's dir is the useful default and homeDir the fallback.
+  const [deckOpen, setDeckOpen] = useState(false)
+  const deckCwd = sessions.find((s) => s.id === activeId)?.cwd || homeDir
   const pick = (id: string) => { setActive(id); onClose() }
   // A subsession belongs UNDER its parent, not at the bottom of the list: order the
   // flat server list into parent → its children (recursively), keeping each level in
@@ -1012,8 +1019,17 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
           ${open ? 'translate-x-0 shadow-pop' : '-translate-x-full'}`}
       >
         <div className="px-4 h-12 flex items-center gap-2.5 border-b border-ctp-surface0 shrink-0">
-          <Mark className="w-5 h-5 text-ctp-accent" />
-          <span className="text-sm font-semibold tracking-tight text-ctp-text">Claudette</span>
+          {/* The brand opens the app-wide deck. Deliberately NOT a fifth right-dock tab:
+              every dock panel edits the ACTIVE SESSION, and this edits the install. */}
+          <button
+            onClick={() => setDeckOpen(true)}
+            title="Claudette settings — connectors and other app-wide config"
+            className="group flex items-center gap-2.5 -mx-1 px-1 py-0.5 rounded hover:bg-ctp-surface0 transition-colors"
+          >
+            <Mark className="w-5 h-5 text-ctp-accent" />
+            <span className="text-sm font-semibold tracking-tight text-ctp-text">Claudette</span>
+            <span className="text-ctp-overlay group-hover:text-ctp-text text-[10px] leading-none transition-colors">⚙</span>
+          </button>
           <div className="ml-auto flex items-center gap-1">
             <EditPopupToggle on={autoOpenEdits} onToggle={onToggleAutoOpenEdits} />
             <SoundToggle notif={notif} />
@@ -1052,6 +1068,7 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
         </div>
 
         {showNew && <NewSessionDialog onClose={() => setShowNew(false)} onCreated={() => { setShowNew(false); onClose() }} />}
+        {deckOpen && <ClaudetteDeck cwd={deckCwd} onClose={() => setDeckOpen(false)} />}
         {confirmClose && (
           <ConfirmDialog
             danger
