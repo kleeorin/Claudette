@@ -40,6 +40,30 @@ function saveHist(id: string, h: string[]): void {
   try { localStorage.setItem(histKey(id), JSON.stringify(h)) } catch { /* quota / disabled storage — recall just won't persist */ }
 }
 
+// Where you are in that history right now, plus the text you'd left in the box at each
+// level (level 0 = your own unsent draft, level k = the k-th message back). Recall
+// carries the box's text with you instead of overwriting it, so stepping away from
+// something you were writing never destroys it — Down brings it back verbatim. Kept in
+// localStorage next to the draft, because ChatView remounts on every session switch and
+// in-memory state would strand the recalled message on top of your draft.
+interface Nav { ptr: number; edits: Record<string, string> }
+const navKey = (id: string) => `claudette:msgnav:${id}`
+function loadNav(id: string): Nav {
+  try {
+    const v = JSON.parse(localStorage.getItem(navKey(id)) ?? 'null')
+    if (!v || typeof v.ptr !== 'number' || v.ptr < 0) return { ptr: 0, edits: {} }
+    const edits: Record<string, string> = {}
+    for (const [k, t] of Object.entries(v.edits ?? {})) if (typeof t === 'string') edits[k] = t
+    return { ptr: v.ptr, edits }
+  } catch { return { ptr: 0, edits: {} } }
+}
+function saveNav(id: string, nav: Nav): void {
+  try {
+    if (nav.ptr === 0 && !Object.keys(nav.edits).length) localStorage.removeItem(navKey(id))
+    else localStorage.setItem(navKey(id), JSON.stringify(nav))
+  } catch { /* quota / disabled storage — recall just won't survive a reload */ }
+}
+
 // Native chat frontend for a Claude session — ported from ClaudeMaster. Renders
 // the structured transcript, streams tokens, and surfaces permission /
 // AskUserQuestion prompts as native cards. Handles /clear + /resume natively
@@ -73,8 +97,8 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
 
   // --- input history (shell-like Up/Down over the messages you've sent) ---------
   // The turns you've sent this session, oldest→newest, persisted across reloads (see
-  // loadHist/saveHist). `histPtr` counts steps back (0 = the live draft); `stashRef`
-  // holds the in-progress draft while browsing. Loaded per session on mount — ChatView
+  // loadHist/saveHist). `histPtr` counts steps back (0 = the live draft); `editsRef`
+  // holds the text left in the box at each level. Loaded per session on mount — ChatView
   // is keyed by session id, so switching sessions remounts and re-reads the right key.
   const [sentHistory, setSentHistory] = useState<string[]>(() => loadHist(sessionId))
   // Seed from a resumed conversation the first time its transcript lands, so an existing
@@ -131,29 +155,53 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
       </div>
     ))
   }, [items])
-  const [histPtr, setHistPtr] = useState(0)
-  const stashRef = useRef('')
+  // Restored on mount (see Nav): a session switch mid-recall comes back exactly where
+  // you left off, with the text you'd been writing still one Down away.
+  const nav0 = useRef<Nav>(loadNav(sessionId))
+  const [histPtr, setHistPtr] = useState(() => nav0.current.ptr)
+  const editsRef = useRef<Map<number, string>>(new Map(Object.entries(nav0.current.edits).map(([k, t]) => [Number(k), t])))
   const caretToEnd = () => requestAnimationFrame(() => { const ta = taRef.current; if (ta) ta.selectionStart = ta.selectionEnd = ta.value.length })
-  // Up: older message. Only hijacks Up when the caret is at the very start (so
-  // multi-line editing still works), unless we're already browsing history.
+  // Persist only what differs from the plain history text — the levels you actually
+  // typed into — so the key stays small.
+  const persistNav = useCallback((ptr: number, edits: Map<number, string>, hist: string[]) => {
+    const out: Record<string, string> = {}
+    for (const [level, text] of edits) if (text !== (level === 0 ? '' : hist[hist.length - level])) out[String(level)] = text
+    saveNav(sessionId, { ptr, edits: out })
+  }, [sessionId])
+  const resetNav = useCallback(() => { editsRef.current.clear(); setHistPtr(0); saveNav(sessionId, { ptr: 0, edits: {} }) }, [sessionId])
+  // Step to another history level, taking the box's current text with us: it's saved
+  // against the level we're leaving, so coming back — including all the way back to
+  // level 0, your own half-written message — restores it verbatim. Read from the DOM
+  // rather than `draft` so it's whatever is on screen at this instant, whatever else
+  // may have set it.
+  const goTo = (level: number, ta: HTMLTextAreaElement): void => {
+    const edits = editsRef.current
+    edits.set(histPtr, ta.value)
+    setHistPtr(level)
+    // `?? ''` also covers a level that no longer exists — history trimmed at the cap, or
+    // a restored pointer into a history that has since been cleared.
+    setDraft(edits.get(level) ?? (level === 0 ? '' : sentHistory[sentHistory.length - level]) ?? '')
+    caretToEnd()
+    persistNav(level, edits, sentHistory)
+  }
+  // Up: older message. Hijacked only when there's no line above the caret to move to,
+  // so multi-line editing keeps working — in your own draft (where we ask for the very
+  // start, as before) and in a recalled message alike.
   const recallPrev = (ta: HTMLTextAreaElement): boolean => {
-    if (sentHistory.length === 0) return false
-    const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0
-    if (histPtr === 0 && !atStart) return false
-    const next = Math.min(histPtr + 1, sentHistory.length)
-    if (histPtr === 0) stashRef.current = draft
-    if (next !== histPtr) { setHistPtr(next); setDraft(sentHistory[sentHistory.length - next]); caretToEnd() }
+    if (histPtr >= sentHistory.length) return histPtr > 0   // at the oldest: swallow, don't jump the caret
+    const room = histPtr === 0
+      ? ta.selectionStart === 0 && ta.selectionEnd === 0
+      : !ta.value.slice(0, ta.selectionStart).includes('\n')
+    if (!room) return false
+    goTo(histPtr + 1, ta)
     return true
   }
-  // Down: newer message; stepping past the newest restores the stashed draft.
+  // Down: newer message, mirroring Up — hijacked when there's no line below the caret.
+  // Stepping past the newest lands back on the draft you were writing.
   const recallNext = (ta: HTMLTextAreaElement): boolean => {
     if (histPtr === 0) return false
-    const atEnd = ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length
-    if (!atEnd) return false
-    const next = histPtr - 1
-    setHistPtr(next)
-    setDraft(next === 0 ? stashRef.current : sentHistory[sentHistory.length - next])
-    caretToEnd()
+    if (ta.value.slice(ta.selectionEnd).includes('\n')) return false
+    goTo(histPtr - 1, ta)
     return true
   }
 
@@ -242,7 +290,7 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
     const t = draft.trim()
     if (!t) return
     pushHistory(draft)   // remember it for Up/Down recall (including slash commands, shell-style)
-    setHistPtr(0); stashRef.current = ''
+    resetNav()           // sent — back to a blank level 0, with no half-written levels left behind
     if (handleSlash(t)) { setDraft(''); return }
     sendTurn(sessionId, draft)
     markBusy(sessionId)   // show Working…/interrupt immediately, before the WS round-trip
@@ -430,7 +478,11 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
             <textarea
               ref={taRef}
               value={draft}
-              onChange={(e) => { setDraft(e.target.value); setHistPtr(0); mention.sync(e.target.value, e.target.selectionStart ?? 0) }}
+              onChange={(e) => {
+                // Typing doesn't leave history: the edit stays with the level you made
+                // it on (goTo carries it), so nothing you write is ever dropped.
+                setDraft(e.target.value); mention.sync(e.target.value, e.target.selectionStart ?? 0)
+              }}
               onKeyUp={(e) => mention.sync(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)}
               onClick={(e) => mention.sync(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)}
               onKeyDown={(e) => {
