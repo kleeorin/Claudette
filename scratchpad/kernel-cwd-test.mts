@@ -4,7 +4,7 @@ import { mkdtemp, realpath } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
-import { JupyterManager } from '../server/src/jupyter/jupyterManager.ts'
+import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 import { KernelManager } from '../server/src/jupyter/kernelManager.ts'
 
 let failed = 0
@@ -17,11 +17,15 @@ const dir = await realpath(await mkdtemp(join(tmpdir(), 'nbcwd-')))
 const path = join(dir, 'run.ipynb')
 
 const docs = new NotebookDocManager()
-const jupyter = new JupyterManager()
-const kernels = new KernelManager(docs, jupyter)
+// KernelManager takes the confinement seam and refuses an UNOWNED notebook (fail closed,
+// so a kernel can never land on the unconfined server by omission) — hence the claim below.
+const SID = 'kernel-cwd'
+const confinement = new SessionConfinement((id) => (id === SID ? { cwd: dir } : undefined))
+const kernels = new KernelManager(docs, confinement)
 
 const doc = await docs.createPath(path)
 const nb = doc.notebookId
+kernels.setOwner(nb, { session: SID })
 const a = doc.cells[0].id
 docs.applyOp({ op: 'editCell', notebookId: nb, cellId: a, source: 'import os; print(os.getcwd())' })
 

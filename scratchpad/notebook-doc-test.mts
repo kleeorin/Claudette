@@ -51,9 +51,14 @@ const moved = doc.cells.find((c) => c.id === c1)!
 ok(doc.cells[0].id === c1, 'moveCell reordered c1 to front')
 ok(moved.outputs?.length === 1 && moved.executionCount === 1, 'output STAYS with c1 after reorder (cellId routing)')
 
-// 5. editCell clears outputs
+// 5. editCell PRESERVES outputs (Jupyter's behaviour, see applyOp's editCell case):
+// they are the record of the last run, and wiping them on every keystroke threw away a
+// plot or a traceback the user was editing against. A stale [n] beside changed source is
+// the signal that the output predates it; only a re-run replaces them.
 nbs.applyOp({ op: 'editCell', notebookId: doc.notebookId, cellId: c1, source: 'print("b2")' })
-ok((doc.cells.find((c) => c.id === c1)!.outputs?.length ?? 0) === 0, 'editCell clears outputs')
+const edited = doc.cells.find((c) => c.id === c1)!
+ok(edited.source === 'print("b2")', 'editCell updated the source')
+ok((edited.outputs?.length ?? 0) === 1 && edited.executionCount === 1, 'editCell KEEPS the last run\'s output and count')
 
 // 6. cell lock hard-denies Claude, allows human
 nbs.claimCell(doc.notebookId, c0, 'focus')

@@ -4,8 +4,8 @@ import { mkdtemp } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
-import { JupyterManager } from '../server/src/jupyter/jupyterManager.ts'
 import { KernelManager } from '../server/src/jupyter/kernelManager.ts'
+import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 
 let failed = 0
 const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
@@ -15,12 +15,19 @@ const streamText = (cell: any) =>
 const dir = await mkdtemp(join(tmpdir(), 'nbke2e-'))
 const path = join(dir, 'run.ipynb')
 
+// KernelManager takes the CONFINEMENT seam, not a JupyterManager — it pools a Jupyter
+// server per sandbox key and resolves the notebook's owning session to pick one. An
+// unowned notebook fails CLOSED (the kernel is refused rather than dropped onto the
+// unconfined server), so the notebook must be claimed before anything will run.
+const SID = 'kernel-e2e'
+const confinement = new SessionConfinement((id) => (id === SID ? { cwd: dir } : undefined))
+
 const docs = new NotebookDocManager()
-const jupyter = new JupyterManager()   // ambient python3 (has jupyter_server)
-const kernels = new KernelManager(docs, jupyter)
+const kernels = new KernelManager(docs, confinement)
 
 const doc = await docs.createPath(path)
 const nb = doc.notebookId
+kernels.setOwner(nb, { session: SID })
 
 // two code cells: A prints "A", B prints "B"
 const a = doc.cells[0].id

@@ -66,7 +66,10 @@ const broadcast: string[] = []
 sm.on('userTurn', (_id: string, text: string) => broadcast.push(text))
 const toEngine: string[] = []
 ;(sm as unknown as { sessions: Map<string, unknown> }).sessions.set('s1', {
-  engine: { sendUserTurn: (t: string) => toEngine.push(t) },
+  // `alive` models ClaudeEngine's getter: sendUserTurn refuses to run its side
+  // effects (broadcast, transcript push, snapshot) against a dead process, since a
+  // crashed engine is still a non-null object until its exit event lands.
+  engine: { alive: true, sendUserTurn: (t: string) => toEngine.push(t) },
   cwd: sessCwd, claudeSessionId: 'c1',
 })
 

@@ -5,11 +5,12 @@ import { mkdtemp, readFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
-import { JupyterManager } from '../server/src/jupyter/jupyterManager.ts'
 import { KernelManager } from '../server/src/jupyter/kernelManager.ts'
 import { AppControlMcpServer } from '../server/src/mcp/appControlServer.ts'
 import { registerNotebookTools } from '../server/src/mcp/notebookTools.ts'
 import { ActivePaneRegistry } from '../server/src/mcp/activePaneRegistry.ts'
+import { TurnNotebookRegistry } from '../server/src/mcp/turnNotebookRegistry.ts'
+import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 
 let failed = 0
 const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
@@ -17,16 +18,20 @@ const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`)
 const dir = await mkdtemp(join(tmpdir(), 'nbmcp-'))
 const path = join(dir, 'mcp.ipynb')
 
+// Unconfined (`host`) session: this test is about the MCP tool surface, not the sandbox.
+// The confinement seam fails CLOSED on an unresolved session, so it must be supplied.
+const confinement = new SessionConfinement((id) => (id === 'sess-1' ? { cwd: dir } : undefined))
+
 const docs = new NotebookDocManager()
-const jupyter = new JupyterManager()
-const kernels = new KernelManager(docs, jupyter)
+const kernels = new KernelManager(docs, confinement)
 const mcp = new AppControlMcpServer()
 // Empty active-pane registry: with no session viewing anything, explicit `path`
 // calls below are honored as-is (the stale-path guard only fires when the caller is
 // viewing a DIFFERENT notebook). Active-pane steering itself is covered by
 // active-pane-test.mts.
 const panes = new ActivePaneRegistry()
-registerNotebookTools(mcp, docs, kernels, panes, () => {})
+const turns = new TurnNotebookRegistry()
+registerNotebookTools(mcp, docs, kernels, panes, turns, () => {}, () => {}, confinement)
 
 const port = await mcp.start()
 // configFor mints a session-attributed token URL — exactly what --mcp-config gives Claude.
@@ -73,7 +78,10 @@ ok(!r.isError && r.text.includes('42'), 'run_cell → output contains 42')
 r = await callTool('read_notebook', { path })
 const view = JSON.parse(r.text)
 ok(view.cells.length === 2 && view.cells[1].type === 'markdown', 'read_notebook: 2 cells, cell 1 is markdown')
-ok(view.kernel === 'running', 'read_notebook: kernel running')
+// KernelStatus is none|starting|idle|busy|dead — there is no 'running'. The run above
+// has finished, so a LIVE kernel reports 'idle'; the property worth pinning is that a
+// bound kernel never reads as 'none' once a cell has executed.
+ok(view.kernel === 'idle', `read_notebook: kernel is live and idle after the run (got ${view.kernel})`)
 
 // the direct-to-disk write-through: the .ipynb on disk has the output + stable ids
 const disk = JSON.parse(await readFile(path, 'utf8'))

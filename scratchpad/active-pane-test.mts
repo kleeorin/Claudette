@@ -7,11 +7,12 @@ import { mkdtemp } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
-import { JupyterManager } from '../server/src/jupyter/jupyterManager.ts'
 import { KernelManager } from '../server/src/jupyter/kernelManager.ts'
 import { AppControlMcpServer } from '../server/src/mcp/appControlServer.ts'
 import { registerNotebookTools } from '../server/src/mcp/notebookTools.ts'
 import { ActivePaneRegistry } from '../server/src/mcp/activePaneRegistry.ts'
+import { TurnNotebookRegistry } from '../server/src/mcp/turnNotebookRegistry.ts'
+import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 
 let failed = 0
 const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
@@ -20,13 +21,23 @@ const dir = await mkdtemp(join(tmpdir(), 'nbpane-'))
 const nbA = join(dir, 'note.ipynb')
 const nbB = join(dir, 'another.ipynb')
 
+// Both sessions run unconfined (`host`): this test is about which notebook a tool call
+// targets, not about the sandbox. KernelManager and the notebook tools take the
+// confinement seam, and an unresolved session fails CLOSED — so it has to be supplied
+// or every call here is denied before it reaches the logic under test.
+const confinement = new SessionConfinement((id) => (id === 'S' || id === 'T' ? { cwd: dir } : undefined))
+
 const docs = new NotebookDocManager()
-const jupyter = new JupyterManager()
-const kernels = new KernelManager(docs, jupyter)
+const kernels = new KernelManager(docs, confinement)
 const panes = new ActivePaneRegistry()
+const turns = new TurnNotebookRegistry()
 const focuses: Array<{ sid: string; path: string }> = []
 const mcp = new AppControlMcpServer()
-registerNotebookTools(mcp, docs, kernels, panes, (sid, doc) => focuses.push({ sid, path: doc.path }))
+registerNotebookTools(mcp, docs, kernels, panes, turns,
+  (sid, doc) => focuses.push({ sid, path: doc.path }),
+  () => {},
+  confinement,
+)
 
 const port = await mcp.start()
 // Two sessions: S (the one the user is looking at) and T (a background session that
@@ -53,6 +64,10 @@ ok(!(await S('create_notebook', { path: nbA })).isError, 'create note.ipynb')
 ok(!(await S('create_notebook', { path: nbB })).isError, 'create another.ipynb')
 
 // --- The user is looking at note.ipynb in session S -------------------------
+// New user turn. index.ts clears the per-turn notebook pin on every 'userTurn', so a
+// test that models turns has to do the same — otherwise the create_notebook calls above
+// leave nbB pinned and every path-less call below targets it instead of the active pane.
+turns.clear('S')
 panes.set('S', { path: nbA, isNotebook: true })
 
 let r = await S('read_active_pane')
@@ -88,12 +103,18 @@ r = await S('edit_cell', { path: nbB, index: 0, source: 'NOW_OK' })
 ok(!r.isError && docs.getByPath(nbB)!.cells[0].source === 'NOW_OK', 'after refocus, editing another.ipynb is allowed')
 
 // --- Degenerate active-pane states -----------------------------------------
+// Each of these is a FRESH turn. The per-turn pin is deliberately sticky within a turn
+// (that is the point: a mid-task tab switch must not redirect Claude's cells), so
+// "path-less errors when nothing is viewed" is only true once the pin has been cleared —
+// which is what a new user turn does.
+turns.clear('S')
 panes.set('S', null)                    // Claude tab focused, nothing open
 r = await S('read_active_pane')
 ok(r.isError, 'read_active_pane errors when the Claude tab is focused')
 r = await S('add_cell', { source: 'x' })
 ok(r.isError && /no `path` was given/i.test(r.text), 'path-less edit errors when nothing is viewed')
 
+turns.clear('S')                        // new turn again
 panes.set('S', { path: '/tmp/notes.txt', isNotebook: false })   // a TEXT file is active
 r = await S('run_all')
 ok(r.isError && /text file/i.test(r.text), 'path-less tool errors when the active pane is a text file')
