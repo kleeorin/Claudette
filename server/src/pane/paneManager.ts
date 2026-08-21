@@ -4,6 +4,11 @@ import { homedir } from 'os'
 import * as pty from 'node-pty'
 import { wrapCommand, sandboxAvailable } from '../claude/sandbox'
 import { DENY_ALL_SANDBOX, type Confinement, type SessionConfinement } from '../claude/sessionConfinement'
+// Imported and re-exported, not re-declared: this file used to carry its own identical
+// copy of PaneInfo while paneApi imported the shared one for its response type — two
+// definitions of a single wire shape, each free to drift from the other.
+import type { PaneInfo } from '@claudette/shared'
+export type { PaneInfo }
 
 // One shell pane = one pty. Ported from ClaudeMaster's `main/paneManager.ts`,
 // LOCAL branch only — the remote/SSH interactive spawn is Phase 3, dropped here as
@@ -86,8 +91,6 @@ const SWEEP_GRACE_MS = 30_000
 
 // What `list()` exposes to the client for reconcile (which saved terminals still map
 // to a live pty; which live ptys are orphans to prune).
-export interface PaneInfo { id: string; cwd: string; sessionId?: string }
-
 export class PaneManager extends EventEmitter {
   private panes = new Map<string, Pane>()
   // clientId → the pane ids that client currently has a tab for. The sweep only kills

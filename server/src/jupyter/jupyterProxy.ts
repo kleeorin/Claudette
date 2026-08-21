@@ -27,14 +27,10 @@ export class JupyterProxy {
   private upstreamPath(url: string): string {
     return url.replace(/^\/jupyter/, '') || '/'
   }
-  private host(): { hostname: string; port: number } {
-    return this.target!   // non-null whenever this.info is (callers guard on this.info)
-  }
-
   // HTTP: forward method/headers/body, add the token as an Authorization header.
   handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
     if (!this.info) { res.writeHead(503).end('jupyter not started'); return }
-    const { hostname, port } = this.host()
+    const { hostname, port } = this.target!   // non-null whenever this.info is (guarded above)
     const proxied = http.request({
       hostname, port,
       method: req.method,
@@ -52,7 +48,7 @@ export class JupyterProxy {
   // the query, since ws clients can also carry it as a header — we set both).
   handleUpgrade(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
     if (!this.info) { socket.destroy(); return }
-    const { hostname, port } = this.host()
+    const { hostname, port } = this.target!   // non-null whenever this.info is (guarded above)
     const path = this.upstreamPath(req.url || '/')
     const sep = path.includes('?') ? '&' : '?'
     const upstreamUrl = `ws://${hostname}:${port}${path}${sep}token=${this.info.token}`

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { errMessage } from '../util/errMessage'
-import type { NotebookDoc, CellLock, KernelStatus, KernelSpecsResponse, WsClientMessage } from '@claudette/shared'
+import type { NotebookDoc, CellLock, KernelStatus, WsClientMessage } from '@claudette/shared'
 import type { WsHub } from '../ws/hub'
 import type { NotebookDocManager } from './notebookDocManager'
 import type { KernelManager } from '../jupyter/kernelManager'
@@ -97,9 +97,12 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   })
 
   // Kernel controls: the pickable specs, plus restart / interrupt / choose-spec.
-  app.get('/api/notebook/kernelspecs', async (_req, reply): Promise<KernelSpecsResponse> => {
+  // No Promise<KernelSpecsResponse> annotation, matching every other route in this file:
+  // the error branch can't satisfy it, and the `as unknown as` cast it needed defeated the
+  // annotation entirely — a type assertion that only silenced the type system.
+  app.get('/api/notebook/kernelspecs', async (_req, reply) => {
     try { return await kernels.listKernelSpecs() }
-    catch (e) { return reply.code(400).send({ error: errMessage(e) }) as unknown as KernelSpecsResponse }
+    catch (e) { return reply.code(400).send({ error: errMessage(e) }) }
   })
   app.post<{ Body: { notebookId: string } }>('/api/notebook/kernel/restart', async (req) => {
     await kernels.restart(req.body.notebookId)

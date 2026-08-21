@@ -20,14 +20,8 @@ export interface NotebookMeta {
 // Split a string into nbformat's line array (each line keeps its trailing "\n"
 // except the last). An empty string serializes to [].
 function splitLines(s: string): string[] {
-  if (s === '') return []
-  const parts = s.split('\n')
-  const out: string[] = []
-  for (let i = 0; i < parts.length; i++) {
-    if (i < parts.length - 1) out.push(parts[i] + '\n')
-    else if (parts[i] !== '') out.push(parts[i])
-  }
-  return out
+  // Each line keeps its trailing newline; a final line without one is kept as-is.
+  return s === '' ? [] : (s.match(/[^\n]*\n|[^\n]+/g) ?? [])
 }
 
 function cellTypeOf(raw: unknown): NbCellType {

@@ -85,11 +85,6 @@ export function resolveAuth(host: string, envToken: string | undefined): Auth {
   return { required: true, token }
 }
 
-// Generate a token suggestion (used only to print a hint; not auto-applied).
-export function suggestToken(): string {
-  return crypto.randomBytes(24).toString('hex')
-}
-
 // Parse a Cookie header into a map (no dependency; the WS upgrade path only has
 // the raw request).
 function parseCookies(header: string | undefined): Record<string, string> {

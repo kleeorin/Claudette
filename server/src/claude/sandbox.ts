@@ -152,11 +152,32 @@ function appSourceProtections(dataMounts: SandboxMount[]): SandboxMount[] {
 // neutralization of anything that still slips through (settings.local.json, a project
 // settings.json created from scratch, pre-existing hooks) is Layer 2 (configProtection.ts).
 function hookSettingsProtections(cwd: string): SandboxMount[] {
-  return [
-    path.join(claudeConfigDir(), 'settings.json'),
-    path.join(cwd, '.claude', 'settings.json'),
-  ].filter((f) => existsSync(f)).map((f) => ({ path: path.resolve(f), mode: 'ro' as const }))
+  // settingsJsonPaths, not a second copy of the same list: this and configProtection are
+  // two layers of ONE defence, and a scope that appears in one but not the other is a
+  // hole. They were written out separately here.
+  return settingsJsonPaths(cwd)
+    .filter((f) => existsSync(f)).map((f) => ({ path: path.resolve(f), mode: 'ro' as const }))
 }
+
+// The OBLIGATORY data mounts every confined session gets, whatever the caller asked for:
+// the global config dir (creds + memory) and the project-local .claude, both rw. They are
+// always present so Claude keeps its config and memory even when the caller makes cwd
+// read-only or drops it entirely.
+//
+// One spelling, because three had already drifted: wrapSandbox added <cwd>/.claude
+// unconditionally (relying on a later existsSync filter at bind time) while
+// sessionDataMounts and sandboxSystemPrompt each gated it inline — and the whole design
+// here rests on the box, the out-of-band authorizer and the prompt describing the SAME
+// set. `existing` is for the two callers that need the list to be true right now rather
+// than filtered later.
+function obligatoryMounts(cwd: string, existing = true): SandboxMount[] {
+  const local = path.join(cwd, '.claude')
+  return [
+    { path: claudeConfigDir(), mode: 'rw' as const },
+    ...(!existing || existsSync(local) ? [{ path: local, mode: 'rw' as const }] : []),
+  ]
+}
+
 
 // --- availability probe ------------------------------------------------------
 // `bwrap` can be installed yet unable to create a namespace (e.g. Ubuntu's
@@ -174,12 +195,25 @@ export function sandboxAvailable(): boolean {
 export function resetSandboxProbe(): void { cachedAvailable = undefined; whichCache.clear() }
 
 function probe(): boolean {
+  // Resolve the test binary rather than hardcoding /usr/bin/true, which everything else
+  // in this file already refuses to do (see the header). On a layout without it — a
+  // busybox userland, a non-usrmerge host — the probe failed for a reason that has
+  // nothing to do with whether bwrap works, `sandboxAvailable()` latched false, and every
+  // session the operator had explicitly configured `enabled: true` then ran UNCONFINED on
+  // the host with only the `sandboxed` flag in the UI to say so. A capability probe that
+  // can't run its own test must not be read as "confinement is unavailable".
+  // `command -v true` reports the shell BUILTIN as the bare word "true" on most shells,
+  // which is not something bwrap can exec — so only an absolute path counts as a hit.
+  const trueBin = which('true')
+  const argv = trueBin?.startsWith('/')
+    ? [trueBin]
+    : ['/bin/sh', '-c', ':']   // POSIX-guaranteed fallback; exits 0 and needs no coreutils
   try {
     const r = spawnSync(BWRAP, [
       '--ro-bind', '/', '/',
       '--dev', '/dev', '--proc', '/proc',
       '--unshare-user', '--die-with-parent',
-      '/usr/bin/true',
+      ...argv,
     ], { stdio: 'ignore', timeout: 5000 })
     return r.status === 0
   } catch {
@@ -349,8 +383,7 @@ export function wrapSandbox(cfg: SandboxConfig, claudeArgv: string[], cwd: strin
   const baseline: SandboxMount[] = [
     ...dnsMounts(),
     ...runtimeInstallMounts(),
-    { path: claudeConfigDir(), mode: 'rw' },
-    { path: path.join(cwd, '.claude'), mode: 'rw' },   // local .claude (skipped below if absent)
+    ...obligatoryMounts(cwd, /* existing */ false),   // local .claude skipped below if absent
   ]
   // User mounts as-is. cwd is NO LONGER force-added, so it's fully optional — rw (the
   // default a new session seeds), ro, or removed. De-dupe baseline+user TOGETHER by path
@@ -458,10 +491,7 @@ function isUnsafeSymlinkMount(p: string, rwRoots: string[]): boolean {
 // session's behalf (e.g. the notebook MCP tools, which run UNSANDBOXED in the server
 // process) can be authorized against exactly what the box itself could reach.
 export function sessionDataMounts(cfg: SandboxConfig, cwd: string): SandboxMount[] {
-  const baseline: SandboxMount[] = [
-    { path: claudeConfigDir(), mode: 'rw' },
-    ...(existsSync(path.join(cwd, '.claude')) ? [{ path: path.join(cwd, '.claude'), mode: 'rw' as const }] : []),
-  ]
+  const baseline: SandboxMount[] = obligatoryMounts(cwd)
   const mounts = dedupeMounts([...baseline, ...cfg.mounts])
   // Include the same ro overlays the box gets (app source + settings.json), or the
   // out-of-band path would authorize writes the box itself refuses. settings.json is
@@ -579,11 +609,7 @@ export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
   // The obligatory data mounts (global + local .claude) plus the caller's mounts. cwd
   // is NOT assumed — it's listed only if the config actually mounts it, so a session
   // with cwd removed/ro is described honestly.
-  const localClaude = path.join(cwd, '.claude')
-  const obligatory: SandboxMount[] = [
-    { path: claudeConfigDir(), mode: 'rw' },
-    ...(existsSync(localClaude) ? [{ path: localClaude, mode: 'rw' as const }] : []),
-  ]
+  const obligatory: SandboxMount[] = obligatoryMounts(cwd)
   const mounts = sortShallowFirst(dedupeMounts([...cfg.mounts, ...obligatory]))
   const list = mounts.map((m) => `  - ${m.path} (${m.mode === 'rw' ? 'read-write' : 'read-only'})`).join('\n')
   return [
@@ -648,11 +674,17 @@ function dedupeMounts(mounts: SandboxMount[]): SandboxMount[] {
 // Sort by path depth (fewer separators first), then lexically, so nested binds are
 // emitted after their parents.
 function sortShallowFirst(mounts: SandboxMount[]): SandboxMount[] {
-  return [...mounts].sort((a, b) => {
-    const da = a.path.split(path.sep).length
-    const db = b.path.split(path.sep).length
-    return da - db || a.path.localeCompare(b.path)
-  })
+  // Depth computed ONCE per mount, not twice per comparison: this list is re-sorted on
+  // every sandboxPathAccess call, which runs per authorized file operation.
+  const depth = (p: string): number => {
+    let n = 0
+    for (let i = 0; i < p.length; i++) if (p[i] === path.sep) n++
+    return n
+  }
+  return mounts
+    .map((m) => ({ m, d: depth(m.path) }))
+    .sort((a, b) => a.d - b.d || a.m.path.localeCompare(b.m.path))
+    .map((x) => x.m)
 }
 
 // The directory holding the real `node` binary (following symlinks), or null. Put on

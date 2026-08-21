@@ -64,10 +64,7 @@ export class NotebookDocManager extends EventEmitter {
       return this.open.get(existingId)!.doc
     }
     // SANDBOX.md G1: refuse a fresh read whose parent was relinked since authorization.
-    if (guardRealDir !== undefined) {
-      const now = await realpath(dirname(abs)).catch(() => null)
-      if (now !== guardRealDir) throw new Error(`refusing to open ${abs}: its directory changed since authorization (possible symlink-swap escape)`)
-    }
+    await assertDirUnchanged(abs, guardRealDir, 'open')
     const text = await readFile(abs, 'utf8')
     return this.register(abs, text)
   }
@@ -250,11 +247,7 @@ export class NotebookDocManager extends EventEmitter {
         doc.cells.splice(i, 1)
         // Drop any lock the deleted cell held (else a sticky 'pin' lingers forever on
         // a cellId that no longer exists) and re-broadcast the pruned lock set.
-        if (nb.locks.has(op.cellId)) {
-          this.clearLockTimer(nb, op.cellId)
-          nb.locks.delete(op.cellId)
-          this.emitLocks(nb)
-        }
+        this.dropLocks(nb, new Set([op.cellId]))
         if (doc.cells.length === 0) doc.cells.push(emptyCodeCell())
         // Land focus on the cell that slid into the deleted slot (else the last one).
         focusId = doc.cells[Math.min(i, doc.cells.length - 1)]?.id
@@ -329,7 +322,8 @@ export class NotebookDocManager extends EventEmitter {
       }
       case 'mergeCells': {
         // Merge in DOCUMENT order regardless of the order ids were passed in.
-        const inOrder = doc.cells.filter((c) => op.cellIds.includes(c.id))
+        const want = new Set(op.cellIds)
+        const inOrder = doc.cells.filter((c) => want.has(c.id))
         if (inOrder.length < 2) return { ok: false, error: 'mergeCells needs at least two existing cells', code: 'not_found' }
         const first = inOrder[0]
         const merged = inOrder.map((c) => c.source).join('\n')
@@ -427,13 +421,6 @@ export class NotebookDocManager extends EventEmitter {
     if (!nb || nb.doc.kernelName === name) return
     nb.doc.kernelName = name
     this.emit('update', nb.doc)
-  }
-
-  // Resolve a 0-based index to a stable cellId against the current doc. The MCP
-  // tools address cells by index (Claude reasons in positions); everything below
-  // the tool boundary is cellId-addressed.
-  cellIdAt(notebookId: string, index: number): string | undefined {
-    return this.open.get(notebookId)?.doc.cells[index]?.id
   }
 
   // --- persistence ---------------------------------------------------------
@@ -652,10 +639,7 @@ export class NotebookDocManager extends EventEmitter {
   // be followed either. (A residual few-instruction window remains — the airtight fix is
   // openat2/RESOLVE_NO_SYMLINKS, unavailable in Node; documented in SANDBOX.md.)
   private async atomicWrite(abs: string, text: string, guardRealDir?: string): Promise<void> {
-    if (guardRealDir !== undefined) {
-      const now = await realpath(dirname(abs)).catch(() => null)
-      if (now !== guardRealDir) throw new Error(`refusing to write ${abs}: its directory changed since authorization (possible symlink-swap escape)`)
-    }
+    await assertDirUnchanged(abs, guardRealDir, 'write')
     const tmp = `${abs}.${randomUUID()}.tmp`
     await writeFile(tmp, text, { flag: 'wx' })
     try {
@@ -703,4 +687,16 @@ function capChars(s: string, max: number): string {
 }
 function notFound(cellId: string): NotebookOpResult {
   return { ok: false, error: `no such cell: ${cellId}`, code: 'not_found' }
+}
+
+// SANDBOX.md G1: refuse to act on a path whose parent directory has been relinked since
+// the caller authorized it. Written out verbatim at each of its call sites, which is the
+// last place a security check should be duplicated — the two copies differed only in the
+// verb they printed.
+async function assertDirUnchanged(abs: string, guardRealDir: string | undefined, verb: string): Promise<void> {
+  if (guardRealDir === undefined) return
+  const now = await realpath(dirname(abs)).catch(() => null)
+  if (now !== guardRealDir) {
+    throw new Error(`refusing to ${verb} ${abs}: its directory changed since authorization (possible symlink-swap escape)`)
+  }
 }
