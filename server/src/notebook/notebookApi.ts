@@ -111,8 +111,10 @@ export function registerNotebookRoutes(app: FastifyInstance, notebooks: Notebook
   })
   // Explicitly kill the kernel (the notebook stays open with no kernel; a later run
   // starts a fresh one). This is the deliberate "kill it" the user asks for.
+  // killKernel, not shutdown: the notebook keeps its owner, which is what lets that
+  // later run resolve a box and actually start.
   app.post<{ Body: { notebookId: string } }>('/api/notebook/kernel/shutdown', async (req) => {
-    kernels.shutdown(req.body.notebookId)
+    kernels.killKernel(req.body.notebookId)
     return { ok: true }
   })
   app.post<{ Body: { notebookId: string; name: string } }>('/api/notebook/kernel/setSpec', async (req, reply) => {

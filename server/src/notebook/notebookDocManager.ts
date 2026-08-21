@@ -153,6 +153,12 @@ export class NotebookDocManager extends EventEmitter {
     // Save (persists the run's output) BEFORE dropping pendingClose, so save's own
     // `update` emit is still suppressed by the broadcast filter — the tab is gone.
     if (this.get(notebookId)?.dirty) { try { await this.save(notebookId) } catch { /* best effort */ } }
+    // Re-check AFTER the await. `save` awaits an atomic write, and openPath's
+    // already-open branch (or cancelClose) can land inside that window and delete this
+    // entry — the documented "reopened before its deferred close fired" cancellation.
+    // Closing anyway tore the doc out from under a live tab: every op on it answered
+    // "no such open notebook" and no further update would ever arrive for it.
+    if (!this.pendingClose.has(notebookId)) return
     this.close(notebookId)
     this.pendingClose.delete(notebookId)
   }
@@ -559,6 +565,13 @@ export class NotebookDocManager extends EventEmitter {
         clearTimeout(nb.watchDebounce)
         nb.watchDebounce = setTimeout(() => { void this.onDiskChange(nb) }, 50)
       })
+      // An FSWatcher is an EventEmitter, and this try/catch only covers the SYNCHRONOUS
+      // watch() call. An 'error' emitted later (the inotify watch removed, EPERM, the
+      // directory unmounted) with no listener attached is an uncaught exception that
+      // takes the whole process down — every session, pty and kernel with it. Degrade to
+      // "no external-change detection for this notebook" instead, which is what the
+      // catch below already treats as acceptable.
+      nb.watcher.on('error', () => { nb.watcher?.close(); nb.watcher = undefined })
     } catch {
       // best-effort; a missing dir just means no external-change detection
     }

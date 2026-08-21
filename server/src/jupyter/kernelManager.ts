@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events'
 import { errMessage } from '../util/errMessage'
 import { dirname } from 'path'
-import type { KernelSpec, KernelSpecsResponse } from '@claudette/shared'
+import type { KernelSpecsResponse } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
 import { JupyterManager, findNearestPython, type JupyterInfo, type JupyterSandbox } from './jupyterManager'
 import { KernelClient, type KernelStatus } from './kernelClient'
@@ -26,6 +26,11 @@ function describeOwner(owner: Owner | undefined): string {
 // bridged to the WS hub as `notebook:kernel` so the UI can show the kernel dot.
 export class KernelManager extends EventEmitter {
   private clients = new Map<string, KernelClient>()   // notebookId → client
+  // In-flight kernel starts, so concurrent runs of the same notebook share one kernel
+  // instead of racing two into existence (see ensureKernel).
+  private starting = new Map<string, Promise<KernelClient>>()
+  // Unconfined server keys already announced to the browser proxy (see serverInfo).
+  private proxied = new Set<string>()
   private status = new Map<string, KernelStatus>()
   private running = new Map<string, Set<string>>()    // notebookId → cellIds currently executing/queued
   private executing = new Set<string>()               // `${notebookId}:${cellId}` actually mid-execution
@@ -111,7 +116,15 @@ export class KernelManager extends EventEmitter {
     }
     const info = await jm.start()
     if (!info) throw new Error(`Jupyter server failed to start with ${pythonPath} (is jupyter-server installed there?)`)
-    if (!sandbox) this.onJupyterStart?.(info)   // browser proxy points at a non-sandboxed server
+    // Point the browser proxy at a non-sandboxed server the FIRST time that server comes
+    // up, not on every resolution. Unconfined servers are pooled per interpreter, so with
+    // two notebooks in different venvs this fired on each run and flip-flopped the single
+    // /jupyter/* target between them: a browser fetch for notebook A's rich output or
+    // /files asset would land on B's server and 404 (or 403 on the token mismatch).
+    if (!sandbox && !this.proxied.has(key)) {
+      this.proxied.add(key)
+      this.onJupyterStart?.(info)
+    }
     return info
   }
 
@@ -180,7 +193,25 @@ export class KernelManager extends EventEmitter {
   // against the folder the .ipynb lives in, not Jupyter's root). We pass the
   // notebook path relative to root_dir (which is '/'); Jupyter derives the kernel
   // cwd from its parent directory.
-  async ensureKernel(notebookId: string): Promise<KernelClient> {
+  // De-duplicated per notebook. `runCell` is dispatched un-awaited from the WS handler,
+  // so two runs in the same tick both used to find `clients` empty (it is written only
+  // after two awaits), both POST /api/kernels, and the second `clients.set` overwrote the
+  // first. The orphaned client was never disposed: its heartbeat interval and websocket
+  // lived for the process lifetime and its Jupyter kernel was never DELETEd. Same
+  // memoization JupyterManager.start() already uses for the same reason.
+  ensureKernel(notebookId: string): Promise<KernelClient> {
+    const inFlight = this.starting.get(notebookId)
+    if (inFlight) return inFlight
+    const p = this.startKernel(notebookId).finally(() => {
+      // Clear only if it's still OURS — a shutdown + restart during the await could have
+      // installed a newer promise here.
+      if (this.starting.get(notebookId) === p) this.starting.delete(notebookId)
+    })
+    this.starting.set(notebookId, p)
+    return p
+  }
+
+  private async startKernel(notebookId: string): Promise<KernelClient> {
     const doc = this.docs.get(notebookId)
     if (!doc) throw new Error(`no such open notebook: ${notebookId}`)
     // Resolve the server the notebook's CURRENT owner requires BEFORE reusing a kernel
@@ -217,7 +248,19 @@ export class KernelManager extends EventEmitter {
     const client = new KernelClient(info.url, info.token, id)
     client.onStatusChange = (s) => this.setStatus(notebookId, s)
     this.setStatus(notebookId, 'starting')
-    await client.connect()
+    try {
+      await client.connect()
+    } catch (e) {
+      // The kernel EXISTS at this point — the REST create succeeded and only the socket
+      // failed. Nothing else can reach it: the client was never stored in `clients`, and
+      // KernelClient.handleClose bails out when it never connected. Left alone, every
+      // retry (runCell surfaces the throw as a cell error, so the user just runs again)
+      // stranded another live kernel process on the Jupyter server.
+      void client.shutdown()
+      client.dispose()
+      this.setStatus(notebookId, 'none')
+      throw e
+    }
     this.clients.set(notebookId, client)
     this.docs.bindKernel(notebookId, id)
     return client
@@ -262,7 +305,9 @@ export class KernelManager extends EventEmitter {
     this.specByNotebook.set(notebookId, name)
     this.defaultSpec = name
     this.docs.setKernelName(notebookId, name)
-    if (this.clients.has(notebookId)) this.shutdown(notebookId)
+    // killKernel, not shutdown: we restart on the very next line, and disowning the
+    // notebook would make that restart throw for want of an owner to resolve a box from.
+    if (this.clients.has(notebookId)) this.killKernel(notebookId)
     await this.ensureKernel(notebookId)
   }
 
@@ -315,6 +360,13 @@ export class KernelManager extends EventEmitter {
   async runAll(notebookId: string): Promise<void> {
     const doc = this.docs.get(notebookId)
     if (!doc) throw new Error(`no such open notebook: ${notebookId}`)
+    // One run-all at a time. The WS path (notebook:op) dispatches this un-awaited and had
+    // no busy guard — only the MCP tool did — so a double-click started a second pass that
+    // interleaved execute_requests on the same kernel with the first, and then whichever
+    // loop finished first cleared `running` for cells the OTHER pass was still executing:
+    // spinners vanished mid-run, and the resulting empty running-set fired onKernelIdle,
+    // which can finalize a deferred close while cells are still producing output.
+    if (this.isRunning(notebookId)) return
     const ids = doc.cells.filter((c) => c.cellType === 'code').map((c) => c.id)
     this.setRunning(notebookId, ids, true)
     try {
@@ -344,8 +396,19 @@ export class KernelManager extends EventEmitter {
     return client.restart()
   }
 
-  shutdown(notebookId: string): void {
-    this.owner.delete(notebookId)   // explicit kill severs session ownership
+  // Stop a notebook's kernel and leave the notebook OWNED. This is the ordinary
+  // "kill it" — the deliberate shutdown from the UI, and the first half of switching
+  // kernelspec — after which a later run starts a fresh kernel on the same server.
+  //
+  // Ownership deliberately survives. It used to be severed here, which broke both
+  // callers: serverFor → boxForNotebook → resolveOwner(undefined) THROWS on an unowned
+  // notebook, so setKernelSpec (which kills then immediately restarts) always failed
+  // with "no resolvable owning session" whenever a kernel was running, and the shutdown
+  // route left the notebook unable to ever run again — every later run landed a
+  // KernelStartError in the cell — until the tab was closed and reopened, which
+  // re-claimed ownership. Keeping the owner is also the SAFER default: the owner is what
+  // pins the confinement the next kernel launches under.
+  killKernel(notebookId: string): void {
     const client = this.clients.get(notebookId)
     if (!client) return
     void client.shutdown()
@@ -354,6 +417,14 @@ export class KernelManager extends EventEmitter {
     this.clearRunning(notebookId)
     this.docs.bindKernel(notebookId, undefined)
     this.setStatus(notebookId, 'none')   // no kernel now — clears the bogus 'idle'
+  }
+
+  // Kill the kernel AND sever session ownership — the takeover/teardown variant (see
+  // setOwner: handing a notebook to a different owner requires that nothing is still
+  // running in the box being handed off).
+  shutdown(notebookId: string): void {
+    this.owner.delete(notebookId)
+    this.killKernel(notebookId)
   }
 
   // Record which session a notebook was opened in — closing that session kills its
@@ -387,8 +458,7 @@ export class KernelManager extends EventEmitter {
   shutdownForSession(sessionId: string): void {
     for (const [notebookId, owner] of [...this.owner]) {
       if (!('session' in owner) || owner.session !== sessionId) continue
-      this.shutdown(notebookId)
-      this.owner.delete(notebookId)
+      this.shutdown(notebookId)   // the session is gone, so its ownership goes with it
     }
   }
 
