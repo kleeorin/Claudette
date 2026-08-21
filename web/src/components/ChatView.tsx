@@ -69,7 +69,7 @@ function saveNav(id: string, nav: Nav): void {
 // AskUserQuestion prompts as native cards. Handles /clear + /resume natively
 // (P1.14); other slash commands pass through as a turn. Permission-mode switch
 // lives in the MetaBar (P1.4).
-export function ChatView({ sessionId, isActive }: { sessionId: string; isActive: boolean }) {
+export function ChatView({ sessionId }: { sessionId: string }) {
   const { transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
   const { sessions, setMode, isFresh, markBusy } = useSessions()
   const session = sessions.find((s) => s.id === sessionId)
@@ -232,9 +232,13 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
 
   // Keep the newest content in view while this session is on screen — but only
   // when the reader is already parked at the bottom. Scrolled up? Stay put.
+  // Keyed on `items`, NOT `items.length`: a streaming block keeps one item and grows
+  // its text (STREAM_DELTA rebuilds the array with the same length), so a length dep
+  // fired once at content_block_start and then never again — the answer started in
+  // view and the rest ran off the bottom while the reader sat still.
   useEffect(() => {
-    if (isActive && pinnedRef.current) bottomRef.current?.scrollIntoView({ block: 'end' })
-  }, [items.length, pending, isActive])
+    if (pinnedRef.current) bottomRef.current?.scrollIntoView({ block: 'end' })
+  }, [items, pending])
 
   // Auto-resume on load: a RESTORED session (not one just created) with an empty
   // transcript pulls in its latest conversation — the equivalent of /resume picking
@@ -372,14 +376,21 @@ export function ChatView({ sessionId, isActive }: { sessionId: string; isActive:
 
           {pending && (
             <div className="mt-4">
+              {/* KEYED BY requestId. Both cards hold their own answer state, and the
+                  pending queue reveals the next prompt in this same slot — so without a
+                  key React reused the instance and the new question mounted already
+                  "answered" with the previous one's selection, Submit live. Clicking it
+                  sent an answer the user never gave for a question they hadn't read. */}
               {pending.toolName === 'AskUserQuestion' ? (
                 <AskUserQuestionCard
+                  key={pending.requestId}
                   input={pending.input}
                   onAnswer={(answers) => respond(sessionId, pending.requestId, { behavior: 'allow', updatedInput: { ...(pending.input as Record<string, unknown>), answers } })}
                   onDismiss={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Dismissed by user' })}
                 />
               ) : (
                 <PermissionCard
+                  key={pending.requestId}
                   toolName={pending.toolName}
                   description={pending.description}
                   input={pending.input}
@@ -886,7 +897,7 @@ function RestartButton({ session }: { session: SessionInfo }) {
   )
 }
 
-function RateChip({ rl, compact }: { rl: RateLimitInfo; compact?: boolean }) {
+function RateChip({ rl }: { rl: RateLimitInfo }) {
   const status = rl.status ?? 'allowed'
   const ok = status === 'allowed'
   const bad = /reject|exceed|block|limit_reached/i.test(status)
@@ -900,7 +911,6 @@ function RateChip({ rl, compact }: { rl: RateLimitInfo; compact?: boolean }) {
     <span className={color} title={`${label} limit: ${status}${rl.isUsingOverage ? ' (using overage)' : ''}${resets ? ` · ${resets}` : ''}`}>
       {ok ? '●' : '▲'} {label}{usedPct}{rl.isUsingOverage ? ' · overage' : ''}
       {/* Compact (sidebar) chip keeps the reset clock in the tooltip only, to stay narrow. */}
-      {!compact && rl.resetsAt ? <span className="text-ctp-surface2"> · {new Date(rl.resetsAt * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span> : null}
     </span>
   )
 }
@@ -954,7 +964,7 @@ export function SidebarUsage() {
   if (!limits.length) return null
   return (
     <span className="flex items-center flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-ctp-overlay normal-case tracking-normal">
-      {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} compact />)}
+      {limits.map((rl) => <RateChip key={rl.rateLimitType ?? 'limit'} rl={rl} />)}
     </span>
   )
 }

@@ -143,8 +143,6 @@ function Shell() {
   // restored one. Ref mirror lets the reconcile effect read current terms synchronously.
   const termSeq = useRef<number>(INITIAL?.seq ?? 0)
   const termsRef = useRef(termsBySession); termsRef.current = termsBySession
-  // Last pane-id set this tab claimed, so the claim effect only posts on real changes.
-  const claimedRef = useRef<string | null>(null)
 
   // Companion orientation for the content split (phones default to stacked).
   const [layout, setLayout] = useState<'side' | 'stack'>(
@@ -178,6 +176,9 @@ function Shell() {
 
   const activeSession = sessions.find((s) => s.id === activeId)
   const termCwd = activeSession?.cwd || homeDir
+  // Session MEMBERSHIP as a stable string, for effects that only care who exists —
+  // `sessions` itself turns over on every state event.
+  const sessionIdKey = sessions.map((s) => s.id).sort().join(',')
 
   // --- content tab management (per session) ----------------------------------
   const pane = (activeId ? bySession[activeId] : null) ?? EMPTY_PANE
@@ -193,6 +194,10 @@ function Shell() {
   const terms = termPane.terms
   const activeTerm = termPane.active
   const allTerms = Object.entries(termsBySession).flatMap(([sid, st]) => st.terms.map((t) => ({ ...t, sid })))
+  // The pane ids this tab holds, as a stable string. `allTerms` is rebuilt by flatMap on
+  // every render, so an effect keyed on it never matched and ran constantly; this is the
+  // value the claim effect actually cares about.
+  const claimKey = allTerms.map((t) => t.paneId).filter(Boolean).join(',')
   const dockShown = termOpen && terms.length > 0   // the active session's dock is visible
   const setTermPane = (sid: string, fn: (p: TermPane) => TermPane) =>
     setTermsBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_TERM) }))
@@ -432,7 +437,10 @@ function Shell() {
     // its clears would otherwise sit in localStorage forever.
     pruneDismissed([...ids])
     pruneDrafts([...ids])   // and the composer text it never sent
-  }, [sessions])
+    // Keyed on the id SET, not the session array: `sessions` gets a new identity on every
+    // state event (running→idle, a rename, an optimistic patch), and this body walks the
+    // whole localStorage keyspace via pruneDrafts. Only membership can make it do work.
+  }, [sessionIdKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // --- refresh survival: reconcile, persist, restore notebooks ----------------
   // ONCE on load: reconcile the restored terminal layout against the ptys the server
@@ -445,10 +453,16 @@ function Shell() {
   // (pushing into `keep`) that the prune below depended on: whenever the updater ran
   // late, prune posted an EMPTY keep-set and the server killed every terminal — the
   // "shell exited" that struck at random on reload. Updaters must stay pure.
+  // Two flags, not one: `started` stops StrictMode's double-mount from listing twice,
+  // while `reconciled` — the gate the claim effect below reads — flips only once the
+  // reconcile has actually LANDED. Setting the single old flag up front meant the claim
+  // effect fired on mount and pruned against the unvalidated restored set, ahead of the
+  // reconcile's own prune; harmless only by accident of the server's spawn grace.
+  const reconcileStarted = useRef(false)
   const reconciled = useRef(false)
   useEffect(() => {
-    if (reconciled.current) return
-    reconciled.current = true
+    if (reconcileStarted.current) return
+    reconcileStarted.current = true
     void api.pane.list().then(({ panes }) => {
       const live = new Set(panes.map((p) => p.id))
       const keep: string[] = []
@@ -462,6 +476,7 @@ function Shell() {
       setTermsBySession(next)
       void api.pane.prune(keep)
     }).catch(() => { /* server not up yet; nothing to reconcile */ })
+      .finally(() => { reconciled.current = true })
   }, [])
 
   // Keep the claim current: every time this tab's terminal set changes, re-post the ids
@@ -470,12 +485,8 @@ function Shell() {
   // the restore with a half-built claim.
   useEffect(() => {
     if (!reconciled.current) return
-    const ids = allTerms.map((t) => t.paneId).filter((id): id is string => !!id)
-    const key = ids.join(',')
-    if (key === claimedRef.current) return
-    claimedRef.current = key
-    void api.pane.prune(ids)
-  }, [allTerms])
+    void api.pane.prune(claimKey ? claimKey.split(',') : [])
+  }, [claimKey])
 
   // ONCE on load: reopen the notebooks that were open per session (by path → fresh id),
   // rebuilding each session's content tabs in their saved order. Reopening reconnects
@@ -514,6 +525,18 @@ function Shell() {
   // Persist the layout on every change. Notebooks are recorded by PATH (skip a tab whose
   // doc hasn't loaded yet — it saves on the next round once the path is known; a session
   // with such a tab carries over its previous save so nothing is transiently lost).
+  //
+  // All this needs from the notebook store is notebookId → path, so that is what it keys
+  // on. `notebooks.open` gets a fresh identity on every notebook:update — once per
+  // appended output frame — and the body does a JSON.parse plus a JSON.stringify and a
+  // synchronous localStorage.setItem, so a cell printing in a loop re-serialized the
+  // entire layout dozens of times a second. That was the jank during long runs.
+  const nbPathKey = notebooks.open.map((o) => `${o.notebookId}\u0000${o.path}`).join('\u0001')
+  const nbPathById = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const o of notebooks.open) m.set(o.notebookId, o.path)
+    return m
+  }, [nbPathKey]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const prev = loadPersisted()
     const content: Record<string, PersistContent> = {}
@@ -525,15 +548,15 @@ function Shell() {
         // reload may not have (a session only replays once its conversation resumes).
         if (t.kind === 'agent') continue
         if (t.kind === 'file') { out.push({ kind: 'file', path: t.path }); continue }
-        const doc = notebooks.open.find((o) => o.notebookId === t.id)
-        if (!doc) { pending = true; break }
-        out.push({ kind: 'notebook', path: doc.path })
+        const path = nbPathById.get(t.id)
+        if (!path) { pending = true; break }
+        out.push({ kind: 'notebook', path })
       }
       if (pending) { if (prev?.content[sid]) content[sid] = prev.content[sid]; continue }
       let active: string | null = null
       const a = p.active
       if (a?.kind === 'file') active = `f:${a.path}`
-      else if (a?.kind === 'notebook') { const doc = notebooks.open.find((o) => o.notebookId === a.id); active = doc ? `n:${doc.path}` : null }
+      else if (a?.kind === 'notebook') { const path = nbPathById.get(a.id); active = path ? `n:${path}` : null }
       if (out.length || active) content[sid] = { active, tabs: out }
     }
     savePersisted({
@@ -543,7 +566,7 @@ function Shell() {
       terms: termsBySession,
       content,
     })
-  }, [termsBySession, bySession, sideW, stackH, dockW, termH, sidebarW, layout, notebooks.open])
+  }, [termsBySession, bySession, sideW, stackH, dockW, termH, sidebarW, layout, nbPathById])
 
   // Tab strip for the CURRENT session's pane, enriched with live doc metadata.
   const tabs: Tab[] = pane.tabs.map((t) => {
@@ -636,7 +659,7 @@ function Shell() {
                   : undefined}
               >
                 <div className="flex-1 min-h-0">
-                  {activeId ? <ChatView key={activeId} sessionId={activeId} isActive /> : <Empty />}
+                  {activeId ? <ChatView key={activeId} sessionId={activeId} /> : <Empty />}
                 </div>
 
                 {/* Bottom dock: tabbed terminals for the ACTIVE session, sized to the

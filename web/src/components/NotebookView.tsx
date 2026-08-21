@@ -400,12 +400,15 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   // when a notebook is closed `doc` goes undefined and the early return runs; any
   // hook after it would be skipped, tripping React's rules-of-hooks and (absent an
   // error boundary) blanking the whole app.
+  // Depends on the FUNCTION, not the whole store value: `nb`'s identity turns over on
+  // every notebook:update, so `[nb]` re-ran this on each streamed output frame.
+  const specsFn = nb.kernelSpecs
   const loadSpecs = useCallback(() => {
     setSpecsError(false)
-    nb.kernelSpecs()
+    specsFn()
       .then((r) => { setSpecs(r.specs); setSpecDefault(r.default) })
       .catch(() => { setSpecs(null); setSpecsError(true) })
-  }, [nb])
+  }, [specsFn])
 
   // Fetch specs when the notebook opens so the header can name the real kernel
   // (not a hardcoded guess) even before anything has run.

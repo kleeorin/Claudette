@@ -125,11 +125,17 @@ export function GitPanelView({ cwd, onClose }: Props) {
     setSelected({ path, staged: isStaged })
   }, [])
 
-  // Select a commit and load its patch into the shared diff pane.
+  // Select a commit and load its patch into the shared diff pane. `showReq` drops a
+  // late reply from an earlier click: pick A then B quickly and A could resolve last,
+  // leaving row B highlighted above A's patch. The working-tree path below has the
+  // same guard as a `cancelled` flag; this one is a click handler, so it counts.
+  const showReq = useRef(0)
   const selectCommit = useCallback(async (hash: string) => {
+    const req = ++showReq.current
     setSelected(null)
     setSelectedCommit(hash)
     const d = await api.git.show(cwd, hash)
+    if (req !== showReq.current) return
     setDiff(d.ok ? d.diff : `# ${d.error}`)
   }, [cwd])
 
@@ -151,6 +157,8 @@ export function GitPanelView({ cwd, onClose }: Props) {
     return () => { cancelled = true }
   }, [selected, selectedCommit, staged, unstaged, cwd])
 
+  // Returns whether the operation SUCCEEDED, so callers with follow-up state (the
+  // commit box) can tell "git said no" apart from "the call returned".
   const run = useCallback(async (fn: () => Promise<{ ok: boolean; error?: string }>) => {
     setBusy(true)
     setError(null)
@@ -158,14 +166,18 @@ export function GitPanelView({ cwd, onClose }: Props) {
       const r = await fn()
       if (!r.ok) setError(r.error ?? 'git error')
       await refresh()
+      return r.ok
     } finally {
       setBusy(false)
     }
   }, [refresh])
 
   const doCommit = useCallback(async () => {
-    await run(() => api.git.commit(cwd, message))
-    setMessage('')
+    // Clear the box ONLY on success. A commit refused by a pre-commit hook, a bad
+    // identity, or "nothing staged" resolves normally here (run only sets `error`), and
+    // the unconditional clear threw away the message the user had just written —
+    // precisely when they need it to fix the error and retry.
+    if (await run(() => api.git.commit(cwd, message))) setMessage('')
   }, [run, cwd, message])
 
   // --- Branches ----------------------------------------------------------------

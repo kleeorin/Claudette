@@ -7,6 +7,7 @@ import { MilkdownEditor } from './MilkdownEditor'
 import { CsvTableView } from './CsvTableView'
 import { basename } from '../lib/paths'
 import { useScrollMemory } from '../lib/scrollMemory'
+import { errText } from '../lib/errText'
 import { peekBuffer, setBuffer } from '../lib/buffers'
 import { useChat } from '../store/chat'
 import { applyProposal, filePathOf, isEditTool, isNotebookPath, reconstructDecision } from '../lib/proposals'
@@ -67,6 +68,13 @@ export function FileEditorView({ path, sessionId }: Props) {
       setDirty(text !== disk)
       setPreview(p.kind === 'text' ? { ...p, text } : p)
       setLoading(false)
+    }).catch((e) => {
+      // `api.fs.read` rejects on a dropped connection or a non-JSON body (a proxy 502,
+      // an expired-cookie redirect to HTML). Without this the promise died silently with
+      // `loading` still true, and the tab sat on "Loading…" forever with no way back.
+      if (cancelled) return
+      setSaveErr(errText(e))
+      setLoading(false)
     })
     return () => { cancelled = true }
   }, [path])
@@ -96,23 +104,30 @@ export function FileEditorView({ path, sessionId }: Props) {
     if (savingRef.current || !dirtyRef.current) return
     savingRef.current = true; setSaving(true); setSaveErr(null)
     const snapshot = textRef.current
-    // Guard against silently clobbering an external change: if disk no longer matches
-    // what we loaded (someone edited it) and isn't already our text, confirm first.
-    const cur = await api.fs.read(path)
-    if (cur.kind === 'text' && cur.text !== loadedRef.current && cur.text !== snapshot) {
-      if (!window.confirm('This file changed on disk since you opened it. Overwrite those changes with your version?')) {
-        savingRef.current = false; setSaving(false); return
+    // try/finally around the whole thing: a rejected read or write (network drop,
+    // non-JSON error body) used to escape with savingRef still true, which both pinned
+    // the button on "Saving…" and made every later save() early-return — Ctrl+S silently
+    // dead until the tab was remounted, with unsaved edits still in the buffer.
+    try {
+      // Guard against silently clobbering an external change: if disk no longer matches
+      // what we loaded (someone edited it) and isn't already our text, confirm first.
+      const cur = await api.fs.read(path)
+      if (cur.kind === 'text' && cur.text !== loadedRef.current && cur.text !== snapshot) {
+        if (!window.confirm('This file changed on disk since you opened it. Overwrite those changes with your version?')) return
       }
+      const r = await api.fs.write(path, snapshot)
+      if (r.ok) {
+        loadedRef.current = snapshot
+        // Only clear dirty if no edits landed during the await — otherwise those
+        // keystrokes would be marked saved and lost on close. Same for the buffer:
+        // it's dropped only when what's on disk is what the editor holds.
+        if (textRef.current === snapshot) { dirtyRef.current = false; setDirty(false); setBuffer(path, null) }
+      } else setSaveErr(r.error)
+    } catch (e) {
+      setSaveErr(errText(e))
+    } finally {
+      savingRef.current = false; setSaving(false)
     }
-    const r = await api.fs.write(path, snapshot)
-    savingRef.current = false; setSaving(false)
-    if (r.ok) {
-      loadedRef.current = snapshot
-      // Only clear dirty if no edits landed during the await — otherwise those
-      // keystrokes would be marked saved and lost on close. Same for the buffer:
-      // it's dropped only when what's on disk is what the editor holds.
-      if (textRef.current === snapshot) { dirtyRef.current = false; setDirty(false); setBuffer(path, null) }
-    } else setSaveErr(r.error)
   }, [path])
 
   // Find state lives HERE, not in each editor, for two reasons: Ctrl/Cmd-F then works

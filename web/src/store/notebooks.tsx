@@ -12,6 +12,13 @@ import { api } from '../api/client'
 // UI never mutates cells locally except the CodeMirror buffer the user types in
 // (reconciled per-cell in Cell.tsx).
 
+// Module scope, so its identity NEVER changes. It closes over nothing, and consumers
+// (NotebookView's header picker, the Kernels dock) fetch specs in an effect: while it
+// was rebuilt inside the context memo below, that memo's identity turned over on every
+// `notebook:update` — i.e. once per appended output frame — and those effects refetched
+// /api/notebook/kernelspecs for the whole duration of every run.
+const kernelSpecs = (): Promise<KernelSpecsResponse> => api.notebook.kernelSpecs()
+
 interface ContextValue {
   open: NotebookDoc[]                       // open notebooks, in tab order
   // `sessionId` records which session the notebook is opened in — closing that
@@ -186,7 +193,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     undo: (notebookId) => { void api.notebook.undo(notebookId) },
     redo: (notebookId) => { void api.notebook.redo(notebookId) },
     clearOutputs: (notebookId) => { void api.notebook.clearOutputs(notebookId) },
-    kernelSpecs: () => api.notebook.kernelSpecs(),
+    kernelSpecs,
     restartKernel: (notebookId) => { void api.notebook.kernelRestart(notebookId) },
     interruptKernel: (notebookId) => { void api.notebook.kernelInterrupt(notebookId) },
     shutdownKernel: (notebookId) => { void api.notebook.kernelShutdown(notebookId) },
