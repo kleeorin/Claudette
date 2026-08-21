@@ -111,13 +111,18 @@ export interface HealthResponse {
   // Functional probe, not "binary exists" — see SANDBOX.md. Drives the UI's
   // "enable sandbox" affordance and the "unavailable" messaging.
   sandboxAvailable: boolean
+  // The two HOST-FACT fields below are optional because /api/health is in the auth
+  // hook's open set: an unauthenticated caller gets liveness (ok/version/ts) and the
+  // sandbox capability flag, and nothing that describes this machine. The UI always
+  // receives them — SessionsProvider mounts inside AuthGate.
+  //
   // The host GPU device nodes a sandboxed session CAN be given (SandboxConfig.gpu),
   // discovered from /dev. Empty on a GPU-less host, where the UI hides the toggle
   // rather than offering a switch that would do nothing.
-  gpuDevices: string[]
+  gpuDevices?: string[]
   // The server user's home directory — the sensible default cwd for new sessions,
   // terminals, and the folder picker (the client can't read the server's $HOME).
-  homeDir: string
+  homeDir?: string
 }
 
 // POST /api/session/create

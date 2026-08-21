@@ -31,7 +31,7 @@ import { ConnectorProxy } from './connectors/connectorProxy'
 import { connectorServers, connectorDenyRules } from './connectors/connectorLaunch'
 import { strictMode, defaultGrants } from './connectors/connectorStore'
 import { registerUsageRoutes } from './usage/usageApi'
-import { resolveAuth, makeAuthHook, isAuthed, authCookie, tokenFilePath } from './auth'
+import { resolveAuth, makeAuthHook, isAuthed, safeEqual, authCookie, tokenFilePath } from './auth'
 
 // Claudette app server. Single-user by design (PLAN §1). Binds loopback by
 // default; when HOST exposes it beyond loopback, an access token is required
@@ -211,13 +211,22 @@ function shutdown(): void {
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, shutdown)
 
-app.get('/api/health', async (): Promise<HealthResponse> => ({
+app.get('/api/health', async (req): Promise<HealthResponse> => ({
   ok: true,
   version: VERSION,
   ts: Date.now(),
   sandboxAvailable: sandboxAvailable(),
-  gpuDevices: gpuDevicePaths(),
-  homeDir: homedir(),
+  // /api/health is in the auth hook's OPEN set, so everything here is disclosed
+  // unauthenticated. The GPU node list is host hardware inventory and has no business
+  // being readable pre-auth (and on a non-loopback bind, by anyone who can reach the
+  // port), so it is served only to an authenticated caller. The UI always is —
+  // SessionsProvider, the only consumer, mounts inside AuthGate.
+  //
+  // homeDir gets the same treatment, for the same reason: it discloses the OS username
+  // and the home path to anyone who can reach the port, which is exactly what you want
+  // before guessing a `?token=` or naming a path under ~/.claude. `ok`/`version`/`ts` are
+  // what an unauthenticated liveness probe legitimately needs; host facts are not.
+  ...(isAuthed(req.raw, auth) ? { gpuDevices: gpuDevicePaths(), homeDir: homedir() } : {}),
 }))
 
 // Token bootstrap: open the app once as `…/api/auth?token=<secret>` (or the SPA
@@ -226,7 +235,10 @@ app.get('/api/health', async (): Promise<HealthResponse> => ({
 app.get<{ Querystring: { token?: string } }>('/api/auth', async (req, reply) => {
   if (!auth.required || !auth.token) return { ok: true, required: false }
   const presented = req.query.token
-  if (!presented || presented !== auth.token) return reply.code(401).send({ ok: false, error: 'invalid token' })
+  // safeEqual, not !==: this is the only unauthenticated, unrate-limited endpoint whose
+  // whole job is checking a token, i.e. the one place a timing oracle is actually
+  // reachable. isAuthed has always used the constant-time compare; this didn't.
+  if (!presented || !safeEqual(presented, auth.token)) return reply.code(401).send({ ok: false, error: 'invalid token' })
   // Add Secure when the request came in over https (Tailscale serve / Cloudflare).
   const https = (req.headers['x-forwarded-proto'] === 'https') || (req.raw.socket as { encrypted?: boolean }).encrypted === true
   reply.header('set-cookie', authCookie(auth.token) + (https ? '; Secure' : ''))

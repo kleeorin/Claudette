@@ -104,7 +104,9 @@ function parseCookies(header: string | undefined): Record<string, string> {
 }
 
 // Constant-time compare so a wrong token can't be timed out character by character.
-function safeEqual(a: string, b: string): boolean {
+// Exported because /api/auth — the one unauthenticated, unrate-limited endpoint whose
+// entire job is validating a presented token — must use it too.
+export function safeEqual(a: string, b: string): boolean {
   const ba = Buffer.from(a)
   const bb = Buffer.from(b)
   if (ba.length !== bb.length) return false
@@ -141,11 +143,14 @@ export function makeAuthHook(auth: Auth) {
   const open = new Set(['/api/health', '/api/auth'])
   return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
     if (!auth.required) return
-    const path = req.url.split('?')[0]
+    // NOT named `path` — that shadowed the module-scope `import path from 'path'` inside
+    // the one function that decides what may be reached unauthenticated. Harmless while
+    // nothing here needed the module, and a trap the moment something did.
+    const urlPath = req.url.split('?')[0]
     // Gate the data/control API and the Jupyter reverse-proxy (it grants kernel
     // access); everything else (static assets / SPA shell) stays open.
-    if (!path.startsWith('/api/') && !path.startsWith('/jupyter/')) return
-    if (open.has(path)) return
+    if (!urlPath.startsWith('/api/') && !urlPath.startsWith('/jupyter/')) return
+    if (open.has(urlPath)) return
     if (!isAuthed(req.raw, auth)) {
       await reply.code(401).send({ error: 'unauthorized' })
     }
