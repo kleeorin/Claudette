@@ -1,15 +1,11 @@
-import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
+import { useEscape } from '../lib/useDismiss'
 
 // Confirm gate for the "Allow all" (bypassPermissions) mode — shared by the chat
 // mode dropdown and the Permissions panel so the guard + wording are identical
 // wherever you flip it. Escape or click-outside cancels.
 export function BypassConfirmDialog({ onConfirm, onCancel }: { onConfirm: () => void; onCancel: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
+  useEscape(onCancel)
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>

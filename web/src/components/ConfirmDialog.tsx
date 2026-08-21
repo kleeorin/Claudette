@@ -1,5 +1,5 @@
-import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
+import { useEscape } from '../lib/useDismiss'
 
 // Generic "are you sure?" gate. Mirrors BypassConfirmDialog's look/behaviour
 // (Escape or click-outside cancels) but takes its wording from props so any
@@ -21,11 +21,7 @@ export function ConfirmDialog({
   onConfirm: () => void
   onCancel: () => void
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
+  useEscape(onCancel)
 
   const confirmClass = danger
     ? 'bg-ctp-red/20 text-ctp-red hover:bg-ctp-red/30'

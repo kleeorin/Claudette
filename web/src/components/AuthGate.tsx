@@ -16,7 +16,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
     return () => { live = false }
   }, [])
 
-  if (status === 'ok') { ensureWs(); return <>{children}</> }
+  // Opening the socket is a side effect, so it belongs in an effect and not in the
+  // render body — where it also ran twice under StrictMode's double render in dev.
+  // It's idempotent either way, but render must stay pure.
+  useEffect(() => { if (status === 'ok') ensureWs() }, [status])
+
+  if (status === 'ok') return <>{children}</>
 
   if (status === 'checking') {
     return (

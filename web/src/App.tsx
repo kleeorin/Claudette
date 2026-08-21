@@ -19,6 +19,7 @@ import { FileBrowser } from './components/FileBrowser'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { AuthGate } from './components/AuthGate'
 import { api } from './api/client'
+import { useEscape, useDismissOnOutside } from './lib/useDismiss'
 import { isEditTool, filePathOf, isNotebookPath } from './lib/proposals'
 import { pruneDrafts } from './lib/drafts'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
@@ -805,11 +806,7 @@ function CloseNotebookDialog({ target, onChoose }: {
   onChoose: (action: 'save' | 'discard' | 'cancel') => void
 }) {
   const { name, dirty, running } = target
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onChoose('cancel') }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onChoose])
+  useEscape(() => onChoose('cancel'))
   const btn = 'text-xs px-3 py-1.5 rounded-md transition'
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={() => onChoose('cancel')}>
@@ -1124,12 +1121,8 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
   const [pendingTrust, setPendingTrust] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => {
-    nameRef.current?.focus()
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEffect(() => { nameRef.current?.focus() }, [])
+  useEscape(onClose)
 
   // The actual session creation, once the cwd is known-trusted. Assumes busy is set.
   const doCreate = async (dir: string) => {
@@ -1203,7 +1196,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
         </div>
       </div>
       {browsing && (
-        <FileBrowser mode="folder" initialPath={cwd.trim() || homeDir} onPick={(path) => { setCwd(path); setBrowsing(false) }} onClose={() => setBrowsing(false)} />
+        <FileBrowser initialPath={cwd.trim() || homeDir} onPick={(path) => { setCwd(path); setBrowsing(false) }} onClose={() => setBrowsing(false)} />
       )}
       {pendingTrust && (
         <ConfirmDialog
@@ -1326,7 +1319,6 @@ function SandboxFields({ value, onChange, cwd, available }: { value: SbState; on
       )}
       {picking && (
         <FileBrowser
-          mode="folder"
           initialPath={cwd}
           onClose={() => setPicking(false)}
           onPick={(p) => { setPicking(false); if (p !== cwd && !value.extra.some((m) => m.path === p)) set({ extra: [...value.extra, { path: p, mode: 'ro' }] }) }}
@@ -1561,11 +1553,7 @@ function SubsessionDialog({ parent, onClose }: { parent: SessionInfo; onClose: (
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscape(onClose)
 
   const submit = async () => {
     if (busy) return
@@ -1624,13 +1612,7 @@ function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onR
   onClose: () => void; onSubsession: () => void; onInfo: () => void; onRename: () => void; onPickRole: (id: string) => void
 }) {
   const [view, setView] = useState<'main' | 'roles'>('main')
-  useEffect(() => {
-    const close = () => onClose()
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('click', close)
-    window.addEventListener('keydown', onKey)
-    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
-  }, [onClose])
+  useDismissOnOutside(true, onClose)
   const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
   const left = Math.min(x, window.innerWidth - 200)
   const top = Math.min(y, window.innerHeight - 220)
@@ -1668,11 +1650,7 @@ function SessionInfoDialog({ session, roleName, parentName, onClose }: {
   session: SessionInfo; roleName: string; parentName: string | null; onClose: () => void
 }) {
   const { sessions, setTeamEmploy } = useSessions()
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscape(onClose)
   const sandbox = session.sandbox?.enabled
     ? (session.sandboxed ? 'on' : 'requested — host can’t confine')
     : 'off'

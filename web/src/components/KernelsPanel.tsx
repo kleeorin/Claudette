@@ -1,34 +1,29 @@
 import { useEffect, useState } from 'react'
-import type { KernelStatus, KernelSpec } from '@claudette/shared'
+import type { KernelSpec } from '@claudette/shared'
 import { useNotebooks } from '../store/notebooks'
 import { basename } from '../lib/paths'
+import { STATUS_DOT, STATUS_LABEL } from '../lib/kernelStatus'
 
 // The "Kernels" sub-tab of the Files dock: a live list of the open notebooks and
 // their Jupyter kernels. Click a row to focus that notebook's tab; hover to reveal
 // per-kernel controls (interrupt / restart / shut down). Mirrors NotebookView's
 // kernel status vocabulary so the two surfaces read the same.
-const STATUS_DOT: Record<KernelStatus, string> = {
-  none: 'bg-ctp-surface2',
-  idle: 'bg-ctp-green',
-  busy: 'bg-ctp-yellow animate-pulse',
-  starting: 'bg-ctp-overlay animate-pulse',
-  dead: 'bg-ctp-red',
-}
-const STATUS_LABEL: Record<KernelStatus, string> = {
-  none: 'no kernel', idle: 'idle', busy: 'busy', starting: 'starting…', dead: 'dead',
-}
 
 export function KernelsPanel({ onFocus, onClose }: { onFocus: (notebookId: string) => void; onClose: () => void }) {
   const nb = useNotebooks()
   const [specs, setSpecs] = useState<KernelSpec[] | null>(null)
   const [specDefault, setSpecDefault] = useState<string | undefined>(undefined)
 
-  // Resolve raw kernelspec names (e.g. 'python3') to human display names.
+  // Resolve raw kernelspec names (e.g. 'python3') to human display names. Keyed on the
+  // FUNCTION (stable at module scope in the store), not on `nb` — whose identity turns
+  // over on every notebook:update, so this refetched once per streamed output frame for
+  // as long as the dock stayed open.
+  const specsFn = nb.kernelSpecs
   useEffect(() => {
     let live = true
-    nb.kernelSpecs().then((r) => { if (live) { setSpecs(r.specs); setSpecDefault(r.default) } }).catch(() => {})
+    specsFn().then((r) => { if (live) { setSpecs(r.specs); setSpecDefault(r.default) } }).catch(() => {})
     return () => { live = false }
-  }, [nb])
+  }, [specsFn])
 
   const kernelLabel = (kernelName?: string) => {
     const effective = kernelName ?? specDefault

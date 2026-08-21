@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
+import { errText } from '../lib/errText'
 import type { DirEntry } from '@claudette/shared'
+import { useDismissOnOutside } from '../lib/useDismiss'
 
 // A file/dir copied or cut in the browser — module-level so it survives a re-render
 // and a folder change, letting you paste it into a different directory (like the OS
@@ -53,34 +55,28 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   // The "+ New" dropdown that gathers the notebook/file/folder/upload add actions.
   const [addOpen, setAddOpen] = useState(false)
 
+  // try/finally: `api.fs.list` REJECTS on a dropped connection or a non-JSON body, and
+  // an unguarded rejection left the dock on "Loading…" with no working way out (⟳ calls
+  // straight back into here).
   const load = useCallback(async (path?: string) => {
     setLoading(true); setErr(null)
-    const res = await api.fs.list(path)
-    if ('error' in res && res.error) { setErr(res.error); setLoading(false); return }
-    if (!('error' in res)) { setDir(res.path); setEntries(res.entries) }
-    setLoading(false)
+    try {
+      const res = await api.fs.list(path)
+      if ('error' in res && res.error) { setErr(res.error); return }
+      if (!('error' in res)) { setDir(res.path); setEntries(res.entries) }
+    } catch (e) {
+      setErr(errText(e, 'could not list this folder'))
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
   useEffect(() => { void load(initialPath) }, [initialPath, load])
   // Close the context menu on any outside click or Escape.
-  useEffect(() => {
-    if (!menu) return
-    const close = () => setMenu(null)
-    const onKey = (ev: KeyboardEvent) => { if (ev.key === 'Escape') setMenu(null) }
-    window.addEventListener('click', close)
-    window.addEventListener('keydown', onKey)
-    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
-  }, [menu])
+  useDismissOnOutside(!!menu, () => setMenu(null))
   // Same outside-click / Escape close for the "+ New" dropdown. The trigger stops
   // propagation so opening it isn't immediately undone by this same listener.
-  useEffect(() => {
-    if (!addOpen) return
-    const close = () => setAddOpen(false)
-    const onKey = (ev: KeyboardEvent) => { if (ev.key === 'Escape') setAddOpen(false) }
-    window.addEventListener('click', close)
-    window.addEventListener('keydown', onKey)
-    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
-  }, [addOpen])
+  useDismissOnOutside(addOpen, () => setAddOpen(false))
 
   // --- file operations -------------------------------------------------------
   const run = async (p: Promise<{ ok: true } | { ok: false; error: string }>) => {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { GitStatus, GitFileStatus, GitCommit } from '@claudette/shared'
 import { api } from '../api/client'
+import { DockShell } from './DockShell'
 
 // Git panel (Phase 2). Ported from ClaudeMaster's GitPanelView, adapted to
 // Claudette's tab model: it's a full main-area view keyed to the active session's
@@ -257,22 +258,22 @@ export function GitPanelView({ cwd, onClose }: Props) {
 
   if (status && status.repo === false) {
     return (
-      <Shell>
+      <DockShell>
         <Header onRefresh={() => { refresh() }} onClose={onClose} disabled />
         <div className="flex-1 flex items-center justify-center p-4 text-center text-xs text-ctp-overlay">
           Not a git repository.
         </div>
-      </Shell>
+      </DockShell>
     )
   }
   if (status && status.repo === 'error') {
     return (
-      <Shell>
+      <DockShell>
         <Header onRefresh={() => { refresh() }} onClose={onClose} disabled />
         <div className="flex-1 flex items-center justify-center p-4 text-center text-xs text-ctp-red">
           {status.error}
         </div>
-      </Shell>
+      </DockShell>
     )
   }
 
@@ -282,7 +283,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
   const behind = status && status.repo === true ? status.behind : 0
 
   return (
-    <Shell>
+    <DockShell>
       {/* Header: branch + ahead/behind + refresh */}
       <div className="h-9 shrink-0 flex items-center gap-2 px-3 bg-ctp-mantle border-b border-ctp-surface0">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-ctp-mauve shrink-0">
@@ -511,7 +512,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
         </button>
       </div>
       )}
-    </Shell>
+    </DockShell>
   )
 }
 
@@ -535,10 +536,6 @@ function Header({ onRefresh, onClose, disabled }: {
       </button>
     </div>
   )
-}
-
-function Shell({ children }: { children: React.ReactNode }) {
-  return <div className="flex flex-col h-full bg-ctp-base overflow-hidden">{children}</div>
 }
 
 interface SectionAction { label: string; onClick: () => void; title?: string }

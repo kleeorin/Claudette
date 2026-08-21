@@ -1,16 +1,12 @@
-import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
+import { useEscape } from '../lib/useDismiss'
 
 // Confirm gate for the "No permissions" profile — the strict inverse of "Allow all".
 // It strips every `allow` rule from the session's settings files and drops the mode to
 // Prompt, so Claude needs explicit approval for every tool. Destructive (removed rules
 // aren't stashed), so it's confirm-gated like bypass. Escape or click-outside cancels.
 export function NoPermsConfirmDialog({ count, onConfirm, onCancel }: { count: number; onConfirm: () => void; onCancel: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
+  useEscape(onCancel)
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>

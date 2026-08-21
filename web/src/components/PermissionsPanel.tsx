@@ -3,9 +3,11 @@ import type {
   SessionInfo, EffectivePermissions, PermissionMode, PermissionScope, PermissionAction, PermissionRule,
 } from '@claudette/shared'
 import { api } from '../api/client'
+import { errText } from '../lib/errText'
 import { useSessions } from '../store/sessions'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { NoPermsConfirmDialog } from './NoPermsConfirmDialog'
+import { DockShell } from './DockShell'
 
 // Permission Control Center — a GUI over Claude's OWN settings files (see the server
 // permissions.ts). Lives in the right dock beside Files / Git. Shows the effective
@@ -61,8 +63,12 @@ export function PermissionsPanel({ session, onClose }: Props) {
     try {
       const p = await api.perms.get(cwd, agentId)
       setPerms(p)
+      // Clear on success. This polls every 4s, so a single transient failure used to
+      // pin the red banner for the life of the panel while the data behind it was
+      // already fresh again.
+      setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(errText(err))
     }
   }, [cwd, agentId])
 
@@ -142,7 +148,7 @@ export function PermissionsPanel({ session, onClose }: Props) {
   }, [allowRules, cwd, mode, applyMode, refresh])
 
   return (
-    <Shell>
+    <DockShell>
       {/* Header */}
       <div className="h-9 shrink-0 flex items-center gap-2 px-3 bg-ctp-mantle border-b border-ctp-surface0">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-ctp-mauve shrink-0">
@@ -336,12 +342,8 @@ export function PermissionsPanel({ session, onClose }: Props) {
           onCancel={() => setConfirmNoPerms(false)}
         />
       )}
-    </Shell>
+    </DockShell>
   )
-}
-
-function Shell({ children }: { children: React.ReactNode }) {
-  return <div className="flex flex-col h-full bg-ctp-base overflow-hidden">{children}</div>
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { EditorView } from '@codemirror/view'
-import type { KernelStatus, KernelSpec, NbCellType } from '@claudette/shared'
+import type { KernelSpec, NbCellType } from '@claudette/shared'
 import { useNotebooks } from '../store/notebooks'
 import { api } from '../api/client'
 import { setSearchMatches, type HighlightRange } from '../lib/searchHighlight'
@@ -11,17 +11,9 @@ import { FindBar } from './FindBar'
 import { basename } from '../lib/paths'
 import { useScrollMemory } from '../lib/scrollMemory'
 import { Cell } from './notebook/Cell'
+import { useEscape, useDismissOnOutside } from '../lib/useDismiss'
+import { STATUS_DOT, STATUS_LABEL } from '../lib/kernelStatus'
 
-const STATUS_DOT: Record<KernelStatus, string> = {
-  none: 'bg-ctp-surface2',
-  idle: 'bg-ctp-green',
-  busy: 'bg-ctp-yellow animate-pulse',
-  starting: 'bg-ctp-overlay animate-pulse',
-  dead: 'bg-ctp-red',
-}
-const STATUS_LABEL: Record<KernelStatus, string> = {
-  none: 'no kernel', idle: 'idle', busy: 'busy', starting: 'starting…', dead: 'dead',
-}
 
 // One occurrence of the find query, somewhere in the notebook: an offset range inside
 // one cell's source, plus what matched (for `$1`-style replacements).
@@ -503,7 +495,6 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
     const ids = selectedInOrder()
     if (!ids.length) return
     const first = cells.findIndex((c) => c.id === ids[0])
-    const last = cells.findIndex((c) => c.id === ids[ids.length - 1])
     // toIndex is a position in the cells REMAINING after the moved run is removed.
     const rest = cells.length - ids.length
     const to = where === 'top' ? 0
@@ -805,13 +796,7 @@ function CellContextMenu({
   onDuplicate: () => void; onConvert: () => void; onMergeBelow: () => void; onSplit: () => void
   onMoveUp: () => void; onMoveDown: () => void; onTogglePin: () => void; onDelete: () => void
 }) {
-  useEffect(() => {
-    const close = () => onClose()
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('click', close)
-    window.addEventListener('keydown', onKey)
-    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey) }
-  }, [onClose])
+  useDismissOnOutside(true, onClose)
   const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
   const run = (fn: () => void) => () => { onClose(); fn() }
   const left = Math.min(x, window.innerWidth - 200)
@@ -884,11 +869,7 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
     ['✂ (cell menu)', 'Split cell at the cursor'],
     ['?', 'This help'],
   ]
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useEscape(onClose)
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
       <div className="w-[460px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>

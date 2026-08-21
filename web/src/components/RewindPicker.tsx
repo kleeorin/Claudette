@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import type { RewindPoint, RewindMode, RewindPreview } from '@claudette/shared'
 import { api } from '../api/client'
+import { useEscape } from '../lib/useDismiss'
+import { ago } from '../lib/ago'
 
 // Native replacement for the TUI's `/rewind` (unavailable in headless stream-json
 // mode). Two steps: pick a past user turn, then choose what to restore —
@@ -30,11 +32,8 @@ export function RewindPicker({
     return () => { live = false }
   }, [sessionId])
 
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => { if (e.key === 'Escape') { if (selected) setSelected(null); else onClose() } }
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-  }, [onClose, selected])
+  // Escape steps BACK one level (out of a chosen point) before it closes the picker.
+  useEscape(() => { if (selected) setSelected(null); else onClose() })
 
   // Newest turn first: rewinding to a recent turn is the common case.
   const ordered = list ? [...list].reverse() : null
@@ -214,10 +213,3 @@ function firstLine(text: string): string {
   return line.trim()
 }
 
-function ago(ms: number): string {
-  const s = (Date.now() - ms) / 1000
-  if (s < 60) return 'just now'
-  const m = s / 60; if (m < 60) return `${Math.floor(m)}m ago`
-  const h = m / 60; if (h < 24) return `${Math.floor(h)}h ago`
-  return `${Math.floor(h / 24)}d ago`
-}

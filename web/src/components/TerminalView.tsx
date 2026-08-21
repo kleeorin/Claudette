@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { useTerminal, type TerminalAPI } from '../hooks/useTerminal'
 
@@ -35,7 +35,10 @@ export function TerminalView(
   const queueRef = useRef<string[]>([])
   const writeToTerm = useRef<((data: string) => void) | null>(null)
 
-  const termApi = useRef<TerminalAPI>({
+  // useMemo, not useRef: the ref form evaluated this whole object literal on EVERY
+  // render and then threw the new one away (useRef ignores its argument after the
+  // first call). It closes only over refs, so an empty dep list is right.
+  const termApi = useMemo<TerminalAPI>(() => ({
     sendInput: (data) => { const id = paneIdRef.current; if (id) api.pane.input(id, data) },
     sendResize: (cols, rows) => { const id = paneIdRef.current; if (id) api.pane.resize(id, cols, rows) },
     subscribeOutput: (cb) => {
@@ -46,7 +49,7 @@ export function TerminalView(
         cb(data)
       })
     },
-  }).current
+  }), [])
 
   const { fit, focus, getSize, reset } = useTerminal(containerRef, termApi)
 

@@ -213,7 +213,6 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
 
       {picking && (
         <FileBrowser
-          mode="folder"
           initialPath={session.cwd}
           onClose={() => setPicking(false)}
           confirmLabel={`Mount ${pickMode}`}
