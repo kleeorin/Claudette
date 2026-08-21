@@ -94,6 +94,12 @@ export class KernelManager extends EventEmitter {
   // Is any cell of this notebook currently executing/queued?
   isRunning(notebookId: string): boolean { return (this.running.get(notebookId)?.size ?? 0) > 0 }
 
+  // WHICH cells are executing/queued — the same set that drives the UI spinners, exposed
+  // so the MCP notebook tools can tell Claude what is in flight. Without it a cell mid-run
+  // is indistinguishable from a finished one (it still carries the PREVIOUS run's outputs
+  // and execution count), so a long run reads to Claude as a stuck notebook.
+  runningCells(notebookId: string): string[] { return [...(this.running.get(notebookId) ?? [])] }
+
   // Get (or lazily spawn) the pooled Jupyter server for a sandbox key, and its URL +
   // token. The 'off' server is the shared unconfined one and drives the browser proxy
   // target; a sandboxed key gets a server confined to that session's box.

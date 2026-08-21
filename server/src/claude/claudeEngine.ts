@@ -94,7 +94,8 @@ function notebookGuard(toolName: string, input: Record<string, unknown> | undefi
     + `${toolName} tool is disabled for notebooks. Use the app-control notebook tools instead: `
     + 'read_notebook to get the cell ids, then edit_cell / add_cell / insert_cell / delete_cell / '
     + 'move_cell / set_cell_type (addressed by notebook + cell id), or create_notebook for a new one, '
-    + 'and run_cell / run_all to execute. These mutate the server-owned notebook document (edited live '
+    + 'and run_cell / run_all to execute (notebook_status to see whether a run is still in flight — a '
+    + 'slow cell is working, not stuck). These mutate the server-owned notebook document (edited live '
     + 'in every open view) instead of overwriting the file.'
 }
 

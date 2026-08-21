@@ -2,7 +2,7 @@ import { extname, resolve, dirname, basename, isAbsolute } from 'path'
 import { errMessage } from '../util/errMessage'
 import { realpath, stat } from 'fs/promises'
 import { nbText as asText } from '@claudette/shared'
-import type { NbCell, NbCellType, NbOutput, NotebookDoc, NotebookOp } from '@claudette/shared'
+import type { KernelStatus, NbCell, NbCellType, NbOutput, NotebookDoc, NotebookOp } from '@claudette/shared'
 import type { NotebookDocManager } from '../notebook/notebookDocManager'
 import type { KernelManager } from '../jupyter/kernelManager'
 import type { ActivePaneRegistry } from './activePaneRegistry'
@@ -41,6 +41,15 @@ function requireIpynb(p: string): McpToolResult | null {
 // path-unset call that turn — the task stays on its notebook even if the user
 // navigates away or closes it. open_notebook/create_notebook re-pin (Claude's
 // explicit choice); the pin resets at the next user turn (SessionManager 'userTurn').
+//
+// RUN STATE (what a stuck notebook actually looks like): the server tracks a kernel
+// status and a per-cell executing/queued set — the UI's kernel dot and `[*]` spinners —
+// and none of it used to reach Claude. `kernel` meant only "a kernel is bound", and a
+// cell mid-execution was byte-identical to a finished one (its outputs and execution
+// count still describe the PREVIOUS run), so a long run looked like a hung notebook and
+// Claude reported it stuck. Every notebook result now carries kernel/busy/runningCells
+// and flags running cells; notebook_status is the cheap poll, and interrupt_kernel the
+// escape hatch for a cell that really is wedged.
 
 export function registerNotebookTools(
   mcp: AppControlMcpServer,
@@ -175,6 +184,38 @@ export function registerNotebookTools(
     return { error: `${doc.path} is owned by a more-confined session, so its kernel would execute there rather than in this one. Refusing to modify or run it. Shut that notebook's kernel down (or close the owning session) to take it over.` }
   }
 
+  // The notebook's LIVE execution state, read from the same KernelManager the UI's kernel
+  // dot and cell spinners read. Claude used to see NONE of it: read_notebook's `kernel`
+  // meant only "a kernel is bound" (so an idle kernel read as "running"), and a cell
+  // mid-execution was byte-identical to a finished one — same stale outputs, same
+  // execution count — so polling a long run looked exactly like a hung notebook and
+  // Claude concluded it was stuck. Every result that describes a notebook goes through here.
+  function runState(doc: NotebookDoc): { running: Set<string>; kernel: KernelStatus; busy: boolean; runningIndexes: number[] } {
+    const running = new Set(kernels.runningCells(doc.notebookId))
+    const busy = running.size > 0
+    const reported = kernels.kernelStatus(doc.notebookId)
+    // `kernel` and `busy` must never contradict each other — a `busy: true, kernel: 'none'`
+    // result is exactly the kind of thing that gets read as a broken notebook. Cells in
+    // flight IS the kernel working, whatever the socket has told us so far: no status yet
+    // means the kernel is still coming up ('starting'), and a stale 'idle' (between the
+    // execute request and the kernel's busy event) is really 'busy'. Idle-and-not-busy
+    // falls back to whether a kernel is bound, so a live one never reports 'none'.
+    const kernel: KernelStatus = busy
+      ? (reported === undefined ? 'starting' : reported === 'idle' ? 'busy' : reported)
+      : (reported ?? (doc.kernelId ? 'idle' : 'none'))
+    const runningIndexes = doc.cells.flatMap((c, i) => (running.has(c.id) ? [i] : []))
+    return { running, kernel, busy, runningIndexes }
+  }
+
+  // The one sentence that stops "still executing" from being read as "stuck" — attached to
+  // every busy result Claude gets back.
+  function busyNote(s: { runningIndexes: number[] }): string {
+    return `Cell(s) ${s.runningIndexes.join(', ')} are still executing or queued on the kernel. `
+      + 'Any outputs shown for them are from their PREVIOUS run and will be replaced when the '
+      + 'current one finishes — the notebook is working, not stuck. Poll notebook_status until '
+      + 'the kernel is idle rather than assuming it has hung.'
+  }
+
   // Resolve a 0-based index against the doc → cellId (with a clear out-of-range error).
   function cellIdAt(doc: NotebookDoc, index: unknown): string | McpToolResult {
     const i = Number(index)
@@ -220,7 +261,12 @@ export function registerNotebookTools(
     handler: async (sid) => {
       const p = panes.get(sid)
       if (!p) return { error: "No file is open in this session's active pane (the Claude tab is focused). Ask the user to open a notebook, or work by explicit `path`." }
-      return { text: JSON.stringify(p) }
+      // Carry the kernel state along for an OPEN notebook: "what am I looking at" and
+      // "is it busy right now" are the same question when a run is in flight.
+      const doc = p.isNotebook ? docs.getByPath(p.path) : undefined
+      if (!doc) return { text: JSON.stringify(p) }
+      const s = runState(doc)
+      return { text: JSON.stringify({ ...p, kernel: s.kernel, busy: s.busy, runningCells: s.runningIndexes }) }
     },
   })
 
@@ -285,12 +331,20 @@ export function registerNotebookTools(
 
   mcp.register({
     name: 'read_notebook',
-    description: 'Read a notebook (the active pane unless `path` is given): returns each cell with its 0-based index, type, source, and a summary of its outputs. Use this to see the current authoritative state (including run outputs) before editing by index.',
+    description: "Read a notebook (the active pane unless `path` is given): returns each cell with its 0-based index, type, source, and a summary of its outputs, plus the notebook's live `kernel` status (none/starting/idle/busy/dead) and `busy`/`runningCells`. A cell still executing is flagged `running: true` and its outputs are from the PREVIOUS run — check that before reading unchanged outputs as a stuck notebook. Use this to see the current authoritative state before editing by index.",
     inputSchema: { type: 'object', properties: { ...pathProp }, required: [] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args, false, 'read')   // reading shouldn't pop a tab
       if (isErr(doc)) return doc
-      return { text: JSON.stringify({ path: doc.path, kernel: doc.kernelId ? 'running' : 'none', cells: doc.cells.map(describeCell) }, null, 1) }
+      const s = runState(doc)
+      return { text: JSON.stringify({
+        path: doc.path,
+        kernel: s.kernel,
+        busy: s.busy,
+        runningCells: s.runningIndexes,
+        ...(s.busy ? { note: busyNote(s) } : {}),
+        cells: describeCells(doc.cells, s.running),
+      }, null, 1) }
     },
   })
 
@@ -395,33 +449,87 @@ export function registerNotebookTools(
 
   mcp.register({
     name: 'run_cell',
-    description: 'Execute the code cell at 0-based `index` in a notebook (the active pane unless `path` is given) on its kernel (started on first run), then return the cell outputs. Outputs are saved to disk.',
+    description: "Execute the code cell at 0-based `index` in a notebook (the active pane unless `path` is given) on its kernel (started on first run), then return the cell outputs. Outputs are saved to disk. Blocks until the cell finishes, so a slow cell means a slow tool call — that is the cell working, not a hang. If the cell is ALREADY executing (the user ran it, or a run_all is in flight) it is not re-run and the call reports `started: false`.",
     inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' } }, required: ['index'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
+      // Already executing or queued (the user hit run, a run_all is in flight, another
+      // session started it): KernelManager silently IGNORES the duplicate run, so we would
+      // hand back the PREVIOUS run's outputs as this run's result — an instant "success"
+      // carrying stale data, which is worse than a hang. Report what's actually happening.
+      {
+        const s = runState(doc)
+        if (s.running.has(id)) return { text: JSON.stringify({ started: false, kernel: s.kernel, runningCells: s.runningIndexes, note: busyNote(s) }, null, 1) }
+      }
       try {
         await kernels.runCell(doc.notebookId, id)
         const g = await gate(sid, doc.path, 'write'); if (isGateErr(g)) return g
         await docs.save(doc.notebookId, g.guard)
         const idx = doc.cells.findIndex((c) => c.id === id)
-        return { text: JSON.stringify(describeCell(doc.cells[idx], idx), null, 1) }
+        // The cell can be deleted while its run is in flight (the run itself tolerates
+        // that) — describing doc.cells[-1] would throw a TypeError over a benign race.
+        if (idx < 0) return { text: `ran, but the cell was deleted from ${doc.path} before the run finished` }
+        return { text: JSON.stringify(describeCell(doc.cells[idx], idx, runState(doc).running), null, 1) }
       } catch (e) { return { error: `run failed: ${errMessage(e)}` } }
     },
   })
 
   mcp.register({
     name: 'run_all',
-    description: 'Execute every code cell top-to-bottom in a notebook (the active pane unless `path` is given) on its kernel, then return all cells with their outputs. Saved to disk.',
+    description: "Execute every code cell top-to-bottom in a notebook (the active pane unless `path` is given) on its kernel, then return all cells with their outputs. Saved to disk. Blocks until the whole notebook finishes — a slow return is the run working, not a hang. Refuses (reporting `started: false`) if a run is already in flight; poll notebook_status instead of retrying.",
     inputSchema: { type: 'object', properties: { ...pathProp }, required: [] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
+      // A second run_all over a notebook that's already running would interleave two
+      // top-to-bottom passes on one kernel — cells re-run underneath the first pass, in
+      // nobody's order. Refuse, and say what's in flight so the wait is an informed one.
+      {
+        const s = runState(doc)
+        if (s.busy) return { text: JSON.stringify({ started: false, kernel: s.kernel, runningCells: s.runningIndexes, note: busyNote(s) }, null, 1) }
+      }
       try {
         await kernels.runAll(doc.notebookId)
         const g = await gate(sid, doc.path, 'write'); if (isGateErr(g)) return g
         await docs.save(doc.notebookId, g.guard)
-        return { text: JSON.stringify(doc.cells.map(describeCell), null, 1) }
+        return { text: JSON.stringify(describeCells(doc.cells, runState(doc).running), null, 1) }
       } catch (e) { return { error: `run_all failed: ${errMessage(e)}` } }
+    },
+  })
+
+  mcp.register({
+    name: 'notebook_status',
+    description: "Report the LIVE execution state of a notebook (the active pane unless `path` is given): its kernel status (none/starting/idle/busy/dead) and which cells are executing or queued, by 0-based index. A running cell keeps showing its PREVIOUS run's outputs and execution count, so this is the only reliable way to tell 'still working' from 'finished'. Call it before ever concluding a notebook is stuck, and to poll a long run — it executes nothing and is cheap.",
+    inputSchema: { type: 'object', properties: { ...pathProp }, required: [] },
+    handler: async (sid, args) => {
+      const doc = await targetDoc(sid, args, false, 'read')   // pure observation: no focus, no ownership claim
+      if (isErr(doc)) return doc
+      const s = runState(doc)
+      return { text: JSON.stringify({
+        path: doc.path,
+        kernel: s.kernel,
+        busy: s.busy,
+        runningCells: s.runningIndexes,
+        ...(s.busy ? { note: busyNote(s) } : {}),
+      }, null, 1) }
+    },
+  })
+
+  mcp.register({
+    name: 'interrupt_kernel',
+    description: "Interrupt a notebook's kernel (the active pane unless `path` is given) — the equivalent of Ctrl-C, raising KeyboardInterrupt in whatever cell is executing. Use it ONLY for a cell that is genuinely stuck: check notebook_status first, since a long-running cell is not a stuck one, and prefer asking the user before killing work in progress. Variables survive (this is not a restart).",
+    inputSchema: { type: 'object', properties: { ...pathProp }, required: [] },
+    handler: async (sid, args) => {
+      // Gated as a READ, and deliberately claiming NO ownership: an interrupt executes no
+      // code, so it can't move a kernel into this session's box — and taking ownership just
+      // to Ctrl-C someone else's notebook would redirect where its kernel later runs.
+      const doc = await targetDoc(sid, args, false, 'read')
+      if (isErr(doc)) return doc
+      const before = runState(doc)
+      if (!before.busy) return { text: `Nothing is executing in ${doc.path} (kernel: ${before.kernel}) — nothing to interrupt.` }
+      try { await kernels.interrupt(doc.notebookId) } catch (e) { return { error: `interrupt failed: ${errMessage(e)}` } }
+      return { text: `Interrupt sent to the kernel of ${doc.path} (it was running cell(s) ${before.runningIndexes.join(', ')}). `
+        + 'The cell should stop with a KeyboardInterrupt error output shortly — poll notebook_status to confirm the kernel is idle.' }
     },
   })
 }
@@ -435,12 +543,23 @@ function strOrUndef(s: unknown): string | undefined {
   return s == null ? undefined : String(s)
 }
 
-// A compact, Claude-friendly view of a cell (index is positional, added by caller
-// via map()). Outputs are summarized to text so the payload stays small.
-function describeCell(cell: NbCell, index: number): Record<string, unknown> {
+// Describe a whole notebook's cells against its live running set. Not `cells.map(
+// describeCell)` — map passes the ARRAY as the third argument, which would land in
+// `running`; the explicit arrow keeps that from ever being a silent type-hole.
+function describeCells(cells: NbCell[], running: Set<string>): Record<string, unknown>[] {
+  return cells.map((c, i) => describeCell(c, i, running))
+}
+
+// A compact, Claude-friendly view of a cell (index is positional, added by the caller).
+// Outputs are summarized to text so the payload stays small. `running` is the notebook's
+// live executing/queued set: a cell in it is flagged `running: true`, because its
+// `outputs` and `executionCount` still describe the PREVIOUS run and are otherwise
+// indistinguishable from a cell that has finished.
+function describeCell(cell: NbCell, index: number, running: Set<string>): Record<string, unknown> {
   const base: Record<string, unknown> = { index, type: cell.cellType, source: cell.source }
   if (cell.cellType === 'code') {
     base.executionCount = cell.executionCount ?? null
+    if (running.has(cell.id)) base.running = true
     base.outputs = (cell.outputs ?? []).map(summarizeOutput)
   }
   return base
