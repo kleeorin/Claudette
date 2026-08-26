@@ -613,7 +613,7 @@ writable source tree + hot reload. Here the unsandboxed process already exists a
 one HTTP POST + one WS frame away. It also gives an *interactive shell* (network, `curl`,
 `chmod`, cron, ssh-key drop, …), a superset of the fs API's write-a-file primitive.
 
-**FIXED (2026-07-18).** The pane pty now runs inside the owning session's box:
+**FIXED (2026-07-18).** The pane pty now runs inside the owning session's box (when `sandboxTerminals` is set — see Revised default below):
 - **`paneSpawnSpec` / `PaneManager.create`** (`pane/paneManager.ts`) resolve the session's
   sandbox (via a resolver wired in `index.ts`, mirroring the kernel one) and, when it's
   confined, spawn the shell through **`wrapCommand(cfg, cwd, shell, [])`** — the exact box

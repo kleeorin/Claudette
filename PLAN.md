@@ -11,7 +11,7 @@ rock-solid Claude↔notebook link built on a Jupyter kernel server.
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| **Deployment** | Single-user, **localhost only**. Server binds `127.0.0.1`; open in a browser (directly, or via SSH tunnel to a remote box). | Simplest security model; mirrors how ClaudeMaster is used today. No multi-user authn/authz. |
+| **Deployment** | **Single-user, local-first, optionally reachable.** The server binds `127.0.0.1` by default and requires an access token *even on loopback* (`server/src/auth.ts`; opt out with `CLAUDETTE_NO_AUTH=1`). Binding a non-loopback `HOST` is supported and **fail-closed**: the server refuses to start without an explicit `CLAUDETTE_TOKEN`. The intended remote path is `./rc_launch.sh` — one origin, `tailscale serve` HTTPS, PWA on a phone. Still **single-user**: one operator, one token, no multi-user authn/authz. | Loopback is not a trust boundary here — sandboxed sessions share the host network namespace and can reach the control API (SANDBOX.md, "Control-plane escape"), so the token gates it. Remote access is a first-class supported mode, not a workaround; the phone is a first-class client. |
 | **Backend** | **Hybrid**: a Node/TypeScript server that ports ClaudeMaster's main process ~verbatim (swap Electron IPC → WebSocket/HTTP), **plus a Jupyter server as a companion process** used for kernels. | Max customizability of our own app, one language front↔back, reuse of the debugged engine, and Jupyter's stability exactly where it matters (kernels). Not a "guest" inside Jupyter. |
 | **Notebook model** | **Server owns one authoritative notebook document**, addressed by a stable `notebookId` + stable cell ids. The UI is a *pure view*. Claude both **edits and executes** the same document through the same server API. **Coordinated editing** (turn-based per cell) with **enforceable per-cell locks**. | Removes the two root-cause bugs from ClaudeMaster (implicit "active pane" targeting; multiple diverging copies / "temp version"). |
 | **Notebook UI** | **Custom React notebook** ("a little Jupyter interface"), ported from ClaudeMaster, rewired as a view over the server document. | Full control, tight Claude integration, matches the desired UX. |
@@ -64,7 +64,6 @@ Claudette removes both causes:
      ├── GitManager            git via execFile/ssh                 (ported)
      ├── FsService             local fs ops + dir picker            (ported)
      ├── Permissions           read/merge/write Claude settings     (ported)
-     ├── Remotes/SSH           ssh, ControlMaster, remoteFs         (ported)
      ├── JupyterManager        spawn Jupyter server + venv discovery (ported)
      └── JupyterProxy          ★ NEW: reverse-proxy /jupyter/* (HTTP + WS)
               │
@@ -208,7 +207,7 @@ API schema for both server and SPA (same package/monorepo).
 optional local token.
 
 **Ports ~as-is to the SPA:** the React components/stores, transcript rendering,
-CodeMirror/xterm, nbformat parsing (`ipynb.ts`), markdown/wikilinks, `toolFormat`,
+CodeMirror/xterm, nbformat parsing (`ipynb.ts`), markdown, `toolFormat`,
 `KernelClient` (repoint `baseUrl`).
 
 **Changes in the SPA:**
@@ -228,8 +227,8 @@ CodeMirror/xterm, nbformat parsing (`ipynb.ts`), markdown/wikilinks, `toolFormat
 
 ## 7. Jupyter integration
 
-- **v1:** kernels only. `JupyterManager` spawns `python3 -m jupyter server` (local
-  or remote-over-SSH tunnel, both already implemented); `JupyterProxy` exposes it
+- **v1:** kernels only. `JupyterManager` spawns `python3 -m jupyter server` locally;
+  `JupyterProxy` exposes it
   at `<origin>/jupyter`. Kernelspec dropdown, `python-autovenv` preference, custom
   kernel cwd, install-jupyter button — all ported.
 - **Later, opt-in (Jupyter-gained features):** adopt the **Contents API** as an
@@ -241,31 +240,25 @@ CodeMirror/xterm, nbformat parsing (`ipynb.ts`), markdown/wikilinks, `toolFormat
 
 ## 8. Feature parity checklist (from ClaudeMaster inventory)
 
-- [ ] Multi-session sidebar (tree, status dots, badges), New Session (name / role /
-      model / local|remote)
-- [ ] Native chat (stream-json transcript, token streaming, thinking blocks, tool
-      cards, markdown), MetaBar (model, context meter, cost, rate-limit chips)
-- [ ] Slash-command menu, `/resume` picker, `/clear`
-- [ ] Permission cards (allow-once / allow-always / deny), AskUserQuestion card,
-      interrupt, retry/relaunch, exited banner
-- [ ] Desktop notifications + chime + attention badge (web equivalents)
-- [ ] Session persistence/restore (incl. `--resume` by claude session id)
-- [ ] Terminal/pty shell panes (stacked, resizable) + optional TUI frontend
-- [ ] **Notebook editor** (server-owned doc, locks, reconcile — §4)
-- [ ] File browser (list/sort/filter, new/rename/copy/paste/trash, drag, previews:
-      text/image/pdf/csv/binary, edit+save, split/strip layout, virtual tabs)
-- [ ] Git panel (changes/stage/commit, diff, log, branches)
-- [ ] Permissions Control Center (mode switch live/relaunch/restart, rules CRUD,
-      settings-file visibility, notebook-funnel/agent read-only view)
-- [ ] Remotes/SSH (manage remotes, remote sessions: claude+term+fs+git+jupyter,
-      `remote://` path encoding, ControlMaster, MCP reverse tunnel)
-- [ ] Docs/wiki (rich DocView, `[[wikilinks]]`, create-on-click)
-- [x] Agent roles (5 built-ins → launch flags), subsessions + `report_to_parent` —
-      shipped as **teams**: star topology (coordinator + members), an idle-gated message
-      mailbox, the operator-gated `employ_teammate`/`dismiss_teammate`, dismissal as an
-      exit interview whose report becomes a role handover note, and sandbox inheritance
-- [ ] MCP app-control tools (`mcp__app__*`), notebook tools rewired server-side
-      (edit + insert/delete/move/type + create + **read + run**)
+- [x] Multi-session sidebar (tree, status dots, attention lights, badges), New Session (name / role / model / sandbox)
+- [x] Native chat (stream-json transcript, token streaming, thinking blocks, tool cards, markdown), MetaBar (model, context meter, cost, rate-limit chips, plan-quota meter)
+- [x] Slash-command menu, `/resume` picker, `/clear`, `/rewind` (chat + git-shadow code restore)
+- [x] Permission cards (allow-once / allow-always / deny), AskUserQuestion card, interrupt, retry/relaunch, exited banner
+- [x] Desktop notifications + chime + attention badge (web equivalents)
+- [x] Session persistence/restore (incl. `--resume` by claude session id)
+- [x] Terminal/pty shell panes (stacked, resizable), confined to the owning session's box
+- [x] **Notebook editor** (server-owned doc, cell locks, per-cell reconcile, undo/redo, kernel picker, heading collapse, cross-cell find — §4)
+- [x] File browser (list/sort/filter, new/rename/copy/paste/trash, upload, previews: text/image/pdf/csv/binary, edit+save, virtual tabs)
+- [x] Inline diff review of Claude's edits, per-hunk accept/reject, inside the file's own editor
+- [x] Git panel (changes/stage/commit, diff, log, branches)
+- [x] Permissions Control Center (effective rules, rules CRUD, settings-file visibility)
+- [x] Agent roles (5 built-ins → launch flags), subsessions + `report_to_parent` — shipped as **teams**: star topology, idle-gated mailbox, operator-gated `employ_teammate`/`dismiss_teammate`, dismissal as an exit interview whose report becomes a role handover note, sandbox inheritance
+- [x] MCP app-control tools (`mcp__app__*`): notebook read/edit/insert/delete/move/type/create/run/run_all/status/interrupt, active-pane steering, `open_file`, plus the team tools
+- [x] **Connectors** — external MCP servers as operator-granted, per-session reach (CONNECTORS.md); not in the ClaudeMaster inventory, new to Claudette
+- [x] **Session sandboxing** — bubblewrap confinement per session, incl. kernels and terminal panes, with GPU passthrough (SANDBOX.md); new to Claudette
+- ~~Docs/wiki (rich DocView, `[[wikilinks]]`, create-on-click)~~ — **CUT** 2026-08-21. The wikilink parser in `Markdown.tsx` was dead code: `onWikiLink` had no call site anywhere, so the plugin never loaded and the feature never ran in production. Its own comment described the integration as "DocView passes `onWikiLink`" — and no DocView was ever built, in any file. Parser and prop deleted with the cut. Milkdown editing stays; it is the markdown file editor, not a wiki.
+- [ ] Phone-native layout — the PWA shell, transport, auth and reconnect are all shipped; the UI is still desktop-only. **Committed work.**
+- ~~Remotes/SSH~~ — **CUT** (superseded by Tailscale-to-one-box).
 
 ---
 
@@ -286,10 +279,9 @@ minimal path input in the MVP).
 **Phase 2 — workspace parity.** File browser + previews, git panel, permissions
 center, docs/wiki, session persistence/restore, notifications (web), slash/resume.
 
-**Phase 3 — orchestration + remotes.** Agent roles + teams **done** (see the checklist
-above; `mcp/teamTools.ts`, `mcp/teamMailbox.ts`, `mcp/teamNotes.ts`, and the team section
-of SANDBOX.md). Still open: full MCP app-control surface, SSH remotes (sessions/fs/git/
-jupyter, MCP tunnel), optional TUI frontend.
+**Phase 3 — orchestration.** Agent roles + teams **done** (see the checklist above;
+`mcp/teamTools.ts`, `mcp/teamMailbox.ts`, `mcp/teamNotes.ts`, and the team section of
+SANDBOX.md). Remotes/SSH is **cut**, not pending. Still open: optional TUI frontend.
 
 **Phase 4 — Jupyter-gained extras (opt-in).** Contents API / server terminals /
 multi-kernel; and, if wanted, the **option-2 upgrade** (Yjs co-editing).
