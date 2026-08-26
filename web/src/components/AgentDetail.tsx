@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useChat, collectAgents, agentKey, isAgentLive, type AgentView, type TranscriptItem } from '../store/chat'
 import { useSessions } from '../store/sessions'
+import { useScrollMemory } from '../lib/scrollMemory'
 import { Markdown } from './Markdown'
 import { ToolRow, ResultRow } from './ChatView'
 
@@ -8,6 +9,16 @@ import { ToolRow, ResultRow } from './ChatView'
 // thought (thinking blocks rendered in full, not collapsed), every tool call it made,
 // and its final result. The sidebar list is the glanceable summary; this is the
 // "what was it actually doing" view, with room to read.
+// Whether the reader was parked at the bottom, remembered per (session, agent) across unmount.
+// `useRef(true)` re-initialised on EVERY mount, and <AgentDetail key={active.id}> remounts on a
+// session switch — while the 80px "is the reader at the bottom" test is only ever read from
+// onScroll and never consulted at mount. So a reader who had scrolled up to study an earlier
+// step was snapped back to the bottom every time they switched session and back. Different
+// symptom from the file-scroll bug (it resets to the END, not the beginning), same cause: no
+// memory across remount. Defaulting to `true` is right for a FIRST visit — a fresh agent view
+// should follow the live output — it was only wrong as a thing to re-assert on every remount.
+const pinnedByKey = new Map<string, boolean>()
+
 export function AgentDetail({ sessionId, agentId }: { sessionId: string; agentId: string }) {
   const { transcriptFor, tasksFor, stopTask } = useChat()
   const { sessions } = useSessions()
@@ -24,7 +35,14 @@ export function AgentDetail({ sessionId, agentId }: { sessionId: string; agentId
   // Follow the agent's activity while it runs, but only while parked at the bottom —
   // scrolling up to read an earlier step stays undisturbed.
   const scrollRef = useRef<HTMLDivElement>(null)
-  const pinnedRef = useRef(true)
+  // Session-scoped like every other scroll key: two sessions viewing the same agent id are two
+  // readers in two places.
+  const scrollKey = `agent:${sessionId}:${agentId}`
+  const pinnedRef = useRef(pinnedByKey.get(scrollKey) ?? true)
+  // Restore the offset too. Composes with the pin rather than fighting it: if the reader was
+  // pinned, the follow effect below puts them at the bottom anyway; if they were not, the pin is
+  // false so the effect no-ops and the restored offset stands.
+  useScrollMemory(scrollKey, () => scrollRef.current)
   const stepCount = agent?.steps.length ?? 0
   useEffect(() => {
     const el = scrollRef.current
@@ -33,7 +51,9 @@ export function AgentDetail({ sessionId, agentId }: { sessionId: string; agentId
   }, [stepCount, active])
   const onScroll = () => {
     const el = scrollRef.current
-    if (el) pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (!el) return
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    pinnedByKey.set(scrollKey, pinnedRef.current)
   }
 
   if (!agent) {

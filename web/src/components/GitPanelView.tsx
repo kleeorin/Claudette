@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { GitStatus, GitFileStatus, GitCommit } from '@claudette/shared'
 import { api } from '../api/client'
 import { DockShell } from './DockShell'
+import { useScrollMemory } from '../lib/scrollMemory'
 
 // Git panel (Phase 2). Ported from ClaudeMaster's GitPanelView, adapted to
 // Claudette's tab model: it's a full main-area view keyed to the active session's
@@ -87,6 +88,44 @@ export function GitPanelView({ cwd, onClose }: Props) {
 
   const modeRef = useRef(mode)
   modeRef.current = mode
+
+  // ── Scroll memory ────────────────────────────────────────────────────────────────
+  // Mounted as <GitPanelView key={termCwd} cwd={termCwd}> (App.tsx), so this panel is
+  // torn down whenever you close the dock or switch to a session with a DIFFERENT cwd.
+  // Both drop you back at the top of a long changed-files list or a long diff.
+  //
+  // Keyed by CWD, NOT by session — a deliberate divergence from every other consumer of this
+  // hook (`file:`/`nb:`/`agent:` are all `${sessionId}:`). Those key by session because ONE
+  // component instance is reused across sessions showing the same path, so two readers need two
+  // offsets. This panel is different: the mount site already keys by cwd, so two sessions
+  // sharing a cwd share this instance and its single DOM node.
+  // The reason is CONSISTENCY WITH THE REST OF THIS PANEL'S STATE. Nothing else here is
+  // session-scoped — the mode, the selected file, the loaded diff and the commit-message draft
+  // all persist untouched across a same-cwd session switch, because nothing remounts. If the
+  // scroll offset alone became session-scoped, switching session would scroll the view while the
+  // selection, the diff under it and the message you were typing all stayed put. One panel, one
+  // position. scroll-memory-check [3g] reds if you session-scope this.
+  // NOT the reason, though it reads like one: "session-scoping would invent a scroll jump."
+  // MEASURED FALSE — a key nobody has stored yet has target 0, and the hook only forces an
+  // offset when target > 0, so the first switch is a no-op either way. It takes a session that
+  // has already left its own offset behind to tell the two schemes apart, which is why [3g] is
+  // shaped the way it is and why [3e] alone was not evidence for anything.
+  const changesRef = useRef<HTMLDivElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
+  const diffRef = useRef<HTMLDivElement>(null)
+  // Pass null while a container isn't rendered rather than letting the hook poll a `getEl`
+  // that cannot resolve: it stops looking after ATTACH_MS and never retries, so a mode
+  // switch later than that would silently stop restoring. null → key re-runs the effect.
+  // Same idiom as FileEditorView's image container.
+  useScrollMemory(mode === 'changes' ? `git:${cwd}:changes` : null, () => changesRef.current)
+  useScrollMemory(mode === 'log' ? `git:${cwd}:log` : null, () => logRef.current)
+  // The diff pane's subject is the specific patch, so it belongs in the key: read file A's
+  // diff, look at B, come back to A and you are where you left off. Staged and unstaged are
+  // two different patches for one path, hence the side.
+  const diffSubject = selectedCommit ? `c:${selectedCommit}`
+    : selected ? `${selected.staged ? 's' : 'u'}:${selected.path}`
+    : null
+  useScrollMemory(diffSubject && `git:${cwd}:diff:${diffSubject}`, () => diffRef.current)
 
   const refresh = useCallback(async () => {
     const s = await api.git.status(cwd)
@@ -416,7 +455,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
 
       {/* File lists (Changes tab) */}
       {mode === 'changes' && (
-      <div className="shrink-0 max-h-[45%] overflow-y-auto px-1.5 py-1.5 space-y-2 border-b border-ctp-surface0">
+      <div ref={changesRef} className="shrink-0 max-h-[45%] overflow-y-auto px-1.5 py-1.5 space-y-2 border-b border-ctp-surface0">
         <Section
           title={`Staged (${staged.length})`}
           actions={staged.length ? [{ label: 'Unstage all', onClick: () => run(() => api.git.unstageAll(cwd)) }] : undefined}
@@ -458,7 +497,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
 
       {/* Commit list (Log tab) */}
       {mode === 'log' && (
-        <div className="shrink-0 max-h-[45%] overflow-y-auto py-1 border-b border-ctp-surface0">
+        <div ref={logRef} className="shrink-0 max-h-[45%] overflow-y-auto py-1 border-b border-ctp-surface0">
           {commits.map((c) => (
             <div
               key={c.hash}
@@ -482,7 +521,7 @@ export function GitPanelView({ cwd, onClose }: Props) {
       {/* Diff (shared by both tabs) */}
       <div className="flex-1 min-h-0 flex flex-col bg-ctp-base">
         {selected || selectedCommit ? (
-          <div className="flex-1 min-h-0 overflow-auto">
+          <div ref={diffRef} className="flex-1 min-h-0 overflow-auto">
             <DiffView text={diff} />
           </div>
         ) : (

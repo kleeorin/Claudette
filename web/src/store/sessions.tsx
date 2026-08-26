@@ -1,13 +1,52 @@
+// SessionsProvider on useReducer. The transitions live in sessionReducer.ts (29 assertions
+// green); this file is now wiring: subscribe, dispatch, expose.
+//
+// ── N2 RESOLVED: `fresh` STAYS IN THE REDUCER. ───────────────────────────────
+// Every isFresh consumer was grepped. There is exactly ONE: ChatView.tsx:249, inside the
+// auto-resume effect at :247-267, with `isFresh` in its dep array at :267.
+//
+// The question was whether it needs SYNCHRONOUS truth. It does not, and the reducer is in
+// fact STRICTLY SAFER there: in the old code `freshRef.current.add(id)` and `setSessions`
+// were two separate writes to two separate places, so the session could in principle appear
+// in state without its fresh mark. Here both come from the SAME `created` action, so a
+// session and its freshness land atomically — they cannot disagree.
+//
+// The real risk turned out to be different from the one predicted, and it is about
+// CALLBACK IDENTITY, not timing. The old isFresh was `useCallback(..., [])` — deliberately
+// stable, so ChatView's effect never re-fired on it. If isFresh closed over the whole store
+// its identity would churn on every state event and that effect would re-run constantly.
+// So it is derived from the `fresh` SET alone:
+//     const isFresh = useCallback((id) => store.fresh.has(id), [store.fresh])
+// The reducer returns `state.fresh` unchanged for every action except `created`, so
+// isFresh's identity is stable across all ordinary churn and changes only when a session is
+// created — which is exactly when that effect should reconsider. Its `autoResumed` guard
+// makes the extra run idempotent.
+//
+// ── WHICH App.tsx HAZARDS THIS REWRITE TOUCHES: NONE. ────────────────────────
+// Stated so it can be checked rather than assumed — and checking it corrected an earlier
+// claim. sessionReducer.ts's header says H2 (App.tsx ~441-443) is "DIRECTLY IMPROVED".
+// THAT IS OVERSTATED AND SHOULD BE READ DOWN. H2's comment says `sessions` gets a new
+// identity on "running→idle, a rename, an optimistic patch" — those are all REAL changes,
+// and a real change must produce a new array. Identity preservation only removes SPURIOUS
+// churn from redundant/no-op events. The effect genuinely wants membership-only, so
+// `sessionIdKey` is still required and H2 STANDS. What the reducer buys is a lower firing
+// rate, not the removal of the workaround.
+// H1 (publishedRef), H3 (pure updaters), H4 (two-flag gating) are all App.tsx-local and
+// untouched. This rewrite fixes nothing in App.tsx; it removes three refs from THIS file.
+//
+// ── WHAT ACTUALLY GOES AWAY HERE ─────────────────────────────────────────────
+//   activeRef, prevStateRef, freshRef  — all three existed only to dodge stale closures.
+//   The WS subscription effect's dep array becomes []  — it now subscribes ONCE instead of
+//     re-subscribing whenever `patch` changed identity.
+//   The attention-clearing useEffect — now part of the same transition that changes the
+//     active session (withActive), so there is no longer a frame in which the newly-active
+//     session still shows its dot.
 import {
-  createContext, useContext, useEffect, useState, useCallback, useMemo, useRef, type ReactNode,
+  createContext, useContext, useEffect, useState, useCallback, useMemo, useReducer, type ReactNode,
 } from 'react'
-import type { SessionInfo, SessionState, PermissionMode, SetModeResult, SandboxConfig, AgentInfo } from '@claudette/shared'
+import type { SessionInfo, PermissionMode, SetModeResult, SandboxConfig, AgentInfo } from '@claudette/shared'
 import { api, getHealth } from '../api/client'
-
-// Minimal Phase-1 session store: mirrors the server's session set (via the WS
-// `session:list`/`state`/`exit` topics + the connect-time snapshot) and exposes
-// create/destroy + active selection. ClaudeMaster's full store (tree/subsessions/
-// remotes/persistence) is a Phase 2/3 port; this is the slice the chat needs.
+import { reduceSessionStore, initialSessionStore, type AttentionReason } from './sessionReducer'
 
 interface ContextValue {
   sessions: SessionInfo[]
@@ -48,78 +87,99 @@ interface ContextValue {
   markBusy: (id: string) => void
   // Sessions that finished a turn (or errored) while you were NOT viewing them — the
   // sidebar shows a red "needs attention" light until you switch to them.
-  attention: Set<string>
+  // ReadonlySet, not Set: it is reducer-owned state now, and a consumer mutating it would
+  // corrupt the store silently. THE ONE TYPE-LEVEL CHANGE IN THIS FILE — if any consumer
+  // needs a mutable Set the typecheck will say so, and that consumer is the bug.
+  attention: ReadonlyMap<string, AttentionReason>
 }
 
 const SessionsContext = createContext<ContextValue | null>(null)
 
 export function SessionsProvider({ children }: { children: ReactNode }) {
-  const [sessions, setSessions] = useState<SessionInfo[]>([])
-  const [activeId, setActiveId] = useState<string | null>(null)
+  const [store, dispatch] = useReducer(reduceSessionStore, initialSessionStore)
+  const { sessions, activeId, attention } = store
+  // State that is NOT part of the session machine: connection status and three facts
+  // fetched once at startup. Deliberately left as plain useState — folding them into the
+  // reducer would put non-transitional data behind a transition vocabulary.
   const [connected, setConnected] = useState(false)
-  const activeRef = useRef<string | null>(null); activeRef.current = activeId
-  // Sessions created via create() this app load (not restored) — kept out of the
-  // auto-resume path so a brand-new session starts empty.
-  const freshRef = useRef<Set<string>>(new Set())
-  // Background sessions that finished / errored while unviewed — cleared on view.
-  const [attention, setAttention] = useState<Set<string>>(new Set())
   const [sandboxAvailable, setSandboxAvailable] = useState(false)
   const [gpuDevices, setGpuDevices] = useState<string[]>([])
   const [homeDir, setHomeDir] = useState('')
   const [agents, setAgents] = useState<AgentInfo[]>([])
-  const prevStateRef = useRef<Map<string, SessionState>>(new Map())
-  const flagAttention = (id: string) => setAttention((a) => a.has(id) ? a : new Set(a).add(id))
 
-  // Patch a single session's fields in place (state/exit), leaving order intact.
   const patch = useCallback((id: string, fields: Partial<SessionInfo>) => {
-    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, ...fields } : s)))
+    dispatch({ type: 'patch', id, fields })
   }, [])
 
+  // Subscribe ONCE. `dispatch` is stable, and every rule these handlers used to apply
+  // inline — don't clobber a running session on ready, flag attention only for a finished
+  // turn on a session you are not watching, keep a failed exit's row — now lives in the
+  // reducer where it is tested. This dep array was [patch] and is now []: the store no
+  // longer needs a ref to read its own current value.
   useEffect(() => {
-    const offList = api.on.list((list) => {
-      setSessions(list)
-      // Default the selection to the first session once one exists.
-      if (!activeRef.current && list.length) setActiveId(list[0].id)
+    const offList = api.on.list((list) => dispatch({ type: 'list', sessions: list }))
+    const offState = api.on.stateChange((id, state) => dispatch({ type: 'state', id, state }))
+    const offReady = api.on.ready((id) => dispatch({ type: 'ready', id }))
+    const offExit = api.on.exit((id, failed, error) => dispatch({ type: 'exit', id, failed, error }))
+    // A reconnect also retires any optimistic row the server never got to acknowledge —
+    // otherwise a drop between a create and its broadcast strands that id in `unacked`
+    // permanently, and since `list` carries unacknowledged rows through, that shows up as a
+    // phantom session that never disappears.
+    //
+    // `wasDown` is required, not decorative: `client.ts` emits `connected(true)` from
+    // `sock.onopen` UNCONDITIONALLY, so without the latch this fires on the FIRST connect as
+    // well as on genuine reconnects. That is harmless only for as long as nothing creates a
+    // session before the socket opens — true today (the sole `create(` call is user-driven and
+    // there is no auto-create on load), and it would quietly stop being true the moment
+    // anything restores a last session, follows a deep link, or spawns a subsession from a URL.
+    // `TerminalView`'s connected handler already uses exactly this latch, so this is the house
+    // pattern rather than a new idea.
+    //
+    // SEEDED, because `connected` is a plain channel with NO REPLAY: a subscriber learns nothing
+    // about where it came in, and a bare `false` gets one of the two cases wrong whichever way
+    // you pick. Mount while the socket is up and the first emit reads as a reconnect; mount
+    // mid-outage and we never observe a down-edge, so the genuine reconnect that follows is not
+    // treated as one — and since `createSession` is HTTP and succeeds while the WS is down, a
+    // session created in that window strands its id in `unacked` permanently.
+    //
+    // THE SEED IS `hasEverConnected() && !isConnected()`, AND `!isConnected()` ALONE IS WRONG —
+    // this was tried and reviewed out. readyState cannot distinguish *never connected yet* from
+    // *was connected and dropped*, which is the entire question here, and a freshly constructed
+    // socket is CONNECTING rather than OPEN. Worse, `SessionsProvider` is nested inside
+    // `AuthGate` and React runs child effects first, while `ensureWs()` is called only from
+    // `AuthGate`'s effect — so at this point `ws` is still null. Either fact alone makes a
+    // readyState-only seed read "down" on every healthy startup, dispatching `reconnected` on
+    // first connect: precisely the bug the latch exists to prevent, reintroduced through another
+    // door. It was a silent no-op only because `unacked` is empty then.
+    //
+    // The four cases this seed gets right: healthy first mount → false (not a reconnect);
+    // remount/outage after a prior connection → true (is a reconnect); app loaded while the
+    // server is down and never connected → false, correctly, since HTTP creates fail too and
+    // there is nothing to strand; StrictMode's second effect run → correct either side of onopen.
+    let wasDown = api.hasEverConnected() && !api.isConnected()
+    const offConn = api.on.connected((up) => {
+      setConnected(up)
+      if (!up) { wasDown = true; return }
+      if (!wasDown) return
+      wasDown = false
+      dispatch({ type: 'reconnected' })
     })
-    const offState = api.on.stateChange((id, state: SessionState) => {
-      const prev = prevStateRef.current.get(id)
-      prevStateRef.current.set(id, state)
-      patch(id, { state })
-      // Turn finished on a session you're not watching → flag it for attention.
-      if (state === 'idle' && (prev === 'running' || prev === 'waiting') && id !== activeRef.current) flagAttention(id)
-    })
-    // `ready` (engine system/init) marks a (re)started engine idle — BUT the CLI
-    // inits lazily, so init often lands AFTER the first turn already set 'running'.
-    // Clobbering that to idle mid-turn hid the working indicator + interrupt for the
-    // whole turn. Only settle to idle when a turn isn't in flight.
-    const offReady = api.on.ready((id) =>
-      setSessions((prev) => prev.map((s) =>
-        s.id === id && s.state !== 'running' && s.state !== 'waiting' ? { ...s, state: 'idle' } : s)))
-    const offExit = api.on.exit((id, failed, error) => {
-      if (failed) { patch(id, { state: 'exited', exitError: error }); if (id !== activeRef.current) flagAttention(id) }
-      else {
-        // Normal close: drop the row; move the selection off it if needed.
-        setSessions((prev) => prev.filter((s) => s.id !== id))
-        if (activeRef.current === id) setActiveId(null)
-      }
-    })
-    const offConn = api.on.connected(setConnected)
     // Pull an initial snapshot too (covers a provider mounted after the WS hello).
-    api.http.listSessions().then((list) => {
-      setSessions(list)
-      if (!activeRef.current && list.length) setActiveId(list[0].id)
-    }).catch(() => { /* server not up yet; the WS snapshot will fill in */ })
+    api.http.listSessions()
+      .then((list) => dispatch({ type: 'list', sessions: list }))
+      .catch(() => { /* server not up yet; the WS snapshot will fill in */ })
     return () => { offList(); offState(); offReady(); offExit(); offConn() }
-  }, [patch])
+  }, [])
 
   const create = useCallback(async (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig }): Promise<string> => {
     const rootDir = opts?.rootDir ?? cwd
     const { id } = await api.http.createSession({ name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox })
-    freshRef.current.add(id)   // a user-created session stays fresh (no auto-resume)
-    // Optimistically add + select; the next list/state event reconciles.
-    setSessions((prev) => prev.some((s) => s.id === id) ? prev
-      : [...prev, { id, name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox, state: 'idle' }])
-    setActiveId(id)
+    // ONE action where there used to be three statements (mark fresh, add optimistically,
+    // select). They were always meant to be one thing.
+    dispatch({
+      type: 'created',
+      session: { id, name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox, state: 'idle' },
+    })
     return id
   }, [])
 
@@ -149,8 +209,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
 
   const destroy = useCallback(async (id: string): Promise<void> => {
     await api.http.destroySession(id)
-    setSessions((prev) => prev.filter((s) => s.id !== id))
-    if (activeRef.current === id) setActiveId(null)
+    // Drops the row AND moves the selection off it if it was active — one transition.
+    dispatch({ type: 'destroyed', id })
   }, [])
 
   // Live permission-mode switch (P1.4). Optimistically reflect the chosen mode; the
@@ -158,6 +218,10 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   const setMode = useCallback(async (id: string, mode: PermissionMode): Promise<SetModeResult> => {
     patch(id, { permissionMode: mode })
     const res = await api.http.setMode(id, mode)
+    // Preserved verbatim from the old code. Note it is now PROVABLY a no-op: the patch
+    // above already set this value, and patchSessions returns the same state when no field
+    // changes. Left in place rather than deleted, because removing dead code is a separate
+    // change from moving live code, and mixing the two is how a refactor hides a decision.
     if (res.applied === 'restart' && res.reason) patch(id, { permissionMode: mode })
     return res
   }, [patch])
@@ -181,25 +245,27 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     await api.http.setTeamEmploy(id, teamEmploy)
   }, [patch])
 
-  const isFresh = useCallback((id: string) => freshRef.current.has(id), [])
+  // Keyed on the `fresh` SET, not on `store` — see the N2 note at the top of this file.
+  // The reducer returns state.fresh unchanged for every action but `created`, so this
+  // identity is stable across ordinary state churn and ChatView's auto-resume effect
+  // (ChatView.tsx:249, its only consumer) re-runs only when a session is created.
+  const isFresh = useCallback((id: string) => store.fresh.has(id), [store.fresh])
 
-  // Viewing a session clears its attention flag (however it became active: click,
-  // create, default selection, or Claude focusing it).
-  useEffect(() => {
-    if (activeId) setAttention((a) => a.has(activeId) ? (() => { const n = new Set(a); n.delete(activeId); return n })() : a)
-  }, [activeId])
+  // Selecting a session ALSO clears its attention flag, in the same transition. The old
+  // code did this in a useEffect on activeId, which ran after render and caught every path
+  // (click, create, default-select, exit) only because they all happened to route through
+  // activeId. Now every path calls withActive on purpose.
+  const setActive = useCallback((id: string | null) => { dispatch({ type: 'setActive', id }) }, [])
 
-  // Only idle→running: never override 'waiting' (a live permission prompt) or clobber
-  // an already-running / exited session.
-  const markBusy = useCallback((id: string) => {
-    setSessions((prev) => prev.map((s) => (s.id === id && s.state === 'idle' ? { ...s, state: 'running' } : s)))
-  }, [])
+  const markBusy = useCallback((id: string) => { dispatch({ type: 'markBusy', id }) }, [])
 
   // Memoize so unrelated session-state churn doesn't hand every consumer a new
-  // context object identity and re-render them all.
+  // context object identity and re-render them all. Most of these callbacks are now
+  // permanently stable (they close over nothing but `dispatch`), so this list is shorter
+  // in practice than it looks.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive: setActiveId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention }),
-    [sessions, activeId, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention],
+    () => ({ sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention }),
+    [sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention],
   )
   return (
     <SessionsContext.Provider value={value}>

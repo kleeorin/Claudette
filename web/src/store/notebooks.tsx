@@ -4,6 +4,10 @@ import {
 import type { NotebookDoc, CellLock, LockReason, KernelStatus, NbCellType, KernelSpecsResponse } from '@claudette/shared'
 import { api } from '../api/client'
 
+// Discriminated on purpose: a bare `null` meaning success is indistinguishable from a bare
+// `null` meaning "nothing happened", which is how the create path lost its id in the first place.
+export type CreateResult = { id: string; error?: undefined } | { error: string; id?: undefined }
+
 // The notebook store is a pure VIEW over the server-owned doc (PLAN §4) — the
 // inverse of ClaudeMaster's store, which OWNED the document. State arrives via the
 // `notebook:update` / `notebook:locks` / `notebook:kernel` WS topics; every mutation
@@ -24,7 +28,7 @@ interface ContextValue {
   // `sessionId` records which session the notebook is opened in — closing that
   // session kills the notebook's kernel.
   openPath: (path: string, sessionId?: string) => Promise<string | null>  // → opened notebookId, or null on failure
-  createPath: (path: string, sessionId?: string) => Promise<string | null>  // → error string or null
+  createPath: (path: string, sessionId?: string) => Promise<CreateResult>  // → { id } | { error }
   // `save`: persist unsaved changes before closing (from the close prompt).
   close: (notebookId: string, save?: boolean) => void
   // Did THIS client open the notebook locally (Files dock / New), vs it arriving
@@ -110,14 +114,21 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     return doc.notebookId
   }, [])
 
-  const createPath = useCallback(async (path: string, sessionId?: string): Promise<string | null> => {
+  // Returns the new notebookId, MIRRORING openPath, so the caller can focus the tab itself.
+  // It used to return error-or-null — the opposite convention from openPath — which left the
+  // caller with no id and forced it to depend on the newly-seen effect in App.tsx firing. That
+  // effect marks each id seen BEFORE testing whether it can act on it, so on the pass where
+  // `activeId` was not yet set the id was consumed and the retry (which its own dep array was
+  // written to provide) could never do anything. Returning the id makes "create opens it" true
+  // by construction instead of by side effect.
+  const createPath = useCallback(async (path: string, sessionId?: string): Promise<CreateResult> => {
     const res = await api.notebook.create(path, sessionId)
-    if (res.error || !res.doc) return res.error ?? 'failed to create notebook'
+    if (res.error || !res.doc) return { error: res.error ?? 'failed to create notebook' }
     const doc = res.doc
     localIds.current.add(doc.notebookId)
     setDocs((prev) => ({ ...prev, [doc.notebookId]: doc }))
     setOrder((prev) => prev.includes(doc.notebookId) ? prev : [...prev, doc.notebookId])
-    return null
+    return { id: doc.notebookId }
   }, [])
 
   const close = useCallback((notebookId: string, save = false) => {

@@ -6,8 +6,82 @@
   color-scheme: dark;
 }
 
-html, body, #root {
-  height: 100%;
+/* html/body track --vvh and clip. BE PRECISE ABOUT WHAT THIS DOES AND DOES NOT FIX — the
+   first draft of this comment overstated it, which is the failure mode this codebase keeps
+   producing in miniature.
+   WHAT IT DOES: forecloses document SCROLL if the content below #root ever exceeds the
+   viewport. It forecloses nothing measurable IN ANY HARNESS today, because body{height:100%}
+   EQUALS the layout viewport rather than exceeding it, so there is no overflow in either
+   state. But it is NOT inert: `overflow: hidden` here propagates to the viewport and disables
+   document-level scrolling outright — including the browser's own
+   scroll-the-focused-input-into-view, which on iOS is one of the few native mitigations for
+   keyboard occlusion. So in principle this could make the pan case WORSE rather than neutral.
+   In-app blast radius checked and clean: every scrollIntoView in web/src (MilkdownEditor,
+   NotebookView, ChatView, and CodeMirror's own in DiffEditor/CodeEditor) targets an element
+   inside an internal scroller, so nothing in our code depends on document scroll. The native
+   focus-scroll behaviour is device-only and we cannot test its absence here.
+   WHAT IT DOES **NOT** FIX, and do not let anyone bank it as such: with the keyboard up the
+   browser can PAN the visual viewport within the unchanged 844px layout viewport, over a
+   #root that is now only 508px — so the pan can land on bare canvas below the app. PANNING
+   IS NOT SCROLLING and `overflow: hidden` does not prevent it. That much is confirmed.
+   STATUS: SETTLED — and the answer is that the remedy this comment used to name does not
+   work. Measured by scratchpad/visual-viewport-pan-probe.mjs, which is where the numbers are.
+   1. IT IS NOT DEVICE-ONLY. This used to say "headless Chrome has no software keyboard and
+      no visual-viewport pan, so this is not observable in any harness in this repo". The
+      first clause is true and the second is false, and the false one is what kept the
+      question open. `Emulation.setPageScaleFactor` gives headless Chrome a visual viewport
+      SHORTER than the layout viewport, and a wheel event pans it: offsetTop 0 -> 336 while
+      window.scrollY stays 0. offsetTop moving while scrollY does not IS the pan.
+   2. `position: fixed; inset: 0` DOES NOT STOP IT, in either form, and the two forms are
+      different rules rather than variants:
+        • keeping the height (`position: fixed; inset: 0; height: var(--vvh)`) is byte-for-byte
+          identical to today — 336px of canvas exposed either way. `position: fixed` resolves
+          against the LAYOUT viewport, which is the very box the visual viewport pans INSIDE,
+          so a fixed element cannot escape a pan by construction.
+        • literally (`inset: 0`, no height) the shell is sized by the insets back to the full
+          844px layout viewport. Canvas exposure goes to 0 only because there is no canvas
+          left — and the composer returns to y=844, under the keyboard, which is the exact
+          defect --vvh was added to fix. It is a regression, not a remedy.
+      So: NOT applied, and do not apply it. Deleting these rules is a separate question.
+   3. WHAT MAKES THE PAN UNLIKELY IS ALREADY HERE. With --vvh applied, #root occupies layout
+      0..508 and the visible window at rest is 0..508 — the SAME BOX. There is nothing
+      off-screen for the browser to reveal, so it has no reason to auto-pan. The probe's pans
+      all had to be driven by hand; the one place the browser panned by ITSELF was the
+      PRE-FIX shell, where the composer genuinely sat outside the visible window.
+   Residual device-only gap — BE PRECISE, THIS LINE USED TO OVERSTATE IT. It said "iOS's own
+   keyboard trigger still cannot be driven headlessly", which reads as though it is unknown
+   whether the browser auto-pans at all. That is NOT what is open: check 6 is tagged [trigger]
+   and it PASSES. The browser DOES pan the visual viewport by itself to reveal a focused input,
+   headlessly, with scrollY never moving (offTop 0 -> 336, composerVisible false -> true). It
+   had to be reproduced against the PRE-FIX shell because, per 3 above, the --vvh layout never
+   puts the input outside the visible window in the first place.
+   What is ACTUALLY still device-only is one step earlier and narrower: whether iOS's software
+   keyboard produces the visual-viewport SHRINK at all. Headless Chrome has no keyboard, so the
+   probe substitutes Emulation.setPageScaleFactor — same geometry (visual viewport shorter than
+   layout viewport, pannable), different cause, and it scales the WIDTH where a keyboard does
+   not. So: the GEOMETRY is settled, the PAN RESPONSE is settled, and only the SHRINK CAUSE is
+   unverified off-device. The probe tags every check [geo] or [trigger] so the two are not
+   confused — but note that [trigger] covers the pan response, which passed, not the shrink
+   cause, which is untestable here and is what this paragraph is about. */
+html, body {
+  height: var(--vvh, 100%);
+  overflow: hidden;
+}
+
+/* THE SHELL IS SIZED TO THE *VISIBLE* VIEWPORT, not the layout one.
+   On iOS the software keyboard does not shrink the layout viewport, so `height: 100%` here
+   kept the whole app 844px tall while the keyboard covered ~40% of the screen — putting
+   everything anchored to the bottom (the composer, the pinned permission card) underneath it.
+   Measured: with the shell at 100%, capping the AskUserQuestion card did not help at all —
+   the card shrank 506px -> 279px and Submit stayed at 669px, because a shorter card just let
+   the transcript above it grow while the column stayed anchored to the layout bottom. The
+   height has to come off the visible viewport or nothing below the fold can be reached.
+   `--vvh` is published by lib/visualViewport.ts. NOTE the `100%` fallback is for the window
+   BEFORE that module runs, NOT for browsers lacking window.visualViewport: visibleHeight()
+   falls back to window.innerHeight and still SETS --vvh, so the CSS fallback never engages
+   in that case. Do not delete the `?? window.innerHeight` believing this covers it. */
+#root {
+  height: var(--vvh, 100%);
 }
 
 body {

@@ -15,7 +15,10 @@ import { api } from '../api/client'
 // GRANTING needs a relaunch (the engine reads its server list once at spawn and ignores
 // tools/list_changed), but REVOKING is already in force — the proxy refuses the next call.
 // So "pending" here never means "still reachable".
-export function ConnectorGrants({ session, compact = false }: { session: SessionInfo; compact?: boolean }) {
+// `bare` drops the leading rule + padding, for a host that already draws its own section
+// divider (the permissions dock). Purely presentational — the grant logic is identical,
+// so there is one place a connector grant is made and one set of caveats explaining it.
+export function ConnectorGrants({ session, compact = false, bare = false }: { session: SessionInfo; compact?: boolean; bare?: boolean }) {
   const [catalog, setCatalog] = useState<ConnectorView[] | null>(null)
   const [accounts, setAccounts] = useState<AccountConnector[]>([])
   const [strict, setStrict] = useState(false)
@@ -48,7 +51,7 @@ export function ConnectorGrants({ session, compact = false }: { session: Session
   if (!catalog) return null
 
   return (
-    <div className="space-y-2 pt-1 border-t border-ctp-surface0">
+    <div className={`space-y-2 ${bare ? '' : 'pt-1 border-t border-ctp-surface0'}`}>
       <div className="flex items-center gap-2">
         <span className="text-ctp-text font-medium">Connectors</span>
         <span className="text-ctp-overlay">{granted.length ? `${granted.length} granted` : 'none granted'}</span>

@@ -1,48 +1,6 @@
-import { memo, useMemo } from 'react'
-import ReactMarkdown, { type Components, defaultUrlTransform } from 'react-markdown'
+import { memo } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-
-// react-markdown sanitizes hrefs to a safe-protocol allowlist (http(s)/mailto/…),
-// which strips our custom `wiki:` scheme to '' before the anchor renders. Let
-// wiki: URLs through untouched; everything else keeps the default sanitization.
-const wikiUrlTransform = (url: string): string =>
-  url.startsWith('wiki:') ? url : defaultUrlTransform(url)
-
-// --- Wikilinks (`[[target]]` / `[[target|alias]]`) -------------------------
-// Opt-in (DocView passes `onWikiLink`; ChatView doesn't, so its rendering is
-// unchanged). A tiny remark plugin rewrites `[[…]]` inside *text* nodes into
-// link nodes with a `wiki:` url — text nodes never live inside code/inlineCode
-// (those carry a raw `value`, no children), so fenced code is left alone.
-interface MdNode { type: string; value?: string; url?: string; title?: string | null; children?: MdNode[] }
-const WIKI_RE = /\[\[([^\][]+)\]\]/g
-
-function splitWiki(value: string): MdNode[] {
-  const out: MdNode[] = []
-  let last = 0
-  for (const m of value.matchAll(WIKI_RE)) {
-    const i = m.index ?? 0
-    if (i > last) out.push({ type: 'text', value: value.slice(last, i) })
-    const [target, alias] = m[1].split('|')
-    out.push({ type: 'link', url: `wiki:${target.trim()}`, title: null, children: [{ type: 'text', value: (alias ?? target).trim() }] })
-    last = i + m[0].length
-  }
-  if (last < value.length) out.push({ type: 'text', value: value.slice(last) })
-  return out
-}
-
-function walkWiki(node: MdNode): void {
-  if (!Array.isArray(node.children)) return
-  const next: MdNode[] = []
-  for (const child of node.children) {
-    if (child.type === 'text' && child.value?.includes('[[')) next.push(...splitWiki(child.value))
-    else { walkWiki(child); next.push(child) }
-  }
-  node.children = next
-}
-
-function remarkWikiLinks() {
-  return (tree: MdNode) => walkWiki(tree)
-}
 
 // Renders Claude's assistant text as real markdown — GFM tables, code fences,
 // lists, headings, blockquotes — styled for the catppuccin theme. Replaces the
@@ -120,45 +78,10 @@ const components: Components = {
   td: ({ node, ...p }) => <td className="border-b border-ctp-surface1/60 px-2.5 py-1.5 align-top" {...p} />,
 }
 
-export const Markdown = memo(function Markdown({
-  text, onWikiLink,
-}: { text: string; onWikiLink?: (target: string) => void }) {
-  // Only enable the wikilink plugin + clickable `wiki:` anchors when a handler is
-  // given, so the ChatView code path is untouched (links stay inert there).
-  const plugins = useMemo(() => (onWikiLink ? [remarkGfm, remarkWikiLinks] : [remarkGfm]), [onWikiLink])
-  const comps = useMemo<Components>(() => {
-    if (!onWikiLink) return components
-    return {
-      ...components,
-      a: ({ node, href, children, ...p }) => {
-        if (href?.startsWith('wiki:')) {
-          const target = href.slice('wiki:'.length)
-          return (
-            <button
-              type="button"
-              onClick={() => onWikiLink(target)}
-              title={`Open ${target}`}
-              className="text-ctp-mauve underline decoration-ctp-mauve/40 hover:decoration-ctp-mauve cursor-pointer"
-            >
-              {children}
-            </button>
-          )
-        }
-        return (
-          <a className="text-ctp-blue underline decoration-ctp-blue/40 hover:decoration-ctp-blue cursor-pointer"
-            title={href} onClick={(e) => e.preventDefault()} {...p}>{children}</a>
-        )
-      },
-    }
-  }, [onWikiLink])
-
+export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div className="cm-markdown">
-      <ReactMarkdown
-        remarkPlugins={plugins}
-        components={comps}
-        urlTransform={onWikiLink ? wikiUrlTransform : undefined}
-      >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {text}
       </ReactMarkdown>
     </div>

@@ -283,6 +283,7 @@ function resultErrorText(e: ClaudeEvent): string {
     .map((v) => (typeof v === 'string' ? v : v ? JSON.stringify(v) : ''))
     .find((s) => s && s !== 'success' && s !== 'null') ?? 'The turn ended with an error.'
   const s = String(raw)
+  if (/authentication_failed|not logged in|\/login/i.test(s)) return 'Not logged in — the CLI could not authenticate. Run `claude /login`, or check whether another session refreshed the shared credentials.'
   if (/usage limit|rate.?limit|429|quota/i.test(s)) return `Usage limit reached — ${s}`
   if (/overloaded|529|503/i.test(s)) return `The model is overloaded right now — ${s}`
   if (/max.?turns/i.test(s)) return 'Stopped: reached the maximum number of turns for one request.'
@@ -329,7 +330,11 @@ function teamItemsFrom(text: string): TranscriptItem[] | null {
   return out
 }
 
-function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
+// Exported ONLY so scratchpad/result-error-classification-test.mts can pin the error
+// classification without a renderer. Same reason outputKeys and sessionReducer are exported:
+// the enforcement boundary and the testability boundary want to be different surfaces. Nothing
+// else imports this.
+export function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
   const out: TranscriptItem[] = []
   // On a subagent's own events this is the parent Task's tool id — tag its items so
   // the UI can nest them under that agent's card.
@@ -389,7 +394,21 @@ function itemsFromEvent(e: ClaudeEvent, fromReplay = false): TranscriptItem[] {
       }
     }
   } else if (e.type === 'result') {
-    const isError = (e as { is_error?: boolean }).is_error === true
+    // An AUTH FAILURE ARRIVES LABELLED `subtype: 'success'`. Verified 2026-08-24 by starving
+    // the CLI of credentials: the result frame carries error:'authentication_failed',
+    // is_api_error_message:true, terminal_reason:'api_error', text "Not logged in · Please run
+    // /login" — AND subtype:'success'. Keying on `is_error` + /error/ on subtype alone therefore
+    // rendered a failed turn as a SUCCESSFUL one: no error text, no notice, nothing. The user
+    // sees a turn that silently did nothing and logs in again, which is what "OAuth keeps coming
+    // up" looks like from the outside. The CLI also writes NOTHING to stderr on this path, so
+    // there is no server-side trace either — this frame is the only witness.
+    // Widened deliberately rather than adding one auth special-case: any of these markers means
+    // the turn did not succeed, whatever `subtype` claims.
+    const r = e as Record<string, unknown>
+    const isError = r.is_error === true
+      || r.is_api_error_message === true
+      || r.terminal_reason === 'api_error'
+      || (typeof r.error === 'string' && r.error !== '')
       || /error/i.test(String((e as { subtype?: string }).subtype ?? ''))
     out.push({
       kind: 'result', id: nextId(),

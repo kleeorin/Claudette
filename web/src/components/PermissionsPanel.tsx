@@ -8,12 +8,22 @@ import { useSessions } from '../store/sessions'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { NoPermsConfirmDialog } from './NoPermsConfirmDialog'
 import { DockShell } from './DockShell'
+import { ConnectorGrants } from './ConnectorGrants'
 
 // Permission Control Center — a GUI over Claude's OWN settings files (see the server
 // permissions.ts). Lives in the right dock beside Files / Git. Shows the effective
 // mode + the allow/deny/ask rules (tagged by scope) and lets you add/remove them and
 // switch the session's permission mode. "Allow all" = the bypassPermissions launch
 // flag, guarded behind a confirm since it lets Claude run every tool without asking.
+//
+// WHAT IS OPEN BY DEFAULT IS THE WHOLE DESIGN OF THIS PANEL. It answers one question —
+// "what can this session reach?" — and the answer has two halves that deserve equal
+// billing: which TOOLS (mode + rules) and which SERVICES (connectors). The rule list is
+// the long tail: it can run to dozens of lines of `Bash(...)` globs that are reference
+// material, not a dashboard, and it pushed connectors off the panel entirely. So mode and
+// connectors are always visible, and rules + the read-only system scope collapse behind a
+// summary that still carries their counts — a collapsed section must never read as an
+// empty one, or the operator concludes there are no rules when there are twenty.
 
 interface Props {
   session: SessionInfo
@@ -130,6 +140,17 @@ export function PermissionsPanel({ session, onClose }: Props) {
 
   const ruleCount = perms?.rules.length ?? 0
 
+  // What the Rules section says while COLLAPSED. Counts by action, because "12 rules"
+  // hides the only distinction that matters at a glance — whether anything is being
+  // allowed unattended. Omits zeroes so a deny-only project doesn't read as "0 allow".
+  const ruleSummary = useMemo(() => {
+    if (!perms) return '…'
+    if (ruleCount === 0) return 'none'
+    const n: Record<PermissionAction, number> = { allow: 0, deny: 0, ask: 0 }
+    for (const r of perms.rules) n[r.action]++
+    return ACTIONS.filter((a) => n[a] > 0).map((a) => `${n[a]} ${a}`).join(' · ')
+  }, [perms, ruleCount])
+
   // "No permissions" profile: the strict inverse of "Allow all". It's active when the
   // mode is Prompt AND no allow rule is in effect, so every tool needs explicit
   // approval. Applying it strips every allow rule (across scopes) and drops to default.
@@ -225,8 +246,16 @@ export function PermissionsPanel({ session, onClose }: Props) {
           {modeHint && <div className="mt-1 text-[10px] text-ctp-overlay">{modeHint}</div>}
         </Section>
 
+        {/* Connectors — service reach, the other half of "what can this session touch?".
+            Same component the sandbox panel uses, so a grant is made in one place and the
+            stdio-secret and revoke-is-immediate caveats are never restated (or forgotten)
+            in a second copy. */}
+        <div className="px-2.5 py-2 border-b border-ctp-surface0 text-[11px]">
+          <ConnectorGrants session={session} compact bare />
+        </div>
+
         {/* Rules by scope */}
-        <Section title={`Rules (${ruleCount})`}>
+        <Collapsible title="Rules" summary={ruleSummary}>
           {perms?.error && <Empty>Couldn’t read settings — {perms.error}</Empty>}
           {SCOPES.map((s) => {
             const rules = byScope[s.value]
@@ -303,10 +332,10 @@ export function PermissionsPanel({ session, onClose }: Props) {
               <span className="font-mono">Bash(git*)</span>, <span className="font-mono">Edit(src/**)</span>.
             </p>
           </div>
-        </Section>
+        </Collapsible>
 
         {/* Read-only: agent tool scope + notebook funnel */}
-        <Section title="System (read-only)">
+        <Collapsible title="System" summary={perms?.agent?.name ? `role · ${perms.agent.name}` : 'read-only'}>
           {perms?.agent && (
             <div className="mb-1.5 text-[11px]">
               <div className="text-[10px] font-semibold text-ctp-overlay uppercase tracking-wider mb-0.5">Role · {perms.agent.name}</div>
@@ -326,7 +355,7 @@ export function PermissionsPanel({ session, onClose }: Props) {
             <div className="flex gap-1.5"><span className="shrink-0 w-9 text-[9px] font-semibold uppercase text-ctp-red">deny</span><span className="flex-1 font-mono text-ctp-overlay break-words">{(perms?.notebookFunnel ?? []).join(', ')}</span></div>
             <p className="mt-0.5 text-[10px] text-ctp-surface2 leading-snug">Notebook edits always route through the app’s cell tools — never raw file writes.</p>
           </div>
-        </Section>
+        </Collapsible>
       </div>
 
       {confirmBypass && (
@@ -351,6 +380,35 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     <div className="px-2.5 py-2 border-b border-ctp-surface0">
       <div className="text-[10px] font-semibold text-ctp-overlay uppercase tracking-widest mb-1.5">{title}</div>
       {children}
+    </div>
+  )
+}
+
+// A Section that starts CLOSED, for the reference material — long rule lists and the
+// read-only system scope. `summary` is what the row says while shut, and it is not
+// decoration: a collapsed section with no summary is indistinguishable from an empty
+// one, which is how an operator talks themselves into believing a project has no deny
+// rules. Children stay unmounted while closed, so the rule list costs nothing to render
+// on a panel that polls every 4s.
+function Collapsible({ title, summary, children }: { title: string; summary?: string; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="border-b border-ctp-surface0">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-1.5 px-2.5 py-2 text-left hover:bg-ctp-surface0/40 transition-colors"
+      >
+        <svg
+          width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"
+          className={`shrink-0 text-ctp-overlay transition-transform ${open ? 'rotate-90' : ''}`}
+        >
+          <path d="M9 6l6 6-6 6" />
+        </svg>
+        <span className="text-[10px] font-semibold text-ctp-overlay uppercase tracking-widest">{title}</span>
+        {summary && <span className="ml-auto text-[10px] text-ctp-surface2 truncate">{summary}</span>}
+      </button>
+      {open && <div className="px-2.5 pb-2">{children}</div>}
     </div>
   )
 }

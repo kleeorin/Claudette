@@ -40,7 +40,7 @@ function headingLevelOf(cellType: NbCellType, source: string): number {
 // the store, sends ops/locks/run intents, and reconciles per-cell. Toolbar adds
 // undo/redo, clear-outputs, a kernel picker + restart/interrupt with an accurate
 // status, cross-cell search (Ctrl+F), and a shortcut help overlay (?).
-export function NotebookView({ notebookId }: { notebookId: string }) {
+export function NotebookView({ notebookId, sessionId }: { notebookId: string; sessionId?: string }) {
   const nb = useNotebooks()
   const doc = nb.open.find((d) => d.notebookId === notebookId)
   const locks = nb.locksFor(notebookId)
@@ -410,7 +410,12 @@ export function NotebookView({ notebookId }: { notebookId: string }) {
   // session is mounted, so switching file/tab/session tears this view down; without
   // this, every return jumped back to cell 1. Keyed by path (stable across reopens);
   // must stay above the `if (!doc)` return — see the note on loadSpecs.
-  useScrollMemory(doc ? `nb:${doc.path}` : null, () => listRef.current)
+  // Session-scoped, same reason as FileEditorView: two sessions open on the same notebook
+  // are two places a human is reading, and a path-only key makes them overwrite each other.
+  // Keyed by PATH and not by `notebookId` deliberately — notebookId is regenerated on every
+  // reload (the restore effect calls openPath fresh), so keying by it would lose the
+  // close/reopen survival this key exists to provide.
+  useScrollMemory(doc ? `nb:${sessionId ?? 'none'}:${doc.path}` : null, () => listRef.current)
 
   if (!doc) {
     return <div className="flex-1 flex items-center justify-center text-xs text-ctp-overlay">Loading…</div>

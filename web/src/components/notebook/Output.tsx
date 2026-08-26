@@ -50,7 +50,10 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   }
 })
 
-function sanitizeHtml(html: string): string {
+// Exported ONLY so scratchpad/output-sanitizer-test.mts can pin these invariants — this
+// is a security boundary with no other seam to test it through. Not for use elsewhere in
+// the app: every render path should go through MimeContent, which memoizes the call.
+export function sanitizeHtml(html: string): string {
   // FORBID <style>/<link>/<base> outright — external CSS + inline stylesheets are the
   // remaining request channel the per-attribute hook can't fully cover.
   return DOMPurify.sanitize(html, { FORBID_TAGS: ['style', 'link', 'base'], ADD_ATTR: ['target'] })

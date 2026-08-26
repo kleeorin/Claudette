@@ -69,7 +69,12 @@ function saveNav(id: string, nav: Nav): void {
 // AskUserQuestion prompts as native cards. Handles /clear + /resume natively
 // (P1.14); other slash commands pass through as a turn. Permission-mode switch
 // lives in the MetaBar (P1.4).
-export function ChatView({ sessionId }: { sessionId: string }) {
+export function ChatView({ sessionId, visible = true }: {
+  sessionId: string
+  // False while this pane is hidden behind another at phone width. Defaults true so every
+  // existing call site (and desktop, which never hides the chat) is unaffected.
+  visible?: boolean
+}) {
   const { transcriptFor, pendingFor, slashCommandsFor, metaFor, sendTurn, interrupt, respond, loadTranscript, clearTranscript } = useChat()
   const { sessions, setMode, isFresh, markBusy } = useSessions()
   const session = sessions.find((s) => s.id === sessionId)
@@ -240,6 +245,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (pinnedRef.current) bottomRef.current?.scrollIntoView({ block: 'end' })
   }, [items, pending])
 
+  // RE-PIN ON RE-SHOW. While this pane is `display:none` it has no box at all, so the effect
+  // above is a NO-OP — scrollIntoView on a zero-box subtree does nothing — and Chrome drops
+  // `scrollTop` to 0 when the box is removed. Without this, a phone user who reads the chat,
+  // taps a file and taps back lands at the TOP of the transcript with the new messages below
+  // them, which reads as lost history rather than a lost scroll position.
+  //
+  // Note WHICH half breaks: `onScroll` is safe on its own, because a hidden element measures
+  // 0 - 0 - 0 = 0, which is < 80 from the bottom and therefore RE-pins rather than unpins. So
+  // the pin survives and only the position is lost — which is why the fix is a re-scroll and
+  // not a re-pin guard. Mirrors TerminalView's existing `visible` contract; the house pattern,
+  // not an invention.
+  useEffect(() => {
+    if (visible && pinnedRef.current) bottomRef.current?.scrollIntoView({ block: 'end' })
+  }, [visible])
+
   // Auto-resume on load: a RESTORED session (not one just created) with an empty
   // transcript pulls in its latest conversation — the equivalent of /resume picking
   // the top entry — so a page reload lands you back where you were. Once per session
@@ -361,11 +381,28 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         onSetMode={(m) => setMode(sessionId, m)}
       />
       {state === 'exited' && (
-        <div className="shrink-0 px-4 py-2 bg-ctp-red/10 border-b border-ctp-red/30 text-[11px] text-ctp-red whitespace-pre-wrap">
-          ⚠ Claude exited{session.exitError ? ` — ${session.exitError}` : ''}
+        // BOUNDED, like the two cards. `exitError` is the server's stderrTail, capped at
+        // TAIL_MAX = 2000 chars — roughly 45 lines at 11px on a 390px phone, ~600-700px of an
+        // 844px viewport. It is `shrink-0` and sat ABOVE the transcript with no max-h and no
+        // overflow, so a session that died with a stack trace squeezed the conversation
+        // toward zero at exactly the moment the user most needs to read it. Same repair as
+        // AskUserQuestionCard: bound and scroll the MESSAGE, keep the banner chrome outside
+        // it so the "⚠ Claude exited" line is always visible.
+        <div className="shrink-0 px-4 py-2 bg-ctp-red/10 border-b border-ctp-red/30 text-[11px] text-ctp-red">
+          <div className="font-medium">⚠ Claude exited</div>
+          {session.exitError && (
+            <div className="mt-0.5 max-h-[calc(var(--vvh,100vh)*0.25)] overflow-y-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-snug opacity-90 pr-1">
+              {session.exitError}
+            </div>
+          )}
         </div>
       )}
-      <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto">
+      {/* `data-testid` so a harness can identify THE transcript scroller directly. It used
+          to be found by scanning for the largest overflowing `.overflow-y-auto`, which is a
+          heuristic that silently retargets the moment any other scrollable region appears —
+          e.g. the bounded question list in AskUserQuestionCard below. A test that keeps
+          passing while measuring the wrong element is worse than one that fails. */}
+      <div ref={scrollRef} onScroll={onScroll} data-testid="transcript-scroller" className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-5 sm:py-6 text-[13px]">
           {items.length === 0 && (
             <div className="text-ctp-overlay text-sm select-none pt-16 text-center">
@@ -374,34 +411,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           )}
           {rendered}
 
-          {pending && (
-            <div className="mt-4">
-              {/* KEYED BY requestId. Both cards hold their own answer state, and the
-                  pending queue reveals the next prompt in this same slot — so without a
-                  key React reused the instance and the new question mounted already
-                  "answered" with the previous one's selection, Submit live. Clicking it
-                  sent an answer the user never gave for a question they hadn't read. */}
-              {pending.toolName === 'AskUserQuestion' ? (
-                <AskUserQuestionCard
-                  key={pending.requestId}
-                  input={pending.input}
-                  onAnswer={(answers) => respond(sessionId, pending.requestId, { behavior: 'allow', updatedInput: { ...(pending.input as Record<string, unknown>), answers } })}
-                  onDismiss={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Dismissed by user' })}
-                />
-              ) : (
-                <PermissionCard
-                  key={pending.requestId}
-                  toolName={pending.toolName}
-                  description={pending.description}
-                  input={pending.input}
-                  suggestions={pending.suggestions}
-                  onAllow={() => respond(sessionId, pending.requestId, { behavior: 'allow' })}
-                  onAllowAlways={() => respond(sessionId, pending.requestId, { behavior: 'allow', updatedPermissions: pending.suggestions })}
-                  onDeny={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Denied by user' })}
-                />
-              )}
-            </div>
-          )}
 
           {state === 'running' && !pending && (
             <div className="mt-4 flex items-center gap-2 text-ctp-overlay text-xs animate-fade-in">
@@ -419,6 +428,49 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           <div ref={bottomRef} />
         </div>
       </div>
+
+      {/* PINNED, and deliberately a SIBLING of the scroll container above rather than a
+          child of it. This card used to render inside the transcript, so a prompt the
+          session is BLOCKED on scrolled off-screen with the conversation — measured at
+          668px away after one viewport of scroll. That is the same defect we fixed for
+          teammates one audience over: a coordinator could not see that a member was
+          blocked, and here a human cannot see that Claude is. On a phone it is the common
+          case, not the edge case. Sitting between the transcript and the composer keeps it
+          in view for as long as it is unanswered, which is exactly as long as it matters.
+
+          NB no `overflow-y-auto` on this wrapper: layout-check's `scroller()` helper picks
+          the largest overflowing `.overflow-y-auto` as "the transcript", and a second one
+          here could be misidentified as the thing the card must not be inside. */}
+      {pending && (
+        <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
+          <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3">
+            {/* KEYED BY requestId. Both cards hold their own answer state, and the
+              pending queue reveals the next prompt in this same slot — so without a
+              key React reused the instance and the new question mounted already
+              "answered" with the previous one's selection, Submit live. Clicking it
+              sent an answer the user never gave for a question they hadn't read. */}
+            {pending.toolName === 'AskUserQuestion' ? (
+              <AskUserQuestionCard
+                key={pending.requestId}
+                input={pending.input}
+                onAnswer={(answers) => respond(sessionId, pending.requestId, { behavior: 'allow', updatedInput: { ...(pending.input as Record<string, unknown>), answers } })}
+                onDismiss={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Dismissed by user' })}
+              />
+            ) : (
+              <PermissionCard
+                key={pending.requestId}
+                toolName={pending.toolName}
+                description={pending.description}
+                input={pending.input}
+                suggestions={pending.suggestions}
+                onAllow={() => respond(sessionId, pending.requestId, { behavior: 'allow' })}
+                onAllowAlways={() => respond(sessionId, pending.requestId, { behavior: 'allow', updatedPermissions: pending.suggestions })}
+                onDeny={() => respond(sessionId, pending.requestId, { behavior: 'deny', message: 'Denied by user' })}
+              />
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
         <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3 relative">
@@ -1007,7 +1059,27 @@ function AskUserQuestionCard({ input, onAnswer, onDismiss }: {
   }
 
   return (
-    <div className="rounded-lg border border-ctp-blue/50 bg-ctp-blue/10 px-3 py-2.5 space-y-3">
+    // BOUNDED, with the actions OUTSIDE the scrolling part. Slice 1 pinned this card as a
+    // `shrink-0` sibling of the transcript, which fixed "the prompt scrolls away" — but this
+    // card had no height bound at all, so it could neither shrink nor scroll and simply grew
+    // past the fold. Measured at 390×844 with the worst case the tool actually permits
+    // (4 questions × 4 options, each with a description, plus the per-question Other input):
+    // card 1578px tall in an 844px viewport, Submit 873px BELOW the fold and unreachable.
+    // That is a worse failure than the one slice 1 replaced — AskUserQuestion is in
+    // ALWAYS_PROMPT, so it is the one card guaranteed to need a human.
+    //
+    // The questions scroll; Submit/Dismiss are a sibling of that region, so they are
+    // reachable at ANY payload size. PermissionCard already uses this shape (max-h on its
+    // detail region, buttons outside it) — this makes the two consistent.
+    //
+    // Sized off `--vvh` (lib/visualViewport.ts), NOT `vh`. On iOS the software keyboard does
+    // not shrink the layout viewport, so `60vh` stayed 506px while the keyboard left ~508px
+    // VISIBLE — measured: Submit at 669px passes a check against innerHeight and is hidden by
+    // 161px in reality. The card's own free-text input is what raises the keyboard, so the
+    // interaction that needs Submit is the one that hides it. `100vh` is the fallback for
+    // browsers without visualViewport, where the two are the same thing anyway.
+    <div className="rounded-lg border border-ctp-blue/50 bg-ctp-blue/10 px-3 py-2.5 flex flex-col gap-3 min-h-0 max-h-[calc(var(--vvh,100vh)*0.55)]">
+      <div className="space-y-3 overflow-y-auto min-h-0 pr-1">
       {qs.map((q, qi) => (
         <div key={qi} className="space-y-1">
           <div className="text-xs text-ctp-text font-medium">{q.question}</div>
@@ -1020,8 +1092,8 @@ function AskUserQuestionCard({ input, onAnswer, onDismiss }: {
                   onClick={() => toggle(qi, op.label, !!q.multiSelect)}
                   className={`text-left text-xs px-2 py-1 rounded border transition-colors ${active ? 'border-ctp-blue bg-ctp-blue/20 text-ctp-text' : 'border-ctp-surface1 text-ctp-subtext hover:bg-ctp-surface0'}`}
                 >
-                  <span className="font-medium">{op.label}</span>
-                  {op.description ? <span className="text-ctp-overlay"> — {op.description}</span> : null}
+                  <span className="font-medium break-words">{op.label}</span>
+                  {op.description ? <span className="text-ctp-overlay break-words"> — {op.description}</span> : null}
                 </button>
               )
             })}
@@ -1034,7 +1106,8 @@ function AskUserQuestionCard({ input, onAnswer, onDismiss }: {
           </div>
         </div>
       ))}
-      <div className="flex gap-2">
+      </div>
+      <div className="flex gap-2 shrink-0">
         <button onClick={submit} disabled={!answered} className="text-xs px-3 py-0.5 rounded bg-ctp-blue/80 hover:bg-ctp-blue text-ctp-base font-medium disabled:opacity-40 disabled:cursor-not-allowed">
           Submit
         </button>

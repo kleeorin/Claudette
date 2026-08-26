@@ -24,6 +24,7 @@ import { isEditTool, filePathOf, isNotebookPath } from './lib/proposals'
 import { pruneDrafts } from './lib/drafts'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
 import { basename, prettyPath } from './lib/paths'
+import { MD_PX, usePhone } from './lib/breakpoint'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
@@ -91,6 +92,86 @@ function savePersisted(p: Persisted): void {
 // Read once at module load (client-only) so useState initializers can hydrate from it.
 const INITIAL = loadPersisted()
 
+// --- phone: which SINGLE pane is on screen -------------------------------------------
+// Below `md` there is no room for panes side by side, so exactly one shows at a time.
+// `null` means desktop — show everything, unchanged.
+export type PhonePane = 'chat' | 'content' | 'terminal' | 'dock'
+
+// ONE pure resolver, module-scoped, rather than four `hidden` expressions scattered through
+// the tree. Every hide below compares against its result, so there is a single place that
+// decides which pane wins and no way for two of them to disagree.
+//
+// THE FALLBACK IS THE POINT, not a detail. A wanted pane whose ENTITY has gone — the content
+// tab was closed, the terminal hidden, the dock toggled off — must not leave the phone showing
+// nothing at all. Falling back to 'chat' makes the chat the floor of this state machine: there
+// is no reachable state with zero visible panes. It is also what lets the closing handlers stay
+// unwired — `hideTerm`, `closeTab` and closing a dock need no phone-pane bookkeeping, because
+// removing the entity is already the signal to fall back.
+export function resolvePhonePane(
+  want: PhonePane,
+  have: { content: boolean; terminal: boolean; dock: boolean },
+): PhonePane {
+  if (want === 'content') return have.content ? 'content' : 'chat'
+  if (want === 'terminal') return have.terminal ? 'terminal' : 'chat'
+  if (want === 'dock') return have.dock ? 'dock' : 'chat'
+  return 'chat'
+}
+
+// --- the terminal dock's height, bounded by what is actually VISIBLE ------------------
+// `termH` is an absolute pixel height the user DRAGGED to, and it is restored from
+// localStorage — so a dock sized on a desktop arrives on a phone unchanged. The dock is
+// `shrink-0` inside a shell that is `overflow-hidden`, so when it no longer fits, nothing
+// scrolls and nothing shrinks: the bottom of the terminal is simply clipped away, and the
+// bottom of a terminal is the prompt.
+//
+// Bounded against `--vvh` (lib/visualViewport.ts) rather than `100vh`/`100dvh`, because the
+// case that needs it is a software keyboard: the LAYOUT viewport does not shrink when the
+// keyboard comes up, so every `vh` unit keeps reporting the whole screen while ~40% of it is
+// covered. `--vvh` is the only one that moves. Measured at 390x844 with a saved 600px dock:
+// with the keyboard up, 176px of terminal sat below an overflow-hidden shell.
+//
+// EXPRESSED AS CSS, NOT AS A SUBSCRIPTION IN JS — and for ONE reason, not two. The bound needs
+// no re-fit plumbing: the dock's box really changes, so the ResizeObserver already in
+// useTerminal fires and FitAddon re-fits. (That observer is NOT the obstacle
+// lib/visualViewport.ts describes it as — a ResizeObserver fires on height-only changes too,
+// and its `contentRect.width > 0` guard is a liveness test, not a width-CHANGED test. What was
+// missing was a box that changes, not a callback.)
+// A SECOND REASON WAS STATED HERE AND WAS WRONG; it is recorded so nobody re-derives it. It
+// claimed that because `--vvh` republishes on visualViewport `scroll` as well as `resize`,
+// reading it into React state would re-render on every pan frame. `publish()` writes
+// `${visibleHeight()}px` — the HEIGHT — and a pan changes `offsetTop`, not height. So a scroll
+// frame rewrites an IDENTICAL string and `setState` would bail on `Object.is`. The claim was
+// false, and it mattered: **a weak reason stated beside a strong one invites someone to refute
+// the weak one and revert the whole change** — which is how the FitAddon misattribution above
+// happened one layer down.
+//
+// THE RESERVE IS MEASURED, NOT DECOMPOSED — an earlier comment derived it as "the mobile top
+// bar (h-12) and the tab bar (h-9), plus 80px". There is no `h-9` tab bar: `MainTabs`' root is
+// `h-8`, and the only `h-9` in this file is the hamburger button and the logo. Counting the
+// `border-b` each band carries gives 49 + 33 = 82, so this is ~82px of measured chrome plus
+// 80px of slack, rounded. Do not present it as a decomposition it does not have.
+// NOTE THE 48 IS MOBILE-ONLY: the top bar is `md:hidden`, so on desktop it contributes 0 and
+// this expression over-reserves by 48px. Inert today (900 - 164 = 736 > any saved dock), but a
+// short desktop window with a large saved `termH` shrinks the dock 48px earlier than needed.
+//
+// *** THE FLOOR IS AN ESCAPE HATCH, NOT A SAFETY NET, AND IT HAS A KNOWN THRESHOLD. *** Below
+// `--vvh` = 284px the `max()` yields the floor and THE BOUND STOPS TRACKING THE VIEWPORT:
+// 120 + 164 = 284 > `--vvh`, so the column exceeds the shell and the prompt is clipped again —
+// the exact failure this bound exists to prevent. Reachable in real configurations: a phone in
+// landscape with the keyboard up (a 320px layout viewport), and any short desktop window. The
+// trade is deliberate — a 120px dock leaves ~91px of body after the `h-7` strip and border,
+// about 5 rows, which beats a sliver — but the threshold is written down here because
+// otherwise the failure returns silently at 284px with nothing saying so.
+// 164, NOT 162, AND DELIBERATELY LEFT AS IT WAS. The honest reading is ~82px of measured chrome
+// plus ~82px of slack; the terms below are a convenient spelling of a MEASURED total, not a
+// derivation. Changing it to match a freshly-constructed decomposition would be a behaviour
+// change smuggled in as a comment fix — and the fails-first evidence for this bound (6 red → 0)
+// was measured against 164.
+const DOCK_RESERVE_PX = 164
+const DOCK_MIN_PX = 120
+const boundedDockH = (px: number) =>
+  `min(${px}px, max(${DOCK_MIN_PX}px, calc(var(--vvh, 100vh) - ${DOCK_RESERVE_PX}px)))`
+
 function Shell() {
   const { sessions, activeId, setActive, homeDir } = useSessions()
   const notebooks = useNotebooks()
@@ -145,9 +226,18 @@ function Shell() {
   const termSeq = useRef<number>(INITIAL?.seq ?? 0)
   const termsRef = useRef(termsBySession); termsRef.current = termsBySession
 
+  const isPhone = usePhone()
+  // The pane the USER last asked for. NOT derived from `active` — see the comment on the
+  // handlers below, which is the single most important decision in this slice.
+  //
+  // DELIBERATELY NOT PERSISTED: `LS_KEY` stays at v1 and `Persisted` does not gain a field.
+  // Persisting it would mean a migration, and "which pane was I on" is session-scoped attention
+  // rather than layout the user arranged.
+  const [phonePane, setPhonePane] = useState<PhonePane>('chat')
+
   // Companion orientation for the content split (phones default to stacked).
   const [layout, setLayout] = useState<'side' | 'stack'>(
-    () => INITIAL?.layout ?? (typeof window !== 'undefined' && window.innerWidth < 768 ? 'stack' : 'side'),
+    () => INITIAL?.layout ?? (typeof window !== 'undefined' && window.innerWidth < MD_PX ? 'stack' : 'side'),
   )
 
   // Resizable sizes (px). sideW/stackH = Claude companion size; dockW = right dock;
@@ -200,11 +290,36 @@ function Shell() {
   // value the claim effect actually cares about.
   const claimKey = allTerms.map((t) => t.paneId).filter(Boolean).join(',')
   const dockShown = termOpen && terms.length > 0   // the active session's dock is visible
+
+  // The resolved pane: `null` on desktop (show everything), one of the four at phone.
+  const shownPane: PhonePane | null = isPhone
+    ? resolvePhonePane(phonePane, { content: active !== null, terminal: dockShown, dock: dock !== null })
+    : null
+  // The terminal dock is the one pane that is ALSO gated by desktop state (`dockShown`), so it
+  // gets a named flag both the container and each TerminalView's `visible` prop read — keeping
+  // that prop truthful is what stops xterm from fitting to a zero box.
+  const dockVisible = dockShown && (!isPhone || shownPane === 'terminal')
   const setTermPane = (sid: string, fn: (p: TermPane) => TermPane) =>
     setTermsBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_TERM) }))
 
+  // *** THE PHONE PANE IS WIRED ONLY INTO THESE — THE USER-INITIATED HANDLERS. ***
+  // It would be a smaller diff to drive the phone's chat/content choice off `active` directly
+  // (`selectChat` already sets `active: null`), and it would be wrong. THREE effects in this
+  // component open a content tab MACHINE-side: notebook-opened, file-opened, and the
+  // proposed-edit auto-open. If a machine-opened tab could displace the chat pane at phone,
+  // then the moment Claude proposes an edit the file editor would cover the permission card
+  // approving THAT VERY EDIT — the card is a sibling of the transcript INSIDE the chat pane.
+  // The user would be looking at the diff with no way to approve it.
+  //
+  // So a machine-opened tab appears in the strip UNHIGHLIGHTED: a notification, not a yank.
+  // The consequence to keep in mind when reading the render: `active` and `shownPane` can
+  // legitimately disagree, which is why MainTabs highlights from `shownPane` at phone.
+  //
+  // Only OPENING is wired. Closing needs nothing — resolvePhonePane falls back to 'chat' the
+  // moment the entity is gone.
   const openFile = (path: string) => {
     if (!activeId) return
+    setPhonePane('content')
     setPane(activeId, (p) => ({
       tabs: p.tabs.some((t) => t.kind === 'file' && t.path === path) ? p.tabs : [...p.tabs, { kind: 'file', path }],
       active: { kind: 'file', path },
@@ -214,6 +329,7 @@ function Shell() {
   // Files dock's open-notebook and by the Kernels tab's notebook list.
   const focusNotebook = (id: string) => {
     if (!activeId) return
+    setPhonePane('content')
     setPane(activeId, (p) => ({
       tabs: p.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'notebook', id }],
       active: { kind: 'notebook', id },
@@ -223,14 +339,16 @@ function Shell() {
   // clicking an agent belonging to a background session switches to that session first.
   const openAgent = (sid: string, id: string, label: string) => {
     setActive(sid)
+    setPhonePane('content')
     setPane(sid, (p) => ({
       tabs: p.tabs.some((t) => t.kind === 'agent' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'agent', id, label }],
       active: { kind: 'agent', id, label },
     }))
   }
-  const selectChat = () => { if (activeId) setPane(activeId, (p) => ({ ...p, active: null })) }
+  const selectChat = () => { setPhonePane('chat'); if (activeId) setPane(activeId, (p) => ({ ...p, active: null })) }
   const selectTab = (t: Content) => {
     if (!activeId) return
+    setPhonePane('content')
     setPane(activeId, (p) => ({ ...p, active: t }))
   }
   const closeTab = (t: Content) => {
@@ -400,10 +518,19 @@ function Shell() {
   const toggleTerm = () => {
     if (!activeId) return
     if (termOpen) { hideTerm(); return }
+    setPhonePane('terminal')
     if (terms.length === 0) addTerm(termCwd)
     else setTermPane(activeId, (p) => ({ ...p, open: true }))
   }
-  const toggleDock = (which: 'files' | 'git' | 'permissions' | 'sandbox') => setDock((d) => (d === which ? null : which))
+  // Rewritten from `setDock((d) => …)` to read `dock` directly: the phone pane has to be set
+  // in the same handler, and calling setPhonePane from inside a setState UPDATER makes the
+  // updater impure — React invokes updaters twice under StrictMode, so the side effect would
+  // fire twice and, worse, would be the kind of thing that only misbehaves in development.
+  const toggleDock = (which: 'files' | 'git' | 'permissions' | 'sandbox') => {
+    const opening = dock !== which
+    setDock(opening ? which : null)
+    if (opening) setPhonePane('dock')
+  }
 
   // When a session goes away, drop its terminal dock. The server already reaped the
   // ptys it owned (sessions.on('destroyed') → panes.destroyForSession), so this is
@@ -580,15 +707,18 @@ function Shell() {
   })
 
   const contentNode = active?.kind === 'notebook'
-    ? <NotebookView key={active.id} notebookId={active.id} />
+    ? <NotebookView key={active.id} notebookId={active.id} sessionId={activeId ?? undefined} />
     : active?.kind === 'file'
       ? <FileEditorView key={active.path} path={active.path} sessionId={activeId ?? undefined} />
       : active?.kind === 'agent' && activeId
         ? <AgentDetail key={active.id} sessionId={activeId} agentId={active.id} />
         : null
 
+  // `data-phone` is for the HARNESS ONLY, never for styling — and note it is an ATTRIBUTE:
+  // this div's className stays byte-for-byte as it was, because index.css owns shell sizing
+  // (`#root { height: var(--vvh) }`) and this is the shell wrapper it sizes.
   return (
-    <div className="flex h-full bg-ctp-base overflow-hidden">
+    <div data-phone={isPhone ? 'true' : 'false'} className="flex h-full bg-ctp-base overflow-hidden">
       <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} onOpenAgent={openAgent} />
       <div
         {...dividerProps({ axis: 'x', get: () => sidebarW, set: setSidebarW, sign: 1, min: 200, max: () => 560 })}
@@ -624,15 +754,21 @@ function Shell() {
           onToggleDock={toggleDock}
           termOpen={termOpen}
           onToggleTerm={toggleTerm}
+          canTerm={activeId !== null}
+          phonePane={shownPane}
         />
 
         <div className="flex-1 min-h-0 flex">
-          {/* Main column: Claude (with the terminal dock under it) | content. */}
-          <div className="flex-1 min-w-0 flex flex-col">
+          {/* Main column: Claude (with the terminal dock under it) | content. At phone the
+              right dock replaces this column outright rather than sharing the row with it. */}
+          <div className={`flex-1 min-w-0 flex flex-col ${shownPane === 'dock' ? 'hidden' : ''}`}>
             {/* Upper region: Claude, plus content beside it when a tab is active. */}
             <div ref={splitRef} className={`flex-1 min-h-0 relative flex ${active && layout === 'side' ? 'flex-row' : 'flex-col'}`}>
               {active && (
-                <div className={`flex-1 min-h-0 min-w-0 ${layout === 'side' ? 'order-3' : ''}`}>
+                <div
+                  data-testid="pane"
+                  className={`flex-1 min-h-0 min-w-0 ${layout === 'side' ? 'order-3' : ''} ${shownPane && shownPane !== 'content' ? 'hidden' : ''}`}
+                >
                   {contentNode}
                 </div>
               )}
@@ -643,7 +779,7 @@ function Shell() {
                     ? dividerProps({ axis: 'x', get: () => sideW, set: setSideW, sign: 1, min: 300, max: () => (splitRef.current?.getBoundingClientRect().width ?? 1200) - 320 })
                     : dividerProps({ axis: 'y', get: () => stackH, set: setStackH, sign: -1, min: 160, max: () => (splitRef.current?.getBoundingClientRect().height ?? 800) - 200 }))}
                   title="Drag to resize"
-                  className={`shrink-0 bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none ${layout === 'side' ? 'w-1 cursor-col-resize order-2' : 'h-1 cursor-row-resize'}`}
+                  className={`hidden md:block shrink-0 bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none ${layout === 'side' ? 'w-1 cursor-col-resize order-2' : 'h-1 cursor-row-resize'}`}
                 />
               )}
 
@@ -651,16 +787,27 @@ function Shell() {
                   tab is open. The terminal dock lives INSIDE this column (below), so it
                   tracks Claude's width rather than spanning the window. */}
               <div
-                className={`flex flex-col ${active ? `shrink-0 min-h-0 min-w-0 ${layout === 'side' ? 'border-r order-1' : 'border-t'} border-ctp-surface0` : 'flex-1 min-h-0 min-w-0'}`}
-                style={active
+                className={`flex flex-col ${
+                  isPhone
+                    // At phone this column is never the fixed-size companion: it is the whole
+                    // pane area, holding the chat body and the terminal dock. It hides only for
+                    // the two panes that live outside it.
+                    ? `flex-1 min-h-0 min-w-0 ${shownPane === 'content' || shownPane === 'dock' ? 'hidden' : ''}`
+                    : active ? `shrink-0 min-h-0 min-w-0 ${layout === 'side' ? 'border-r order-1' : 'border-t'} border-ctp-surface0` : 'flex-1 min-h-0 min-w-0'}`}
+                // Gated off at phone: an inline height/width beats the Tailwind class above, so
+                // leaving it would pin this column to a desktop companion size no class can undo.
+                style={!isPhone && active
                   // In 'stack' the column is a fixed height, and it now carries the dock
                   // too — so add the dock's height on top, leaving the chat its full
                   // stackH (the content area absorbs the difference, as before).
-                  ? (layout === 'side' ? { width: sideW } : { height: stackH + (dockShown ? termH + 1 : 0) })
+                  // It must add the dock's BOUNDED height, not the raw `termH`: bounding one
+                  // and not the other would make the column reserve space the dock no longer
+                  // occupies, which is a gap below the terminal instead of a clipped one.
+                  ? (layout === 'side' ? { width: sideW } : { height: dockShown ? `calc(${stackH}px + ${boundedDockH(termH)} + 1px)` : stackH })
                   : undefined}
               >
-                <div className="flex-1 min-h-0">
-                  {activeId ? <ChatView key={activeId} sessionId={activeId} /> : <Empty />}
+                <div data-testid="pane" className={`flex-1 min-h-0 ${shownPane && shownPane !== 'chat' ? 'hidden' : ''}`}>
+                  {activeId ? <ChatView key={activeId} sessionId={activeId} visible={!shownPane || shownPane === 'chat'} /> : <Empty />}
                 </div>
 
                 {/* Bottom dock: tabbed terminals for the ACTIVE session, sized to the
@@ -672,11 +819,20 @@ function Shell() {
                   <div
                     {...dividerProps({ axis: 'y', get: () => termH, set: setTermH, sign: -1, min: 120, max: () => 700 })}
                     title="Drag to resize"
-                    className="shrink-0 h-1 cursor-row-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
+                    className="hidden md:block shrink-0 h-1 cursor-row-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
                   />
                 )}
                 {allTerms.length > 0 && (
-                  <div className={dockShown ? 'shrink-0 flex flex-col min-w-0 border-t border-ctp-surface0' : 'hidden'} style={dockShown ? { height: termH } : undefined}>
+                  <div
+                    data-testid="pane"
+                    className={!dockVisible ? 'hidden'
+                      // At phone the dock IS the pane, so it fills the column. Dropping
+                      // boundedDockH here is safe only because #root is sized to var(--vvh) —
+                      // flex-1 inherits the visible viewport rather than the layout one.
+                      : isPhone ? 'flex-1 min-h-0 flex flex-col min-w-0'
+                      : 'shrink-0 flex flex-col min-w-0 border-t border-ctp-surface0'}
+                    style={dockVisible && !isPhone ? { height: boundedDockH(termH) } : undefined}
+                  >
                     {/* Tab strip: one tab per terminal in the ACTIVE session (× to close), + to add, hide on the right. */}
                     <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">
                       {terms.map((t, i) => (
@@ -708,7 +864,10 @@ function Shell() {
                         only the active session's active terminal is shown. */}
                     <div className="flex-1 min-h-0 relative">
                       {allTerms.map((t) => {
-                        const show = t.sid === activeId && dockShown && activeTerm === t.key
+                        // `dockVisible`, not `dockShown`: at phone the dock can be mounted but
+                        // hidden behind another pane, and a TerminalView told it is visible
+                        // while inside display:none fits xterm to a zero box.
+                        const show = t.sid === activeId && dockVisible && activeTerm === t.key
                         return (
                           <div key={t.key} className={show ? 'absolute inset-0' : 'hidden'}>
                             <TerminalView
@@ -733,11 +892,17 @@ function Shell() {
             <div
               {...dividerProps({ axis: 'x', get: () => dockW, set: setDockW, sign: -1, min: 240, max: () => 640 })}
               title="Drag to resize"
-              className="shrink-0 w-1 cursor-col-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
+              className="hidden md:block shrink-0 w-1 cursor-col-resize bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none"
             />
           )}
           {dock && (
-            <div className="shrink-0 min-h-0 border-l border-ctp-surface0" style={{ width: dockW }}>
+            <div
+              data-testid="pane"
+              className={`min-h-0 ${isPhone
+                ? `flex-1 min-w-0 border-l-0 ${shownPane === 'dock' ? '' : 'hidden'}`
+                : 'shrink-0 border-l border-ctp-surface0'}`}
+              style={isPhone ? undefined : { width: dockW }}
+            >
               {dock === 'files' ? (
                 <div className="flex flex-col h-full bg-ctp-base overflow-hidden">
                   {/* Files ⇄ Kernels sub-tabs. */}
@@ -761,7 +926,17 @@ function Shell() {
                           if (id) focusNotebook(id)
                         })}
                         onOpenFile={openFile}
-                        onNewNotebook={(p) => notebooks.createPath(p, activeId ?? undefined)}
+                        onNewNotebook={async (p) => {
+                          // Focus explicitly, exactly as onOpenNotebook does above. Do NOT rely on
+                          // the newly-seen effect: it marks an id seen before it checks whether it
+                          // can attach, so a create while `activeId` is still null consumes the id
+                          // and the retry its dep array provides is dead. FileManager's contract is
+                          // unchanged — error string, or null on success.
+                          const r = await notebooks.createPath(p, activeId ?? undefined)
+                          if (r.error) return r.error
+                          if (r.id) focusNotebook(r.id)
+                          return null
+                        }}
                         onClose={() => setDock(null)}
                       />
                     ) : (
@@ -847,7 +1022,7 @@ function tabToContent(t: Tab): Content {
 
 // Tab strip: Chat + one tab per open content item, then the dock toggles (Files /
 // Git / Terminal) and the companion-orientation control.
-function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout, onSetLayout, showLayout, dock, onToggleDock, termOpen, onToggleTerm }: {
+function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout, onSetLayout, showLayout, dock, onToggleDock, termOpen, onToggleTerm, canTerm, phonePane }: {
   tabs: Tab[]
   active: Content | null
   onSelectChat: () => void
@@ -856,11 +1031,23 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
   layout: 'side' | 'stack'; onSetLayout: (l: 'side' | 'stack') => void; showLayout: boolean
   dock: 'files' | 'git' | 'permissions' | 'sandbox' | null; onToggleDock: (w: 'files' | 'git' | 'permissions' | 'sandbox') => void
   termOpen: boolean; onToggleTerm: () => void
+  // The dock toggles above are GLOBAL state and work with no session. The terminal is
+  // PER-SESSION: toggleTerm opens `if (!activeId) return`. Without this the button renders
+  // enabled and normally-styled and silently does nothing — reachable on a fresh install or
+  // after closing the last session. Disable it rather than letting it lie about being live.
+  canTerm: boolean
+  // The RESOLVED phone pane, or null on desktop. The strip must highlight from THIS, not from
+  // `active`: a machine-opened tab (notebook-opened, file-opened, proposed-edit auto-open) sets
+  // `active` without taking the screen, so at phone the two legitimately disagree. Highlighting
+  // from `active` would show a tab as current while the chat is what you are looking at.
+  phonePane: PhonePane | null
 }) {
   const tab = (on: boolean) =>
     `px-3 h-8 flex items-center gap-1.5 text-xs border-b-2 -mb-px whitespace-nowrap transition-colors ${
       on ? 'border-ctp-accent text-ctp-text' : 'border-transparent text-ctp-overlay hover:text-ctp-subtext'}`
   const isOn = (t: Tab) => {
+    // At phone a content tab is only "on" when the content pane is actually the one showing.
+    if (phonePane && phonePane !== 'content') return false
     if (!active) return false
     if (t.kind === 'notebook') return active.kind === 'notebook' && active.id === t.id
     if (t.kind === 'agent') return active.kind === 'agent' && active.id === t.id
@@ -874,7 +1061,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
       {/* Tabs scroll in their OWN region so growing/overflowing tabs never push the
           toolbar. */}
       <div className="flex items-stretch min-w-0 flex-1 overflow-x-auto">
-        <button className={tab(active === null)} onClick={onSelectChat}>Chat</button>
+        <button className={tab(phonePane ? phonePane === 'chat' : active === null)} onClick={onSelectChat}>Chat</button>
         {/* Where Claude sits relative to open content — a SINGLE toggle that lives
             next to the Chat tab (so it reads as "Claude's position"), flipping
             beside ⇄ under. Only meaningful once a content tab is open. */}
@@ -883,7 +1070,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
             onClick={() => onSetLayout(layout === 'side' ? 'stack' : 'side')}
             title={layout === 'side' ? 'Claude is beside — click to put it under' : 'Claude is under — click to put it beside'}
             aria-label="Toggle where Claude sits"
-            className="self-center shrink-0 mx-1 w-6 h-6 flex items-center justify-center rounded text-ctp-overlay hover:text-ctp-subtext hover:bg-ctp-surface0 transition-colors"
+            className="hidden md:flex self-center shrink-0 mx-1 w-6 h-6 items-center justify-center rounded text-ctp-overlay hover:text-ctp-subtext hover:bg-ctp-surface0 transition-colors"
           >
             {layout === 'side'
               ? <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="1.5" y="2.5" width="4.5" height="9" rx="1" /><rect x="8" y="2.5" width="4.5" height="9" rx="1" /></svg>
@@ -909,7 +1096,12 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         <button className={toggle(dock === 'git')} onClick={() => onToggleDock('git')} title="Git panel">Git</button>
         <button className={toggle(dock === 'permissions')} onClick={() => onToggleDock('permissions')} title="Permissions — what this session's Claude can do">Permissions</button>
         <button className={toggle(dock === 'sandbox')} onClick={() => onToggleDock('sandbox')} title="Sandbox — what this session can reach: filesystem mounts, GPU devices, and connectors">Sandbox</button>
-        <button className={toggle(termOpen)} onClick={onToggleTerm} title="Terminal">Terminal</button>
+        <button
+          className={`${toggle(termOpen)} disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-ctp-overlay`}
+          onClick={onToggleTerm}
+          disabled={!canTerm}
+          title={canTerm ? 'Terminal' : 'Terminal — needs a session; create or select one first'}
+        >Terminal</button>
       </div>
     </div>
   )
@@ -1074,7 +1266,13 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
           {sessions.length === 0 && <div className="px-2 py-2 text-xs text-ctp-overlay">No sessions yet.</div>}
           {ordered.map(({ session: s, depth }) => (
             <SessionRow
-              key={s.id} session={s} depth={depth} active={s.id === activeId} attention={attention.has(s.id)}
+              // `finished` ONLY, deliberately. SessionRow renders the literal "done" and a dot
+              // titled "Finished — needs your attention", both of which are FALSE for a
+              // session that is merely blocked on a permission prompt. The store now carries
+              // the reason; until the rendering slice lands, this narrows it back to a
+              // boolean so the sidebar stays exactly as it is today. THIS is the line the
+              // next slice changes.
+              key={s.id} session={s} depth={depth} active={s.id === activeId} attention={attention.get(s.id) === 'finished'}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
               onOpenAgent={(id, label) => { onOpenAgent(s.id, id, label); onClose() }}
             />
@@ -1204,9 +1402,12 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
           body={
             <>
               You haven’t trusted <span className="font-mono text-ctp-text">{prettyPath(cwd.trim())}</span> yet.
-              Trusting it lets its <span className="font-mono">.claude/settings.local.json</span> grant tool
-              permissions to sessions running here. Until then, Claude ignores those permission entries.
-              Only trust folders whose contents you recognise.
+              Trusting it lets <span className="font-mono">.claude/settings.local.json</span> in this folder grant
+              tool permissions to <b>every session that runs here — now and in future</b>, including teammates a
+              session hires. That file is <b>writable by sessions themselves</b>, so this approves not just the
+              permissions in it today but any a session adds later. Sandbox mounts still bound what a session can
+              reach; this only affects whether it is prompted. Only trust folders whose contents <em>and
+              sessions</em> you recognise.
             </>
           }
           confirmLabel="Trust folder"

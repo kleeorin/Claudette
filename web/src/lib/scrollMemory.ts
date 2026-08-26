@@ -78,7 +78,27 @@ export function useScrollMemory(key: string | null, getEl: () => HTMLElement | n
         if (node) attach(node)
       }
       if (el && restoring) {
-        if (el.scrollHeight === lastHeight) settled++
+        // A container that CANNOT SCROLL YET is not a settled container. `settled` used to
+        // increment regardless, and "the content has not loaded" is a perfectly stable
+        // scrollHeight — so an empty box counted 60 unchanging frames (~1s at rAF), declared
+        // the layout settled, abandoned the restore and exited the loop for good. RESTORE_MS
+        // never got a chance: the stability budget fired EIGHT TIMES EARLIER than the backstop
+        // meant to catch exactly this.
+        // That is the same defect this file's own comment claims to have fixed. A flat time
+        // budget was replaced by a stability budget with the identical blind spot for a
+        // different reason: neither can tell "the content finished and is genuinely shorter"
+        // from "the content has not started". Both look like an unchanging height.
+        // Symptom: open a large file (or hit a cold server), scroll down, leave, come back —
+        // the fetch outlives the ~1s budget, the restore is abandoned, and you land at the top.
+        // Then `save` is live again, so the next scroll writes the top-of-file offset over the
+        // stored one and the position is forgotten PERMANENTLY. It hits every surface using
+        // this hook, and the notebook worst of all: cells mount over many frames.
+        // Why it survived: a small or cached file resolves in well under a second, so the
+        // height changes and the counter resets. Test with a slow or multi-MB load or you get
+        // a false pass.
+        const canScroll = el.scrollHeight - el.clientHeight > 0
+        if (!canScroll) settled = 0
+        else if (el.scrollHeight === lastHeight) settled++
         else { settled = 0; lastHeight = el.scrollHeight }
         const max = el.scrollHeight - el.clientHeight
         if (max > 0 && Math.abs(el.scrollTop - target) > 1) el.scrollTop = Math.min(target, max)
@@ -96,6 +116,12 @@ export function useScrollMemory(key: string | null, getEl: () => HTMLElement | n
       // Record a settled offset only (`save` no-ops mid-restore). If we never reached
       // the target — switched away while the content was still growing — keep the
       // stored one rather than overwriting it with a clamped value.
+      // NOTE this call is usually a NO-OP on a real unmount, and is not the mechanism that
+      // captures your final offset. React runs passive cleanups after the mutation phase has
+      // detached the host node, and a detached element reports scrollHeight === clientHeight
+      // === 0, so the guard inside `save` returns early. The `scroll` listener above is what
+      // actually records the position as you scroll; this is a backstop for the
+      // still-attached cases (a key change, a dep change). Verify with `el.isConnected`.
       save()
       if (el) {
         el.removeEventListener('scroll', save)

@@ -5,5 +5,9 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": []
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Vitest owns the test files and supplies their types (see vitest.config.ts). Excluding
+  // them here keeps `npm run typecheck` and `npm run build` working before the test deps
+  // are installed — otherwise a staged, not-yet-runnable test breaks the production build.
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

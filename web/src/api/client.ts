@@ -96,6 +96,12 @@ const focusPanes = channel<[string, string, string]>()   // [sessionId, notebook
 const focusFiles = channel<[string, string]>()           // [sessionId, path]
 
 let ws: WebSocket | null = null
+// Has the socket EVER been open in this page load? Set once in `sock.onopen`, never cleared.
+// This is a different question from `isConnected()` and the difference is the whole point:
+// readyState cannot distinguish "never connected yet" from "was connected and dropped", and a
+// subscriber that wants to know whether an incoming `connected(true)` is a RECONNECT needs
+// exactly that distinction. See the `wasDown` seed in the sessions store.
+let everConnected = false
 let backoff = 500
 const outbox: WsClientMessage[] = []
 
@@ -135,6 +141,14 @@ function connect(): void {
   ws = sock
   sock.onopen = () => {
     backoff = 500
+    // ORDER IS LOAD-BEARING: this must precede `connected.emit(true)`. `channel.emit` runs its
+    // subscribers SYNCHRONOUSLY, so a handler that asks `hasEverConnected()` while servicing
+    // this very emit sees `true` only if the flag is already set. Reversed, a subscriber shaped
+    // like the sessions store's seed (`hasEverConnected() && !isConnected()`) would get the
+    // wrong answer on the exact edge it exists to classify. No current subscriber does that —
+    // this is not a live bug — but the seed pattern invites one, so do not tidy these three
+    // statements into a different order.
+    everConnected = true
     connected.emit(true)
     for (const m of outbox.splice(0)) sock.send(JSON.stringify(m))
   }
@@ -191,6 +205,19 @@ export async function checkAuth(): Promise<boolean> {
 // --- the api surface ---------------------------------------------------------
 
 export const api = {
+  // The socket's CURRENT state. True only while OPEN — CONNECTING, CLOSING, CLOSED and a null
+  // socket all read false, which is correct for every caller: during a drop `retry()` nulls
+  // `ws` before emitting, and in the window between `close()` and `onclose` the socket is
+  // CLOSING, so "not usable right now" is the honest answer in both.
+  isConnected: (): boolean => ws !== null && ws.readyState === WebSocket.OPEN,
+  // Whether the socket has been open at least once this page load. NOT a substitute for
+  // `isConnected` and not interchangeable with it: `connected` is a plain channel with no
+  // replay, so a subscriber that mounts mid-outage never observes the down-edge, and asking
+  // "am I open?" cannot tell *never connected yet* from *was connected and dropped*. That
+  // distinction is the entire question when deciding whether an incoming `connected(true)` is
+  // a RECONNECT, and it is the one readyState cannot answer — a freshly constructed socket is
+  // CONNECTING, never OPEN, so a readyState-only seed reads "down" on every healthy startup.
+  hasEverConnected: (): boolean => everConnected,
   // Streaming subscriptions (namespaced by session id, except list/connected).
   on: {
     event: (fn: Fn<[string, ClaudeEvent]>) => events.on(fn),

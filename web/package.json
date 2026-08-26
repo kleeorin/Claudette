@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && NODE_ENV=production vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@claudette/shared": "*",

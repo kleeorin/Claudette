@@ -9,6 +9,7 @@ import { searchHighlight, setSearchMatches } from '../lib/searchHighlight'
 import { findMatches, firstMatchFrom, isInvalidQuery, type Match } from '../lib/findMatches'
 import type { FindState } from '../lib/useFind'
 import { FindBar } from './FindBar'
+import { useScrollMemory } from '../lib/scrollMemory'
 
 interface Props {
   original: string        // base text on disk (the "before")
@@ -17,6 +18,7 @@ interface Props {
   find: FindState         // shared with the file's own editor, so the query survives the flip
   onDoc: (text: string) => void         // latest accepted text (proposed minus rejected hunks)
   onAllResolved: (text: string) => void  // every hunk decided (accepted/rejected) → commit
+  scrollKey?: string      // remembers where you were when this diff reopens
 }
 
 // A CodeMirror unified-merge view: renders Claude's proposed change as inline +/-
@@ -27,8 +29,12 @@ interface Props {
 // CodeEditor so the diff looks like the rest of the app.
 const NO_MATCHES: Match[] = []
 
-export function DiffEditor({ original, proposed, filename, find, onDoc, onAllResolved }: Props) {
+export function DiffEditor({ original, proposed, filename, find, onDoc, onAllResolved, scrollKey }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
+  // Reviewing a long diff and switching session used to drop you back at the top: this had
+  // the same scroller shape as CodeEditor and simply was never wired. Same host div, same
+  // overflow-auto, same hook.
+  useScrollMemory(scrollKey ?? null, () => hostRef.current)
   const viewRef = useRef<EditorView | null>(null)
   const cbRef = useRef({ onDoc, onAllResolved })
   cbRef.current = { onDoc, onAllResolved }

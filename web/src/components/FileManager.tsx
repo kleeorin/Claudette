@@ -165,7 +165,7 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
       err = r.ok ? null : r.error
     } else if (creating === 'notebook') {
       const p = joinPath(dir, n.endsWith('.ipynb') ? n : `${n}.ipynb`)
-      err = await onNewNotebook(p)   // createPath opens + activates it
+      err = await onNewNotebook(p)   // the handler focuses the new notebook's tab; null = created
     } else {
       const r = await api.fs.createFile(joinPath(dir, n))
       err = r.ok ? null : r.error
