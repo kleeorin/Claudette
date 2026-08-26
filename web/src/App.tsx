@@ -25,6 +25,7 @@ import { pruneDrafts } from './lib/drafts'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
 import { basename, prettyPath } from './lib/paths'
 import { MD_PX, usePhone } from './lib/breakpoint'
+import { attachNewNotebooks } from './lib/notebookAttach'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
@@ -385,14 +386,18 @@ function Shell() {
   const openIds = notebooks.open.map((d) => d.notebookId).join(',')
   useEffect(() => {
     const ids = notebooks.open.map((d) => d.notebookId)
-    for (const id of ids) {
-      if (seenNb.current.has(id)) continue
-      seenNb.current.add(id)
-      // Only a notebook THIS user opened attaches to the session they're viewing.
-      // A notebook a Claude tool opened arrives pushed from the server; it attaches
-      // to the CALLING session via `focusPane` below — never leaks into whatever
-      // session you happen to be looking at.
-      if (activeId && notebooks.wasLocallyOpened(id)) setPane(activeId, (p) => ({
+    // H6 (store/sessionReducer.ts): this loop used to mark an id seen BEFORE testing whether it
+    // could act on it, which permanently defeated the retry its own `[openIds, activeId]` dep
+    // array was there to provide. The decision — and the marking, which must be the same event
+    // as the acting — now lives in lib/notebookAttach.ts, where it is unit-tested. Only a
+    // notebook THIS user opened attaches to the session they're viewing; one a Claude tool
+    // opened arrives pushed from the server and attaches to the CALLING session via `focusPane`
+    // below, so it never leaks into whatever session you happen to be looking at.
+    // Guarded rather than asserted with `!`: attachNewNotebooks returns ids only when activeId
+    // is set, but that guarantee lives in another file, and a non-null assertion here would be
+    // load-bearing on it silently. This costs nothing — with no activeId the call returns [].
+    if (activeId) for (const id of attachNewNotebooks(ids, seenNb.current, { activeId, wasLocallyOpened: notebooks.wasLocallyOpened })) {
+      setPane(activeId, (p) => ({
         tabs: p.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'notebook', id }],
         active: { kind: 'notebook', id },
       }))

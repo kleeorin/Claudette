@@ -55,8 +55,20 @@
 //      Note also that this is a CORRECTNESS invariant about the effect BODY, distinct from
 //      H2's PERFORMANCE invariant about a dependency ARRAY. The two are easy to conflate.
 //
-//  H6  App.tsx — the notebook-restore effect (`seenNb`) *** THIS ONE IS LIVE. ***
-//      Order in the loop body: `if (seenNb.current.has(id)) continue`, then
+//  H6  App.tsx — the notebook-restore effect (`seenNb`) *** FIXED 2026-08-26. ***
+//      THE FIX AS IT LANDED: the ordering rule moved out of the effect into
+//      web/src/lib/notebookAttach.ts (`attachNewNotebooks`), which marks an id seen ONLY as it
+//      returns it for attaching — so marking-seen and acting are now one indivisible step
+//      rather than two statements that drifted apart. App.tsx's effect keeps only the React
+//      work. Extracted rather than reordered in place so the rule could be TESTED:
+//      scratchpad/notebook-attach-test.mts, 5 assertions, pure, no DOM. Test 2 is the
+//      regression and fails against the old ordering (verified: 2/5 with the `add` moved back
+//      above the precondition).
+//      NOT fixed by a React-level test: `web/src/store/sessions.test.tsx` would be the natural
+//      home for one, but `vitest` is neither installed nor declared in web/package.json, so
+//      that file cannot currently be executed at all. Worth knowing before adding another.
+//      The description below is kept in the past tense as the record of what the bug WAS.
+//      Order in the loop body WAS: `if (seenNb.current.has(id)) continue`, then
 //      `seenNb.current.add(id)`, and only THEN the precondition
 //      `if (activeId && notebooks.wasLocallyOpened(id))`. The effect CONSUMES its input
 //      before testing whether it can act on it. Its dep array is `[openIds, activeId]`, so
@@ -70,9 +82,8 @@
 //      remove it. notebooks.tsx's comment describes this shape accurately and must not be
 //      read as retiring it. Any future caller that depends on this effect firing hits the
 //      same trap.
-//      THE FIX, when someone takes it: move the `add` after the precondition test so an
-//      id is marked seen only once it has actually been acted on. Not done here because it
-//      is a behaviour change in App.tsx, and this file is comment-only.
+//      (The fix named here at the time — move the `add` after the precondition test — is what
+//      was done, in the extracted form described above.)
 //      This is an instance of a named pattern in this codebase — a guard that consumes its
 //      input before testing its precondition. The other known instances are scrollMemory's
 //      `settled` counter and the session-blind scroll key.
