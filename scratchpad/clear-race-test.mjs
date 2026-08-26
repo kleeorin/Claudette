@@ -18,7 +18,10 @@ import { join, extname } from 'path'
 import { WebSocket, WebSocketServer } from 'ws'
 
 const ROOT = new URL('..', import.meta.url).pathname
-const APP = 'http://127.0.0.1:4321'
+// Own port, not the shared :4321. super-editor-test.mjs ALSO binds a proxy on 4321, so the
+// two collided with each other — and :4321 is additionally the port an operator's manual
+// dev server uses, which would make this proxy fail EADDRINUSE on a developer's machine.
+const APP = 'http://127.0.0.1:4329'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 const READ_DELAY = 2000   // ms the proxy holds readConversation, so /clear lands mid-fetch
 
@@ -41,14 +44,24 @@ await writeFile(join(projDir, `${convId}.jsonl`), [
 // --- build web to a temp dir ----------------------------------------------------
 execSync(`NODE_ENV=production npx vite build --outDir ${buildDir} --emptyOutDir --logLevel warn`, { cwd: join(ROOT, 'web'), stdio: 'inherit' })
 
-// --- backend on :4322 with the isolated HOME ------------------------------------
-const env = { ...process.env, PORT: '4322', HOST: '127.0.0.1', CLAUDETTE_NO_AUTH: '1', CLAUDETTE_DATA_DIR: dataDir, HOME: tmpHome }
+// --- backend on :4327 with the isolated HOME ------------------------------------
+const env = { ...process.env, PORT: '4327', HOST: '127.0.0.1', CLAUDETTE_NO_AUTH: '1', CLAUDETTE_DATA_DIR: dataDir, HOME: tmpHome }
+// ISOLATING $HOME IS NOT ENOUGH. The server resolves its project dir through
+// claudeConfigDir(), which prefers $CLAUDE_CONFIG_DIR and only falls back to
+// homedir()/.claude — and this env is a `...process.env` spread, so an inherited
+// CLAUDE_CONFIG_DIR silently wins over the tmpHome we just set. Every Claudette sandbox
+// sets that variable, so running this suite from inside one sent the server looking for
+// the fixture conversation in the REAL config dir, found nothing, and failed only the
+// positive control at :131 — leaving the three race assertions passing VACUOUSLY, because
+// with no conversation served there was nothing for auto-resume to race against. A test
+// that isolates one of two config roots is not isolated.
+delete env.CLAUDE_CONFIG_DIR
 delete env.CLAUDETTE_TOKEN
 const server = spawn('npx', ['tsx', 'src/index.ts'], { cwd: join(ROOT, 'server'), env, stdio: 'pipe', detached: true })
 server.stderr.on('data', (d) => process.env.DEBUG && process.stderr.write(`[srv] ${d}`))
-for (let i = 0; i < 80; i++) { try { if ((await fetch('http://127.0.0.1:4322/api/health')).ok) break } catch {} await wait(250) }
+for (let i = 0; i < 80; i++) { try { if ((await fetch('http://127.0.0.1:4327/api/health')).ok) break } catch {} await wait(250) }
 
-// --- proxy on :4321 (delays readConversation) -----------------------------------
+// --- proxy on :4329 (delays readConversation) -----------------------------------
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' }
 const proxy = createServer(async (req, res) => {
   const url = req.url || '/'
@@ -56,7 +69,7 @@ const proxy = createServer(async (req, res) => {
     // The exact endpoint auto-resume awaits second — hold it so /clear can land first.
     if (url.startsWith('/api/session/conversation?')) await wait(READ_DELAY)
     const chunks = []; for await (const c of req) chunks.push(c)
-    const r = await fetch(`http://127.0.0.1:4322${url}`, { method: req.method, headers: { ...req.headers, host: '127.0.0.1:4322' }, body: chunks.length ? Buffer.concat(chunks) : undefined, redirect: 'manual' })
+    const r = await fetch(`http://127.0.0.1:4327${url}`, { method: req.method, headers: { ...req.headers, host: '127.0.0.1:4327' }, body: chunks.length ? Buffer.concat(chunks) : undefined, redirect: 'manual' })
     const buf = Buffer.from(await r.arrayBuffer())
     const h = Object.fromEntries(r.headers); delete h['content-encoding']; delete h['content-length']
     res.writeHead(r.status, h); res.end(buf); return
@@ -70,7 +83,7 @@ const wss = new WebSocketServer({ noServer: true })
 proxy.on('upgrade', (req, socket, head) => {
   if (!(req.url || '').startsWith('/ws')) { socket.destroy(); return }
   wss.handleUpgrade(req, socket, head, (client) => {
-    const up = new WebSocket(`ws://127.0.0.1:4322${req.url}`)
+    const up = new WebSocket(`ws://127.0.0.1:4327${req.url}`)
     const q = []
     up.on('open', () => { for (const m of q) up.send(m); q.length = 0 })
     client.on('message', (m) => (up.readyState === 1 ? up.send(m.toString()) : q.push(m.toString())))
@@ -79,18 +92,45 @@ proxy.on('upgrade', (req, socket, head) => {
     client.on('close', bye); up.on('close', bye); client.on('error', bye); up.on('error', bye)
   })
 })
-await new Promise((r) => proxy.listen(4321, '127.0.0.1', r))
+await new Promise((r) => proxy.listen(4329, '127.0.0.1', r))
 
 // --- headless Chrome + CDP ------------------------------------------------------
 const CHROME_BIN = process.env.CHROME_BIN
   || (existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome' : null)
   || execSync(`ls ${ROOT}.chrome-headless/chrome/linux-*/chrome-linux64/chrome 2>/dev/null | head -1`).toString().trim()
 const chromeDir = await mkdtemp(join(tmpdir(), 'chrome-clr-'))
-const chrome = spawn(CHROME_BIN, ['--headless=new', '--remote-debugging-port=9360', `--user-data-dir=${chromeDir}`, '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1400,900', 'about:blank'], { stdio: 'pipe' })
+const chrome = spawn(CHROME_BIN, ['--headless=new', '--remote-debugging-port=9360', `--user-data-dir=${chromeDir}`, '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1400,900', 'about:blank'], { stdio: 'pipe', detached: true })
+
+// Reap the browser on EVERY exit path, not just the happy one (see find-diff-check).
+// Reap the SERVER too, not just at the end of the happy path. This test runs its backend
+// with CLAUDETTE_NO_AUTH=1, so an orphan is an UNAUTHENTICATED server left listening.
+// It used to sit on :4322 — the port auth-loopback-test.mjs uses — and a leaked instance
+// silently hijacked that run, making the security test report 8 false failures including
+// "WS upgrade refused without token". A security alarm that cries wolf is worse than none.
+// Two independent fixes, deliberately both: the port moved to :4327 so the collision
+// cannot recur, and the reap below stops the leak itself.
+const reapServer = () => { try { process.kill(-server.pid, 'SIGKILL') } catch { try { server.kill('SIGKILL') } catch {} } }
+// Reap by process GROUP, not by pid — the same discipline this file uses for its server,
+// where it IS load-bearing (`npx` forks the real node, so killing the wrapper by pid can
+// strand the port). For Chrome it is defence in depth only: measured, the bare kill did
+// not orphan it. See rule 3 in scratchpad/port-and-reap-lint.mts.
+const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
+process.on('exit', () => { reapChrome(); reapServer() })
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapChrome(); reapServer(); if (e) console.error(e); process.exit(1) })
+}
 async function cdpTarget() { for (let i = 0; i < 40; i++) { try { const list = await (await fetch('http://127.0.0.1:9360/json')).json(); const page = list.find((t) => t.type === 'page'); if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl } catch {} await wait(250) } throw new Error('no CDP target') }
 const cdp = new WebSocket(await cdpTarget())
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
 let cdpId = 0; const pend = new Map()
+// A CDP reply is awaited on a promise that ONLY the socket can resolve, so if Chrome dies
+// mid-run — crash, OOM, an external pkill — every pending send() hangs forever and the
+// harness sleeps in ep_poll holding its ports until someone hunts it down. Abort loudly
+// instead. No reap() here on purpose: process.exit() runs the process.on('exit') handlers,
+// which already cover every child. `cdpDone` keeps this off the DELIBERATE teardown below,
+// where the very same close event is expected and must not be read as a failure.
+let cdpDone = false
+cdp.on('close', () => { if (cdpDone) return; console.error('CDP socket closed — Chrome died; aborting rather than hanging'); process.exit(1) })
 cdp.on('message', (raw) => { const m = JSON.parse(raw); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id) } })
 const send = (method, params = {}) => { const id = ++cdpId; return new Promise((res) => { pend.set(id, res); cdp.send(JSON.stringify({ id, method, params })) }) }
 async function evaluate(expression) { const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }); if (r.result?.exceptionDetails) throw new Error('eval threw: ' + JSON.stringify(r.result.exceptionDetails)); return r.result?.result?.value }
@@ -134,7 +174,8 @@ try {
 } catch (e) {
   check('test run completed', false, String(e))
 } finally {
-  chrome.kill('SIGKILL')
+  cdpDone = true   // deliberate teardown from here — the CDP close below is expected
+  reapChrome()
   try { proxy.close() } catch {}
   try { process.kill(-server.pid, 'SIGKILL') } catch { server.kill('SIGKILL') }
   for (const d of [tmpHome, workDir, dataDir, buildDir]) await rm(d, { recursive: true, force: true }).catch(() => {})

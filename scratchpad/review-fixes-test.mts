@@ -226,12 +226,16 @@ function eq(label: string, got: unknown, want: unknown): void {
   eq('readOnlyHint is honoured', learned?.find((t) => t.name === 'read_thing')?.write, false)
   eq('an unhinted tool counts as write-capable', learned?.find((t) => t.name === 'write_thing')?.write, true)
 
-  // And the point of classifying at all: a read-only role now gets a per-tool deny
-  // instead of losing the whole server.
+  // Classification still happens and is still worth checking (above) — it drives the catalog
+  // UI. What it no longer does is SCOPE A READ-ONLY ROLE. Patch 6 stopped consulting it there,
+  // because `write` comes from the upstream's own annotations and the MCP spec says a client
+  // must not trust those from an untrusted server. These two used to assert the per-tool
+  // contract; they now assert the whole-server one.
   const launch = await import('../server/src/connectors/connectorLaunch.ts')
   const rules = launch.connectorDenyRules({ granted: ['sse-srv'], accountAllow: [], readOnlyRole: true })
-  ok('read-only role denies the write tool', rules.includes('mcp__sse-srv__write_thing'))
-  ok('…and is NOT denied the whole server any more', !rules.includes('mcp__sse-srv'))
+  ok('read-only role is denied the WHOLE connector', rules.includes('mcp__sse-srv'))
+  ok('…and the self-declared read-only tool is covered by it too',
+    !rules.some((r: string) => r.startsWith('mcp__sse-srv__')))
 
   // The capture is gated on the REQUEST being a tools/list, not on the reply shape.
   // Without that, a tools/call response carrying `result.tools` could rewrite the

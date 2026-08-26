@@ -1,0 +1,84 @@
+# DEAD — DOES NOT APPLY. Verified 2026-08-24: `git apply --check` fails against the current tree.
+# NOT YET DISTINGUISHED: "already landed" vs "genuinely conflicted". Those need different
+# remedies, and you CANNOT tell which by reading this file — a superseded patch still describes
+# the tree accurately, a conflicted one does not. READ THE TREE, or run the matching test.
+# CONTEXT: all 10 patches in scratchpad/ were swept and NONE applies. Treating any of them as
+# pending work is a mistake that has already been made once today — a handover described the
+# reviewer unscoped-Bash hazard as open when it had been closed and tested green.
+--- a/server/src/auth.ts
++++ b/server/src/auth.ts
+@@ -136,16 +136,47 @@
+ // upgrade (see index.ts). Returns 401 for anything unauthenticated.
+ export function makeAuthHook(auth: Auth) {
+   const open = new Set(['/api/health', '/api/auth'])
++  // Paths the token must guard: the data/control API and the Jupyter reverse-proxy (it
++  // grants kernel access). Everything else is the static SPA shell and stays open.
++  const gated = (p: string): boolean => p.startsWith('/api/') || p.startsWith('/jupyter/')
+   return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
+     if (!auth.required) return
+     // NOT named `path` — that shadowed the module-scope `import path from 'path'` inside
+     // the one function that decides what may be reached unauthenticated. Harmless while
+     // nothing here needed the module, and a trap the moment something did.
+     const urlPath = req.url.split('?')[0]
+-    // Gate the data/control API and the Jupyter reverse-proxy (it grants kernel
+-    // access); everything else (static assets / SPA shell) stays open.
+-    if (!urlPath.startsWith('/api/') && !urlPath.startsWith('/jupyter/')) return
+-    if (open.has(urlPath)) return
++    // DECODE BEFORE MATCHING. Fastify's router percent-decodes the path before choosing a
++    // route; this hook used to prefix-match the RAW url. The two therefore disagreed about
++    // what the path even was, and a single encoded character walked between them:
++    // `/%61pi/session/list` failed the `/api/` test here, skipped the gate entirely, and
++    // still reached the real route. Every control-plane handler is "trusted because this
++    // route is auth-gated" (sessionApi.ts, connectorApi.ts say so in those words), so the
++    // mismatch made `POST /%61pi/session/setSandbox {"enabled":false}` an UNAUTHENTICATED
++    // un-sandboxing — reachable from inside any box, since we deliberately share the network
++    // namespace. (Verified live: five encodings served real data.)
++    //
++    // decodeURIComponent decodes a SUPERSET of what find-my-way does (it also turns %2F into
++    // a separator), so testing it can only ever gate MORE than the router will route — never
++    // less, which is the only direction that would leave a hole.
++    let decoded: string
++    try {
++      decoded = decodeURIComponent(urlPath)
++    } catch {
++      // A malformed escape has no single meaning, so refuse rather than guess. Must not
++      // throw: an uncaught throw in a preHandler is a 500 on every request, static included.
++      await reply.code(400).send({ error: 'bad request path' })
++      return
++    }
++    // …and the route the router ACTUALLY matched, which makes hook and router unable to
++    // disagree by construction — it reads `/api/session/list` even for `/%61pi/...`.
++    // Undefined for the not-found path and populated with its own pattern for a static
++    // asset, both of which fall through to the spelling tests above. Purely additive: this
++    // term can only add gating, never remove it.
++    const matched = req.routeOptions?.url ?? ''
++    if (!gated(urlPath) && !gated(decoded) && !gated(matched)) return
++    // Compare the OPEN set against the decoded spelling, so `/%61pi/health` is still open
++    // — the router sends it to the same handler.
++    if (open.has(decoded)) return
+     if (!isAuthed(req.raw, auth)) {
+       await reply.code(401).send({ error: 'unauthorized' })
+     }
+--- a/server/src/fs/fsApi.ts
++++ b/server/src/fs/fsApi.ts
+@@ -104,7 +104,19 @@
+   // refuse anything the browser tags cross-site. The app's own same-origin fetch()s
+   // pass, dev/proxy setups report same-site, and a directly-typed URL reports 'none'.
+   app.addHook('onRequest', async (req, reply) => {
+-    if (!req.url.startsWith('/api/fs/')) return
++    // Decode before matching, for exactly the reason makeAuthHook does (see auth.ts): the
++    // router decodes the path and this hook did not, so `/%61pi/fs/write` slipped past the
++    // CSRF check while still reaching the route — re-opening the very cross-site write this
++    // guard exists to refuse. Test BOTH spellings; either matching is enough to guard.
++    const raw = req.url.split('?')[0]
++    let decoded: string
++    try {
++      decoded = decodeURIComponent(raw)
++    } catch {
++      return reply.code(400).send({ error: 'bad request path' })
++    }
++    const isFs = (p: string): boolean => p.startsWith('/api/fs/')
++    if (!isFs(raw) && !isFs(decoded)) return
+     const site = req.headers['sec-fetch-site']
+     if (typeof site === 'string' && site !== 'same-origin' && site !== 'same-site' && site !== 'none') {
+       return reply.code(403).send({ error: 'cross-site request to /api/fs refused' })

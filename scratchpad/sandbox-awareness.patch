@@ -1,3 +1,10 @@
+# DEAD — DOES NOT APPLY. Verified 2026-08-24: `git apply --check` fails against the current tree.
+# NOT YET DISTINGUISHED: "already landed" vs "genuinely conflicted". Those need different
+# remedies, and you CANNOT tell which by reading this file — a superseded patch still describes
+# the tree accurately, a conflicted one does not. READ THE TREE, or run the matching test.
+# CONTEXT: all 10 patches in scratchpad/ were swept and NONE applies. Treating any of them as
+# pending work is a mistake that has already been made once today — a handover described the
+# reviewer unscoped-Bash hazard as open when it had been closed and tested green.
 --- a/server/src/claude/sandbox.ts
 +++ b/server/src/claude/sandbox.ts
 @@ -596,6 +596,21 @@

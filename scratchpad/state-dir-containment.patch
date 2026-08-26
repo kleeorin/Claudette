@@ -1,0 +1,99 @@
+# DEAD — GENUINELY CONFLICTED, not merely superseded. `git apply` fails "patch does not
+# apply" at sandbox.ts:5 — the region it edits has moved underneath it. Its protection IS in
+# the tree (stateDirsToHide / hiddenStateDests, verified live: token, sessions.json, ledger
+# and team-notes all read=false write=false with $HOME mounted rw). REMEDY: delete. Because
+# it conflicts, you CANNOT read this file to learn what is or isn't applied — read the tree.
+--- a/server/src/claude/sandbox.ts
++++ b/server/src/claude/sandbox.ts
+@@ -5,6 +5,8 @@
+ import { fileURLToPath } from 'url'
+ import type { SandboxConfig, SandboxMount } from '@claudette/shared'
+ import { ensureUserSettingsPinnable, settingsJsonPaths } from './configProtection'
++import { dataDir } from '../util/dataDir'
++import { tokenFilePath } from '../auth'
+ 
+ // Wraps a `claude …` invocation in a bubblewrap sandbox that confines the process
+ // to a set of mounts (see SANDBOX.md). We do NOT --unshare-net, so the shared
+@@ -141,6 +143,48 @@
+   return null
+ }
+ 
++// The dirs that must be INVISIBLE inside every box, whatever the caller mounted.
++//
++// DIFFERENT IN KIND FROM appSourceProtections, and the difference is the whole point: there,
++// `ro` suffices because WRITING the app source is the escape and reading it is harmless.
++// Here READING IS THE ESCAPE. `~/.config/claudette/token` is the loopback auth token; a box
++// that reads it can authenticate to the control API (we deliberately do not --unshare-net,
++// see the header) and POST /api/session/create — which is auth-gated and therefore passes
++// `trusted: true` — creating an UNSANDBOXED session immediately, with no restart. An
++// --ro-bind would still permit that read and would look like a protection. So these are
++// bound over with an EMPTY directory instead: present, read-only, and containing nothing.
++//
++// The same dir also holds sessions.json, which restore() replays as trusted, so a writable
++// copy lets a box grant itself teamEmploy/sandbox:{enabled:false} across a restart; plus the
++// hook-poisoning ledger and team-notes, which are read-then-influence channels.
++//
++// BOTH PATHS, INDEPENDENTLY: dataDir() honours CLAUDETTE_DATA_DIR and tokenFilePath() does
++// not, so an override splits them and a protection covering only one re-opens the other.
++//
++// dataDir.ts and auth.ts each justify their location with "~/.config is never bind-mounted
++// into a session sandbox". That is true of the OBLIGATORY mounts only — a user who mounts
++// $HOME, a parent of it, or / defeats it with no symlink and no bug. A rationale copied
++// between two files is a fact nobody owns; this function is the owner.
++function stateDirsToHide(): string[] {
++  const dirs = [path.resolve(dataDir()), path.resolve(path.dirname(tokenFilePath()))]
++  return [...new Set(dirs)]
++}
++
++// Where the BOX sees each hidden dir, given the mounts. Reuses overlayDestFor for the same
++// reason appSourceProtections does: an overlay bound at the canonical path binds a path
++// nothing else binds, and (Critic proved live) sorts first under shallow-first ordering and
++// LOSES the last-match-wins race — actively defeated while appearing present.
++function hiddenStateDests(dataMounts: SandboxMount[]): string[] {
++  const out: string[] = []
++  for (const dir of stateDirsToHide()) {
++    for (const m of dataMounts) {
++      const dest = overlayDestFor(m, dir)
++      if (dest && !out.includes(dest)) out.push(dest)
++    }
++  }
++  return out
++}
++
+ function appSourceProtections(dataMounts: SandboxMount[]): SandboxMount[] {
+   if (appSourceMountAllowed()) return []
+   const out: SandboxMount[] = []
+@@ -363,6 +407,18 @@
+     args.push(m.mode === 'rw' ? '--bind' : '--ro-bind', m.path, m.path)
+   }
+ 
++  // HIDE THE STATE DIR. Emitted AFTER every data mount so it layers on top (bwrap: later
++  // and deeper binds win), and bound from an EMPTY directory rather than ro over the real
++  // one — see stateDirsToHide: reading is the escape here, so read-only is not a fix.
++  // Refusing loudly beats binding nothing: a silent skip would leave the token exposed while
++  // the code reads as though it were protected, which is the failure shape this whole file
++  // keeps re-learning.
++  for (const dest of hiddenStateDests(allMounts)) {
++    const empty = emptyMountpoint()
++    if (!empty) throw new Error(`sandbox: could not create an empty mountpoint to hide ${dest}; refusing to launch with the state dir (auth token, session roster) exposed to the box`)
++    args.push('--ro-bind', empty, dest)
++  }
++
+   // GPU passthrough (SandboxConfig.gpu). MUST be --dev-bind: an ordinary --bind carries
+   // MS_NODEV, which leaves the node present but DEAD — nvidia-smi reports "Insufficient
+   // Permissions" and CUDA sees no device, a failure that looks like a driver problem
+@@ -578,6 +634,14 @@
+     const root = canonicalizeForAccess(m.path)
+     if (target === root || target.startsWith(root + path.sep)) match = m
+   }
++  // …unless the target is inside a hidden state dir, which the box sees as an empty
++  // directory. The authorizer must agree with the box or an unsandboxed MCP tool would be
++  // authorized to read the auth token on a session's behalf — the same divergence
++  // sessionDataMounts exists to prevent.
++  for (const dir of stateDirsToHide()) {
++    const root = canonicalizeForAccess(dir)
++    if (target === root || target.startsWith(root + path.sep)) return { read: false, write: false }
++  }
+   return { read: !!match, write: match?.mode === 'rw' }
+ }
+ 

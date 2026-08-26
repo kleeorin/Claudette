@@ -1,0 +1,178 @@
+# DEAD — DOES NOT APPLY. Verified 2026-08-24: `git apply --check` fails against the current tree.
+# NOT YET DISTINGUISHED: "already landed" vs "genuinely conflicted". Those need different
+# remedies, and you CANNOT tell which by reading this file — a superseded patch still describes
+# the tree accurately, a conflicted one does not. READ THE TREE, or run the matching test.
+# CONTEXT: all 10 patches in scratchpad/ were swept and NONE applies. Treating any of them as
+# pending work is a mistake that has already been made once today — a handover described the
+# reviewer unscoped-Bash hazard as open when it had been closed and tested green.
+diff --git a/server/src/claude/configProtection.ts b/server/src/claude/configProtection.ts
+index d52d302..38dd540 100644
+--- a/server/src/claude/configProtection.ts
++++ b/server/src/claude/configProtection.ts
+@@ -1,6 +1,7 @@
+ import {
+   existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, symlinkSync, rmSync,
+-  lstatSync, copyFileSync, chmodSync, statSync, renameSync, unlinkSync,
++  lstatSync, copyFileSync, chmodSync, statSync, renameSync, unlinkSync, watch,
++  type FSWatcher,
+ } from 'fs'
+ import path from 'path'
+ import { claudeConfigDir } from './sandbox'
+@@ -153,14 +154,21 @@ function writeScrubbedSettings(src: string, dest: string): void {
+ // the real creds during a host-mode run, so copying back is always a strict improvement.
+ // .claude.json is deliberately NOT reconciled — the app writes trust/prefs straight to the
+ // real file, and clobbering it with a session's mirror copy could lose those edits.
+-function reconcileCredsBack(mirror: string, real: string): void {
+-  const name = '.credentials.json'
++const CREDS = '.credentials.json'
++
++// Returns true when the SHARED dir is known to hold a token at least as fresh as the
++// mirror's (salvaged, or deliberately skipped because the shared one was newer/unchanged),
++// and false only when the salvage actually errored. Callers that go on to re-point the
++// mirror at the shared file must gate on this: relinking after a FAILED salvage would
++// discard the very token that was rescued. Nothing else reads the result.
++function reconcileCredsBack(mirror: string, real: string): boolean {
++  const name = CREDS
+   const dest = path.join(real, name)
+   const tmp = `${dest}.claudette-${process.pid}.tmp`
+   try {
+     const m = path.join(mirror, name)
+     // An intact symlink means no refresh happened; only a real file is a salvaged token.
+-    if (!existsSync(m) || lstatSync(m).isSymbolicLink()) return
++    if (!existsSync(m) || lstatSync(m).isSymbolicLink()) return true
+     // ONLY MOVE A TOKEN FORWARD IN TIME. Several mirrors can hold salvaged tokens at once
+     // (one per host-mode session, plus whatever a crash stranded), and nothing orders the
+     // reconciles — session A can exit after B and carry an older token. An unconditional
+@@ -176,7 +184,7 @@ function reconcileCredsBack(mirror: string, real: string): void {
+     const mirrorMtime = statSync(m).mtimeMs
+     let destMtime = -Infinity
+     try { destMtime = statSync(dest).mtimeMs } catch { /* absent: any salvaged token is an improvement */ }
+-    if (mirrorMtime < destMtime) return
++    if (mirrorMtime < destMtime) return true
+     // Atomically. Readers of the shared creds (a sandboxed session, `claude` in a terminal,
+     // usageApi) must never observe a half-written file, and a crash mid-copy must not leave
+     // the shared token truncated. Stage beside the destination, then rename over it — the
+@@ -184,12 +192,103 @@ function reconcileCredsBack(mirror: string, real: string): void {
+     copyFileSync(m, tmp)
+     chmodSync(tmp, 0o600)   // creds are 0600; keep it that way even if dest was freshly created
+     renameSync(tmp, dest)
++    return true
+   } catch (e) {
+     try { if (existsSync(tmp)) unlinkSync(tmp) } catch { /* nothing else to try */ }
+     console.warn(`[sandbox] could not reconcile ${name} back to the config dir (${errMessage(e)}); a refreshed token may be lost`)
++    return false
++  }
++}
++
++// --- keeping a LIVE mirror shared ------------------------------------------
++//
++// THE RESIDUAL THIS CLOSES. Everything above moves a token MIRROR → SHARED, and only at
++// session exit or at boot. The reverse direction was never handled at all: once a refresh
++// has replaced the mirror's symlink with a real file, the session is DIVORCED from the
++// shared credentials for the rest of its life. A `claude login` in a terminal — or any
++// other session's refresh — writes the shared file that this session no longer reads, so
++// the user logs in, sees it succeed, and the live session still says "Not logged in".
++// For a long-running session, which is the normal case for this app, that window is the
++// entire session.
++//
++// WHY THE FIX IS TO RESTORE THE SYMLINK rather than to keep copying. Copying in either
++// direction makes two independent files that must be kept in agreement forever, and every
++// copy needs a freshness rule to decide which wins (the mtime guard above exists precisely
++// because that ordering is unknowable across sessions). Re-pointing the mirror entry back
++// at the shared file removes the second copy entirely: the session reads the same inode as
++// everyone else, so a later login is visible with no further machinery. The divorce is the
++// bug; re-linking is the annulment.
++//
++// Ordering is load-bearing: SALVAGE FIRST, then relink. The real file in the mirror holds
++// the newest token; relinking before salvaging would unlink it and lose exactly what we
++// were trying to keep. Hence the `ok` gate.
++
++// Point `<mirror>/.credentials.json` back at the shared file. Atomic: stage a temp symlink
++// beside it and rename over, so a reader never sees the entry missing.
++function relinkCredsToShared(mirror: string, real: string): void {
++  const link = path.join(mirror, CREDS)
++  const tmp = `${link}.claudette-relink-${process.pid}.tmp`
++  try {
++    if (!existsSync(mirror)) return
++    // Already a symlink (or gone): nothing was replaced, so there is nothing to restore.
++    try { if (lstatSync(link).isSymbolicLink()) return } catch { /* absent → (re)create it */ }
++    try { unlinkSync(tmp) } catch { /* no stale temp */ }
++    symlinkSync(path.join(real, CREDS), tmp)
++    renameSync(tmp, link)
++  } catch (e) {
++    try { if (existsSync(tmp)) unlinkSync(tmp) } catch { /* nothing else to try */ }
++    console.warn(`[sandbox] could not re-link ${CREDS} in the host-mode mirror (${errMessage(e)}); this session may not see a later login until it exits`)
+   }
+ }
+ 
++// Salvage a token the mirror just took by atomic rename, then re-share the entry. Safe to
++// call at any time and on a mirror that was never written to — both paths are no-ops.
++// Exported so a test can drive the exact sequence the watcher drives, without racing inotify.
++export function resyncMirrorCreds(sessionId: string): void {
++  const mirror = mirrorFor(sessionId)
++  if (!existsSync(mirror)) return
++  const real = path.resolve(claudeConfigDir())
++  if (reconcileCredsBack(mirror, real)) relinkCredsToShared(mirror, real)
++}
++
++// One watcher per live host-mode mirror.
++const credsWatchers = new Map<string, FSWatcher>()
++
++// Watch the mirror DIRECTORY, not the creds file: an atomic rename swaps the inode, and a
++// file watch follows the old inode into oblivion — it would fire once, for the write we
++// already handle at exit, and never again. A directory watch reports the entry being
++// replaced, which is the event that matters.
++function startCredsWatch(sessionId: string, mirror: string): void {
++  stopCredsWatch(sessionId)
++  try {
++    let timer: NodeJS.Timeout | undefined
++    const w = watch(mirror, (_event, filename) => {
++      if (filename && path.basename(String(filename)) !== CREDS) return
++      // Debounce: a rename lands as several inotify events, and our own relink re-enters
++      // the watcher. Coalescing keeps one refresh to one resync.
++      if (timer) clearTimeout(timer)
++      timer = setTimeout(() => { try { resyncMirrorCreds(sessionId) } catch { /* logged inside */ } }, 150)
++      timer.unref?.()
++    })
++    w.on('error', () => stopCredsWatch(sessionId))   // watch died; exit/boot salvage still covers us
++    w.unref?.()                                      // never hold the process open
++    credsWatchers.set(sessionId, w)
++  } catch {
++    // No watch (fd limits, an exotic FS). Degrade to the pre-existing exit + boot salvage
++    // rather than failing the launch — strictly no worse than before this fix.
++  }
++}
++
++function stopCredsWatch(sessionId: string): void {
++  const w = credsWatchers.get(sessionId)
++  if (!w) return
++  credsWatchers.delete(sessionId)
++  try { w.close() } catch { /* already closed */ }
++}
++
++// Test hook: how many mirrors are being watched right now.
++export function watchedMirrorCount(): number { return credsWatchers.size }
++
+ // Root holding the per-session mirrors (one subdir per host-mode session).
+ function mirrorRoot(): string { return path.join(dataDir(), 'host-scrubbed-config') }
+ 
+@@ -249,6 +348,9 @@ function mirrorHeldByLiveProcess(mirror: string): boolean {
+ // EventEmitter callback takes the process down with it. The boot sweep is the backstop for
+ // anything we fail to remove here.
+ export function releaseHostConfigDir(sessionId: string): void {
++  // Before anything else: the mirror is about to be reconciled and deleted, so a watcher
++  // still firing on it would resync a directory that no longer exists.
++  stopCredsWatch(sessionId)
+   try {
+     const mirror = mirrorFor(sessionId)
+     if (!existsSync(mirror)) return
+@@ -342,6 +444,9 @@ export function scrubbedHostConfigDir(sessionId: string): string | null {
+       const to = path.join(mirror, name)
+       if (!existsSync(to)) writeFileSync(to, '{}\n', 'utf8')
+     }
++    // Watch from here on: a refresh during the session is salvaged and re-shared within
++    // the session's lifetime, instead of stranding it until exit (see relinkCredsToShared).
++    startCredsWatch(sessionId, mirror)
+     return mirror
+   } catch (e) {
+     console.warn(`[sandbox] host-mode config scrub failed (${errMessage(e)}); falling back to the real config dir — hooks in an exposed config could run. Prefer keeping sessions sandboxed.`)

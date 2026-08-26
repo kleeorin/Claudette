@@ -375,9 +375,39 @@ attack('G6: an unscopeable id is still mounted into the session config',
 
 // ============================================================================
 fs.rmSync(DATA, { recursive: true, force: true })
-console.log(`\n${blocked} attacks blocked, ${findings.length} finding(s)`)
-if (findings.length) {
-  console.log('\nFINDINGS:')
-  findings.forEach((f, i) => console.log(`  ${i + 1}. ${f}`))
+// This used to be an unconditional `process.exit(0)`: findings printed and the runner
+// still said PASS, so the day a connector change let a NEW attack through it would have
+// scrolled past in a log. CONNECTORS.md cites this file as its verification evidence,
+// which made the silence worse.
+//
+// But a plain `exit(findings.length ? 1 : 0)` would be wrong too. Three of these findings
+// are ACCEPTED residual risk, documented inline with their rationale — failing on them
+// would leave the suite permanently red, and a suite that is always red hides whatever
+// you break next (the lesson of commit 2a57def).
+//
+// So: a BASELINE keyed on the attack id. A finding not listed here is new, and fails.
+// Adding an id is a deliberate, reviewable act — do NOT add one to silence a new finding.
+const ACCEPTED = new Map<string, string>([
+  ['D1', 'classification is server-asserted — an upstream can declare a mutating tool read-only'],
+  ['E2', 'a stolen session token is usable by its holder — same model as the app-control server'],
+  ['F3', 'id reuse re-points an existing grant — needs operator action twice'],
+])
+const idOf = (f: string) => f.split(':')[0].trim()
+const unexpected = findings.filter((f) => !ACCEPTED.has(idOf(f)))
+const accepted = findings.filter((f) => ACCEPTED.has(idOf(f)))
+
+console.log(`\n${blocked} attacks blocked, ${findings.length} finding(s) — ${accepted.length} accepted, ${unexpected.length} unexpected`)
+if (accepted.length) {
+  console.log('\nACCEPTED (known residual risk, not failures):')
+  accepted.forEach((f) => console.log(`  · ${idOf(f)} — ${ACCEPTED.get(idOf(f))}`))
 }
-process.exit(0)
+if (unexpected.length) {
+  console.log('\n🚨 UNEXPECTED FINDINGS:')
+  unexpected.forEach((f, i) => console.log(`  ${i + 1}. ${f}`))
+}
+// An accepted id that STOPPED appearing means the risk was closed — say so, so the
+// baseline can shrink rather than quietly outliving what it describes.
+for (const id of ACCEPTED.keys()) {
+  if (!findings.some((f) => idOf(f) === id)) console.log(`  ℹ️  accepted finding ${id} no longer reproduces — remove it from ACCEPTED`)
+}
+process.exit(unexpected.length ? 1 : 0)

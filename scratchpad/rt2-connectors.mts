@@ -209,7 +209,18 @@ attack('C1: the proxy buffers an entire JSON reply in one string with no cap',
   `RSS rose from ${(before.rss / 1e6).toFixed(0)} MB to ${(peak / 1e6).toFixed(0)} MB for a ${(BIG / 1e6).toFixed(0)} MB reply`)
 bigServer.close()
 
-console.log(`\n${findings.length} finding(s):`)
-for (const f of findings) console.log(`  🚨 ${f}`)
+
+// Was an unconditional `process.exit(0)`: findings printed and the runner still said PASS.
+// A plain `exit(findings.length ? 1 : 0)` would be wrong too — the findings below are
+// ACCEPTED residual risk, and a permanently-red suite hides whatever you break next
+// (commit 2a57def). So: a BASELINE keyed on the attack id. Anything not listed is new and
+// fails. Adding an id is a deliberate, reviewable act.
+const ACCEPTED = new Set<string>(['A2'])
+const idOf = (f: string) => f.split(':')[0].trim()
+const unexpected = findings.filter((f) => !ACCEPTED.has(idOf(f)))
+console.log(`\n${findings.length} finding(s) — ${findings.length - unexpected.length} accepted, ${unexpected.length} unexpected`)
+for (const f of findings) console.log(`  ${ACCEPTED.has(idOf(f)) ? '·  (accepted)' : '🚨 UNEXPECTED'} ${f}`)
+for (const id of ACCEPTED) if (!findings.some((f) => idOf(f) === id)) console.log(`  \u2139\ufe0f  accepted finding ${id} no longer reproduces — remove it from ACCEPTED`)
 upstream.close(); proxy.stop()
-process.exit(0)
+process.exit(unexpected.length ? 1 : 0)
+

@@ -15,28 +15,67 @@ const CWD = process.cwd()
 let failed = 0
 const ok = (c, m) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-const post = (path, body) => fetch(`${APP}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json())
-const getj = (path) => fetch(`${APP}${path}`).then((r) => r.json())
+// A token is ALWAYS required, even on loopback (SANDBOX.md control-plane escape). The
+// same token is pinned across BOTH boots so the restore-after-restart leg keeps working.
+const TOKEN = 'loose-ends-token-loose-ends-token'
+const AUTH = { authorization: `Bearer ${TOKEN}` }
+
+// Report a non-2xx instead of letting `r.json()` flatten it into a shapeless object. A 401
+// used to arrive at the first assertion as `id === undefined`, then take out every later
+// step with `Cannot read properties of null` — three failures and a stack trace, all
+// describing one unauthenticated request.
+const post = async (path, body) => {
+  const r = await fetch(`${APP}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', ...AUTH }, body: JSON.stringify(body) })
+  const text = await r.text()
+  if (!r.ok) { console.error(`   ✗ POST ${path} → HTTP ${r.status}: ${text.slice(0, 300)}`); dumpServer() }
+  try { return JSON.parse(text) } catch { return {} }
+}
+const getj = async (path) => {
+  const r = await fetch(`${APP}${path}`, { headers: AUTH })
+  const text = await r.text()
+  if (!r.ok) { console.error(`   ✗ GET ${path} → HTTP ${r.status}: ${text.slice(0, 300)}`); dumpServer() }
+  try { return JSON.parse(text) } catch { return {} }
+}
 
 const dataDir = await mkdtemp(join(tmpdir(), 'claudette-data-'))
+
+// Keep the server's stderr instead of discarding it — swallowing it is why an auth
+// rejection presented as a null-property TypeError with no visible cause.
+let serverErr = []
+function dumpServer() {
+  if (!serverErr.length) return
+  console.error('--- server stderr (tail) ---')
+  console.error(serverErr.join('').trimEnd())
+  console.error('--- end server stderr ---')
+}
 
 let current = null
 function boot() {
   // detached so we can SIGKILL the whole process group (npx → tsx → node server);
   // killing just the npx parent would leave the real server grandchild holding the port.
   const p = spawn('npx', ['tsx', 'server/src/index.ts'], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', CLAUDETTE_DATA_DIR: dataDir },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', CLAUDETTE_DATA_DIR: dataDir, CLAUDETTE_TOKEN: TOKEN },
     cwd: CWD, stdio: 'pipe', detached: true,
   })
-  p.stderr.on('data', () => {})
+  serverErr = []   // per-boot, so a dump after a restart shows THAT server's output
+  p.stderr.on('data', (d) => { serverErr.push(d.toString()); if (serverErr.length > 80) serverErr.shift() })
   current = p
   return p
 }
 function killServer(p) { try { process.kill(-p.pid, 'SIGKILL') } catch { try { p.kill('SIGKILL') } catch {} } }
 // Never leave a zombie server holding the port, even if an assertion throws.
 process.on('exit', () => { if (current) killServer(current) })
+// …and on the SIGNAL paths too. `process.on('exit')` does not fire for SIGINT/SIGTERM, so
+// a Ctrl-C used to orphan the detached child and strand its port. This child is
+// CLAUDETTE_TOKEN-protected rather than no-auth, so an orphan is a stuck port rather than
+// an open server — but a stuck port is exactly what makes the NEXT run report false
+// failures against a server it did not start.
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection'] as const) {
+  process.on(sig, (e?: unknown) => { if (current) killServer(current); if (e) console.error(e); process.exit(1) })
+}
 process.on('uncaughtException', (e) => { console.error(e); if (current) killServer(current); process.exit(1) })
-async function waitHealth() { for (let i = 0; i < 60; i++) { try { if ((await fetch(`${APP}/api/health`)).ok) return } catch {} await wait(250) } throw new Error('server never came up') }
+// /api/health is in the auth hook's open set, so this leg needs no token.
+async function waitHealth() { for (let i = 0; i < 60; i++) { try { if ((await fetch(`${APP}/api/health`)).ok) return } catch {} await wait(250) } dumpServer(); throw new Error('server never came up') }
 
 const readSaved = async () => JSON.parse(await readFile(join(dataDir, 'sessions.json'), 'utf8'))
 const pollSaved = async (pred, tries = 40) => { for (let i = 0; i < tries; i++) { try { const s = await readSaved(); if (pred(s)) return s } catch {} await wait(200) } return null }

@@ -8,17 +8,33 @@ import { mkdtemp } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { WebSocket } from 'ws'
+import { answerTrustGate, waitForComposer } from './trust-gate.mjs'
 
 const APP = 'http://127.0.0.1:4321'
 const CWD = '/tmp'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const chromeDir = await mkdtemp(join(tmpdir(), 'chrome-realt-'))
-const chrome = spawn('/usr/bin/google-chrome', [
+const chrome = spawn(process.env.CHROME_BIN ?? '/usr/bin/google-chrome', [
   '--headless=new', '--remote-debugging-port=9358', `--user-data-dir=${chromeDir}`,
   '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1300,900',
   'about:blank',
-], { stdio: 'pipe' })
+], { stdio: 'pipe', detached: true })
+
+// Reap the browser on EVERY exit path, not just the happy one. These tests used to kill
+// Chrome only at the end, so any throw — a timeout on a dead selector, an assertion that
+// blew up — orphaned the whole headless process tree. One session left 14 of them behind,
+// which quietly eats a machine until someone reboots. Pattern copied from find-diff-check.
+// Reap by process GROUP, not by pid — the same discipline this file uses for its server,
+// where it IS load-bearing (`npx` forks the real node, so killing the wrapper by pid can
+// strand the port). For Chrome it is defence in depth only: measured, the bare kill did
+// not orphan it. See rule 3 in scratchpad/port-and-reap-lint.mts.
+const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
+process.on('exit', reapChrome)
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapChrome(); if (e) console.error(e); process.exit(1) })
+}
+
 
 async function cdpTarget() {
   for (let i = 0; i < 40; i++) {
@@ -35,6 +51,14 @@ const cdp = new WebSocket(await cdpTarget())
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
 let cdpId = 0
 const pending = new Map()
+// A CDP reply is awaited on a promise that ONLY the socket can resolve, so if Chrome dies
+// mid-run — crash, OOM, an external pkill — every pending send() hangs forever and the
+// harness sleeps in ep_poll holding its ports until someone hunts it down. Abort loudly
+// instead. No reap() here on purpose: process.exit() runs the process.on('exit') handlers,
+// which already cover every child. `cdpDone` keeps this off the DELIBERATE teardown below,
+// where the very same close event is expected and must not be read as a failure.
+let cdpDone = false
+cdp.on('close', () => { if (cdpDone) return; console.error('CDP socket closed — Chrome died; aborting rather than hanging'); process.exit(1) })
 cdp.on('message', (raw) => { const m = JSON.parse(raw); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id) } })
 function send(method, params = {}) { const id = ++cdpId; return new Promise((res) => { pending.set(id, res); cdp.send(JSON.stringify({ id, method, params })) }) }
 async function evaluate(expression) {
@@ -62,10 +86,22 @@ await clickTitle('New session')
 await waitFor(`!!([...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Create session'))`)
 await evaluate(`(()=>{const inp=[...document.querySelectorAll('input')].find(i=>i.className.includes('font-mono'));const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(inp,${JSON.stringify(CWD)});inp.dispatchEvent(new Event('input',{bubbles:true}));return true})()`)
 await clickText('Create session')
+// Same workspace-trust gate as doubling-agents-test: an untrusted cwd renders "Trust this
+// folder?" instead of creating the session, and this file predated it. Without answering,
+// the next line's value-setter ran against a null textarea and threw `Illegal invocation`.
+await answerTrustGate(evaluate)
+await waitForComposer(evaluate)
 await wait(4000)  // let the engine spawn + init
 
 // Send a real multi-step prompt.
-await evaluate(`(()=>{const ta=document.querySelector('textarea');const s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;s.call(ta,'Run the bash command echo hello, then tell me in one short sentence what it printed.');ta.dispatchEvent(new Event('input',{bubbles:true}));return true})()`)
+// PROMPT LENGTH IS LOAD-BEARING, not incidental. The assertion below needs to observe the
+// indicator STILL UP after the init has fired, and it uses >2.5s as the proxy for "init has
+// certainly landed". This prompt used to be a bare `echo hello` + one sentence, and the
+// whole turn finished in ~2.7s: samples read stop=true at 2.4s and stop=false at 3.0s, so
+// the 2500ms threshold fell in the gap and the check failed with the indicator having been
+// up the entire turn. That was the harness racing the model, not a regression. Ask for
+// enough work that the turn comfortably outlives the threshold.
+await evaluate(`(()=>{const ta=document.querySelector('textarea');const s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;s.call(ta,'Run the bash command echo hello, then the bash command uname -a, then write two short paragraphs explaining what each printed and why they differ.');ta.dispatchEvent(new Event('input',{bubbles:true}));return true})()`)
 await wait(150)
 await evaluate(`(()=>{const ta=document.querySelector('textarea');ta.focus();ta.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));return true})()`)
 
@@ -83,10 +119,19 @@ while (Date.now() - start < 45000) {
   // Turn done once the assistant's answer is in and state is idle with no Stop.
   const done = await evaluate(`document.body.innerText.toLowerCase().includes('hello') && [...document.querySelectorAll('button')].every(b=>b.textContent.trim()!=='Stop')`)
   if (done && Date.now() - start > 6000) break
-  await wait(600)
+  await wait(200)
 }
 
 console.log('samples:\n  ' + samples.join('\n  '))
+// Locate the transition explicitly. A failure of the next check is either "the indicator
+// vanished early" (the real bug) or "the turn was shorter than the threshold" (the harness
+// racing the model, which is what happened on 2026-08-24); printing the last moment Stop was
+// seen tells the two apart without re-running.
+{
+  const upSamples = samples.filter((l) => l.includes('stop=true'))
+  const lastUp = upSamples.length ? upSamples[upSamples.length - 1].trim().split(' ')[0] : 'never'
+  console.log(`  → Stop last seen at ${lastUp} (threshold for the init check is 2.5s)`)
+}
 check('Stop/interrupt was visible during the turn', sawStop)
 check('indicator SURVIVED init (Stop still up >2.5s in)', sawRunningAfterInit)
 const answered = await evaluate(`document.body.innerText.toLowerCase().includes('hello')`)
@@ -96,7 +141,8 @@ check('after the turn, footer returns to idle', endState === 'idle', `state=${en
 const stopGone = await hasStop()
 check('after the turn, Stop is gone', stopGone === false)
 
-chrome.kill('SIGKILL')
+cdpDone = true   // deliberate teardown from here — the CDP close below is expected
+reapChrome()
 const passed = results.filter(Boolean).length
 console.log(`\n${passed}/${results.length} passed`)
 process.exit(passed === results.length ? 0 : 1)

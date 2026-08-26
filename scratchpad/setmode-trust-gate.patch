@@ -1,0 +1,44 @@
+# DEAD — DOES NOT APPLY. Verified 2026-08-24: `git apply --check` fails against the current tree.
+# NOT YET DISTINGUISHED: "already landed" vs "genuinely conflicted". Those need different
+# remedies, and you CANNOT tell which by reading this file — a superseded patch still describes
+# the tree accurately, a conflicted one does not. READ THE TREE, or run the matching test.
+# CONTEXT: all 10 patches in scratchpad/ were swept and NONE applies. Treating any of them as
+# pending work is a mistake that has already been made once today — a handover described the
+# reviewer unscoped-Bash hazard as open when it had been closed and tested green.
+--- a/server/src/claude/sessionManager.ts
++++ b/server/src/claude/sessionManager.ts
+@@ -855,7 +855,21 @@
+   //     effect now without losing the conversation;
+   //  3. otherwise (no engine, or a turn in flight we won't interrupt) leave it
+   //     stored to apply on the next launch.
+-  async setPermissionMode(id: string, mode: PermissionMode): Promise<SetModeResult> {
++  // TRUST-GATED, for the same reason normalizeSandbox / normalizeGrants / setTeamEmploy are
++  // (SANDBOX.md "Control-plane escape"): a confined session can reach the loopback control
++  // API, and the two WIDENING modes below remove the very prompt standing between it and an
++  // unreviewed tool call. `trusted` is set only by the auth-gated HTTP route — the operator's
++  // own browser. This was the last operator-held right with no defence-in-depth gate; it is
++  // NOT currently reachable from a box (no MCP path calls this), so the gate is here ahead of
++  // the next caller rather than to close a live hole. 'default' and 'plan' are unrestricted:
++  // both only ever RAISE prompting, so refusing them would be a downgrade of its own.
++  async setPermissionMode(id: string, mode: PermissionMode, trusted = false): Promise<SetModeResult> {
++    // Refuse BEFORE the session lookup: the gate is then unreachable-past regardless of what
++    // the lookup does, and an untrusted caller learns nothing about which ids exist.
++    if (!trusted && (mode === 'bypassPermissions' || mode === 'acceptEdits')) {
++      console.warn(`[permissions] ignoring untrusted request to set ${mode} — only the operator may lower a session's permission prompting`)
++      return { applied: 'error', error: `${mode} may only be set by the operator` }
++    }
+     const session = this.sessions.get(id)
+     if (!session) return { applied: 'error', error: 'no such session' }
+     session.permissionMode = mode
+--- a/server/src/session/sessionApi.ts
++++ b/server/src/session/sessionApi.ts
+@@ -126,7 +126,8 @@
+   })
+ 
+   app.post<{ Body: SetModeRequest }>('/api/session/setMode', async (req): Promise<SetModeResult> =>
+-    sessions.setPermissionMode(req.body.id, req.body.mode))
++    // Auth-gated route ⇒ the operator; only this path may set a widening mode.
++    sessions.setPermissionMode(req.body.id, req.body.mode, /* trusted */ true))
+ 
+   // Change a session's role — relaunches (resume-preserving) to apply the new charter.
+   app.post<{ Body: SetAgentRequest }>('/api/session/setAgent', async (req): Promise<OkResponse> => ({

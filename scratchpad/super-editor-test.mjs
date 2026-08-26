@@ -13,7 +13,7 @@
 // NOTE: in the hardened sandbox `web/dist` is READ-ONLY, so we can't replace the
 // bundle the backend serves. Instead we build the app to a writable temp dir and
 // run a thin proxy on :4321 that serves THAT build while forwarding /api + /ws to
-// the real backend on :4322 — so the test drives the freshly-built code.
+// the real backend on :4328 — so the test drives the freshly-built code.
 import { spawn, execSync } from 'child_process'
 import { mkdtemp, writeFile, readFile, rm } from 'fs/promises'
 import { createReadStream, existsSync, statSync } from 'fs'
@@ -36,29 +36,32 @@ await writeFile(FILE, BASE)
 const buildDir = await mkdtemp(join(tmpdir(), 'se-build-'))
 execSync(`NODE_ENV=production npx vite build --outDir ${buildDir} --emptyOutDir --logLevel warn`, { cwd: join(ROOT, 'web'), stdio: 'inherit' })
 
-// --- boot the real backend on :4322 (no auth, isolated data dir) ----------------
+// --- boot the real backend on :4328 (no auth, isolated data dir) ----------------
+// :4328, not :4322 — this backend runs with CLAUDETTE_NO_AUTH=1, and auth-loopback-test.mjs
+// owns :4322. An orphan here on that port silently hijacks the security test and makes it
+// report false auth failures, which is worse than having no security test at all.
 const dataDir = await mkdtemp(join(tmpdir(), 'super-editor-data-'))
-const env = { ...process.env, PORT: '4322', HOST: '127.0.0.1', CLAUDETTE_NO_AUTH: '1', CLAUDETTE_DATA_DIR: dataDir }
+const env = { ...process.env, PORT: '4328', HOST: '127.0.0.1', CLAUDETTE_NO_AUTH: '1', CLAUDETTE_DATA_DIR: dataDir }
 delete env.CLAUDETTE_TOKEN
 const server = spawn('npx', ['tsx', 'src/index.ts'], { cwd: join(ROOT, 'server'), env, stdio: 'pipe', detached: true })
 server.stderr.on('data', (d) => process.env.DEBUG && process.stderr.write(`[srv] ${d}`))
 async function waitServer() {
   for (let i = 0; i < 80; i++) {
-    try { const r = await fetch('http://127.0.0.1:4322/api/health'); if (r.ok) return } catch {}
+    try { const r = await fetch('http://127.0.0.1:4328/api/health'); if (r.ok) return } catch {}
     await wait(250)
   }
   throw new Error('server never came up')
 }
 await waitServer()
 
-// --- proxy on :4321: static(buildDir) + /api,/jupyter → :4322 + /ws bridge -------
+// --- proxy on :4321: static(buildDir) + /api,/jupyter → :4328 + /ws bridge -------
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' }
 const proxy = createServer(async (req, res) => {
   const url = req.url || '/'
   if (url.startsWith('/api') || url.startsWith('/jupyter')) {
     const chunks = []; for await (const c of req) chunks.push(c)
     const body = chunks.length ? Buffer.concat(chunks) : undefined
-    const r = await fetch(`http://127.0.0.1:4322${url}`, { method: req.method, headers: { ...req.headers, host: '127.0.0.1:4322' }, body, redirect: 'manual' })
+    const r = await fetch(`http://127.0.0.1:4328${url}`, { method: req.method, headers: { ...req.headers, host: '127.0.0.1:4328' }, body, redirect: 'manual' })
     const buf = Buffer.from(await r.arrayBuffer())
     const h = Object.fromEntries(r.headers); delete h['content-encoding']; delete h['content-length']
     res.writeHead(r.status, h); res.end(buf); return
@@ -72,7 +75,7 @@ const wss = new WebSocketServer({ noServer: true })
 proxy.on('upgrade', (req, socket, head) => {
   if (!(req.url || '').startsWith('/ws')) { socket.destroy(); return }
   wss.handleUpgrade(req, socket, head, (client) => {
-    const up = new WebSocket(`ws://127.0.0.1:4322${req.url}`)
+    const up = new WebSocket(`ws://127.0.0.1:4328${req.url}`)
     const q = []
     up.on('open', () => { for (const m of q) up.send(m); q.length = 0 })
     client.on('message', (m) => (up.readyState === 1 ? up.send(m.toString()) : q.push(m.toString())))
@@ -92,7 +95,23 @@ const chrome = spawn(CHROME_BIN, [
   '--headless=new', '--remote-debugging-port=9358', `--user-data-dir=${chromeDir}`,
   '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1500,950',
   'about:blank',
-], { stdio: 'pipe' })
+], { stdio: 'pipe', detached: true })
+
+// Reap the browser on EVERY exit path, not just the happy one. These tests used to kill
+// Chrome only at the end, so any throw — a timeout on a dead selector, an assertion that
+// blew up — orphaned the whole headless process tree. One session left 14 of them behind,
+// which quietly eats a machine until someone reboots. Pattern copied from find-diff-check.
+const reapServer = () => { try { process.kill(-server.pid, 'SIGKILL') } catch { try { server.kill('SIGKILL') } catch {} } }
+// Reap by process GROUP, not by pid — the same discipline this file uses for its server,
+// where it IS load-bearing (`npx` forks the real node, so killing the wrapper by pid can
+// strand the port). For Chrome it is defence in depth only: measured, the bare kill did
+// not orphan it. See rule 3 in scratchpad/port-and-reap-lint.mts.
+const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
+process.on('exit', () => { reapChrome(); reapServer() })
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapChrome(); reapServer(); if (e) console.error(e); process.exit(1) })
+}
+
 
 async function cdpTarget() {
   for (let i = 0; i < 40; i++) {
@@ -109,6 +128,14 @@ const cdp = new WebSocket(await cdpTarget())
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
 let cdpId = 0
 const pend = new Map()
+// A CDP reply is awaited on a promise that ONLY the socket can resolve, so if Chrome dies
+// mid-run — crash, OOM, an external pkill — every pending send() hangs forever and the
+// harness sleeps in ep_poll holding its ports until someone hunts it down. Abort loudly
+// instead. No reap() here on purpose: process.exit() runs the process.on('exit') handlers,
+// which already cover every child. `cdpDone` keeps this off the DELIBERATE teardown below,
+// where the very same close event is expected and must not be read as a failure.
+let cdpDone = false
+cdp.on('close', () => { if (cdpDone) return; console.error('CDP socket closed — Chrome died; aborting rather than hanging'); process.exit(1) })
 cdp.on('message', (raw) => { const m = JSON.parse(raw); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id) } })
 const send = (method, params = {}) => { const id = ++cdpId; return new Promise((res) => { pend.set(id, res); cdp.send(JSON.stringify({ id, method, params })) }) }
 async function evaluate(expression) {
@@ -163,6 +190,25 @@ try {
   } })
 
   // 3. The file auto-opens and the inline diff renders.
+  // STANDING DIAGNOSTIC — and READ THE RESOLUTION BELOW BEFORE ACTING ON IT. These readings
+  // are printed on every run, green or red; they are not an open finding.
+  // History: this wait timed out for a stretch on 2026-08-24. The suspicion was a fixture
+  // problem (the injected session pruned by a reconcile before the permission frame landed,
+  // the same class as notifications-test inventing an id). These readings refuted that — the
+  // sidebar still LISTED the session and the TAB for the file EXISTED, so the frame reached a
+  // live session and the permission→tab path worked; only the editor failed to mount. That
+  // localised it downstream, and the cause turned out to be sessionReducer's `list` case
+  // calling the full `forget`, which drops `fresh` — a flag ChatView's auto-resume is gated
+  // on. RESOLVED on 2026-08-25 with a narrowed forgetPresenceState on the `list` path; this
+  // file is 19/19 again. Keep the readings: they separate "fixture invented a session" from
+  // "app did not render" on the first run, which is what made that diagnosis possible.
+  await wait(1500)
+  console.log('  ↳ diag: sidebar still lists demo? ' +
+    await evaluate(`document.body.innerText.includes('demo')`) +
+    ' | any .cm-content? ' + await evaluate(`!!document.querySelector('.cm-content')`) +
+    ' | review bar? ' + await evaluate(`/Claude proposes changes/.test(document.body.innerText)`) +
+    ' | a session is ACTIVE (composer present)? ' + await evaluate(`!!document.querySelector('textarea')`) +
+    ' | a TAB for demo.ts exists? ' + await evaluate(`/demo\\.ts/.test(document.body.innerText)`))
   await waitFor(`!!document.querySelector('.cm-merge-revert, .cm-changedLine, .cm-deletedChunk')`, 12000)
   const hasReviewBar = await evaluate(`!!([...document.querySelectorAll('*')].find(n=>/Claude proposes changes/.test(n.textContent)&&n.children.length<3))`)
   check('inline diff + review bar rendered', hasReviewBar)
@@ -258,7 +304,8 @@ try {
 } catch (e) {
   check('test run completed', false, String(e))
 } finally {
-  chrome.kill('SIGKILL')
+  cdpDone = true   // deliberate teardown from here — the CDP close below is expected
+  reapChrome()
   try { proxy.close() } catch {}
   try { process.kill(-server.pid, 'SIGKILL') } catch { server.kill('SIGKILL') }   // whole tree (npx → tsx)
   await rm(workDir, { recursive: true, force: true }).catch(() => {})

@@ -78,5 +78,16 @@ const rules = connectorDenyRules({ granted: ['a,Bash'], accountAllow: [], readOn
 attack('B: a comma in a hand-edited catalog id/account name forges an extra --disallowedTools entry',
   !rules.some((r) => r.includes(',')), JSON.stringify(rules))
 
-console.log(`\n${findings.length} finding(s)`)
-upstream.close(); proxy.stop(); process.exit(0)
+
+// Was an unconditional `process.exit(0)`: findings printed and the runner still said PASS.
+// A plain `exit(findings.length ? 1 : 0)` would be wrong too — accepted residual risk would
+// leave the suite permanently red, which hides whatever you break next (commit 2a57def).
+// So: a BASELINE keyed on the attack id. Anything not listed is new and fails.
+const ACCEPTED = new Set<string>([])
+const idOf = (f: string) => f.split(':')[0].trim()
+const unexpected = findings.filter((f) => !ACCEPTED.has(idOf(f)))
+console.log(`\n${findings.length} finding(s) — ${findings.length - unexpected.length} accepted, ${unexpected.length} unexpected`)
+for (const f of findings) console.log(`  ${ACCEPTED.has(idOf(f)) ? '·  (accepted)' : '🚨 UNEXPECTED'} ${f}`)
+upstream.close(); proxy.stop()
+process.exit(unexpected.length ? 1 : 0)
+

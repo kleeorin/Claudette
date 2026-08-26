@@ -1,0 +1,43 @@
+# DEAD — ALREADY LANDED. `git apply --check` fails "patch failed:
+# server/src/connectors/connectorLaunch.ts:133" because the change is IN THE TREE.
+# Verified 2026-08-23 via reviewer-scope-test.mts: a read-only role now gets a WHOLE-SERVER
+# deny ignoring `readOnlyHint`, there is no per-tool enumeration trusting the connector-supplied
+# `write` flag, the destructive self-declared-safe tool is covered, and a non-read-only role is
+# unaffected. REMEDY: delete. Because it CONFLICTS, you cannot read this file to learn what is
+# applied — read the tree.
+--- a/server/src/connectors/connectorLaunch.ts
++++ b/server/src/connectors/connectorLaunch.ts
+@@ -133,11 +133,28 @@
+ 
+ function roleScopedDenies(def: ConnectorDef, readOnlyRole: boolean): string[] {
+   const tools = toolsOf(def.id)
+-  // Never probed — OR probed to an empty list. Both mean "we do not know this server's
+-  // tool surface", and an empty list is the easy one to get wrong: a server that answers
+-  // tools/list with [] (or that we failed to parse) would otherwise read as "probed,
+-  // nothing to deny" and hand a read-only role the whole server. Fail closed on both.
+-  if (readOnlyRole && !tools?.length) return [denyAllRule(def.id)]
++  // A READ-ONLY ROLE IS DENIED THE WHOLE SERVER, ALWAYS — the classification is not
++  // trusted to scope it. `write` is seeded from the upstream's own `annotations
++  // .readOnlyHint` (connectorProxy.learnTools), i.e. from the very party being scoped, and
++  // the MCP spec says outright that a client must not trust annotations from an untrusted
++  // server. Enumerating per-tool denials therefore asked the connector which of its tools
++  // a reviewer may call: a server answering `readOnlyHint: true` on `drop_table` got it
++  // classified read-only, no rule was written for it, and a read-only role could call it.
++  // Worse, setTools PERSISTS that answer to the on-disk catalog, so the lie survived
++  // restarts and was replayed at boot by restore().
++  //
++  // This is not a new mechanism — it is the branch immediately below, widened from
++  // "unprobed" to "read-only, full stop". The original design already failed CLOSED on
++  // silence (absent hint ⇒ write:true; unprobed or empty ⇒ deny all); it only failed OPEN
++  // on a lie. Removing the lie's only route in is the whole fix.
++  //
++  // The cost is real and deliberate: a read-only role now reaches NO connector tools at
++  // all, including genuinely read-only ones. Restoring per-tool precision needs an
++  // OPERATOR-set allowlist — `ConnectorTool.write` cannot serve, because setTools
++  // overwrites `def.tools` wholesale on every tools/list, so an operator edit would be
++  // clobbered by the next probe. That needs a new field on ConnectorDef and a way to set
++  // it; deliberately not built here.
++  if (readOnlyRole) return [denyAllRule(def.id)]
+ 
+   const out: string[] = []
+   for (const t of tools ?? []) {

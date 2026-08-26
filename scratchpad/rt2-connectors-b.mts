@@ -135,7 +135,18 @@ attack('F1: a read-only session hires a full-tool teammate that inherits its con
 attack('F2: an untrusted setConnectors grants the teammate more',
   mgr.setConnectors(child, ['evil'], [], /* trusted */ false) === false)
 
-console.log(`\n${findings.length} finding(s):`)
-for (const f of findings) console.log(`  🚨 ${f}`)
+
+// Was an unconditional `process.exit(0)`: findings printed and the runner still said PASS.
+// A plain `exit(findings.length ? 1 : 0)` would be wrong too — the findings below are
+// ACCEPTED residual risk, and a permanently-red suite hides whatever you break next
+// (commit 2a57def). So: a BASELINE keyed on the attack id. Anything not listed is new and
+// fails. Adding an id is a deliberate, reviewable act.
+const ACCEPTED = new Set<string>([])
+const idOf = (f: string) => f.split(':')[0].trim()
+const unexpected = findings.filter((f) => !ACCEPTED.has(idOf(f)))
+console.log(`\n${findings.length} finding(s) — ${findings.length - unexpected.length} accepted, ${unexpected.length} unexpected`)
+for (const f of findings) console.log(`  ${ACCEPTED.has(idOf(f)) ? '·  (accepted)' : '🚨 UNEXPECTED'} ${f}`)
+for (const id of ACCEPTED) if (!findings.some((f) => idOf(f) === id)) console.log(`  \u2139\ufe0f  accepted finding ${id} no longer reproduces — remove it from ACCEPTED`)
 upstream.close(); proxy.stop(); mgr.shutdown()
-setTimeout(() => process.exit(0), 300)
+setTimeout(() => process.exit(unexpected.length ? 1 : 0), 300)
+

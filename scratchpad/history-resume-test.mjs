@@ -5,7 +5,7 @@
 // session s2 (cwd has a fixture conversation) drives auto-resume on activation.
 //   node scratchpad/history-resume-test.mjs
 import { spawn } from 'child_process'
-import { mkdtemp, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { WebSocket } from 'ws'
@@ -14,11 +14,26 @@ const APP = 'http://127.0.0.1:4321'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const chromeDir = await mkdtemp(join(tmpdir(), 'chrome-hr-'))
-const chrome = spawn('/usr/bin/google-chrome', [
+const chrome = spawn(process.env.CHROME_BIN ?? '/usr/bin/google-chrome', [
   '--headless=new', '--remote-debugging-port=9354', `--user-data-dir=${chromeDir}`,
   '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1400,900',
   'about:blank',
-], { stdio: 'pipe' })
+], { stdio: 'pipe', detached: true })
+
+// Reap the browser on EVERY exit path, not just the happy one. These tests used to kill
+// Chrome only at the end, so any throw — a timeout on a dead selector, an assertion that
+// blew up — orphaned the whole headless process tree. One session left 14 of them behind,
+// which quietly eats a machine until someone reboots. Pattern copied from find-diff-check.
+// Reap by process GROUP, not by pid — the same discipline this file uses for its server,
+// where it IS load-bearing (`npx` forks the real node, so killing the wrapper by pid can
+// strand the port). For Chrome it is defence in depth only: measured, the bare kill did
+// not orphan it. See rule 3 in scratchpad/port-and-reap-lint.mts.
+const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
+process.on('exit', reapChrome)
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapChrome(); if (e) console.error(e); process.exit(1) })
+}
+
 
 async function cdpTarget() {
   for (let i = 0; i < 40; i++) {
@@ -35,6 +50,14 @@ const cdp = new WebSocket(await cdpTarget())
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
 let cdpId = 0
 const pending = new Map()
+// A CDP reply is awaited on a promise that ONLY the socket can resolve, so if Chrome dies
+// mid-run — crash, OOM, an external pkill — every pending send() hangs forever and the
+// harness sleeps in ep_poll holding its ports until someone hunts it down. Abort loudly
+// instead. No reap() here on purpose: process.exit() runs the process.on('exit') handlers,
+// which already cover every child. `cdpDone` keeps this off the DELIBERATE teardown below,
+// where the very same close event is expected and must not be read as a failure.
+let cdpDone = false
+cdp.on('close', () => { if (cdpDone) return; console.error('CDP socket closed — Chrome died; aborting rather than hanging'); process.exit(1) })
 cdp.on('message', (raw) => { const m = JSON.parse(raw); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id) } })
 function send(method, params = {}) { const id = ++cdpId; return new Promise((res) => { pending.set(id, res); cdp.send(JSON.stringify({ id, method, params })) }) }
 async function evaluate(expression) {
@@ -61,8 +84,31 @@ await waitFor(`!!window.__appws`)
 await wait(700)
 
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
+
+// Write the fixture conversation this test asserts on, instead of assuming one is already
+// on the machine. It never created it: `writeFile` was imported and never called, so the
+// two auto-resume assertions passed only where someone had once made the transcript by
+// hand, and failed everywhere else — including here, where it read as an intermittent
+// failure (15s = the 10s waitFor timing out, 5s = finding it straight away) rather than a
+// missing file. A test whose result depends on the machine is worse than one that fails.
+//
+// Layout mirrors conversations.ts: <claudeConfigDir>/projects/<cwd with every
+// non-alphanumeric replaced by '-'>/<id>.jsonl
+const RESUME_CWD = '/tmp/claudette-resume-test'
+const mangleCwd = (cwd) => cwd.replace(/[^a-zA-Z0-9]/g, '-')
+const cfgDir = process.env.CLAUDE_CONFIG_DIR || join(process.env.HOME, '.claude')
+const fixtureDir = join(cfgDir, 'projects', mangleCwd(RESUME_CWD))
+await mkdir(fixtureDir, { recursive: true })
+await mkdir(RESUME_CWD, { recursive: true }).catch(() => {})
+await writeFile(join(fixtureDir, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl'), [
+  { type: 'user', uuid: '11111111-1111-1111-1111-111111111111', timestamp: '2026-08-20T10:00:00Z',
+    message: { role: 'user', content: 'Explain quicksort briefly' } },
+  { type: 'assistant', uuid: '22222222-2222-2222-2222-222222222222', timestamp: '2026-08-20T10:00:01Z',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Quicksort is a divide-and-conquer sort that picks a pivot and partitions around it.' }] } },
+].map((l) => JSON.stringify(l)).join('\n') + '\n')
+
 // Two RESTORED sessions (not created via the UI, so not "fresh"): s1 for history,
-// s2 (cwd has a fixture conversation) for auto-resume.
+// s2 (cwd has the fixture conversation written above) for auto-resume.
 await feed({ type: 'session:list', sessions: [
   { id: 's1', name: 'hist-demo', cwd: '/tmp/claudette-hist-test', rootDir: '/tmp/claudette-hist-test', state: 'idle' },
   { id: 's2', name: 'resume-demo', cwd: '/tmp/claudette-resume-test', rootDir: '/tmp/claudette-resume-test', state: 'idle' },
@@ -114,7 +160,8 @@ await wait(500)
 const s1Kept = await evaluate(`document.body.innerText.includes('third message') && !document.body.innerText.includes('Quicksort is a divide')`)
 check('per-session transcripts stay separate after switching', s1Kept === true)
 
-chrome.kill('SIGKILL')
+cdpDone = true   // deliberate teardown from here — the CDP close below is expected
+reapChrome()
 const passed = results.filter(Boolean).length
 console.log(`\n${passed}/${results.length} passed`)
 process.exit(passed === results.length ? 0 : 1)

@@ -64,6 +64,25 @@ const wsResult = (headers) => new Promise((res) => {
 
 // ---- 1. Default loopback: token minted + required.
 let s = boot()
+
+// REAP ON EVERY EXIT PATH. This file boots FOUR servers on a fixed port, one of them with
+// CLAUDETTE_NO_AUTH=1, and until now it only cleaned up on the happy path — `await stop(s)`
+// after each block, with no exit hook and no signal handlers. So any thrown check, any
+// unexpected fetch rejection, or a Ctrl-C between the no-auth boot and its stop() left an
+// UNAUTHENTICATED server listening on this port. The next run of THIS SAME FILE then
+// connected to the survivor and reported 8 false failures — including "WS upgrade refused
+// without token", i.e. the security test accusing the server of the opposite of the bug.
+// A security alarm that cries wolf is worse than no alarm: it teaches you to discount it.
+//
+// `s` is REASSIGNED across the four boots, so the reaper reads the current binding rather
+// than capturing one child. SIGKILL the whole process group: `detached` means npx has its
+// own group, and killing only npx orphans the tsx/node grandchild that actually holds the
+// port. Same treatment clear-race-test.mjs now gets — see its reapServer.
+const reapServer = () => { try { process.kill(-s.child.pid, 'SIGKILL') } catch { try { s.child.kill('SIGKILL') } catch {} } }
+process.on('exit', reapServer)
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapServer(); if (e) console.error(e); process.exit(1) })
+}
 check('server came up (no env token)', await up())
 check('API is gated: /api/session/list → 401', await status('/api/session/list') === 401)
 const tokenFile = join(cfgDir, 'claudette', 'token')

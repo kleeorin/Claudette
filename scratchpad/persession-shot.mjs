@@ -14,11 +14,30 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 await new Promise((r) => spawn('mkdir', ['-p', OUT]).on('exit', r))
 
 const chromeDir = await mkdtemp(join(tmpdir(), 'chrome-ps-'))
-const chrome = spawn('/usr/bin/google-chrome', ['--headless=new', '--remote-debugging-port=9350', `--user-data-dir=${chromeDir}`, '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1500,940', 'about:blank'], { stdio: 'pipe' })
+const chrome = spawn(process.env.CHROME_BIN ?? '/usr/bin/google-chrome', ['--headless=new', '--remote-debugging-port=9350', `--user-data-dir=${chromeDir}`, '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1500,940', 'about:blank'], { stdio: 'pipe', detached: true })
+
+// Reap the browser on EVERY exit path, not just the happy one (see find-diff-check).
+// Reap by process GROUP, not by pid — the same discipline this file uses for its server,
+// where it IS load-bearing (`npx` forks the real node, so killing the wrapper by pid can
+// strand the port). For Chrome it is defence in depth only: measured, the bare kill did
+// not orphan it. See rule 3 in scratchpad/port-and-reap-lint.mts.
+const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
+process.on('exit', reapChrome)
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapChrome(); if (e) console.error(e); process.exit(1) })
+}
 async function cdpTarget() { for (let i = 0; i < 40; i++) { try { const list = await (await fetch('http://127.0.0.1:9350/json')).json(); const p = list.find((t) => t.type === 'page'); if (p?.webSocketDebuggerUrl) return p.webSocketDebuggerUrl } catch {} await wait(250) } throw new Error('no CDP') }
 const cdp = new WebSocket(await cdpTarget())
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
 let cdpId = 0; const pending = new Map()
+// A CDP reply is awaited on a promise that ONLY the socket can resolve, so if Chrome dies
+// mid-run — crash, OOM, an external pkill — every pending send() hangs forever and the
+// harness sleeps in ep_poll holding its ports until someone hunts it down. Abort loudly
+// instead. No reap() here on purpose: process.exit() runs the process.on('exit') handlers,
+// which already cover every child. `cdpDone` keeps this off the DELIBERATE teardown below,
+// where the very same close event is expected and must not be read as a failure.
+let cdpDone = false
+cdp.on('close', () => { if (cdpDone) return; console.error('CDP socket closed — Chrome died; aborting rather than hanging'); process.exit(1) })
 cdp.on('message', (raw) => { const m = JSON.parse(raw); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id) } })
 const send = (method, params = {}) => { const id = ++cdpId; return new Promise((res) => { pending.set(id, res); cdp.send(JSON.stringify({ id, method, params })) }) }
 const evaluate = async (e) => (await send('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true })).result?.result?.value
@@ -82,5 +101,6 @@ const only = (arr, name) => arr.length === 1 && arr[0].includes(name)
 const pass = only(tabsA1, 'README.md') && tabsB0.length === 0 && only(tabsB1, 'sample.ts') && only(tabsAback, 'README.md')
 console.log(pass ? '\n🎉 PER-SESSION PANES OK' : '\n💥 panes leaked across sessions')
 
-cdp.close(); chrome.kill('SIGKILL')
+cdpDone = true   // deliberate teardown from here — the CDP close below is expected
+cdp.close(); reapChrome()
 process.exit(pass ? 0 : 1)

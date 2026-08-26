@@ -176,9 +176,23 @@ setTools('gh', [
   { name: 'create_issue', write: true },
 ])
 const roDeny = connectorDenyRules({ granted: ['gh'], accountAllow: [], readOnlyRole: true })
-check('deny: read-only role + probed → the WRITE tool is denied', roDeny.includes('mcp__gh__create_issue'))
-check('deny: read-only role + probed → the READ tool is allowed', !roDeny.includes('mcp__gh__list_issues'))
-check('deny: read-only role + probed → no longer denies the whole server', !roDeny.includes('mcp__gh'))
+// POST-PATCH-6 CONTRACT. These three used to assert per-tool enumeration — "deny the write
+// tool, allow the read tool, do NOT deny the whole server". That was the guarantee patch 6
+// deliberately REMOVED: `write` is seeded from the upstream's own `annotations.readOnlyHint`,
+// i.e. from the very party being scoped, and the MCP spec says a client must not trust it. So
+// a read-only role is now denied the WHOLE connector and the classification is not consulted.
+//
+// Note what the old middle assertion became: `!roDeny.includes('mcp__gh__list_issues')` still
+// PASSED after the change — but only because no per-tool rule is emitted at all, while the
+// read tool is in fact denied by the whole-server rule. It kept its green while asserting the
+// opposite of the truth. Replaced with one that states what is actually guaranteed.
+check('deny: read-only role → the WHOLE connector is denied', roDeny.includes('mcp__gh'))
+check('deny: read-only role → NO per-tool rules are emitted (classification not consulted)',
+  !roDeny.some((r) => r.startsWith('mcp__gh__')))
+// The teeth: `list_issues` is declared write:false by the upstream. Under the old contract
+// that self-declaration bought it an exemption; under the new one it buys nothing.
+check('deny: a tool the connector declares read-only is still covered',
+  roDeny.includes('mcp__gh') && !roDeny.includes('mcp__gh__list_issues'))
 const rwDeny = connectorDenyRules({ granted: ['gh'], accountAllow: [], readOnlyRole: false })
 check('deny: a normal role keeps the write tool', !rwDeny.includes('mcp__gh__create_issue'))
 check('deny: no duplicate rules', new Set(roDeny).size === roDeny.length)
@@ -344,9 +358,31 @@ const denyValue = argv[argv.indexOf('--disallowedTools') + 1]
 check('argv: exactly ONE --disallowedTools flag',
   argv.filter((a) => a === '--disallowedTools').length === 1)
 check('argv: NOTEBOOK_DENY survives the merge', denyValue.startsWith(NOTEBOOK_DENY))
-check('argv: the role’s own denials are in it', denyValue.includes('Write'))
-check('argv: the connector denials are in it too', denyValue.includes('mcp__gh__create_issue'))
-check('argv: ungranted account connectors are denied in it', denyValue.includes('mcp__gmail'))
+// EXACT entries, not a substring, and PROVEN to discriminate. NOTEBOOK_DENY already
+// contains `Write(**/*.ipynb)`, so `denyValue.includes('Write')` was satisfied by the
+// notebook rules alone: it passed identically for a role with ZERO denials of its own and
+// therefore asserted nothing about the merge it names. Split on the comma the flag is
+// joined with, then compose the SAME argv for `general` — same connector denials, no role
+// denials — so the only difference is the thing under test.
+const denyEntries = denyValue.split(',')
+check('argv: the role’s own denials are in it as their own entries',
+  denyEntries.includes('Write') && denyEntries.includes('Edit'))
+const generalArgv = claudeArgs({
+  sessionId: 'sid', mcpConfig: JSON.stringify({ mcpServers: {} }),
+  allowedTools: AGENTS.general.allowedTools,
+  disallowedTools: [...(AGENTS.general.disallowedTools ?? []), ...connDeny],
+})
+const generalEntries = generalArgv[generalArgv.indexOf('--disallowedTools') + 1].split(',')
+check('argv: …and a role with none of its own gets none (the check above discriminates)',
+  !generalEntries.includes('Write') && !generalEntries.includes('Edit'))
+// EXACT entry, not a substring: the pre-patch-6 value `mcp__gh__create_issue` CONTAINS
+// "mcp__gh", so an includes() check passes against both contracts and therefore asserts
+// nothing about which one is in force. Split on the comma the flag is joined with.
+check('argv: the WHOLE-connector denial is in it as its own entry',
+  denyEntries.includes('mcp__gh'))
+// Same prefix hazard as the rule above — a value carrying only `mcp__gmail__send`
+// satisfies includes('mcp__gmail') while the WHOLE-server denial is absent.
+check('argv: ungranted account connectors are denied in it', denyEntries.includes('mcp__gmail'))
 check('argv: --strict-mcp-config reaches the command line', argv.includes('--strict-mcp-config'))
 const cfgArg = argv[argv.indexOf('--mcp-config') + 1]
 check('argv: the granted connector is in --mcp-config', cfgArg.includes('"gh"'))

@@ -19,11 +19,26 @@ await spawnSync('mkdir', ['-p', OUT])
 function spawnSync(cmd, args) { return new Promise((r) => spawn(cmd, args).on('exit', r)) }
 
 const chromeDir = await mkdtemp(join(tmpdir(), 'chrome-shots-'))
-const chrome = spawn('/usr/bin/google-chrome', [
+const chrome = spawn(process.env.CHROME_BIN ?? '/usr/bin/google-chrome', [
   '--headless=new', '--remote-debugging-port=9345', `--user-data-dir=${chromeDir}`,
   '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1440,900',
   'about:blank',
-], { stdio: 'pipe' })
+], { stdio: 'pipe', detached: true })
+
+// Reap the browser on EVERY exit path, not just the happy one. These tests used to kill
+// Chrome only at the end, so any throw — a timeout on a dead selector, an assertion that
+// blew up — orphaned the whole headless process tree. One session left 14 of them behind,
+// which quietly eats a machine until someone reboots. Pattern copied from find-diff-check.
+// Reap by process GROUP, not by pid — the same discipline this file uses for its server,
+// where it IS load-bearing (`npx` forks the real node, so killing the wrapper by pid can
+// strand the port). For Chrome it is defence in depth only: measured, the bare kill did
+// not orphan it. See rule 3 in scratchpad/port-and-reap-lint.mts.
+const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
+process.on('exit', reapChrome)
+for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
+  process.on(sig, (e) => { reapChrome(); if (e) console.error(e); process.exit(1) })
+}
+
 
 async function cdpTarget() {
   for (let i = 0; i < 40; i++) {
@@ -41,6 +56,14 @@ const cdp = new WebSocket(await cdpTarget())
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
 let cdpId = 0
 const pending = new Map()
+// A CDP reply is awaited on a promise that ONLY the socket can resolve, so if Chrome dies
+// mid-run — crash, OOM, an external pkill — every pending send() hangs forever and the
+// harness sleeps in ep_poll holding its ports until someone hunts it down. Abort loudly
+// instead. No reap() here on purpose: process.exit() runs the process.on('exit') handlers,
+// which already cover every child. `cdpDone` keeps this off the DELIBERATE teardown below,
+// where the very same close event is expected and must not be read as a failure.
+let cdpDone = false
+cdp.on('close', () => { if (cdpDone) return; console.error('CDP socket closed — Chrome died; aborting rather than hanging'); process.exit(1) })
 cdp.on('message', (data) => {
   const m = JSON.parse(data.toString())
   if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id) }
@@ -99,7 +122,8 @@ await wait(1500) // shell prompt
 await evaluate(`(() => { const t = document.querySelector('.xterm textarea'); if (t) t.focus(); return true })()`)
 await shot('3-terminal')
 
+cdpDone = true   // deliberate teardown from here — the CDP close below is expected
 cdp.close()
-chrome.kill('SIGKILL')
+reapChrome()
 console.log(`done → ${OUT}`)
 process.exit(0)
