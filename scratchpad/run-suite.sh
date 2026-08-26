@@ -113,22 +113,74 @@ echo "prereqs: chrome=$have_chrome jupyter=$have_jupyter claude=$have_claude"
 
 # ---- IS BUCKET 1 WORTH ANYTHING THIS RUN? ------------------------------------------
 # The ~11 harnesses that serve web/dist are interpretable only while that bundle is newer
-# than the source it was built from. That is a comparison of two timestamps, not a judgement
+# than EVERYTHING IT WAS BUILT FROM. That is a comparison of timestamps, not a judgement
 # call, so make the machine do it — it would have printed on every run for days, and instead
 # the staleness had to be rediscovered by hand each time.
+#
+# ★ THE INPUT SET IS NOT web/src, AND ASSUMING IT WAS LEFT A SILENT HOLE (fixed 2026-08-26).
+# This compared web/dist against web/src alone. But web imports @claudette/shared, and
+# shared/package.json `exports` points straight at ./src/index.ts — there is NO build step,
+# so vite compiles shared/src INTO the bundle. An edit to shared/src therefore invalidated
+# web/dist while this banner went on printing `interpretable`, and eleven harnesses would
+# run against a stale build with nothing anywhere saying so. Every other staleness race this
+# suite has hit was at least VISIBLE; this one was not, which makes it the worse kind.
+# The set is now everything vite reads out of the repo: all of web/ EXCEPT the bundle it
+# writes and its node_modules, plus shared/src. That also picks up index.html,
+# vite.config.ts, tailwind/postcss config, package.json and public/ — sw.js among them,
+# a real runtime input — none of which a web/src scan ever saw either.
+# server/src is deliberately NOT in the set. @claudette/server is symlinked into
+# node_modules, but nothing under web/ imports it (checked with grep, not assumed); a server
+# edit changes what the harnesses talk TO, which is a different question, and one the tree
+# fingerprint below already answers.
 BUCKET1_STALE=no
 if [ -f web/dist/index.html ]; then
+  # index.html specifically, as the bundle's build time: vite rewrites it on every build, so
+  # it is the one file guaranteed to be stamped. NOT the oldest file in web/dist, which would
+  # be the strictly conservative choice — a single uncleaned asset from an older build would
+  # then pin this to NO SIGNAL permanently, and an alarm that can never be cleared gets
+  # ignored, which is the failure mode this whole banner exists to avoid.
   dist_t=$(stat -c %Y web/dist/index.html 2>/dev/null || echo 0)
-  src_t=$(find web/src -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)
-  src_t=${src_t:-0}
   n1=$(grep -cE '"(srv4321[^:]*|chrome):(terminal-ui-e2e|notebook-ui-e2e)\.mjs"|"srv4321[^:]*:' "$0")
-  if [ "$dist_t" -lt "$src_t" ]; then
-    BUCKET1_STALE=yes
-    echo "bucket 1 ($n1 harnesses): NO SIGNAL — web/dist built $(date -d @"$dist_t" '+%F %T'), web/src last written $(date -d @"$src_t" '+%F %T')"
-    echo "  their passes and failures are equally uninterpretable until web/dist is rebuilt."
-  else
-    echo "bucket 1 ($n1 harnesses): interpretable — web/dist ($(date -d @"$dist_t" '+%F %T')) is newer than web/src"
-  fi
+  # Newest file PER INPUT ROOT, so a stale verdict names every tree that moved rather than
+  # just the single newest file. Naming one witness is enough to justify the verdict, but not
+  # enough to act on: told only "buffers.ts is newer" you rebuild for that and never learn
+  # shared/src moved too, which is the exact blindness this check was widened to remove.
+  b1_stale_lines=""; b1_newest=""; b1_newest_t=0
+  for root in web shared/src; do
+    [ -d "$root" ] || continue
+    n=$(find "$root" -type d \( -path web/dist -o -path web/node_modules \) -prune -o \
+          -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)
+    [ -n "$n" ] || continue
+    t="${n%% *}"; t="${t%%.*}"; f="${n#* }"
+    if [ "$t" -gt "$b1_newest_t" ]; then b1_newest_t="$t"; b1_newest="$f"; fi
+    if [ "$dist_t" -lt "$t" ]; then
+      b1_stale_lines="$b1_stale_lines  · $root — newest is $f, written $(date -d @"$t" '+%F %T')
+"
+    fi
+  done
+  # SELF-TEST, because this check has exactly one catastrophic failure mode. If the prune ever
+  # breaks, the "newest input" is a file web/dist itself just wrote, the bundle is compared
+  # against itself, and this banner reports a confident and PERMANENT green — the one
+  # direction that must never fail quietly. An empty scan does the same thing by a different
+  # route (nothing to compare, so nothing looks stale). Refuse to give a verdict instead.
+  case "${b1_newest:-EMPTY}" in
+    EMPTY|web/dist/*)
+      BUCKET1_STALE=yes
+      echo "bucket 1: CANNOT TELL — the bundle-input scan returned ${b1_newest:-nothing}, so it is"
+      echo "  either empty or picking up web/dist itself. Fix the scan; until then no bucket-1"
+      echo "  result means anything, in either direction."
+      ;;
+    *)
+      if [ -n "$b1_stale_lines" ]; then
+        BUCKET1_STALE=yes
+        echo "bucket 1 ($n1 harnesses): NO SIGNAL — web/dist was built $(date -d @"$dist_t" '+%F %T') and these inputs are newer:"
+        printf '%s' "$b1_stale_lines"
+        echo "  their passes and failures are equally uninterpretable until web/dist is rebuilt."
+      else
+        echo "bucket 1 ($n1 harnesses): interpretable — web/dist ($(date -d @"$dist_t" '+%F %T')) is newer than every bundle input (newest: $b1_newest)"
+      fi
+      ;;
+  esac
 fi
 
 # ---- DID THE TREE MOVE UNDER THE RUN? ----------------------------------------------
@@ -137,8 +189,17 @@ fi
 # already quoted. So the run validates itself. Rollup hash per tree before and after; on a
 # mismatch, name the tree AND the files whose mtime falls inside the run window, and stamp
 # the FINAL SUMMARY — because the only line most people read is the last one.
-FP_TREES="web/src server/src shared/src scratchpad"
-tree_fp() { find "$1" -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum | cut -d' ' -f1; }
+# `web`, not `web/src`, for the same reason the banner above widened: a mid-run edit to
+# index.html, vite.config.ts or public/sw.js moves the bundle just as surely as a source
+# edit, and web/src never saw them. web/dist is INSIDE that tree and is deliberately kept —
+# a rebuild landing mid-run changes what every bucket-1 harness is served and contaminates
+# a run exactly as much as a source edit does, so it should be caught, not excluded.
+# node_modules is pruned everywhere: it is huge, it churns for reasons unrelated to the run,
+# and hashing it would make this alarm too noisy to keep. (Verified nothing in the suite
+# writes into web/dist — clear-race and super-editor both `vite build --outDir` into their
+# own mkdtemp, and in the hardened sandbox web/dist is --ro-bind anyway.)
+FP_TREES="web server/src shared/src scratchpad"
+tree_fp() { find "$1" -type d -name node_modules -prune -o -type f -print 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum | cut -d' ' -f1; }
 RUN_T0=$(date +%s)
 FP_BEFORE=""
 for t in $FP_TREES; do [ -d "$t" ] && FP_BEFORE="$FP_BEFORE$t $(tree_fp "$t")\n"; done
@@ -544,6 +605,17 @@ if [ $# -gt 0 ]; then
   SUITE=("${picked[@]}")
 fi
 
+# How many BUCKET 1 harnesses are actually in THIS invocation. The stale-bundle stamp at the
+# bottom is gated on it: run a single Group B file and the bundle's freshness is irrelevant to
+# the result, so stamping it anyway trains you to scroll past the one banner that matters on a
+# full run. Same membership test the n1 count uses — the srv4321 group plus the two that boot
+# their own server with NODE_ENV=production and are therefore served the same bundle.
+b1_in_run=0
+for entry in "${SUITE[@]}"; do
+  case "${entry%%:*}" in srv4321*) b1_in_run=$((b1_in_run+1)); continue ;; esac
+  case "${entry#*:}" in terminal-ui-e2e.mjs|notebook-ui-e2e.mjs) b1_in_run=$((b1_in_run+1)) ;; esac
+done
+
 # ---- GATE: AN ORPHANED HEADLESS CHROME ON A CDP PORT ------------------------------
 # The SAME contamination shape as a foreign :4321, one layer down, and it cost this run
 # real time on 2026-08-26: two orphaned Chromes were squatting :9333 and :9348 — the CDP
@@ -741,9 +813,23 @@ if [ -n "$MOVED" ]; then
   # again afterwards shows only the later stamp), so this is a floor on what moved, not a
   # complete list. Say so rather than let the list read as exhaustive.
   for t in $MOVED; do
-    find "$t" -type f -newermt "@$RUN_T0" -printf '!!!   %p written %TH:%TM:%.2TS (mid-run)\n' 2>/dev/null
+    # Same node_modules prune as tree_fp: `web` is now a fingerprinted tree, and without this
+    # a single real culprit would be listed among thousands of dependency files — a report
+    # nobody reads is the same as no report.
+    find "$t" -type d -name node_modules -prune -o -type f -newermt "@$RUN_T0" \
+      -printf '!!!   %p written %TH:%TM:%.2TS (mid-run)\n' 2>/dev/null
   done
   echo "!!! (files listed by mtime — a floor, not a complete list: mtime records only the LAST write.)"
+fi
+# BUCKET1_STALE was set at the top of the run and then READ BY NOTHING — the banner scrolled
+# past and the summary went on to report a clean-looking total for a run in which eleven
+# harnesses tested a bundle nobody had rebuilt. Same argument as the fingerprint stamp four
+# lines up: the last line is the only line most people read, so a caveat that lives only in
+# the scrollback is a caveat that does not exist.
+if [ "$BUCKET1_STALE" = yes ] && [ "${b1_in_run:-0}" -gt 0 ]; then
+  echo "!!! BUCKET 1 WAS NOT INTERPRETABLE THIS RUN — the $b1_in_run harnesses served by web/dist"
+  echo "!!!   neither passed nor failed meaningfully. Their greens are worth exactly as much as"
+  echo "!!!   their reds. See the banner at the top of this run for which inputs moved."
 fi
 if [ "${foreign_skipped:-0}" -gt 0 ]; then
   echo "!!! $foreign_skipped shared-server tests DID NOT RUN — :4321 was held by another process."
