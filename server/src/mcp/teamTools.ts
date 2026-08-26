@@ -95,6 +95,20 @@ export function registerTeamTools(
       from: from.name, role: roleOf(from), sessionId: from.id, kind, body,
     })
     if (!res.ok) return { error: res.error }
+    // `waiting` is not a generic "busy": claudeEngine sets it in exactly ONE place — the
+    // permission-prompt handler — so it means precisely "blocked on a permission prompt".
+    // Saying "it will receive this when its current turn ends" there is FALSE: the turn does
+    // not end, the mailbox only drains on `idle` (drain() bails unless state === 'idle'), and
+    // the queue simply grows to QUEUE_CAP behind a session that may never come free. A
+    // coordinator told "busy" reasonably ends its turn and the whole team deadlocks silently.
+    if (to.state === 'waiting') {
+      return {
+        text: `Queued for ${to.name}, but it is BLOCKED on a permission prompt and cannot act on `
+          + 'anything until the operator approves it in that session. It will not receive this — or '
+          + 'any other message — until then. Do not wait for it: say so to the user if it matters, '
+          + 'carry on with what you can, and end your turn.',
+      }
+    }
     return {
       text: res.queued
         ? `Queued for ${to.name} — it is busy right now, and will receive this when its current turn ends. Do not wait for it; carry on or end your turn.`
@@ -122,6 +136,11 @@ export function registerTeamTools(
         role: roleOf(s),
         roleDescription: getAgent(s.agentId).description,
         state: s.state,
+        // `state` alone is the exact signal — claudeEngine sets 'waiting' only in the
+        // permission-prompt handler — but "waiting" reads to a model as "still thinking",
+        // which is the misreading that lets a coordinator wait forever on a teammate that
+        // needs a human. Name the thing instead of leaving it to be inferred.
+        blockedOnPermissionPrompt: s.state === 'waiting',
         messagesWaiting: mailbox.pendingCount(s.id),
         isYou: s.id === me.id,
       })

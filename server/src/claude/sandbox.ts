@@ -5,6 +5,8 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import type { SandboxConfig, SandboxMount } from '@claudette/shared'
 import { ensureUserSettingsPinnable, settingsJsonPaths } from './configProtection'
+import { dataDir } from '../util/dataDir'
+import { tokenFilePath } from '../auth'
 
 // Wraps a `claude …` invocation in a bubblewrap sandbox that confines the process
 // to a set of mounts (see SANDBOX.md). We do NOT --unshare-net, so the shared
@@ -124,17 +126,83 @@ function appSourceDirs(): string[] {
 // bwrap layers them ON TOP of the broader rw bind, making just that subtree ro. The
 // rest of a rw project (web/, docs, scratchpad, …) stays writable. Opt out to keep the
 // source rw (dev-in-app) with CLAUDETTE_ALLOW_APP_SOURCE_MOUNT=1.
+// An overlay has to be emitted at the path the BOX WRITES THROUGH — the dest under the rw
+// mount — not at the source dir's realpath. bwrap creates a mountpoint at the LITERAL dest,
+// so an overlay at a path nothing else binds just materializes an unrelated empty dir inside
+// the box and protects nothing, while the real subtree stays writable through the rw mount.
+// Returns that dest when `rd` is inside the mount by either spelling, else null.
+function overlayDestFor(mount: SandboxMount, rd: string): string | null {
+  if (mount.mode !== 'rw') return null
+  const logical = path.resolve(mount.path)
+  // Same both-ways probe as isUnsafeSymlinkMount, for the same reason and the same bug.
+  for (const root of [logical, tryRealpath(logical)]) {
+    if (root === null) continue
+    if (root === rd) return logical
+    if (rd.startsWith(root + path.sep)) return path.join(logical, rd.slice(root.length + 1))
+  }
+  return null
+}
+
+// The dirs that must be INVISIBLE inside every box, whatever the caller mounted.
+//
+// DIFFERENT IN KIND FROM appSourceProtections, and the difference is the whole point: there,
+// `ro` suffices because WRITING the app source is the escape and reading it is harmless.
+// Here READING IS THE ESCAPE. `~/.config/claudette/token` is the loopback auth token; a box
+// that reads it can authenticate to the control API (we deliberately do not --unshare-net,
+// see the header) and POST /api/session/create — which is auth-gated and therefore passes
+// `trusted: true` — creating an UNSANDBOXED session immediately, with no restart. An
+// --ro-bind would still permit that read and would look like a protection. So these are
+// bound over with an EMPTY directory instead: present, read-only, and containing nothing.
+//
+// The same dir also holds sessions.json, which restore() replays as trusted, so a writable
+// copy lets a box grant itself teamEmploy/sandbox:{enabled:false} across a restart; plus the
+// hook-poisoning ledger and team-notes, which are read-then-influence channels.
+//
+// BOTH PATHS, INDEPENDENTLY: dataDir() honours CLAUDETTE_DATA_DIR and tokenFilePath() does
+// not, so an override splits them and a protection covering only one re-opens the other.
+//
+// dataDir.ts and auth.ts each justify their location with "~/.config is never bind-mounted
+// into a session sandbox". That is true of the OBLIGATORY mounts only — a user who mounts
+// $HOME, a parent of it, or / defeats it with no symlink and no bug. A rationale copied
+// between two files is a fact nobody owns; this function is the owner.
+function stateDirsToHide(): string[] {
+  const dirs = [path.resolve(dataDir()), path.resolve(path.dirname(tokenFilePath()))]
+  return [...new Set(dirs)]
+}
+
+// Where the BOX sees each hidden dir, given the mounts. Reuses overlayDestFor for the same
+// reason appSourceProtections does: an overlay bound at the canonical path binds a path
+// nothing else binds, and (Critic proved live) sorts first under shallow-first ordering and
+// LOSES the last-match-wins race — actively defeated while appearing present.
+function hiddenStateDests(dataMounts: SandboxMount[]): string[] {
+  const out: string[] = []
+  for (const dir of stateDirsToHide()) {
+    for (const m of dataMounts) {
+      const dest = overlayDestFor(m, dir)
+      if (dest && !out.includes(dest)) out.push(dest)
+    }
+  }
+  return out
+}
+
 function appSourceProtections(dataMounts: SandboxMount[]): SandboxMount[] {
   if (appSourceMountAllowed()) return []
   const out: SandboxMount[] = []
   for (const dir of appSourceDirs()) {
+    // `rd` is a REALPATH: appSourceRoot() derives it from import.meta.url, which Node has
+    // already resolved through symlinks. It used to be compared only against the LOGICAL
+    // mount path, so a checkout whose ancestor is a symlink — Claudette at
+    // /mnt/data/work/Claudette with `~/work` → /mnt/data/work mounted rw — matched nothing,
+    // NO overlay was emitted, and the box could write the server's own source. The next
+    // `tsx watch` reload then executes attacker code in the UNSANDBOXED server process.
+    // Same root cause as the symlink-guard bug above, different consequence. (Verified live.)
     const rd = path.resolve(dir)
-    const exposedRw = dataMounts.some((m) => {
-      if (m.mode !== 'rw') return false
-      const mp = path.resolve(m.path)
-      return mp === rd || rd.startsWith(mp + path.sep)
-    })
-    if (exposedRw) out.push({ path: rd, mode: 'ro' })
+    for (const m of dataMounts) {
+      const dest = overlayDestFor(m, rd)
+      // Deduped by path at emission (dedupeMounts) — but note the overlay is keyed on the
+      // DEST, so two rw mounts reaching the same source dir correctly pin both spellings.
+      if (dest && !out.some((o) => o.path === dest)) out.push({ path: dest, mode: 'ro' })
+    }
   }
   return out
 }
@@ -339,6 +407,18 @@ function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[], gpu = false): st
     args.push(m.mode === 'rw' ? '--bind' : '--ro-bind', m.path, m.path)
   }
 
+  // HIDE THE STATE DIR. Emitted AFTER every data mount so it layers on top (bwrap: later
+  // and deeper binds win), and bound from an EMPTY directory rather than ro over the real
+  // one — see stateDirsToHide: reading is the escape here, so read-only is not a fix.
+  // Refusing loudly beats binding nothing: a silent skip would leave the token exposed while
+  // the code reads as though it were protected, which is the failure shape this whole file
+  // keeps re-learning.
+  for (const dest of hiddenStateDests(allMounts)) {
+    const empty = emptyMountpoint()
+    if (!empty) throw new Error(`sandbox: could not create an empty mountpoint to hide ${dest}; refusing to launch with the state dir (auth token, session roster) exposed to the box`)
+    args.push('--ro-bind', empty, dest)
+  }
+
   // GPU passthrough (SandboxConfig.gpu). MUST be --dev-bind: an ordinary --bind carries
   // MS_NODEV, which leaves the node present but DEAD — nvidia-smi reports "Insufficient
   // Permissions" and CUDA sees no device, a failure that looks like a driver problem
@@ -476,8 +556,23 @@ export function pathVisibleInSandbox(mounts: SandboxMount[], p: string): boolean
 // malicious link can't launder itself into the writable set.
 function isUnsafeSymlinkMount(p: string, rwRoots: string[]): boolean {
   if (!isSymlink(p)) return false
-  const parent = tryRealpath(path.dirname(path.resolve(p))) ?? path.dirname(path.resolve(p))
-  const boxWritable = rwRoots.some((r) => parent === r || parent.startsWith(r + path.sep))
+  // Test the parent BOTH WAYS — logical and realpath'd — and refuse if EITHER lands in a
+  // box-writable root. Only the realpath'd form used to be probed, against roots that are
+  // deliberately LOGICAL (see the note above). Those two agree only while no ancestor of
+  // any mount is itself a symlink; the moment one is — `~/work` → `/mnt/data/work`, an
+  // ordinary two-volume layout — the realpath'd parent matches no logical root, the guard
+  // silently permits the mount, and the escape it exists to stop is back. It is not a
+  // contrived setup, and nothing about the failure is visible: the refusal warning below
+  // simply never prints. (Verified live: `/` bound rw into the box.)
+  //
+  // Keep the roots logical — that is what stops a malicious link laundering itself into
+  // the writable set — and make the PROBE the thing that covers both spellings. OR-ing is
+  // strictly more restrictive than either test alone, so this can only refuse more, never
+  // less.
+  const logicalParent = path.dirname(path.resolve(p))
+  const realParent = tryRealpath(logicalParent)
+  const under = (dir: string): boolean => rwRoots.some((r) => dir === r || dir.startsWith(r + path.sep))
+  const boxWritable = under(logicalParent) || (realParent !== null && under(realParent))
   if (boxWritable) {
     console.warn(`[sandbox] refusing symlinked mount source ${p} → ${tryRealpath(p) ?? '?'}: its parent is writable inside the box, so binding it would follow the link out of the sandbox (potential escape). Mount the real path instead.`)
   }
@@ -538,6 +633,14 @@ export function sandboxPathAccess(cfg: SandboxConfig, cwd: string, p: string): {
   for (const m of sortShallowFirst(sessionDataMounts(cfg, cwd))) {
     const root = canonicalizeForAccess(m.path)
     if (target === root || target.startsWith(root + path.sep)) match = m
+  }
+  // …unless the target is inside a hidden state dir, which the box sees as an empty
+  // directory. The authorizer must agree with the box or an unsandboxed MCP tool would be
+  // authorized to read the auth token on a session's behalf — the same divergence
+  // sessionDataMounts exists to prevent.
+  for (const dir of stateDirsToHide()) {
+    const root = canonicalizeForAccess(dir)
+    if (target === root || target.startsWith(root + path.sep)) return { read: false, write: false }
   }
   return { read: !!match, write: match?.mode === 'rw' }
 }
@@ -703,7 +806,24 @@ function which(bin: string): string | null {
   if (hit !== undefined) return hit
   let result: string | null
   try {
-    result = execFileSync('sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).trim() || null
+    // `bin` rides as a POSITIONAL ARGUMENT ($1) — never interpolated into the script. It
+    // used to be spliced straight into the command string, and this function is reached
+    // with an ATTACKER-CHOSEN path: canImportJupyter (jupyterManager.ts) routes a
+    // box-writable interpreter candidate through wrapCommand precisely so a planted binary
+    // executes CONFINED — but wrapCommand resolves the program through here BEFORE it
+    // builds the box. So a confined session that created
+    // `<cwd>/p$(payload)/.venv/bin/python3` inside its own legitimate rw mount and then ran
+    // a notebook cell got the substitution executed on the HOST, unsandboxed, with the
+    // server's full env including CLAUDETTE_TOKEN. The mitigation contained the
+    // vulnerability. (Verified live; note which() memoizes, so it fires once per distinct
+    // path per server run.)
+    //
+    // `--` so a leading-dash path can't be read as an option either, and "$1" is quoted so
+    // word-splitting and globbing can't reach it. The SHELL STAYS on purpose: `command -v`
+    // resolves a bare name the way the child will, and probe() depends on it reporting a
+    // BUILTIN as a bare word (see the trueBin check there) — a Node-side PATH walk would
+    // return null for `true` and silently change what the capability probe tests.
+    result = execFileSync('sh', ['-c', 'command -v -- "$1"', 'sh', bin], { encoding: 'utf8' }).trim() || null
   } catch {
     result = null
   }

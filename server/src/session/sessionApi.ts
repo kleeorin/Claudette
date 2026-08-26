@@ -126,7 +126,8 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
   })
 
   app.post<{ Body: SetModeRequest }>('/api/session/setMode', async (req): Promise<SetModeResult> =>
-    sessions.setPermissionMode(req.body.id, req.body.mode))
+    // Auth-gated route ⇒ the operator; only this path may set a widening mode.
+    sessions.setPermissionMode(req.body.id, req.body.mode, /* trusted */ true))
 
   // Change a session's role — relaunches (resume-preserving) to apply the new charter.
   app.post<{ Body: SetAgentRequest }>('/api/session/setAgent', async (req): Promise<OkResponse> => ({

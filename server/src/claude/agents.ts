@@ -12,14 +12,28 @@ import type { AgentInfo } from '@claudette/shared'
 // The client-facing id/name/description come from AgentInfo (the role-picker contract);
 // the rest is the server-only charter/tool-scope the client never sees.
 export interface Agent extends AgentInfo {
+  // NB `systemPrompt` and `description` are now deliberately worded DIFFERENTLY, and that
+  // divergence is the point — do not "harmonize" them. The prompt is what we ASK the model
+  // to do (a charter it can misread, forget, or be argued out of); the description is what
+  // the tool scope ENFORCES, and it is what the operator reads in the role picker and in
+  // list_team. When they disagreed, the description inherited the prompt's optimism: it
+  // said "Read-only … never edits" while the role held an auto-approved shell. Describe the
+  // enforcement, ask for the intent.
   systemPrompt?: string        // persistent charter → --append-system-prompt
   model?: string               // pin a model; undefined = user default
   allowedTools?: string[]      // whitelist → --allowedTools (auto-approve)
   disallowedTools?: string[]   // blacklist → --disallowedTools (MERGED with NOTEBOOK_DENY)
-  // Is this role READ-ONLY in intent? Declared rather than inferred from disallowedTools,
-  // because the two differ: `reviewer` keeps Bash (to run git diff and tests) yet must
-  // still not gain a mutating MCP tool. Connector scoping reads this — an MCP tool is not
-  // in any of the native lists above, so nothing else would catch it.
+  // READ-ONLY BY NATIVE TOOL SCOPE — shell access is HUMAN-GATED, not absent. Precisely:
+  // the role holds no file-editing tool, and any shell it can reach beyond a pre-approved
+  // read-only allowlist falls through to a PROMPT rather than a block. So the role DEFERS
+  // writes to the operator; it does not deny them. That distinction is load-bearing and was
+  // previously overstated: `reviewer` carried bare `Bash` in allowedTools, which
+  // `--allowedTools` auto-approves with no prompt, so a role badged read-only ran `sed -i`
+  // and `rm -rf` unattended.
+  //
+  // Declared rather than inferred from disallowedTools, because the two differ, and read by
+  // connector scoping (an MCP tool sits in none of the native lists, so nothing else would
+  // catch it) and by the `launders` guard in sessionManager.register.
   readOnly?: boolean
 }
 
@@ -40,7 +54,7 @@ export const AGENTS: Record<string, Agent> = {
   planner: {
     id: 'planner',
     name: 'Planner',
-    description: 'Investigates and writes a step-by-step implementation plan. Read-only — never edits files or runs commands.',
+    description: 'Investigates and writes a step-by-step implementation plan. Holds no editing tools and no shell — it cannot change anything itself.',
     systemPrompt:
       'You are a planning agent. Investigate the codebase and the request, then produce a clear, ordered implementation plan a developer or another agent can execute. '
       + 'You are READ-ONLY: do not modify files or run mutating commands — read, search, and reason. End with the concrete steps, the files each touches, and the risks or open questions.',
@@ -51,15 +65,22 @@ export const AGENTS: Record<string, Agent> = {
   reviewer: {
     id: 'reviewer',
     name: 'Reviewer',
-    description: 'Reviews changes for correctness and quality. Read-only (may run read commands), never edits.',
+    description: 'Reviews changes for correctness and quality. Holds no file-editing tools; read-only git commands are pre-approved, anything else it runs will ask you first.',
     systemPrompt:
       'You are a code reviewer. Examine the changes/diff and report correctness bugs first, then quality issues (reuse, simplification, clarity), most severe first, each with a concrete failure scenario. '
       + 'Do not edit files. You may run read-only commands (e.g. git diff, tests) to verify, but never anything that mutates the workspace.',
-    // A reviewer may run read-only shell (git diff, run tests) — allow Bash, block edits.
-    allowedTools: [...READ_TOOLS, 'Bash'],
+    // Pre-approve only the read-only git commands a review actually needs. Bare `Bash`
+    // used to sit here, and `--allowedTools` AUTO-APPROVES: a role whose badge said
+    // "Read-only" ran nested bwrap, `sed -i`, `rm -rf` and `npm audit` without one prompt
+    // reaching the operator. Note `WRITE_TOOLS` above already calls a shell an edit channel
+    // — this line simply handed it straight back.
+    //
+    // Everything NOT listed here falls through to a PROMPT, not a block, so a reviewer that
+    // needs the test suite still runs it — it asks first. That is the intended shape: a
+    // shell cannot be safely pattern-matched (`sh -c` defeats any allowlist), so the answer
+    // is to make the human the gate rather than to widen the list.
+    allowedTools: [...READ_TOOLS, 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git status:*)', 'Bash(git show:*)'],
     disallowedTools: ['Write', 'Edit', 'NotebookEdit'],
-    // Keeps Bash, so it is NOT read-only by tool list — but it is by charter, and a
-    // mutating MCP tool would sit outside every native deny above.
     readOnly: true,
   },
   implementer: {
@@ -73,7 +94,7 @@ export const AGENTS: Record<string, Agent> = {
   researcher: {
     id: 'researcher',
     name: 'Researcher',
-    description: 'Gathers information from the web and the codebase and synthesizes concise, cited findings. Read-only.',
+    description: 'Gathers information from the web and the codebase and synthesizes concise, cited findings. Holds no editing tools and no shell.',
     systemPrompt:
       'You are a research agent. Gather information from the web and the codebase, corroborate across sources, and synthesize a concise, cited answer. '
       + 'You are READ-ONLY: do not modify files or run mutating commands. Distinguish what the sources establish from your inference, and flag uncertainty.',
@@ -124,6 +145,35 @@ export function getAgent(id?: string): Agent {
   // resolves up the prototype chain to a truthy non-Agent, which would win over the
   // `general` fallback.
   return (id && Object.hasOwn(AGENTS, id) ? AGENTS[id] : undefined) || AGENTS.general
+}
+
+// A stable key of the RESOLVED role definition — the third configured-vs-effective
+// dimension, alongside sandboxKey (sandbox.ts) and connectorKey (connectorLaunch.ts).
+//
+// WHY A KEY OF THE DEFINITION AND NOT JUST `agentId`. A running engine never re-reads
+// this file: launch() copies `systemPrompt`/`model`/`allowedTools`/`disallowedTools`/
+// `readOnly` into the spawn once and the child holds that scope for its whole life. So a
+// session can be running a TOOL SCOPE THAT PREDATES THE CURRENT ROLE DEFINITION with
+// nothing able to say so — which is not hypothetical: after the `reviewer` role was
+// narrowed from bare `Bash` to read-only git patterns, a live reviewer session was still
+// holding the old unscoped shell, and the UI reported it as an ordinary reviewer. Keying
+// on `agentId` alone cannot see that: the id never changed, the definition did.
+//
+// The five fields below are exactly the ones launch() reads off the agent. If a sixth is
+// ever consumed there, add it here in the same commit or `agentPending` goes quietly
+// blind to it — the failure is silent, which is why this list is spelled out rather than
+// JSON.stringify'ing the whole object (that would also fold in `name`/`description`, which
+// are display-only and would report a pending relaunch for a copy edit).
+export function agentKey(id?: string): string {
+  const a = getAgent(id)
+  return JSON.stringify([
+    a.id,
+    a.model ?? '',
+    a.systemPrompt ?? '',
+    a.allowedTools ?? [],
+    a.disallowedTools ?? [],
+    !!a.readOnly,
+  ])
 }
 
 export function isAgent(id: string): boolean {

@@ -136,16 +136,47 @@ export function isAuthed(req: IncomingMessage, auth: Auth): boolean {
 // upgrade (see index.ts). Returns 401 for anything unauthenticated.
 export function makeAuthHook(auth: Auth) {
   const open = new Set(['/api/health', '/api/auth'])
+  // Paths the token must guard: the data/control API and the Jupyter reverse-proxy (it
+  // grants kernel access). Everything else is the static SPA shell and stays open.
+  const gated = (p: string): boolean => p.startsWith('/api/') || p.startsWith('/jupyter/')
   return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
     if (!auth.required) return
     // NOT named `path` — that shadowed the module-scope `import path from 'path'` inside
     // the one function that decides what may be reached unauthenticated. Harmless while
     // nothing here needed the module, and a trap the moment something did.
     const urlPath = req.url.split('?')[0]
-    // Gate the data/control API and the Jupyter reverse-proxy (it grants kernel
-    // access); everything else (static assets / SPA shell) stays open.
-    if (!urlPath.startsWith('/api/') && !urlPath.startsWith('/jupyter/')) return
-    if (open.has(urlPath)) return
+    // DECODE BEFORE MATCHING. Fastify's router percent-decodes the path before choosing a
+    // route; this hook used to prefix-match the RAW url. The two therefore disagreed about
+    // what the path even was, and a single encoded character walked between them:
+    // `/%61pi/session/list` failed the `/api/` test here, skipped the gate entirely, and
+    // still reached the real route. Every control-plane handler is "trusted because this
+    // route is auth-gated" (sessionApi.ts, connectorApi.ts say so in those words), so the
+    // mismatch made `POST /%61pi/session/setSandbox {"enabled":false}` an UNAUTHENTICATED
+    // un-sandboxing — reachable from inside any box, since we deliberately share the network
+    // namespace. (Verified live: five encodings served real data.)
+    //
+    // decodeURIComponent decodes a SUPERSET of what find-my-way does (it also turns %2F into
+    // a separator), so testing it can only ever gate MORE than the router will route — never
+    // less, which is the only direction that would leave a hole.
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(urlPath)
+    } catch {
+      // A malformed escape has no single meaning, so refuse rather than guess. Must not
+      // throw: an uncaught throw in a preHandler is a 500 on every request, static included.
+      await reply.code(400).send({ error: 'bad request path' })
+      return
+    }
+    // …and the route the router ACTUALLY matched, which makes hook and router unable to
+    // disagree by construction — it reads `/api/session/list` even for `/%61pi/...`.
+    // Undefined for the not-found path and populated with its own pattern for a static
+    // asset, both of which fall through to the spelling tests above. Purely additive: this
+    // term can only add gating, never remove it.
+    const matched = req.routeOptions?.url ?? ''
+    if (!gated(urlPath) && !gated(decoded) && !gated(matched)) return
+    // Compare the OPEN set against the decoded spelling, so `/%61pi/health` is still open
+    // — the router sends it to the same handler.
+    if (open.has(decoded)) return
     if (!isAuthed(req.raw, auth)) {
       await reply.code(401).send({ error: 'unauthorized' })
     }

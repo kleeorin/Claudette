@@ -89,6 +89,15 @@ export interface SessionInfo {
                                // than silently inheriting whatever the account has connected.
                                // Enforced by a deny rule for everything not listed, since
                                // Claudette holds no credential and so cannot withhold one.
+  agentPending?: boolean   // the ROLE DEFINITION differs from the one the RUNNING engine was
+                           // launched with. Third of the configured-vs-effective pair set,
+                           // after sandboxPending and connectorsPending, and the one whose
+                           // absence bit us: launch() copies the role's tool scope into the
+                           // spawn once, so narrowing a role (e.g. `reviewer` losing bare
+                           // `Bash`) leaves every RUNNING session on the old, wider scope.
+                           // Note what makes this one different — it flips when agents.ts
+                           // changes, not when the session's own config does, so a single
+                           // edit can set it for many sessions at once. Clears on relaunch.
   connectorsPending?: boolean  // the granted set differs from what the RUNNING engine has. The
                                // engine reads its server list once at spawn (and ignores
                                // tools/list_changed), so a new grant only becomes visible on

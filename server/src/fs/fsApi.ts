@@ -104,7 +104,19 @@ export function registerFsRoutes(app: FastifyInstance): void {
   // refuse anything the browser tags cross-site. The app's own same-origin fetch()s
   // pass, dev/proxy setups report same-site, and a directly-typed URL reports 'none'.
   app.addHook('onRequest', async (req, reply) => {
-    if (!req.url.startsWith('/api/fs/')) return
+    // Decode before matching, for exactly the reason makeAuthHook does (see auth.ts): the
+    // router decodes the path and this hook did not, so `/%61pi/fs/write` slipped past the
+    // CSRF check while still reaching the route — re-opening the very cross-site write this
+    // guard exists to refuse. Test BOTH spellings; either matching is enough to guard.
+    const raw = req.url.split('?')[0]
+    let decoded: string
+    try {
+      decoded = decodeURIComponent(raw)
+    } catch {
+      return reply.code(400).send({ error: 'bad request path' })
+    }
+    const isFs = (p: string): boolean => p.startsWith('/api/fs/')
+    if (!isFs(raw) && !isFs(decoded)) return
     const site = req.headers['sec-fetch-site']
     if (typeof site === 'string' && site !== 'same-origin' && site !== 'same-site' && site !== 'none') {
       return reply.code(403).send({ error: 'cross-site request to /api/fs refused' })

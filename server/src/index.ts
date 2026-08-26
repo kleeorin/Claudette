@@ -184,9 +184,40 @@ sessions.on('userTurn', (id: string, _text: string, _turnId: string | undefined,
   turnNotebooks.clear(id)
   if (origin !== 'team') teamMailbox.onHumanTurn(id)
 })
+// Members we have already told their coordinator about, so a turn that hits several
+// permission prompts in a row notifies ONCE rather than on every waiting→running→waiting
+// flap. Cleared on `idle` — the turn ending is what makes the next block a new episode
+// worth reporting, and it is also the point at which the teammate is demonstrably unstuck.
+const notifiedBlocked = new Set<string>()
+
 // A session just came free → hand it anything its teammates sent while it was busy.
+// A session that went to `waiting` is a different case entirely: it is blocked on a
+// permission prompt (claudeEngine sets that state nowhere else) and will NOT drain its
+// queue, so its coordinator has to be told or the team deadlocks in silence — the
+// coordinator ends its turn believing the teammate is merely busy.
+//
+// Safe to send from here: mailbox.send() only queues + arms a setTimeout, so it cannot
+// reenter SessionManager on this stack. And it cannot loop — only MEMBERS notify, always
+// upward, and a coordinator has no parentId to notify in turn.
 sessions.on('stateChange', (id: string, state: string) => {
-  if (state === 'idle') teamMailbox.onIdle(id)
+  if (state === 'idle') { notifiedBlocked.delete(id); teamMailbox.onIdle(id); return }
+  if (state !== 'waiting' || notifiedBlocked.has(id)) return
+  const me = sessions.get(id)
+  if (!me?.parentId) return                     // not a member (or a promoted orphan)
+  const coordinator = sessions.get(me.parentId)
+  if (!coordinator) return
+  notifiedBlocked.add(id)
+  // Rides the ordinary mailbox path, budget included: this is information the coordinator
+  // needs, not privileged traffic, and giving it a bypass would put a second unaccounted
+  // writer into queue/budget state that is carefully reasoned about. Once-per-turn per
+  // member keeps the cost at most one message per teammate against a budget of 40.
+  teamMailbox.send(coordinator.id, {
+    from: me.name, role: me.agentId ?? 'general', sessionId: me.id, kind: 'report',
+    body: `[automatic notice — not written by ${me.name}] ${me.name} is BLOCKED on a permission `
+      + 'prompt and cannot act, or receive anything you send, until the operator approves it in '
+      + `that session. Messages you send to ${me.name} will queue but will not be delivered. If `
+      + 'this is holding up the work, tell the user which session needs them.',
+  })
 })
 
 // Reap all Claude engines when the server goes down so bwrap/claude children don't

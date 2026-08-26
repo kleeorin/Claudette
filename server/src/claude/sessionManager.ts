@@ -13,7 +13,7 @@ import {
   assistantToolUses, userToolResults, userEventText,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
-import { getAgent, isAgent, COORDINATOR_INSTRUCTION, MEMBER_INSTRUCTION } from './agents'
+import { getAgent, isAgent, agentKey, COORDINATOR_INSTRUCTION, MEMBER_INSTRUCTION } from './agents'
 import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
@@ -56,6 +56,11 @@ interface Session extends SessionInfo {
   // pending detection as appliedSandboxKey. Granting needs a relaunch because the engine
   // reads its MCP server list once at spawn; REVOKING does not (the proxy refuses live).
   appliedConnectorKey?: string
+  // The ROLE DEFINITION actually in force at the last launch (agentKey), for the same
+  // pending detection. Distinct from `agentId`, which records only WHICH role was asked
+  // for: launch() copies the role's tool scope and charter into the spawn once, so editing
+  // agents.ts leaves every running session on the OLD scope with nothing able to report it.
+  appliedAgentKey?: string
   claudeSessionId: string       // claude's own session id (for --resume)
   startedAt: number             // last launch time, for the fast-failure heuristic
   resume: boolean               // whether Claude was launched with --resume
@@ -264,6 +269,15 @@ export class SessionManager extends EventEmitter {
     // preserves WHICH SERVERS, but the read-only guarantee is stated in terms of WHICH
     // TOOLS, so the two only agree while the roles match. Refuse the inheritance and make
     // the operator grant it explicitly.
+    //
+    // WHICH guarantee this leans on, since `readOnly` now means two different strengths in
+    // its two readers: for CONNECTORS it is a hard denial — roleScopedDenies emits a
+    // whole-server deny for a read-only role and does not consult the upstream's own
+    // `readOnlyHint` — so "the write tools the parent's role denies" below is literally
+    // true. On the NATIVE side `readOnly` is weaker (shell falls through to a prompt rather
+    // than a block), but this guard governs connector reach only, so the stronger of the two
+    // is the one it rests on. If per-tool connector precision is ever restored via an
+    // operator allowlist, re-read this: the sentence stops being unconditional.
     // BOTH kinds of reach ride the same hop, so both are tested together. Gating only on
     // `inheritedGrants` let a read-only parent holding ONLY account connectors (catalog
     // grants empty) slip through: `launders` was false, the child inherited
@@ -422,6 +436,11 @@ export class SessionManager extends EventEmitter {
 
     session.appliedSandboxKey = sandboxKey(session.sandbox, runCwd)   // what's now actually running
     session.appliedConnectorKey = connectorKey(session.connectors, session.accountConnectors)
+    // Snapshot the RESOLVED role, not session.agentId: the id is unchanged by an edit to
+    // agents.ts, and the scope the child is about to receive is what we need to compare
+    // against later. Read from `agent` — the same object launch() spawned from, two lines
+    // of divergence away from being a different role than the one actually applied.
+    session.appliedAgentKey = agentKey(session.agentId)
 
     const engine = new ClaudeEngine({
       command: spawn.command,
@@ -855,7 +874,21 @@ export class SessionManager extends EventEmitter {
   //     effect now without losing the conversation;
   //  3. otherwise (no engine, or a turn in flight we won't interrupt) leave it
   //     stored to apply on the next launch.
-  async setPermissionMode(id: string, mode: PermissionMode): Promise<SetModeResult> {
+  // TRUST-GATED, for the same reason normalizeSandbox / normalizeGrants / setTeamEmploy are
+  // (SANDBOX.md "Control-plane escape"): a confined session can reach the loopback control
+  // API, and the two WIDENING modes below remove the very prompt standing between it and an
+  // unreviewed tool call. `trusted` is set only by the auth-gated HTTP route — the operator's
+  // own browser. This was the last operator-held right with no defence-in-depth gate; it is
+  // NOT currently reachable from a box (no MCP path calls this), so the gate is here ahead of
+  // the next caller rather than to close a live hole. 'default' and 'plan' are unrestricted:
+  // both only ever RAISE prompting, so refusing them would be a downgrade of its own.
+  async setPermissionMode(id: string, mode: PermissionMode, trusted = false): Promise<SetModeResult> {
+    // Refuse BEFORE the session lookup: the gate is then unreachable-past regardless of what
+    // the lookup does, and an untrusted caller learns nothing about which ids exist.
+    if (!trusted && (mode === 'bypassPermissions' || mode === 'acceptEdits')) {
+      console.warn(`[permissions] ignoring untrusted request to set ${mode} — only the operator may lower a session's permission prompting`)
+      return { applied: 'error', error: `${mode} may only be set by the operator` }
+    }
     const session = this.sessions.get(id)
     if (!session) return { applied: 'error', error: 'no such session' }
     session.permissionMode = mode
@@ -936,7 +969,12 @@ export class SessionManager extends EventEmitter {
     // "a grant is waiting for a relaunch". A REVOCATION is already in force — the proxy
     // refuses the next call — so pending never means "still reachable".
     const connectorsPending = !!s.engine && connectorKey(connectors, accountConnectors) !== s.appliedConnectorKey
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, state }
+    // The third dimension. Unlike the two above, what changes here is usually not the
+    // SESSION's config but the ROLE DEFINITION shared by every session holding that role —
+    // so one edit to agents.ts can flip this for many sessions at once, which is exactly
+    // the case that had no way to be reported.
+    const agentPending = !!s.engine && agentKey(agentId) !== s.appliedAgentKey
+    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, agentPending, state }
   }
 
   // A session's granted catalog connectors — the live set the proxy authorizes against,
