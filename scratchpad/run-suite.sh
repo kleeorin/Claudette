@@ -338,6 +338,11 @@ SUITE=(
   "none:connectors-gpu-adversarial-test.mts"
   "none:rt2-connectors.mts"
   "none:rt2-connectors-b.mts"
+  # ~130s, and the slowest browser-free member by an order of magnitude — almost all of it
+  # case A3 waiting out the proxy's real 120s UPSTREAM_TIMEOUT_MS. That wait is the assertion:
+  # "the request is bounded" cannot be established without watching it complete, and the
+  # constant is not exported so there is no shortcut. It was 3s while A3 was a FALSE RED
+  # claiming an unbounded hang; the cost is what it takes to stop lying. See its header.
   "none:rt2-connectors-c.mts"
   "none:review-fixes-test.mts"
   "none:iframe-output-adversarial-test.mts"
@@ -569,6 +574,22 @@ SUITE=(
   # CLI's delegation path. It covers the RENDERING of subagent/assistant frames and nothing
   # upstream of them. `chrome:` and not `chrome+claude:` — it needs no CLI on PATH.
   "chrome:doubling-agents-test.mjs"
+  # GROUP B — own server (4486), own vite (5286), own Chrome. The `session:sendFailed`
+  # branch: a turn that never reached a live engine must SAY so instead of sitting in the
+  # transcript looking delivered. Registered because the rest of the suite is blind to this
+  # in BOTH directions — seven harnesses send a real turn and none inspects a bubble's
+  # delivery state, so the branch can neither fire nor mis-fire without every one of them
+  # staying green. Its [2] LIVE control is the half that catches an inverted check.
+  # `chrome:` and not `chrome+claude:` — the dead engine is a stand-in CLI that exits.
+  "chrome:send-failed-guard.mjs"
+  # PURE, no server, no browser (~3ms) — same shape as session-reducer-test.mts. Pins hazard
+  # H6 from web/src/store/sessionReducer.ts: App.tsx's notebook-restore effect marked an id
+  # seen BEFORE testing whether it could act on it, which permanently defeated the retry its
+  # own [openIds, activeId] dep array existed to provide. Test 2 is the regression; it fails
+  # against the old ordering and passes against the new one. Registered here rather than as a
+  # vitest file because vitest is neither installed nor declared in web/package.json, so
+  # web/src/store/sessions.test.tsx cannot currently be executed at all.
+  "none:notebook-attach-test.mts"
   # --- these eight need the shared :4321 server (see start_shared_server) ---
   "srv4321:attention-test.mjs"
   "srv4321:history-resume-test.mjs"
