@@ -149,22 +149,29 @@ await wait(1500)
 const MEASURE = `(() => {
   const rows = document.querySelector('.xterm-rows')
   if (!rows) return { err: 'no xterm' }
-  // Walk to the first ancestor with an INLINE height, STARTING OUTSIDE the xterm subtree.
-  // Two selectors were wrong here before this one, both silently:
+  // LOCATE THE DOCK BY ITS TEST HOOK. Three selectors were wrong here before this one, each
+  // silently, and the comment predicting a third drift was itself proven right by the third:
   //   closest('[style*=height])   also matches min-height/max-height in the style attribute
   //   walking up from .xterm-rows  lands on .xterm-screen, which xterm sizes INLINE itself
-  // Both returned a real element with a plausible height, so the probe reported numbers that
-  // were simply about the wrong box. dockClass is printed so a third drift is visible.
+  //   walking up for an INLINE height finds NOTHING at phone since slice 2B, because the dock
+  //     is deliberately flex-sized there (App.tsx sizes it only when NOT isPhone). The
+  //     premise "the dock always carries an inline height" became false.
+  // data-testid="pane" is structural rather than stylistic, so it does not move when the
+  // sizing strategy does. closest() from .xterm picks the ONE pane that contains the terminal.
   // (No backticks in here: this whole block lives inside a JS template literal.)
   const xterm = document.querySelector('.xterm')
-  let dock = null
-  for (let e = xterm && xterm.parentElement; e; e = e.parentElement) { if (e.style && e.style.height) { dock = e; break } }
+  const dock = xterm ? xterm.closest('[data-testid="pane"]') : null
+  if (!dock) return { err: 'dock pane not found', hasXterm: !!xterm }
   const root = document.getElementById('root')
   const dr = dock ? dock.getBoundingClientRect() : null
   const rr = root.getBoundingClientRect()
   const sr = rows.getBoundingClientRect()
   const vvh = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--vvh')) || innerHeight
   return {
+    // Which invariant applies is a property of the LAYOUT MODE, not of the viewport width the
+    // harness happens to have set — read it from the source (2B publishes it on the shell).
+    phoneLayout: (document.querySelector('[data-phone]') || {}).getAttribute
+      ? document.querySelector('[data-phone]').getAttribute('data-phone') === 'true' : null,
     vvh, rootH: Math.round(rr.height),
     dockH: dr && Math.round(dr.height), dockTop: dr && Math.round(dr.top), dockBottom: dr && Math.round(dr.bottom),
     dockInlineH: dock ? dock.style.height : null,
@@ -176,8 +183,33 @@ const MEASURE = `(() => {
 })()`
 
 const setVvh = async (px) => { await ev(`document.documentElement.style.setProperty('--vvh', '${px}px')`); await wait(900) }
+const setViewport = async (w, h) => {
+  await send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: w < 768 })
+  await wait(900)
+}
+// A width that is NOT phone (>= Tailwind's md) but is still short enough for a keyboard to
+// matter — a small tablet in portrait, and also every phone in LANDSCAPE, which is the case
+// that now exercises the inline bound hardest: 844x390 is desktop-layout by width while a
+// keyboard takes half the height.
+const TABLET_W = 900
 
-console.log('')
+// EVERY assertion below states WHICH LAYOUT MODE's invariant it is checking, because since
+// slice 2B there are two different correct answers and neither is wrong:
+//   phone  — the dock IS the single pane, flex-sized, bounded by #root (which is var(--vvh));
+//            it carries NO inline height, deliberately.
+//   >= md  — the dock is a dragged-to pixel height, bounded by min(termH, --vvh - reserve).
+// Asserting the >= md invariant at phone is what made this probe report on a box that did not
+// exist. `guard()` refuses to let an assertion run on a failed lookup at all: the previous
+// version had `kb.dockH <= kb.vvh` evaluate `null <= 508` — which JS says is TRUE — so two
+// checks went GREEN while measuring nothing.
+const guard = (m, tag, name) => {
+  if (m && !m.err && m.dockH !== null && m.dockH !== undefined) return true
+  ok(tag, name, false, `lookup failed: ${m ? (m.err || 'dockH is ' + m.dockH) : 'no measurement'}`)
+  return false
+}
+
+// ══ PHONE LAYOUT (390x844) ═════════════════════════════════════════════════════════════
+console.log('\n── phone layout (390x844): the dock is the single pane, flex-sized ──')
 await setVvh(LAYOUT_H)
 const rest = await ev(MEASURE)
 console.log('  at rest      (--vvh 844):', JSON.stringify(rest))
@@ -188,16 +220,54 @@ console.log('')
 
 ok('today', 'the terminal actually mounted and fitted', !rest.err && rest.rowCount > 0,
    `${rest.rowCount} rows`)
-ok('fix', 'the dock height is expressed against --vvh, not as a raw pixel value',
-   /--vvh/.test(rest.dockInlineH || ''), `inline height: ${rest.dockInlineH}`)
-ok('fix', 'the dock is bounded by the VISIBLE viewport, not just the layout one',
-   kb.dockH <= kb.vvh, `dock ${kb.dockH}px inside a ${kb.vvh}px visible viewport`)
-ok('fix', 'nothing is clipped below the shell when the keyboard is up',
-   kb.clippedPx === 0, `${kb.clippedPx}px of dock below #root (dock ends ${kb.dockBottom}, #root ends ${rest.rootH ? kb.rootH : '?'})`)
-ok('fix', 'xterm RE-FITS when --vvh changes: fewer rows with the keyboard up',
-   kb.rowCount < rest.rowCount, `rows ${rest.rowCount} → ${kb.rowCount}`)
-ok('today', 'CONTROL: at rest the dock keeps the full saved height (the bound is conditional, not a blanket shrink)',
-   rest.dockH === SAVED_TERM_H, `dock ${rest.dockH}px of a saved ${SAVED_TERM_H}px`)
+if (guard(rest, 'today', 'PHONE: the dock pane was located by its test hook') &&
+    guard(kb, 'today', 'PHONE: the dock pane is still located with the keyboard up')) {
+  ok('today', 'PHONE: the layout really is in phone mode (data-phone)', rest.phoneLayout === true,
+     `data-phone=${rest.phoneLayout}`)
+  // THE PHONE INVARIANT, and it is the opposite of the desktop one. Slice 2B makes the dock the
+  // single pane and sizes it with flex, so an inline pixel height here would be the DEFECT — it
+  // is what would pin the dock to a dragged desktop size the pane layout cannot override.
+  ok('fix', 'PHONE: the dock is flex-sized, carrying NO inline height',
+     !rest.dockInlineH, `inline height: ${rest.dockInlineH || '(none)'}`)
+  // …and what replaces the --vvh arithmetic is a structural fact: flex inside #root, which IS
+  // var(--vvh). So the property to assert is the OUTCOME the bound existed to produce.
+  ok('fix', 'PHONE: the dock never extends below the shell, at rest or with the keyboard up',
+     rest.clippedPx === 0 && kb.clippedPx === 0,
+     `clipped ${rest.clippedPx}px at rest, ${kb.clippedPx}px with the keyboard up (dock ends ${kb.dockBottom}, #root ends ${kb.rootH})`)
+  ok('fix', 'PHONE: the dock tracks --vvh through flex (it shrinks with the visible viewport)',
+     kb.dockH < rest.dockH && kb.dockH > 0, `dock ${rest.dockH}px → ${kb.dockH}px`)
+  ok('fix', 'PHONE: xterm RE-FITS when --vvh changes: fewer rows with the keyboard up',
+     kb.rowCount < rest.rowCount, `rows ${rest.rowCount} → ${kb.rowCount}`)
+}
+
+// ══ >= md LAYOUT (900x844) ═════════════════════════════════════════════════════════════
+// Where the inline --vvh bound still lives. 900px wide is past Tailwind's md, so App.tsx takes
+// the desktop branch, while 844px tall leaves a keyboard something to take.
+console.log('\n── >= md layout (900x844): the dock keeps its dragged pixel height, bounded ──')
+await setViewport(TABLET_W, LAYOUT_H)
+await setVvh(LAYOUT_H)
+const mdRest = await ev(MEASURE)
+console.log('  at rest      (--vvh 844):', JSON.stringify(mdRest))
+await setVvh(PORTRAIT_KB)
+const mdKb = await ev(MEASURE)
+console.log('  keyboard up  (--vvh 508):', JSON.stringify(mdKb))
+console.log('')
+
+if (guard(mdRest, 'today', '>=md: the dock pane was located') &&
+    guard(mdKb, 'today', '>=md: the dock pane is still located with the keyboard up')) {
+  ok('today', '>=md: the layout really is in desktop mode (data-phone)', mdRest.phoneLayout === false,
+     `data-phone=${mdRest.phoneLayout}`)
+  ok('fix', '>=md: the dock height is expressed against --vvh, not as a raw pixel value',
+     /--vvh/.test(mdRest.dockInlineH || ''), `inline height: ${mdRest.dockInlineH}`)
+  ok('fix', '>=md: the dock is bounded by the VISIBLE viewport, not just the layout one',
+     mdKb.dockH <= mdKb.vvh, `dock ${mdKb.dockH}px inside a ${mdKb.vvh}px visible viewport`)
+  ok('fix', '>=md: nothing is clipped below the shell when the keyboard is up',
+     mdKb.clippedPx === 0, `${mdKb.clippedPx}px of dock below #root (dock ends ${mdKb.dockBottom}, #root ends ${mdKb.rootH})`)
+  ok('fix', '>=md: xterm RE-FITS when --vvh changes: fewer rows with the keyboard up',
+     mdKb.rowCount < mdRest.rowCount, `rows ${mdRest.rowCount} → ${mdKb.rowCount}`)
+  ok('today', '>=md CONTROL: at rest the dock keeps the full saved height (the bound is conditional, not a blanket shrink)',
+     mdRest.dockH === SAVED_TERM_H, `dock ${mdRest.dockH}px of a saved ${SAVED_TERM_H}px`)
+}
 
 
 // ── the OTHER site that carries termH: the stacked Claude column ───────────────────────
@@ -205,6 +275,14 @@ ok('today', 'CONTROL: at rest the dock keeps the full saved height (the bound is
 // the dock were bounded, the column would keep reserving the FULL saved termH and the bound
 // would buy a gap below the terminal instead of an unclipped one — so this asserts the two
 // agree. Opening a file is the cheapest way to reach that branch.
+//
+// RUNS AT >= md, NOT AT PHONE, and that is a correctness requirement rather than a preference.
+// Since slice 2B the Claude column takes NO inline style at phone either (App.tsx gates it on
+// `!isPhone && active`), and at phone the content pane REPLACES the column outright rather than
+// sharing a split with it — so there is no stacked column to measure and the section asserted
+// against a box that does not exist. It was reporting "column not found" and reading as a
+// missing fix. The stacked-column invariant is a desktop one now; this is where it lives.
+await setViewport(TABLET_W, LAYOUT_H)
 await setVvh(LAYOUT_H)
 const opened = await ev(`(() => {
   const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Files')
@@ -228,8 +306,11 @@ ok('today', 'PRECONDITION: a leaf element with the text "demo.py" was found and 
    picked === 'ok', `lookup returned: ${picked}`)
 const COLUMN = `(() => {
   const xterm = document.querySelector('.xterm')
+  // The DOCK comes from the pane hook (see MEASURE); only the COLUMN above it is found by its
+  // inline height, which at >= md it genuinely has (calc(stackH + boundedDockH + 1px)).
+  const dockPane = xterm ? xterm.closest('[data-testid="pane"]') : null
   let dock = null
-  for (let e = xterm && xterm.parentElement; e; e = e.parentElement) { if (e.style && e.style.height) { dock = e; break } }
+  dock = dockPane
   let col = null
   for (let e = dock && dock.parentElement; e; e = e.parentElement) { if (e.style && e.style.height) { col = e; break } }
   const root = document.getElementById('root').getBoundingClientRect()
