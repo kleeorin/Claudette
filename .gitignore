@@ -9,3 +9,6 @@ out/
 # Generated phone-pairing QR — encodes the URL WITH the access token; never commit.
 /qr.png
 .chrome-headless/
+
+# Local Claude Code session config (per-machine permissions).
+.claude/
