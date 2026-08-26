@@ -346,7 +346,7 @@ wss.on('connection', (ws: WebSocket) => {
     }
     if (handleNotebookClientMessage(notebooks, kernels, msg)) return
     if (handlePaneClientMessage(panes, msg)) return
-    handleSessionClientMessage(sessions, msg)
+    handleSessionClientMessage(sessions, msg, hub)
   })
 })
 

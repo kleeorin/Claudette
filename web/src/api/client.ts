@@ -79,6 +79,7 @@ const snapshots = channel<[string, ClaudeEvent[], PermissionRequest[] | undefine
 const tasks = channel<[string, TaskRecord[]]>()   // [id, subagent registry] — live updates
 const permissions = channel<[string, PermissionRequest]>()
 const userTurns = channel<[string, string, string | undefined]>()   // [id, text, turnId]
+const sendFailed = channel<[string, string | undefined]>()          // [id, turnId] — turn never reached a live engine
 const permsResolved = channel<[string, string]>()                   // [id, requestId]
 const states = channel<[string, SessionState]>()
 const readies = channel<[string, string]>()
@@ -118,6 +119,7 @@ function dispatch(msg: WsServerMessage): void {
     case 'session:event': events.emit(msg.id, msg.event); break
     case 'session:permission': permissions.emit(msg.id, msg.request); break
     case 'session:userTurn': userTurns.emit(msg.id, msg.text, msg.turnId); break
+    case 'session:sendFailed': sendFailed.emit(msg.id, msg.turnId); break
     case 'session:permissionResolved': permsResolved.emit(msg.id, msg.requestId); break
     case 'session:state': states.emit(msg.id, msg.state); break
     case 'session:ready': readies.emit(msg.id, msg.claudeSessionId); break
@@ -227,6 +229,10 @@ export const api = {
     permission: (fn: Fn<[string, PermissionRequest]>) => permissions.on(fn),
     // A user turn mirrored from the server (any device); turnId de-dupes the sender's echo.
     userTurn: (fn: Fn<[string, string, string | undefined]>) => userTurns.on(fn),
+    // A send that never reached a live claude process. The optimistic echo is already
+    // in the transcript under this turnId, so the UI marks THAT item undelivered rather
+    // than appending anything — see chat.tsx MARK_UNDELIVERED.
+    sendFailed: (fn: Fn<[string, string | undefined]>) => sendFailed.on(fn),
     // A pending permission prompt was resolved — clear it on every client.
     permissionResolved: (fn: Fn<[string, string]>) => permsResolved.on(fn),
     stateChange: (fn: Fn<[string, SessionState]>) => states.on(fn),

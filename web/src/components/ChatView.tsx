@@ -621,10 +621,24 @@ function gapClass(it: TranscriptItem, prev?: TranscriptItem): string {
 const Item = memo(function Item({ item }: { item: TranscriptItem }) {
   switch (item.kind) {
     case 'user':
+      // `undelivered` = the server told us this turn never reached a live claude process
+      // (session:sendFailed). The bubble is appended optimistically the moment you hit
+      // send, so WITHOUT this it keeps the ordinary accent styling and reads as delivered
+      // forever. Muted + dashed + an explicit line, because the failure is otherwise
+      // completely silent: no reply ever arrives and nothing else in the transcript
+      // changes. The text is kept selectable so it can be copied and re-sent.
       return (
         <div className="flex justify-end animate-fade-in">
-          <div className="max-w-[85%] rounded-2xl rounded-br-md bg-ctp-accent/12 border border-ctp-accent/25 px-3.5 py-2 whitespace-pre-wrap text-ctp-text">
+          <div className={item.undelivered
+            ? 'max-w-[85%] rounded-2xl rounded-br-md bg-ctp-surface0/40 border border-dashed border-ctp-red/50 px-3.5 py-2 whitespace-pre-wrap text-ctp-subtext'
+            : 'max-w-[85%] rounded-2xl rounded-br-md bg-ctp-accent/12 border border-ctp-accent/25 px-3.5 py-2 whitespace-pre-wrap text-ctp-text'}>
             {item.text}
+            {item.undelivered && (
+              <div className="mt-1.5 pt-1.5 border-t border-ctp-red/25 text-[11px] text-ctp-red flex items-center gap-1.5">
+                <span aria-hidden>⚠</span>
+                <span>Not delivered — the session wasn't running. Copy this and send it again.</span>
+              </div>
+            )}
           </div>
         </div>
       )

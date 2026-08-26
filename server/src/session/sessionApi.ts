@@ -230,10 +230,20 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
 // Dispatch a client→server WS message that drives a session. Returns true if the
 // message was a session topic (handled), false otherwise (e.g. ping) so the caller
 // can fall through to other handlers.
-export function handleSessionClientMessage(sessions: SessionManager, msg: WsClientMessage): boolean {
+export function handleSessionClientMessage(sessions: SessionManager, msg: WsClientMessage, hub: WsHub): boolean {
   switch (msg.type) {
     case 'session:send':
-      sessions.sendUserTurn(msg.id, msg.text, msg.turnId)
+      // sendUserTurn is async and its boolean is the ONLY signal that the turn reached a
+      // live engine. Dropping it made a send into the mid-relaunch/mid-close/just-died
+      // window vanish with no trace: the false returns run before any side effect, so no
+      // userTurn is emitted, no state flips, nothing renders — while the client had
+      // already appended its optimistic echo, leaving the message looking sent forever.
+      // The team mailbox has always inspected this same boolean and re-queued on false;
+      // only the human path threw it away. We do not retry here — a silent retry is what
+      // printed turns twice before — we tell the sender instead.
+      void sessions.sendUserTurn(msg.id, msg.text, msg.turnId)
+        .then((delivered) => { if (!delivered) hub.broadcast({ type: 'session:sendFailed', id: msg.id, turnId: msg.turnId }) })
+        .catch(() => hub.broadcast({ type: 'session:sendFailed', id: msg.id, turnId: msg.turnId }))
       return true
     case 'session:interrupt':
       sessions.interrupt(msg.id)

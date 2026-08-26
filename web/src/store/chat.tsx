@@ -20,7 +20,10 @@ export { isSubagentTool }
 // events (assistant / user tool_result / result), with token-level streaming of
 // text/thinking layered on via stream_event deltas.
 export type TranscriptItem =
-  | { kind: 'user'; id: string; text: string }
+  // `undelivered` marks a turn the server told us never reached a live claude process
+  // (session:sendFailed). The optimistic echo is appended before the send is confirmed,
+  // so without this the message sits in the transcript looking sent forever.
+  | { kind: 'user'; id: string; text: string; undelivered?: true }
   | { kind: 'text'; id: string; text: string; streaming?: boolean; parentId?: string }
   | { kind: 'thinking'; id: string; text: string; streaming?: boolean; parentId?: string }
   // `toolId` = the anthropic tool_use block id (`toolu_…`); pairs a call with its
@@ -73,6 +76,10 @@ interface State {
 
 type Action =
   | { type: 'APPEND'; sessionId: string; items: TranscriptItem[] }
+  // Flag the optimistic user echo whose turnId the server could not deliver. Keyed by
+  // the same turnId the sender minted, so it is a no-op on any device that never
+  // rendered that turn.
+  | { type: 'MARK_UNDELIVERED'; sessionId: string; turnId: string }
   | { type: 'LOAD'; sessionId: string; items: TranscriptItem[] }
   | { type: 'STREAM_START'; sessionId: string; index: number; kind: 'text' | 'thinking' }
   | { type: 'STREAM_DELTA'; sessionId: string; index: number; text: string }
@@ -114,6 +121,19 @@ function reducer(state: State, action: Action): State {
     case 'APPEND': {
       const prev = state.transcripts[action.sessionId] ?? []
       return { ...state, transcripts: { ...state.transcripts, [action.sessionId]: [...prev, ...action.items] } }
+    }
+    case 'MARK_UNDELIVERED': {
+      const prev = state.transcripts[action.sessionId]
+      if (!prev) return state
+      let hit = false
+      const next = prev.map((it) => {
+        if (it.kind !== 'user' || it.id !== action.turnId || it.undelivered) return it
+        hit = true
+        return { ...it, undelivered: true as const }
+      })
+      // Identity is preserved on a miss so an unknown turnId (another device's send,
+      // or one already cleared) does not churn every subscriber for nothing.
+      return hit ? { ...state, transcripts: { ...state.transcripts, [action.sessionId]: next } } : state
     }
     case 'LOAD': {
       const open = { ...state.open }; delete open[action.sessionId]
@@ -757,7 +777,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const offState = api.on.stateChange((id, s) => {
       if (s === 'idle' && stateRef.current.pending[id]?.length) dispatch({ type: 'CLEAR_PENDING', sessionId: id })
     })
-    return () => { offEvent(); offSnapshot(); offTasks(); offPerm(); offUserTurn(); offPermResolved(); offState() }
+    const offSendFailed = api.on.sendFailed((id, turnId) => {
+      // No turnId means we cannot identify which echo to mark, and guessing "the last
+      // user item" would mislabel a turn that DID land. Drop it rather than lie.
+      if (turnId) dispatch({ type: 'MARK_UNDELIVERED', sessionId: id, turnId })
+    })
+    return () => { offEvent(); offSnapshot(); offTasks(); offPerm(); offUserTurn(); offPermResolved(); offState(); offSendFailed() }
   }, [])
 
   const sendTurn = useCallback((sessionId: string, text: string) => {

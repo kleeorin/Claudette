@@ -65,6 +65,16 @@ export type WsServerMessage =
   // A user turn, broadcast to EVERY client so all mirror it (not just the sender's
   // optimistic echo). turnId lets the sender de-dupe its own optimistic message.
   | { type: 'session:userTurn'; id: string; text: string; turnId?: string }
+  // A session:send that never reached a live claude process. sendUserTurn resolves
+  // false whenever the turn was not handed to a live engine — mid-relaunch, mid-close,
+  // or an engine object that is still non-null because the child died microseconds ago
+  // and the exit event has not fired. That check deliberately runs BEFORE any side
+  // effect, so no session:userTurn is emitted and nothing else marks the attempt: the
+  // turn simply does not exist server-side. Without this message the sender's optimistic
+  // echo sits in the transcript looking delivered forever, which is worse than showing
+  // nothing. Broadcast like session:userTurn so the right device gets it regardless of
+  // which one typed; clients that never rendered this turnId ignore it.
+  | { type: 'session:sendFailed'; id: string; turnId?: string }
   // A pending permission prompt was resolved (answered, auto-denied, or the session
   // ended) — every client clears that prompt, so a non-answering device (e.g. the
   // phone) isn't left stuck on a dead prompt.
