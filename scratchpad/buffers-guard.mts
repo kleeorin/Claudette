@@ -31,20 +31,26 @@
 // Everything above the module boundary. FileEditorView is what calls peekBuffer with fresh
 // disk text (:66) and setBuffer with `loadedRef.current` as the base (:104); if a future edit
 // passes the wrong baseline, or stops calling peek on load, buffers.ts stays correct and the
-// editor breaks anyway. [7] pins the one shape of that mistake the module can see by itself.
+// editor breaks anyway. Nothing here can see a wrong baseline passed by a caller.
 // The Milkdown normalize-on-load emit is SIMULATED here as "text !== disk on open"; nothing
 // in this file runs Milkdown.
 //
 // ── FAILS-FIRST, and HOW it was taken (the method matters here) ──────────────────────
 // Against the pre-fix implementation — a path-keyed buffer with no baseline, restored
-// unconditionally — this file scores 5 passed / 4 failed: [3] and [4] red with their own
+// unconditionally — this file scores 5 passed / 3 failed: [3] and [4] red with their own
 // predicted diagnostics ("the stale edit was restored on top of new disk content" and
-// "peekBuffer compared but did not delete"), plus [6b] and [7]. Green as shipped: 9/0.
+// "peekBuffer compared but did not delete"), plus [6b]. Green as shipped: 8/0.
+// (Both numbers were 9/0 and 5/4 until [7] was deleted along with the trap it documented —
+// see the note where it stood. Re-measured after the deletion, not adjusted on paper.)
 // ★ That mutation was run against a COPY of the module, not by editing web/src/lib/buffers.ts
 //   in place, and deliberately so. The suite's bucket-1 banner is an MTIME comparison between
-//   web/dist and web/src, so touching a web/src file — even reverting it byte-identically
-//   afterwards — flips eleven harnesses to NO SIGNAL until someone rebuilds the bundle, and
-//   a rebuild is operator-gated. A byte-identical revert does not restore an mtime.
+//   web/dist and every bundle input (all of web/ bar dist and node_modules, plus shared/src),
+//   so touching any of them — even reverting byte-identically afterwards — flips eleven
+//   harnesses to NO SIGNAL until someone rebuilds the bundle, and a rebuild is operator-gated.
+//   A byte-identical revert does not restore an mtime. Note the asymmetry with the tree
+//   fingerprint, which hashes CONTENT: the same revert is invisible to one and fatal to the
+//   other, because they answer different questions ("did the tree move under the run?" vs
+//   "was the bundle built after its inputs?").
 //   Nothing is lost by using a copy: these assertions are pure functions of peekBuffer's
 //   behaviour, and that this file is wired to the REAL module is proven by its green run.
 import { peekBuffer, setBuffer, clearBuffers } from '../web/src/lib/buffers'
@@ -105,17 +111,15 @@ ok('core', '[6a] opening a .md file out of normal form does hold a buffer (the t
 ok('core', '[6b] …and that no-op buffer still cannot shadow a file that changed since',
   peekBuffer(P, DISK_B) === undefined)
 
-// [7] CHARACTERIZATION, not an endorsement. `setBuffer(path, text, base = '')` defaults the
-// baseline to the empty string, and an entry stored that way can never match a non-empty
-// file — so it is silently discarded on the next open and the unsaved text is gone with no
-// error. Every call site today passes a real baseline (FileEditorView.tsx:104), so this is
-// latent, not live. It is pinned here so that if someone adds a two-argument call the shape
-// of the loss is already written down. ★ If the default is ever removed, THIS CHECK SHOULD
-// BE DELETED, not "fixed" — it documents the trap, it does not ask for it.
-clearBuffers()
-setBuffer(P, EDITED)
-ok('char', '[7] a buffer stored WITHOUT a baseline never restores (the default-arg trap)',
-  peekBuffer(P, DISK_A) === undefined)
+// ── [7] WAS HERE, AND WAS DELETED WHEN THE TRAP IT DOCUMENTED WAS REMOVED ───────────
+// It pinned `setBuffer(path, text, base = '')`: the default baseline could never match a
+// non-empty file, so an entry stored that way was silently discarded and the unsaved text
+// was gone with no error — the same silent-loss shape the fix existed to remove. The default
+// is gone (`base: string` is required as of 2026-08-26) and the check went with it, exactly
+// as its own note instructed, rather than being "updated" into something that outlived its
+// subject. ★ It could not simply have been left: tsx transpiles without typechecking, so the
+// two-argument call would still RUN and still PASS, testing a call nobody can write any more
+// — a green with no subject, which is the one thing this file exists to argue against.
 
 // [8] clearBuffers really clears — everything above depends on it to isolate its cases, so
 // an assertion that it works is load-bearing for the file rather than a courtesy.

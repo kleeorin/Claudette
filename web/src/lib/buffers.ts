@@ -50,10 +50,17 @@ export function peekBuffer(path: string, disk: string): string | undefined {
 /**
  * Hold (or, with null, drop — it matches disk again) a path's unsaved text.
  *
+ * `base` is REQUIRED AND HAS NO DEFAULT, deliberately. It defaulted to '' once, which
+ * is a baseline no non-empty file can ever equal — so an entry stored without one was
+ * silently discarded on the next open and the unsaved text was gone with no error. That
+ * is the same silent-loss shape this module exists to remove, reintroduced as a
+ * convenience. Requiring it puts the compiler on the problem instead of a reviewer.
+ * When dropping (`text === null`) it is ignored; pass whatever baseline is at hand.
+ *
  * @param base the disk text this edit was made against; a later peekBuffer only
  *   restores `text` while disk still equals it.
  */
-export function setBuffer(path: string, text: string | null, base = ''): void {
+export function setBuffer(path: string, text: string | null, base: string): void {
   if (text === null) buffers.delete(path)
   else buffers.set(path, { text, base })
 }

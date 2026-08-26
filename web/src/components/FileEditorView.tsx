@@ -88,7 +88,7 @@ export function FileEditorView({ path, sessionId }: Props) {
     textRef.current = text
     loadedRef.current = text
     dirtyRef.current = false; setDirty(false)
-    setBuffer(path, null)
+    setBuffer(path, null, text)
     setReloadKey((k) => k + 1)
   }, [path])
 
@@ -125,7 +125,7 @@ export function FileEditorView({ path, sessionId }: Props) {
         // Only clear dirty if no edits landed during the await — otherwise those
         // keystrokes would be marked saved and lost on close. Same for the buffer:
         // it's dropped only when what's on disk is what the editor holds.
-        if (textRef.current === snapshot) { dirtyRef.current = false; setDirty(false); setBuffer(path, null) }
+        if (textRef.current === snapshot) { dirtyRef.current = false; setDirty(false); setBuffer(path, null, snapshot) }
       } else setSaveErr(r.error)
     } catch (e) {
       setSaveErr(errText(e))
