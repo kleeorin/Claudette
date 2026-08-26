@@ -61,7 +61,9 @@ export function FileEditorView({ path, sessionId }: Props) {
       // unmounted whenever another tab or session is on screen, so without the buffer
       // a glance elsewhere discarded them. The baseline stays DISK text, so the dirty
       // marker and the save-time overwrite check still measure against reality.
-      const kept = p.kind === 'text' ? peekBuffer(path) : undefined
+      // peekBuffer takes the fresh disk text and returns nothing when the file moved
+      // underneath the edit — so a stale buffer can no longer shadow a changed file.
+      const kept = p.kind === 'text' ? peekBuffer(path, disk) : undefined
       const text = kept ?? disk
       textRef.current = text
       dirtyRef.current = text !== disk
@@ -97,7 +99,9 @@ export function FileEditorView({ path, sessionId }: Props) {
     textRef.current = text
     const nowDirty = text !== loadedRef.current
     if (nowDirty !== dirtyRef.current) { dirtyRef.current = nowDirty; setDirty(nowDirty) }
-    setBuffer(path, nowDirty ? text : null)   // survive the unmount a tab/session switch causes
+    // Baseline is the DISK text this edit was made against; peekBuffer refuses to
+    // restore onto anything else. survive the unmount a tab/session switch causes
+    setBuffer(path, nowDirty ? text : null, loadedRef.current)
   }, [path])
 
   const save = useCallback(async () => {
@@ -227,10 +231,21 @@ export function FileEditorView({ path, sessionId }: Props) {
   const showSave = preview?.kind === 'text' && !reviewing
 
   // Only the active tab of the active session is mounted, so leaving this file (or
-  // this session) unmounts the editor. Key its scroll offset by path so coming back
-  // lands where you left off instead of at the top. `reloadKey` is deliberately NOT
-  // part of the key: a reload should keep your place too.
-  const scrollKey = `file:${path}`
+  // this session) unmounts the editor. Key its scroll offset so coming back lands where
+  // you left off instead of at the top. `reloadKey` is deliberately NOT part of the key:
+  // a reload should keep your place too.
+  //
+  // THE KEY IS PER SESSION, and that is the whole point rather than a detail. Keyed by
+  // path alone, two sessions open on the SAME file share one offset: read to line 500 in
+  // session A, switch to B and read that file from the top, and B's scrolling overwrites
+  // the shared entry — so returning to A drops you at B's position, usually the top. That
+  // presents exactly as "switching sessions resets my place", and it gets worse the more
+  // sessions you run on one project, which is the normal way this app is used. Two views
+  // of one file are two places a human is reading, so they get two offsets.
+  // `path` stays in the key so the same file in one session survives tab and file
+  // switches; `?? 'none'` keeps a session-less preview (opened outside any session) from
+  // colliding with a real one.
+  const scrollKey = `file:${sessionId ?? 'none'}:${path}`
   const imgRef = useRef<HTMLDivElement>(null)
   useScrollMemory(preview?.kind === 'image' ? scrollKey : null, () => imgRef.current)
 
@@ -322,6 +337,7 @@ export function FileEditorView({ path, sessionId }: Props) {
             proposed={applied.proposed}
             filename={name}
             find={find}
+            scrollKey={`${scrollKey}#diff`}
             onDoc={(t) => { resultRef.current = t }}
             onAllResolved={(t) => { resultRef.current = t; applyDecision() }}
           />
