@@ -83,6 +83,42 @@ const states: string[] = []
 // frame carrying `error: 'authentication_failed'` and `Not logged in · Please run /login`
 // — note it also carries `subtype: 'success'`, so keying on subtype would miss it.
 let apiError = ''
+// ── WHAT COUNTS AS AN API FAILURE, AND WHY IT IS NOT THE APP'S CLASSIFIER ────────────
+// This detector used to include `ev.is_error === true`, and it fired on EVERY run. The
+// frame it tripped on, captured rather than guessed:
+//   {"type":"result","subtype":"error_during_execution","is_error":true,"error":undefined}
+// That is THIS TEST'S SUCCESS CONDITION. Interrupting a turn ends it in error by
+// definition, so the harness was classifying the thing it exists to cause as a reason to
+// disbelieve itself — and then, because `apiError` never reached the exit code, printed
+// "this run is NOT a verdict" and exited 0 anyway. Both halves were wrong and each hid
+// the other: the warning was a false alarm, and a GENUINE API failure would have passed
+// just as silently. Measured three for three before the fix.
+//
+// chat.tsx:425-431 is the shipped classifier and it DOES count `is_error === true` — do
+// not "align" this with it. It answers a different question: "did this turn fail?", for
+// which an interrupted turn is correctly a failure and the UI says so. This harness asks
+// the narrower "did the CLI fail for a reason that INVALIDATES the test?", and `is_error`
+// cannot answer that because the interrupt under test sets it.
+//
+// The markers that do mean an API failure are the ones chat.tsx documents from the real
+// measured auth-failure frame (`is_api_error_message`, `terminal_reason: 'api_error'`, a
+// non-empty `error`) — note that frame arrives labelled `subtype: 'success'`, which is why
+// subtype is not consulted here at all.
+//
+// ★ AND WHY THERE IS NO `subtype === 'error_during_execution'` EXCLUSION, despite that
+//   being the obvious repair: a genuine API failure could carry that subtype too, and a
+//   blacklist would then silence it. Discriminating on the API markers is strictly
+//   narrower than excluding a subtype, and cannot mask a real failure the way a blacklist
+//   can. The interrupt's own frame simply carries none of them.
+//
+// The `!== ''` guard matches chat.tsx and is deliberate: `typeof ev.error === 'string'` was
+// true for an EMPTY error field, so a frame carrying `error: ''` counted as an API failure
+// and reported itself as "unknown API error" — the shipped classifier already guards this
+// and the divergence was a second, independent way for this to fire falsely.
+const isApiFailure = (ev: any): boolean =>
+  ev?.is_api_error_message === true
+  || ev?.terminal_reason === 'api_error'
+  || (typeof ev?.error === 'string' && ev.error !== '')
 ws.on('message', (raw) => {
   let m: any
   try { m = JSON.parse(raw.toString()) } catch { return }
@@ -94,7 +130,7 @@ ws.on('message', (raw) => {
       const d = ev.event?.delta
       if (d?.type === 'text_delta' && d.text) textLen += d.text.length
       if (d?.type === 'thinking_delta' && d.thinking) textLen += d.thinking.length
-    } else if (!apiError && (ev?.is_error === true || ev?.is_api_error_message === true || typeof ev?.error === 'string')) {
+    } else if (!apiError && isApiFailure(ev)) {
       const text = ev.result || ev.message?.content?.[0]?.text || ''
       apiError = [ev.error, text].filter(Boolean).join(' — ') || 'unknown API error'
     }
@@ -148,9 +184,18 @@ await post('/api/session/destroy', { id }).catch(() => {})
 kill()
 await wait(500)
 await rm(dataDir, { recursive: true, force: true }).catch(() => {})
+// ── THE OUTCOME MUST FOLLOW THE DIAGNOSIS ────────────────────────────────────────────
+// A real API failure invalidates this run, so the assertions above are not a verdict in
+// EITHER direction and reporting their outcome would be a lie whichever way it fell. It is
+// also not a test failure: nothing in the app is broken, the harness could not reach its
+// subject. That is a PREREQUISITE problem, and this suite's own rule is that a prerequisite
+// problem must never be reported as a test result — so it exits 77, the runner's runtime-
+// skip code, which lands in the SKIP column with this reason attached. See run-suite.sh.
 if (apiError) {
-  console.error(`\n⚠  the CLI reported an API error, so this run is NOT a verdict on interrupt: ${apiError}`)
+  console.error(`\n[skip] the CLI reported an API failure, so this run is not a verdict on interrupt: ${apiError}`)
   console.error('   Re-running until it goes green proves nothing — fix the credential, then re-run.')
+  console.error(`   (assertions this run, reported for information only: ${failed === 0 ? 'all passed' : failed + ' failed'})`)
+  process.exit(77)
 }
 console.log(failed === 0 ? '\n🎉 all passed' : `\n💥 ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)

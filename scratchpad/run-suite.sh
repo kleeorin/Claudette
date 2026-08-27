@@ -582,6 +582,11 @@ SUITE=(
   # staying green. Its [2] LIVE control is the half that catches an inverted check.
   # `chrome:` and not `chrome+claude:` — the dead engine is a stand-in CLI that exits.
   "chrome:send-failed-guard.mjs"
+  # GROUP B — own server (4487), own vite (5287), own Chrome. The file editor's "reload from
+  # disk" button: it reloads, and it asks before discarding unsaved work. Registered because
+  # the confirm is the kind of gate that silently stops gating — [3]/[4] are the only two
+  # checks that can see it, and the mutation record in its header says so.
+  "chrome:editor-refresh-check.mjs"
   # PURE, no server, no browser (~3ms) — same shape as session-reducer-test.mts. Pins hazard
   # H6 from web/src/store/sessionReducer.ts: App.tsx's notebook-restore effect marked an id
   # seen BEFORE testing whether it could act on it, which permanently defeated the retry its
@@ -687,7 +692,7 @@ MSG
   fi
 fi
 
-pass=0; fail=0; skip=0; failed=()
+pass=0; fail=0; skip=0; failed=(); ran_logs=(); rtskipped=()
 
 # ---- GATE: a suite member must be ABLE to report failure -------------------------
 # `connectors-gpu-adversarial-test.mts` printed its findings and then called an
@@ -782,8 +787,37 @@ for entry in "${SUITE[@]}"; do
   timeout 300 "${cmd[@]}" >"$LOGDIR/$name.log" 2>&1
   rc=$?
   dur=$((SECONDS-start))
+  # Every log this run actually produced. The census below scans THIS list, not $LOGDIR/*.log
+  # — the log directory persists between runs, so globbing it would report findings from a
+  # file that did not run this time, which is the stale-data trap in its purest form.
+  ran_logs+=("$LOGDIR/$name.log")
   if [ $rc -eq 0 ]; then
     printf 'PASS  %-42s %3ds\n' "$f" "$dur"; pass=$((pass+1)); passed_files+=("$f")
+  elif [ $rc -eq 77 ]; then
+    # ---- RUNTIME SKIP (exit 77) ----------------------------------------------------
+    # A prerequisite this runner CANNOT probe in advance, discovered by the harness once it
+    # was already running: a dead credential, an upstream that will not answer, a device
+    # that vanished. Before this existed a harness in that position had only two ways to
+    # speak, and both lied — exit 0 and be counted as coverage that did not happen, or
+    # exit 1 and report a broken prerequisite as a defect, which this file's header
+    # forbids. interrupt-test.mts did the former for three consecutive baselines.
+    # It lands in the SKIP column but is NOT the same thing as a registration skip, so it
+    # is marked and listed separately: a registration skip means "we knew, we did not run
+    # it"; a runtime skip means "it RAN and could not verify its subject", which is a
+    # coverage hole with a green-looking summary and deserves to be loud.
+    # Truncate with a visible marker. A reason cut silently mid-word misleads — the first
+    # run of this printed "…: authentication" for `authentication_failed`, which reads like
+    # a different error. The full text is always in the log; this line only has to be
+    # enough to recognise it by.
+    # `.*` and NOT `[^$]*`: inside an ERE bracket expression `$` is a LITERAL, so `[^$]*` means
+    # "a run of non-dollar-sign characters" and truncates silently at the first `$` — which is
+    # plausible in a path or a measurement. `grep -o` is already per-line, so `.*` is what was
+    # meant. Same class as the mid-word truncation fixed two lines below, reintroduced one line
+    # away from its own lesson.
+    rs_reason=$(grep -am1 -oE '\[skip\].*' "$LOGDIR/$name.log" | sed 's/^\[skip\][[:space:]]*//' \
+                | awk '{ if (length($0) > 116) print substr($0,1,116) " …"; else print }')
+    printf 'SKIP* %-42s %3ds  %s\n' "$f" "$dur" "${rs_reason:-harness reported an unusable prerequisite}"
+    skip=$((skip+1)); rtskipped+=("$f|${rs_reason:-harness reported an unusable prerequisite}")
   else
     [ $rc -eq 124 ] && why="TIMEOUT(300s)" || why="rc=$rc"
     printf 'FAIL  %-42s %3ds  %s\n' "$f" "$dur" "$why"; fail=$((fail+1)); failed+=("$f")
@@ -816,6 +850,31 @@ if [ ${#unexp[@]} -gt 0 ]; then
 else
   [ $fail -gt 0 ] && echo "  no unexpected failures — every red in this run is a documented one."
 fi
+# ---- CENSUS: measured-but-unowned findings, and harnesses that could not verify ------
+# Three separate files now pass while their logs carry a defect they measured and chose not
+# to fail on (an `[open]` line). That is the right trade — the alternative is a permanent
+# false red — but three of them means `[open]` has quietly become the new place findings go
+# to be ignored, which is exactly what this suite keeps having to fix. So they are counted
+# and listed where the summary is read.
+# ★ THE COUNT PRINTS EVEN WHEN IT IS ZERO, deliberately. A line that only appears when there
+# is something to say cannot be distinguished from a line nobody wrote: "no open findings"
+# and "the census silently broke" would look identical. Zero has to be stated to mean zero.
+open_lines=()
+for lg in "${ran_logs[@]}"; do
+  [ -f "$lg" ] || continue
+  b=$(basename "$lg" .log)
+  while IFS= read -r line; do
+    open_lines+=("$b|$(echo "$line" | sed -E 's/.*\[open\][[:space:]]*//' \
+      | awk '{ if (length($0) > 104) print substr($0,1,104) " …"; else print }')")
+  done < <(grep -aoE '\[open\].*' "$lg" 2>/dev/null)   # `.*`, not `[^$]*` — see the note above
+done
+echo "  [open] measured, unowned, deliberately not failed on: ${#open_lines[@]}"
+for o in "${open_lines[@]}"; do printf '    · %-28s %s\n' "${o%%|*}" "${o#*|}"; done
+# A runtime skip is a COVERAGE HOLE wearing a green-looking summary — the harness ran and
+# could not verify its subject. Always stated, same argument as above.
+echo "  runtime skips (harness ran, could not verify its subject): ${#rtskipped[@]}"
+for r in "${rtskipped[@]}"; do printf '    !!! %-28s %s\n' "${r%%|*}" "${r#*|}"; done
+
 # An expected red that PASSES is not good news to be filed away: it means the work landed and
 # the banner above is now a stale post-mortem describing a defect that no longer exists —
 # the exact hazard that had a fixed data-dir bug reading as a live one for months. Say so.
