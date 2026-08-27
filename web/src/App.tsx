@@ -170,8 +170,43 @@ export function resolvePhonePane(
 // was measured against 164.
 const DOCK_RESERVE_PX = 164
 const DOCK_MIN_PX = 120
-const boundedDockH = (px: number) =>
-  `min(${px}px, max(${DOCK_MIN_PX}px, calc(var(--vvh, 100vh) - ${DOCK_RESERVE_PX}px)))`
+
+// THE STACKED COLUMN'S OWN RESERVE — why the flat one above is not enough there.
+//
+// In 'stack' with a content tab open, the Claude column is sized `stackH + dock + 1` and is
+// `shrink-0`, so the dock is no longer competing only with the viewport: it shares a budget
+// with `stackH` and with the content pane above it. Measured at 900x844 with a saved 600px
+// dock: 32 chrome + 0 content + 4 divider + 881 column = 917 against an 844px shell, clipping
+// the bottom 73px of the terminal, and 153px with a keyboard up.
+//
+// *** THE CAUSE IS NOT EITHER TERM. IT IS TWO INDEPENDENT BOUNDS ON ONE SHARED BUDGET. ***
+// The dock's bound is `--vvh - 164`: viewport-aware, but blind to `stackH` and to the content
+// pane. `stackH`'s drag max is `splitRef.height - 200`: content-pane-aware, but blind to the
+// dock. Each is individually satisfiable and their SUM is not, so neither shows up as the
+// culprit when you look at it alone — and neither alone can clip (a maximal dock with no
+// stackH fits; a maximal stackH with no dock fits).
+//
+// The content pane cannot be the one that gives way, because IT ALREADY DID: it is the only
+// elastic term here and it measured 0px in both states before anything was clipped. By the
+// time the terminal is being cut off, the file editor above it is already gone entirely.
+//
+// So the DOCK gives way, and it is the right term for three reasons: it is the only one that
+// already has a viewport-aware bound (this is one more subtrahend, not a new mechanism); it
+// has a designed floor (DOCK_MIN_PX), so "gives way" has a defined stopping point; and the
+// bound is transient CSS, so the user's dragged `termH` survives in state and re-expands when
+// there is room — clamping the persisted `stackH` instead would fight a saved preference and
+// need un-clamping later.
+//
+// 200 is not a new number: it is the same content-pane reserve `stackH`'s own drag max already
+// uses, so the two bounds now agree about what the content pane is owed instead of disagreeing.
+const STACK_CONTENT_MIN_PX = 200
+// MainTabs (h-8) + the drag divider (h-1) + the column's 1px top border. The mobile top bar is
+// `md:hidden` and this path is >= md only, so it is deliberately NOT counted. Measured, not
+// assumed: chrome 32, divider 4.
+const STACK_CHROME_PX = 32 + 4 + 1
+
+const boundedDockH = (px: number, reservePx: number = DOCK_RESERVE_PX) =>
+  `min(${px}px, max(${DOCK_MIN_PX}px, calc(var(--vvh, 100vh) - ${reservePx}px)))`
 
 function Shell() {
   const { sessions, activeId, setActive, homeDir } = useSessions()
@@ -300,6 +335,13 @@ function Shell() {
   // gets a named flag both the container and each TerminalView's `visible` prop read — keeping
   // that prop truthful is what stops xterm from fitting to a zero box.
   const dockVisible = dockShown && (!isPhone || shownPane === 'terminal')
+  // Computed ONCE and used at BOTH sites below. Computing it twice is exactly how the column
+  // came to reserve a different height than the dock occupied — a gap below the terminal
+  // instead of a clipped one. Keeping it a single value makes that divergence unrepresentable.
+  const dockHeightCss = boundedDockH(
+    termH,
+    active && layout === 'stack' ? STACK_CHROME_PX + STACK_CONTENT_MIN_PX + stackH : DOCK_RESERVE_PX,
+  )
   const setTermPane = (sid: string, fn: (p: TermPane) => TermPane) =>
     setTermsBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_TERM) }))
 
@@ -808,7 +850,7 @@ function Shell() {
                   // It must add the dock's BOUNDED height, not the raw `termH`: bounding one
                   // and not the other would make the column reserve space the dock no longer
                   // occupies, which is a gap below the terminal instead of a clipped one.
-                  ? (layout === 'side' ? { width: sideW } : { height: dockShown ? `calc(${stackH}px + ${boundedDockH(termH)} + 1px)` : stackH })
+                  ? (layout === 'side' ? { width: sideW } : { height: dockShown ? `calc(${stackH}px + ${dockHeightCss} + 1px)` : stackH })
                   : undefined}
               >
                 <div data-testid="pane" className={`flex-1 min-h-0 ${shownPane && shownPane !== 'chat' ? 'hidden' : ''}`}>
@@ -836,7 +878,7 @@ function Shell() {
                       // flex-1 inherits the visible viewport rather than the layout one.
                       : isPhone ? 'flex-1 min-h-0 flex flex-col min-w-0'
                       : 'shrink-0 flex flex-col min-w-0 border-t border-ctp-surface0'}
-                    style={dockVisible && !isPhone ? { height: boundedDockH(termH) } : undefined}
+                    style={dockVisible && !isPhone ? { height: dockHeightCss } : undefined}
                   >
                     {/* Tab strip: one tab per terminal in the ACTIVE session (× to close), + to add, hide on the right. */}
                     <div className="h-7 shrink-0 flex items-stretch gap-1 px-2 bg-ctp-mantle border-b border-ctp-surface0 overflow-x-auto">

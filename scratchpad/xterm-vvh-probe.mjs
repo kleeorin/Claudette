@@ -318,9 +318,28 @@ const COLUMN = `(() => {
     inlineHeights: [...document.querySelectorAll('[style]')].filter(e => e.style.height && !e.closest('.xterm')).map(e => (e.tagName + '.' + String(e.className).slice(0, 40) + '=' + e.style.height)),
     hasDemoTab: document.body.innerText.includes('demo.py') }
   const dr = dock.getBoundingClientRect(), cr = col.getBoundingClientRect()
+  // THE FULL BUDGET, term by term. The summary number alone ("clipped 73px") invites a
+  // single-culprit reading, and the clip is a SUM — every competing term is reported so the
+  // attribution can be checked rather than inferred.
+  //   splitRow  the flex row the column lives in (what the column must fit inside)
+  //   chromeH   everything above that row (MainTabs, plus the md:hidden mobile bar at phone)
+  //   contentH  the content pane, which is the elastic one and collapses FIRST
+  //   dividerH  the drag handle between them
+  const splitRow = col.parentElement
+  const sp = splitRow ? splitRow.getBoundingClientRect() : null
+  const content = splitRow ? [...splitRow.children].find(e => e !== col && !e.getAttribute('title')) : null
+  const divider = splitRow ? [...splitRow.children].find(e => e.getAttribute('title') === 'Drag to resize') : null
+  const chat = col.firstElementChild
   return { colInlineH: col.style.height, colH: Math.round(cr.height), colBottom: Math.round(cr.bottom),
            dockH: Math.round(dr.height), dockBottom: Math.round(dr.bottom),
-           gapPx: Math.round(cr.bottom - dr.bottom), clippedPx: Math.max(0, Math.round(dr.bottom - root.bottom)) }
+           gapPx: Math.round(cr.bottom - dr.bottom), clippedPx: Math.max(0, Math.round(dr.bottom - root.bottom)),
+           rootH: Math.round(root.height),
+           splitTop: sp ? Math.round(sp.top) : null, splitH: sp ? Math.round(sp.height) : null,
+           chromeH: sp ? Math.round(sp.top) : null,
+           contentH: content ? Math.round(content.getBoundingClientRect().height) : null,
+           dividerH: divider ? Math.round(divider.getBoundingClientRect().height) : null,
+           chatH: chat ? Math.round(chat.getBoundingClientRect().height) : null,
+           colTop: Math.round(cr.top) }
 })()`
 const colRest = await ev(COLUMN)
 await setVvh(PORTRAIT_KB)
@@ -334,17 +353,27 @@ if (colRest.err || colKb.err) {
      /--vvh/.test(colKb.colInlineH || ''), `column height: ${colKb.colInlineH}`)
   ok('fix', 'no gap opens below the terminal when the dock is bounded',
      Math.abs(colKb.gapPx) <= 2, `${colKb.gapPx}px between the dock's bottom and the column's`)
-  // NOT FIXED HERE, and NOT a keyboard defect. The column is `stackH + dock + 1` and
-  // `stackH` (280, also restored from localStorage) is bounded by nothing: 84px of chrome +
-  // 280 + 600 + 1 = 965 against an 844px shell, so the terminal is clipped AT REST on a full
-  // viewport, before any keyboard exists. Bounding the dock cannot fix that — it is a policy
-  // question about how stackH, the dock and the content pane share a short viewport, and
-  // that is a call to make deliberately rather than in passing. Asserted as "clips at rest
-  // too", which is what proves it pre-existing: if someone bounds stackH this goes green and
-  // the check should be deleted.
-  ok('open', 'PRE-EXISTING, unowned: the stacked column clips the terminal AT REST as well as with the keyboard',
+  // FIXED 2026-08-26 — and the attribution this line used to carry was WRONG, which is worth
+  // keeping because it is the reason the item sat open so long. It read "the residual is
+  // stackH (280px), not the dock". Measured term by term, the clip is a SUM: 32 chrome + 0
+  // content + 4 divider + 881 column against an 844px shell. Neither term alone can clip. The
+  // cause was two INDEPENDENT bounds on one shared budget — the dock bounded by `--vvh - 164`
+  // (blind to stackH) and stackH's drag max by `splitRef - 200` (blind to the dock).
+  // The content pane was never a candidate for "which gives way": it measured 0px in BOTH
+  // states, so it had already given everything before the terminal was cut at all.
+  ok('fix', 'the stacked column does NOT clip the terminal, at rest or with the keyboard up',
      colRest.clippedPx === 0 && colKb.clippedPx === 0,
-     `clipped ${colRest.clippedPx}px at rest (--vvh 844) and ${colKb.clippedPx}px with the keyboard up — the residual is stackH (280px), not the dock`)
+     `clipped ${colRest.clippedPx}px at rest (--vvh 844) and ${colKb.clippedPx}px with the keyboard up`)
+  // THE HALF THAT PROVES THE SQUEEZE WAS NOT JUST MOVED. Capping the column alone would also
+  // read as "not clipped" while leaving the content pane at 0 and the chat at 11px — the same
+  // budget failure one element over. At rest the content pane must get its full reserve back.
+  ok('fix', 'the content pane gets its reserve back at rest, rather than the clip moving to it',
+     colRest.contentH >= 200,
+     `content pane ${colRest.contentH}px at rest (was 0px), chat ${colRest.chatH}px, dock ${colRest.dockH}px`)
+  // With the keyboard up the floor wins and the content pane goes under its reserve — stated
+  // rather than asserted away, because a 120px terminal that is fully visible is the correct
+  // outcome and pretending otherwise would need a number nobody chose.
+  console.log(`  [note] keyboard-up: content ${colKb.contentH}px (below the 200px reserve — DOCK_MIN_PX floor wins, nothing clipped)`)
 
   // WHAT THE BOUND ACTUALLY BOUGHT, measured rather than computed. Put the dock and the
   // column back to their UNBOUNDED values by hand and re-measure the same clip. This runs
@@ -363,7 +392,7 @@ if (colRest.err || colKb.err) {
   })()`)
   ok('fix', 'the --vvh bound measurably shrinks the keyboard-up clip',
      before > colKb.clippedPx,
-     `${before}px clipped unbounded → ${colKb.clippedPx}px bounded (the remainder is the [open] stackH defect above)`)
+     `${before}px clipped unbounded → ${colKb.clippedPx}px bounded`)
 }
 
 // ── DESKTOP NO-REGRESSION ──────────────────────────────────────────────────────────────
