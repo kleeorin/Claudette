@@ -5,6 +5,7 @@ import { CodeEditor } from './CodeEditor'
 import { DiffEditor } from './DiffEditor'
 import { MilkdownEditor } from './MilkdownEditor'
 import { CsvTableView } from './CsvTableView'
+import { ConfirmDialog } from './ConfirmDialog'
 import { basename } from '../lib/paths'
 import { useScrollMemory } from '../lib/scrollMemory'
 import { errText } from '../lib/errText'
@@ -40,6 +41,8 @@ export function FileEditorView({ path, sessionId }: Props) {
   // Bumped to remount the editor with fresh disk content — e.g. after Claude's
   // proposal is applied, so the view shows the new text live (not the stale load).
   const [reloadKey, setReloadKey] = useState(0)
+  const [refreshing, setRefreshing] = useState(false)
+  const [confirmRefresh, setConfirmRefresh] = useState(false)
 
   // Latest editor text + status, in refs so the save callback never goes stale
   // and doesn't force the editors to rebuild on each keystroke. `loadedRef` is the
@@ -90,6 +93,47 @@ export function FileEditorView({ path, sessionId }: Props) {
     dirtyRef.current = false; setDirty(false)
     setBuffer(path, null, text)
     setReloadKey((k) => k + 1)
+  }, [path])
+
+  // ── Reload from disk ────────────────────────────────────────────────────────────
+  // The load effect above is keyed on `path` alone, so a file that changes underneath you
+  // — a Claude edit, a git checkout, another device, an external editor — stays on screen
+  // as it was when the tab opened. Until now the only way back was to close the tab and
+  // reopen it. This is that, without the round trip.
+  //
+  // It re-reads and replaces the WHOLE preview rather than routing through applyText,
+  // which only patches `.text` on an existing text preview. That distinction matters: a
+  // file can come back with different metadata — `truncated` flipping once it grows past
+  // the 2 MB cap is the obvious one — and patching only the text would leave the header
+  // claiming the old state while showing new content.
+  //
+  // The unsaved buffer is dropped explicitly. Refreshing IS the discard, so leaving the
+  // buffer would let peekBuffer restore the edits on the next mount and quietly undo what
+  // the user just asked for.
+  const doRefresh = useCallback(async () => {
+    setConfirmRefresh(false)
+    setRefreshing(true); setSaveErr(null)
+    try {
+      const p = await api.fs.read(path)
+      const disk = p.kind === 'text' ? p.text : ''
+      setPreview(p)
+      textRef.current = disk
+      loadedRef.current = disk
+      dirtyRef.current = false; setDirty(false)
+      // Third arg is the new baseline. It is unused when the text is null (the entry is
+      // deleted), but `base` is REQUIRED rather than defaulted — deliberately, since a
+      // defaulted '' could never match a non-empty file and would silently discard a real
+      // buffer. Passing `disk` matches applyText and keeps the call honest.
+      setBuffer(path, null, disk)
+      setReloadKey((k) => k + 1)
+    } catch (e) {
+      // Same failure surface as the initial load: a dropped connection or a non-JSON body
+      // (a proxy 502, an expired-cookie redirect to HTML) rejects here. Show it rather
+      // than leaving the button spinning with no explanation.
+      setSaveErr(errText(e))
+    } finally {
+      setRefreshing(false)
+    }
   }, [path])
 
   // Dirty is a real difference from disk, not "was ever edited" — so Milkdown's
@@ -277,6 +321,20 @@ export function FileEditorView({ path, sessionId }: Props) {
         )}
         <div className="ml-auto flex items-center gap-2">
           {saveErr && <span className="text-[10px] text-ctp-red truncate max-w-[220px]" title={saveErr}>{saveErr}</span>}
+          {/* Reload from disk. Gated behind a confirm ONLY when there is something to lose —
+              a clean file reloads immediately, because a dialog you always dismiss is one you
+              stop reading. Disabled mid-review: applyDecision writes the accepted hunks
+              against `baseText`, and swapping the file underneath that would decide hunks
+              against a document the user never saw. */}
+          <button
+            onClick={() => (dirty ? setConfirmRefresh(true) : void doRefresh())}
+            disabled={refreshing || reviewing}
+            title={reviewing ? "Finish reviewing Claude's proposed change first" : 'Reload this file from disk'}
+            aria-label="Reload from disk"
+            className="text-xs w-7 h-7 flex items-center justify-center rounded-md text-ctp-subtext hover:text-ctp-text hover:bg-ctp-surface0 disabled:opacity-40 disabled:cursor-not-allowed transition"
+          >
+            <span className={refreshing ? 'inline-block animate-spin' : undefined} aria-hidden>⟳</span>
+          </button>
           {showSave && (
             <button
               onClick={() => void save()}
@@ -289,6 +347,17 @@ export function FileEditorView({ path, sessionId }: Props) {
           )}
         </div>
       </div>
+
+      {confirmRefresh && (
+        <ConfirmDialog
+          title="Discard unsaved changes?"
+          body={<>Reloading <span className="font-mono text-ctp-text">{name}</span> from disk will discard your unsaved edits to it. This cannot be undone.</>}
+          confirmLabel="Discard and reload"
+          danger
+          onConfirm={() => void doRefresh()}
+          onCancel={() => setConfirmRefresh(false)}
+        />
+      )}
 
       {/* Proposal review bar — Claude's pending Edit/MultiEdit/Write for this file */}
       {reviewing && (
