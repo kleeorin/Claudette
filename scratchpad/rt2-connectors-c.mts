@@ -17,6 +17,19 @@
 // existed. The baselines of 74/4/6 and 75/4/6 both counted this red: a diff against them
 // should read the drop to 3 reds as A FALSE RED RETRACTED, NOT A DEFECT CLOSED.
 //
+// ── ★ A3's NAME WAS CORRECTED AGAIN ON 2026-08-27, AND THIS IS THE SECOND CORRECTION ──
+// It briefly asserted "is the session's request BOUNDED (does it complete at all)?" — which
+// generalised a measurement of ONE case into a claim about all of them. Measured: a DRIPPING
+// upstream (one chunked keepalive every 5s) was still open after 150s, because
+// upstream.setTimeout() is Node's socket IDLE timeout and any byte resets it. So:
+//   · silent upstream   → bounded at 120s, 504.   (asserted here)
+//   · dripping upstream → NOT BOUNDED AT ALL.     (an [open] below; no fix exists yet)
+// The history of this one assertion is the whole lesson of this file. It has now claimed, in
+// order: "hangs with no timeout" (false — a defect fixed before the probe was written),
+// "the request is bounded" (false in general — true only for the case measured), and now the
+// narrow thing that is actually true. Each wrong version was CONFIDENT AND SPECIFIC, which is
+// exactly why they survived. Name the case you measured, in the assertion itself.
+//
 // ★ THE TRAP, AND WHY THE `[open]` LINE BELOW MUST NOT BE "SIMPLIFIED" AWAY.
 // The obvious repair — widen the wait to 130s — turns this file green and leaves the REAL
 // concern with no representation anywhere: 120 seconds is an absurd bound for a `tools/list`
@@ -110,17 +123,34 @@ const A3_CEILING_MS = 130_000
 const t0 = Date.now()
 const r3 = await probe('silent', A3_CEILING_MS)
 const took = Math.round((Date.now() - t0) / 1000)
-attack('A: upstream never answers — is the session\'s request BOUNDED (does it complete at all)?',
-  !r3.startsWith('HUNG'), `${r3} after ${took}s`)
+// ★ THE LOWER BOUND IS NOT DECORATION. `!startsWith('HUNG')` alone goes green for ANY prompt
+// result — a fixture that fails to start, a refused port, an early throw — all of which return
+// in ~0s and satisfy "bounded" while proving nothing about the timeout. `took` was printed but
+// never asserted on, so the strongest evidence in this file was pinned by nothing.
+// 5s, not ~120s: this must survive the timeout VALUE changing (a per-method budget is being
+// designed), and the failure mode being excluded is an INSTANT return, not a slightly-wrong
+// one. The measured value is carried by the [open] line below, which is where it belongs.
+attack('A: upstream never answers AND SENDS NOTHING — is that case bounded?',
+  !r3.startsWith('HUNG') && took >= 5,
+  `${r3} after ${took}s` + (took < 5 && !r3.startsWith('HUNG')
+    ? ' ← returned instantly: that is a broken fixture, not a bounded request' : ''))
 // Not a finding — a measured fact with no owner, printed where it cannot be missed. Same
 // pattern as scratchpad/shell-fixed-cost-probe.mjs. The number is the point: the decision in
 // front of the operator is "is 120s right for a tools/list handshake", not "is this test ok".
 if (!r3.startsWith('HUNG')) {
-  console.log(`\n⚠  [open] MEASURED, unowned: a silent upstream ties up this call for ${took}s`)
+  console.log(`\n⚠  [open] MEASURED, unowned: a SILENT upstream ties up this call for ${took}s`)
   console.log('   before the 504 (connectorProxy.ts:48, UPSTREAM_TIMEOUT_MS = 120_000). That is the')
   console.log('   full handshake budget for a tools/list — the tool call is dead for two minutes and')
   console.log('   the session cannot tell. Bounded is not the same as reasonable. This file asserts')
   console.log('   only the bound; the VALUE is a product decision and deliberately not asserted here.')
+  console.log('')
+  console.log('⚠  [open] MEASURED 2026-08-27, unowned, and WORSE: a DRIPPING upstream is not bounded')
+  console.log('   AT ALL. upstream.setTimeout() is Node\'s SOCKET IDLE timeout, so any byte resets it.')
+  console.log('   A fixture emitting one chunked keepalive every 5s was STILL OPEN after 150s (29')
+  console.log('   drips), well past the 120s ceiling. So no resource bound exists for a stream that')
+  console.log('   trickles — the SSE-that-opens-and-dies case. The fix is a separate TOTAL-duration')
+  console.log('   guard (a plain setTimeout on the request, cleared on end), NOT a different idle')
+  console.log('   value; no choice of UPSTREAM_TIMEOUT_MS can bound this. Re-verify with SLOW=1.')
 }
 void modes
 
