@@ -155,6 +155,18 @@ async function enter() {
   await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
   await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
   await wait(300)
+  // EVERY SEND IN THIS HARNESS FAILS, BY CONSTRUCTION — and that is new information, not a
+  // defect. The sessions here are PHANTOMS: they exist only because the shim fed a synthetic
+  // `session:list` frame, so the real server behind this harness has never heard of `h1`.
+  // `sendUserTurn` therefore returns false and the server broadcasts `session:sendFailed`
+  // (sessionApi.ts). That was invisible until the dispatch fix made the frame arrive, and now
+  // ChatView answers it by restoring the lost text into the composer — correctly.
+  // So `enter()` no longer leaves an empty box, and the next `type()` INSERTS at the caret,
+  // producing the "first messagesecond message" concatenation. Clearing here restores this
+  // helper's original meaning: leave the composer as a SUCCESSFUL send would.
+  // Scenarios B/C/D never saw this because `resetToDraft()` already cleared for them; A and E
+  // are the two that type straight after a send.
+  await clearBox()
 }
 const state = () => evaluate(`(()=>{const ta=document.querySelector('textarea');return {v:ta.value,s:ta.selectionStart,e:ta.selectionEnd}})()`)
 // Walk back down to your own draft (level 0) and empty the box — where a scenario

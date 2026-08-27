@@ -284,6 +284,11 @@ window.__sf = {
     return true;
   },
   turnIdFor(text) { const m = (window.__sent || []).find((x) => (x.text || '').includes(text)); return m ? (m.turnId ?? null) : null; },
+  value() { const ta = this.composer(); return ta ? ta.value : null; },
+  // recallPrev only hijacks Up when there is no line above the caret — at level 0 it asks for
+  // the very start. Without this the Up presses below are swallowed as ordinary caret moves and
+  // every assertion in [4] would measure a history pointer that never left 0.
+  caret(pos) { const ta = this.composer(); if (!ta) return false; ta.focus(); ta.selectionStart = ta.selectionEnd = pos; return true; },
   // Hand the page a sendFailed frame as if the server had sent it. Used ONLY by [3], which
   // pins a CLIENT-side decision that no server can produce: the server always sends a
   // turnId, so a frame without one cannot be generated end-to-end.
@@ -307,6 +312,18 @@ await wait(1500)
 const loadsAtStart = await evaluate(`Number(sessionStorage.getItem('__loads') || 0)`)
 
 
+
+// Real key events, not synthetic ones: `recallPrev`/`recallNext` read `selectionStart` off the
+// DOM, and the composer's handler calls `preventDefault()` — both behave faithfully only for a
+// genuine key press. `n` repeats it (walking back down several levels at once).
+const pressKey = async (name, code, n = 1) => {
+  await evaluate(`(() => { const ta = window.__sf.composer(); if (ta) ta.focus(); return true })()`)
+  for (let i = 0; i < n; i++) {
+    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: name, code: name, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code })
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: name, code: name, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code })
+    await wait(180)
+  }
+}
 
 const sendTurn = async (text) => {
   await evaluate(`window.__sf.type(${JSON.stringify(text)})`)
@@ -411,6 +428,77 @@ if (failed) {
       landed, landed ? '' : `← inject returned ${injectedReal}; the frame is not reaching the client, so [3b] proves nothing`)
   }
 }
+
+  // ═══ [4] THE COMPOSER RESTORE — the feature, and the guard on it ═══════════════════
+  // Added because NOTHING tested this. Sections [1]–[3] assert the BUBBLE (its sentence,
+  // its dashed styling, its turnId handling) and only that the composer stays USABLE. The
+  // restore — putting the lost turn's text back so the user can edit and resend — had no
+  // coverage at all, in either direction, which is how a correct feature came to be blamed
+  // for a stale test premise in composer-history-repro.
+  console.log('\n[4] the failed turn is restored INTO the composer')
+  const loads4 = await evaluate(`Number(sessionStorage.getItem('__loads') || 0)`)
+  if (loads4 !== loadsAtStart) {
+    console.log(`  ⚠ the page reloaded before [4] (document loads ${loadsAtStart} → ${loads4}) — [4] DID NOT RUN.`)
+    console.log('    A reload re-seeds the composer from the draft store, so nothing here is measurable after one.')
+  } else {
+  await evaluate(`window.__sf.clickSession(${JSON.stringify(DEAD)})`)
+  await wait(900)
+  // Start from a known place: level 0, empty box. Down walks back out of any recalled level.
+  await pressKey('ArrowDown', 40, 6)
+  await evaluate(`window.__sf.type('')`)
+  await wait(300)
+
+  // ── [4a] THE FEATURE. End to end, no injection: the DEAD session's engine really is gone,
+  // so this send really fails and the real frame really arrives.
+  const RESTORE_TEXT = 'zzrestoremezz the words I do not want to retype'
+  await sendTurn(RESTORE_TEXT)
+  const restored = await waitFor(`window.__sf.value() === ${JSON.stringify(RESTORE_TEXT)}`, 15000)
+  ok('core', '[4a] a failed send puts its text BACK in the empty composer',
+    restored, restored ? '' : `composer holds ${JSON.stringify(await evaluate(`window.__sf.value()`))} — the words are lost`)
+
+  // ── [4b] THE GUARD. The restore must not fire while the user is BROWSING history.
+  // Reaching the state needs care: at a recalled level the box normally holds the recalled
+  // text, so the empty-composer guard already blocks and this one would never be exercised.
+  // The window where they differ is REAL but narrow — recall a message, decide against it,
+  // clear the box, and you are sitting at level 1 with an empty composer. That is the state
+  // built below, and it is the only one in which [4b] tests anything.
+  await evaluate(`window.__sf.type('')`)
+  await wait(300)
+  await evaluate(`window.__sf.caret(0)`)
+  await pressKey('ArrowUp', 38)                       // level 0 → 1, box = the recalled turn
+  const recalledText = await evaluate(`window.__sf.value()`)
+  ok('setup', '[4b0] PRECONDITION: Up actually recalled a message (history level is not 0)',
+    typeof recalledText === 'string' && recalledText.length > 0, `box=${JSON.stringify(recalledText)}`)
+  await evaluate(`window.__sf.type('')`)              // clear it, still at level 1
+  await wait(300)
+
+  const restoreTurnId = await evaluate(`window.__sf.turnIdFor(${JSON.stringify(RESTORE_TEXT)})`)
+  ok('setup', '[4b1] PRECONDITION: the restored turn has a turnId to inject',
+    typeof restoreTurnId === 'string' && !!restoreTurnId, `turnId=${restoreTurnId}`)
+  await evaluate(`window.__sf.inject(${JSON.stringify(dead.id)}, ${JSON.stringify(restoreTurnId)})`)
+  await wait(1200)
+  const midBrowseBox = await evaluate(`window.__sf.value()`)
+  ok('core', '[4b2] mid-browse, the restore DECLINES: the composer is left alone',
+    midBrowseBox === '',
+    midBrowseBox === '' ? 'box still empty'
+      : `composer holds ${JSON.stringify(midBrowseBox)} — it wrote into a box the user is browsing with`)
+
+  // ★ AND THE HALF THAT MATTERS MORE — assert the LEVEL, not the visible text.
+  // `goTo` saves the box's live DOM value against the level it is LEAVING, so a restore that
+  // lands mid-browse is not merely overwritten by the next keypress: it is recorded as the
+  // user's own edit of that level and comes back every time they return to it. Walking away
+  // and back is what makes that persistence observable; asserting the visible text alone
+  // would pass even while level 1 carried a message the user never typed.
+  await evaluate(`window.__sf.caret(0)`)
+  await pressKey('ArrowDown', 40)                     // level 1 → 0, saving the box against 1
+  await evaluate(`window.__sf.caret(0)`)
+  await pressKey('ArrowUp', 38)                       // back to level 1
+  const level1 = await evaluate(`window.__sf.value()`)
+  ok('core', '[4b3] …and the browsed LEVEL is not corrupted: it still holds what the user left',
+    level1 === '',
+    level1 === '' ? 'level 1 still holds the empty box the user left there'
+      : `level 1 holds ${JSON.stringify(level1)} — a fake edit the user never typed, persisted by goTo`)
+  }
 
 console.log(`\n${passed} passed / ${failed} failed`)
 reapAll()

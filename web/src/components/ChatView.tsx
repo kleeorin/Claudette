@@ -174,6 +174,43 @@ export function ChatView({ sessionId, visible = true }: {
     saveNav(sessionId, { ptr, edits: out })
   }, [sessionId])
   const resetNav = useCallback(() => { editsRef.current.clear(); setHistPtr(0); saveNav(sessionId, { ptr: 0, edits: {} }) }, [sessionId])
+
+  // A turn the server could not hand to a live engine: put its TEXT back in the
+  // composer. The dashed "Not delivered" bubble is a receipt, and a receipt is nearly
+  // worthless on its own — what the user lost is the words, and the only thing they
+  // want to do with them is edit and resend. The draft store is already the right home:
+  // per-session, localStorage-backed, seeded on mount above, and pruned when a session
+  // goes away, so this needs no new lifecycle and no server change at all.
+  //
+  // IT MUST GO THROUGH setDraft, NOT saveDraft. Writing localStorage directly from here
+  // would be clobbered within 300ms by the debounced persist effect above, which writes
+  // whatever `draft` currently holds — normally '' at exactly this moment, because the
+  // send that just failed cleared the composer. Routing through state means that same
+  // effect persists the restored text for us.
+  //
+  // ONLY WHEN THE COMPOSER IS EMPTY. That is the overwhelmingly common case (the send
+  // cleared it moments ago). If the user has since started typing something else,
+  // silently replacing it would destroy live work to recover dead work — so the bubble
+  // stays the fallback there, with its text selectable, and Up-arrow still reaches it
+  // because pushHistory recorded it on send.
+  //
+  // AND ONLY AT HISTORY LEVEL 0. An empty composer is not the same as an idle one: the user
+  // may be BROWSING recalled messages, and level 0 with an empty box is where browsing starts
+  // and returns to. `goTo` saves the box's live DOM value against the level it is leaving, so a
+  // restore landing mid-browse does not merely get overwritten — it is recorded as the user's
+  // edit of whatever level they were on, and survives there. That corrupts navigation rather
+  // than just the current text. Reachable in the real app: send a turn, press Up before the
+  // frame arrives. Nothing is lost by declining — `pushHistory` recorded the turn on send, so
+  // Up still reaches it, and the "Not delivered" bubble still holds the text.
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+  const histPtrRef = useRef(histPtr)
+  histPtrRef.current = histPtr
+  useEffect(() => api.on.sendFailed((id, turnId) => {
+    if (id !== sessionId || !turnId || draftRef.current || histPtrRef.current !== 0) return
+    const lost = itemsRef.current.find((it) => it.kind === 'user' && it.id === turnId)
+    if (lost?.kind === 'user') setDraft(lost.text)
+  }), [sessionId])
   // Step to another history level, taking the box's current text with us: it's saved
   // against the level we're leaving, so coming back — including all the way back to
   // level 0, your own half-written message — restores it verbatim. Read from the DOM
