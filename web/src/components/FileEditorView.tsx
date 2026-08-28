@@ -43,6 +43,12 @@ export function FileEditorView({ path, sessionId }: Props) {
   const [reloadKey, setReloadKey] = useState(0)
   const [refreshing, setRefreshing] = useState(false)
   const [confirmRefresh, setConfirmRefresh] = useState(false)
+  // Live sync: the file moved on disk while we hold unsaved edits (stale), or was deleted
+  // out from under us (gone). Both are BANNERS, never modals — these fire because a
+  // background process touched a file, and a dialog that appears while you are typing is
+  // the wrong shape for news you did not ask for.
+  const [staleOnDisk, setStaleOnDisk] = useState(false)
+  const [goneFromDisk, setGoneFromDisk] = useState(false)
 
   // Latest editor text + status, in refs so the save callback never goes stale
   // and doesn't force the editors to rebuild on each keystroke. `loadedRef` is the
@@ -56,6 +62,7 @@ export function FileEditorView({ path, sessionId }: Props) {
   useEffect(() => {
     let cancelled = false
     setLoading(true); setDirty(false); dirtyRef.current = false; setSaveErr(null)
+    setStaleOnDisk(false); setGoneFromDisk(false)
     api.fs.read(path).then((p) => {
       if (cancelled) return
       const disk = p.kind === 'text' ? p.text : ''
@@ -113,6 +120,7 @@ export function FileEditorView({ path, sessionId }: Props) {
   const doRefresh = useCallback(async () => {
     setConfirmRefresh(false)
     setRefreshing(true); setSaveErr(null)
+    setStaleOnDisk(false); setGoneFromDisk(false)
     try {
       const p = await api.fs.read(path)
       const disk = p.kind === 'text' ? p.text : ''
@@ -134,6 +142,42 @@ export function FileEditorView({ path, sessionId }: Props) {
     } finally {
       setRefreshing(false)
     }
+  }, [path])
+
+  // --- live sync: follow the file on disk, the way a notebook already does -----------
+  //
+  // Subscribe while this path is open; the server refcounts, so two tabs on one file are
+  // independent. `fs:changed` is broadcast to EVERY socket (the hub does no per-socket
+  // filtering, by design), so the path comparison here is load-bearing, not defensive.
+  //
+  // Three cases, and they are the same three NotebookDocManager.onDiskChange has:
+  //   reviewing → do NOTHING. applyDecision writes accepted hunks against `baseText`;
+  //     swapping the file underneath decides hunks against a document the user never saw.
+  //     The ⟳ button is disabled here for exactly this reason — live sync is the same
+  //     hazard arriving through a different door, so it obeys the same rule.
+  //   clean     → take disk silently. doRefresh already does the whole job.
+  //   dirty     → flag it and let the user choose. Never clobber an unsaved buffer.
+  //
+  // Reading the REFS rather than `dirty`/`reviewing` state: the subscription is created
+  // once per path, so a value captured at subscribe time would be the answer from whenever
+  // this file was opened — for the dirty flag specifically, always `false`.
+  const reviewingRef = useRef(false)
+  const refreshRef = useRef(doRefresh)
+  refreshRef.current = doRefresh
+  useEffect(() => {
+    api.fs.watch(path)
+    const offChanged = api.on.fsChanged((p) => {
+      if (p !== path) return
+      if (reviewingRef.current) return
+      // A save of our own comes back byte-identical, so this is a no-op rather than a
+      // flicker — no server-side `writing` flag needed. Content comparison also stays
+      // correct when someone else's write lands inside the same debounce window, which
+      // an mtime check would not.
+      if (dirtyRef.current) setStaleOnDisk(true)
+      else void refreshRef.current()
+    })
+    const offRemoved = api.on.fsRemoved((p) => { if (p === path) setGoneFromDisk(true) })
+    return () => { offChanged(); offRemoved(); api.fs.unwatch(path) }
   }, [path])
 
   // Dirty is a real difference from disk, not "was ever edited" — so Milkdown's
@@ -242,6 +286,9 @@ export function FileEditorView({ path, sessionId }: Props) {
   // permission card in the chat.
   const canReview = !!proposal && applied?.ok === true
   const reviewing = canReview && !dirty && baseText != null   // diff view is live
+  // Mirrored into a ref for the live-sync subscription above, which is created once per
+  // path and would otherwise read whatever this was when the file was opened.
+  reviewingRef.current = reviewing
   const reviewBlocked = canReview && dirty                    // save first to review
 
   // When a proposal we were reviewing resolves from ELSEWHERE — Allowed/Denied on the
@@ -347,6 +394,33 @@ export function FileEditorView({ path, sessionId }: Props) {
           )}
         </div>
       </div>
+
+      {/* Live-sync notices. Banners rather than modals, and deliberately not auto-resolved:
+          both of these mean "someone else changed the world under you", and the right
+          response is always the user's to pick. */}
+      {goneFromDisk && (
+        <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 text-[11px] bg-ctp-red/10 border-b border-ctp-red/30 text-ctp-red">
+          <span className="flex-1">
+            <span className="font-mono">{name}</span> was deleted on disk. Your copy is still here —
+            Save to write it back.
+          </span>
+          <button onClick={() => setGoneFromDisk(false)} className="shrink-0 px-1 hover:brightness-125" aria-label="Dismiss">✕</button>
+        </div>
+      )}
+      {staleOnDisk && !goneFromDisk && (
+        <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 text-[11px] bg-ctp-yellow/10 border-b border-ctp-yellow/30 text-ctp-yellow">
+          <span className="flex-1">Changed on disk since you started editing.</span>
+          <button
+            onClick={() => setConfirmRefresh(true)}
+            className="shrink-0 px-2 py-0.5 rounded bg-ctp-yellow/20 hover:bg-ctp-yellow/30 font-medium"
+          >Reload…</button>
+          <button
+            onClick={() => setStaleOnDisk(false)}
+            className="shrink-0 px-2 py-0.5 rounded hover:bg-ctp-yellow/15"
+            title="Keep editing; your Save will overwrite what is on disk"
+          >Keep mine</button>
+        </div>
+      )}
 
       {confirmRefresh && (
         <ConfirmDialog

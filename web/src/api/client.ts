@@ -95,6 +95,13 @@ const paneOutputs = channel<[string, string]>()
 const paneExits = channel<[string]>()
 const focusPanes = channel<[string, string, string]>()   // [sessionId, notebookId, path]
 const focusFiles = channel<[string, string]>()           // [sessionId, path]
+// A watched file changed / vanished on disk. Path only — the subscriber re-reads through
+// GET /api/fs/read, so readPreview stays the single implementation of "what is this file".
+const fsChanges = channel<[string]>()
+const fsRemovals = channel<[string]>()
+// Paths this page has asked the server to watch, with a LOCAL refcount. Survives the
+// socket so the watches can be re-armed on reconnect — see api.fs.watch for why.
+const watched = new Map<string, number>()
 
 let ws: WebSocket | null = null
 // Has the socket EVER been open in this page load? Set once in `sock.onopen`, never cleared.
@@ -109,6 +116,13 @@ const outbox: WsClientMessage[] = []
 function send(msg: WsClientMessage): void {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
   else outbox.push(msg)  // flushed on (re)connect
+}
+
+// Send only if the socket is up, never queue. For messages that describe STATE rather than
+// an event: the state is re-sent wholesale on connect, so queuing an individual change
+// would double-apply it. `watched` is the only such state today.
+function sendLive(msg: WsClientMessage): void {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
 }
 
 function dispatch(msg: WsServerMessage): void {
@@ -133,6 +147,8 @@ function dispatch(msg: WsServerMessage): void {
     case 'pane:exit': paneExits.emit(msg.id); break
     case 'session:focusPane': focusPanes.emit(msg.id, msg.notebookId, msg.path); break
     case 'session:focusFile': focusFiles.emit(msg.id, msg.path); break
+    case 'fs:changed': fsChanges.emit(msg.path); break
+    case 'fs:removed': fsRemovals.emit(msg.path); break
     // 'hello' / 'pong' are connection-liveness only.
   }
 }
@@ -153,6 +169,11 @@ function connect(): void {
     everConnected = true
     connected.emit(true)
     for (const m of outbox.splice(0)) sock.send(JSON.stringify(m))
+    // Re-arm file watches. The server keys them per socket and released this page's on the
+    // old socket's close, so a watch that was delivered successfully is nonetheless gone.
+    // `watched` is the authoritative set (watch/unwatch never queue), so this is a full
+    // state re-sync rather than a replay of missed messages.
+    for (const path of watched.keys()) sock.send(JSON.stringify({ type: 'fs:watch', path }))
   }
   sock.onmessage = (e) => {
     let msg: WsServerMessage
@@ -248,6 +269,10 @@ export const api = {
     // The authoritative set of running/queued cells for a notebook (server-owned).
     notebookRunning: (fn: Fn<[string, string[]]>) => nbRunning.on(fn),
     paneOutput: (fn: Fn<[string, string]>) => paneOutputs.on(fn),
+    // An open editor's file moved on disk. Broadcast to every socket (the hub does no
+    // per-socket filtering), so a subscriber MUST compare the path against its own.
+    fsChanged: (fn: Fn<[string]>) => fsChanges.on(fn),
+    fsRemoved: (fn: Fn<[string]>) => fsRemovals.on(fn),
     paneExit: (fn: Fn<[string]>) => paneExits.on(fn),
     // Claude asked (via open_notebook) to focus a notebook in a given session.
     focusPane: (fn: Fn<[string, string, string]>) => focusPanes.on(fn),
@@ -380,6 +405,41 @@ export const api = {
     remove: (path: string) => post<WriteResult>('/api/fs/delete', { path }),
     // A same-origin URL the browser can navigate to; the auth cookie rides along.
     downloadUrl: (path: string) => `/api/fs/download?path=${encodeURIComponent(path)}`,
+    // Ask the server to watch / stop watching a path for this client.
+    //
+    // Two things happen here that a bare `send` would get wrong, and both are about the
+    // fact that the server's refcount is keyed PER SOCKET:
+    //
+    // 1. RE-ARM AFTER A RECONNECT. A watch is not a message that can sit in `outbox` — it
+    //    was delivered successfully, so nothing retains it — but the socket it was
+    //    registered against is gone, and the server released everything that socket held
+    //    when it closed. Without re-sending on the next open, live sync silently stops
+    //    working after any drop (a server restart, a laptop sleep, a network blip) and the
+    //    editor goes back to its pre-live behaviour with nothing on screen to say so. A
+    //    feature that fails by becoming invisible is the worst kind to leave unhandled.
+    // 2. COLLAPSE TO ONE WATCH PER PATH PER SOCKET. Two editors open on the same file each
+    //    call watch/unwatch; sending both would make the re-arm (which can only send one
+    //    per path) leave the server's count lower than the unwatches that will follow.
+    //    Counting locally and only talking to the server on the 0↔1 edge makes the wire
+    //    contract exactly one watch and one unwatch per path, which is trivially idempotent.
+    //
+    // Both use `sendLive`, so neither is ever QUEUED. A watch is state, not an event: the
+    // whole set is re-sent on connect, so an outboxed fs:watch would arrive and then be
+    // re-armed a second time — one watch too many against a socket that will only ever send
+    // one unwatch, which is a leaked watch that nothing can cancel. An fs:unwatch during an
+    // outage is moot for the same reason the re-arm is needed: the server released every
+    // watch this page held the moment the old socket closed.
+    watch: (path: string) => {
+      const n = (watched.get(path) ?? 0) + 1
+      watched.set(path, n)
+      if (n === 1) sendLive({ type: 'fs:watch', path })
+    },
+    unwatch: (path: string) => {
+      const n = (watched.get(path) ?? 1) - 1
+      if (n > 0) { watched.set(path, n); return }
+      watched.delete(path)
+      sendLive({ type: 'fs:unwatch', path })
+    },
   },
   // Permission Control Center: read the merged picture over GET (cwd + agent in the
   // query); add/remove a rule over POST. Per-session mode uses http.setMode.

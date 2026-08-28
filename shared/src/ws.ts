@@ -15,6 +15,18 @@ import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, Kerne
 
 export type WsClientMessage =
   | { type: 'ping' }
+  // ── Live file sync: the editor asks the server to tell it when a file changes ──────
+  // Sent on editor mount / path change, released on unmount. REFCOUNTED server-side: the
+  // same file is routinely open in two tabs, and a naive map would make closing either one
+  // go blind in the other.
+  // These are OPERATOR-scoped, exactly like the `/api/fs/*` routes they shadow — the file
+  // browser is the operator's own, guarded by the auth cookie plus the Sec-Fetch-Site CSRF
+  // hook, with no per-session containment. A watch is precisely as privileged as the
+  // `GET /api/fs/read` beside it. Said explicitly because the next reader will assume a
+  // path-taking API must be session-confined and will otherwise either add a redundant
+  // check or conclude the missing one is a bug.
+  | { type: 'fs:watch'; path: string }
+  | { type: 'fs:unwatch'; path: string }
   // Native turn I/O for a session (lifecycle create/list/destroy/… is HTTP).
   | { type: 'session:send'; id: string; text: string; turnId?: string }
   | { type: 'session:interrupt'; id: string }
@@ -44,6 +56,18 @@ export type WsClientMessage =
 
 export type WsServerMessage =
   | { type: 'hello'; version: string }
+  // ── Live file sync: a watched file moved on disk ───────────────────────────────────
+  // Carries NO CONTENT, deliberately. The client re-reads through the existing
+  // `GET /api/fs/read`, which already owns the kind / truncation / binary / data-url
+  // logic; putting text on the socket would mean a second implementation of readPreview,
+  // and the second one is the one that drifts. The cost is one round trip per external
+  // change. Broadcast to every socket (the hub does no per-socket filtering, by design) —
+  // a tab not showing `path` simply ignores it.
+  | { type: 'fs:changed'; path: string }
+  // Distinct from fs:changed because the client's response differs: a deleted file with
+  // unsaved edits is the one case where the in-memory buffer is the only surviving copy,
+  // so the editor keeps it and shows a banner rather than following disk.
+  | { type: 'fs:removed'; path: string }
   | { type: 'pong'; ts: number }
   // A snapshot of all sessions, sent on connect so a fresh tab renders the list.
   | { type: 'session:list'; sessions: SessionInfo[] }

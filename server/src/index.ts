@@ -10,6 +10,7 @@ import { sandboxAvailable, gpuDevicePaths } from './claude/sandbox'
 import { SessionConfinement } from './claude/sessionConfinement'
 import { reclaimStrandedHostConfigs } from './claude/configProtection'
 import { WsHub } from './ws/hub'
+import { FileWatchRegistry } from './fs/fileWatchRegistry'
 import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage, sendSessionSnapshots } from './session/sessionApi'
 import { loadState, saveState } from './session/sessionPersistence'
 import { NotebookDocManager } from './notebook/notebookDocManager'
@@ -56,6 +57,14 @@ app.addHook('preHandler', makeAuthHook(auth))
 // notebook tools (registered below) read the registry to target the notebook the
 // user is viewing, and `open_notebook` broadcasts a focus message through the hub.
 const hub = new WsHub()
+
+// Live file sync: watch what the editors have open and broadcast disk changes. The message
+// carries no content — the client re-reads through GET /api/fs/read, which already owns the
+// kind/truncation/binary logic, so putting text on the socket would mean a second
+// implementation of readPreview and the second one is the one that drifts.
+const fileWatches = new FileWatchRegistry((e) =>
+  hub.broadcast({ type: e.kind === 'removed' ? 'fs:removed' : 'fs:changed', path: e.path }))
+hub.onClose((ws) => fileWatches.release(ws))
 const activePanes = new ActivePaneRegistry()
 // Per-turn "working notebook" pin: once Claude establishes which notebook a turn is
 // about, path-unset tools stick to it even if the user navigates away (see
@@ -344,6 +353,11 @@ wss.on('connection', (ws: WebSocket) => {
       activePanes.set(msg.id, msg.pane)
       return
     }
+    // Live file sync. Keyed by the SOCKET so a closed tab releases exactly what it held;
+    // see fileWatchRegistry's cleanup note for why the socket is both the refcount key and
+    // the release trigger.
+    if (msg.type === 'fs:watch') { fileWatches.watch(msg.path, ws); return }
+    if (msg.type === 'fs:unwatch') { fileWatches.unwatch(msg.path, ws); return }
     if (handleNotebookClientMessage(notebooks, kernels, msg)) return
     if (handlePaneClientMessage(panes, msg)) return
     handleSessionClientMessage(sessions, msg, hub)
