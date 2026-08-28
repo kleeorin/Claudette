@@ -178,12 +178,24 @@ ok(await evaluate(`document.body.innerText.includes('Files')`), 'app shell rende
 // rot, not a missing precondition: `FileManager.tsx:23` records that "the old modal file
 // picker and the tab-strip '+ notebook' are retired in favour of this", and the string
 // exists nowhere in web/src except that comment. The flow is now three steps —
-// Files dock → "+ New ▾" → "📓 Notebook" → name it and press Enter.
+// Files dock → "+ New ▾" → "Notebook" → name it and press Enter.
+//
+// ★ MATCHED BY TEXT ALONE, NOT BY THE ICON, AND THAT IS THE POINT (fixed 2026-08-28).
+// This asserted `textContent.trim() === '📓 Notebook'`. Commit 9df0744 replaced the emoji
+// with a drawn <FileIcon kind="notebook" /> — an SVG, which contributes NO text — so the
+// button's text became plain "Notebook" and the exact-equality match could never hold
+// again. Nothing about the feature changed; the harness was asserting a glyph the product
+// had deliberately stopped rendering.
+// It went unnoticed because this file needs jupyter_server, which was unavailable on this
+// machine until 2026-08-28 — so it SKIPped for the whole life of the change that broke it.
+// A test that cannot run is a test that cannot tell you it has gone stale.
+// Matching on the label rather than the decoration also makes this survive the next icon
+// change, which is the one thing about a files dock you can be sure will happen again.
 // EXACT text match, not `includes`. A substring match silently hit the sidebar's
 // "+ New session" button — it contains "+ New" and comes earlier in the DOM — which opened
 // the New Session dialog instead of the dock's "+ New ▾" menu. And because the helper
 // returned "true, I clicked something", the assertion went GREEN while the flow was already
-// off the rails; the failure only surfaced two steps later as a missing 📓 Notebook item.
+// off the rails; the failure only surfaced two steps later as a missing Notebook item.
 // A click helper that reports success for clicking the WRONG thing is the same class of
 // lie as a selector that has rotted.
 const clickExact = async (label) => evaluate(
@@ -197,9 +209,9 @@ ok(await evaluate(`!!document.querySelector('input[placeholder="Filter…"], but
   'Files dock actually rendered (not just a click that landed somewhere)')
 ok(await clickExact('+ New ▾'), '"+ New ▾" menu opened')
 await wait(200)
-ok(await evaluate(`[...document.querySelectorAll('button')].some(b => b.textContent.trim() === '📓 Notebook')`),
-  'the add-menu is open and offers 📓 Notebook')
-ok(await clickExact('📓 Notebook'), '"📓 Notebook" chosen')
+ok(await evaluate(`[...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Notebook')`),
+  'the add-menu is open and offers a Notebook item')
+ok(await clickExact('Notebook'), '"Notebook" chosen')
 await wait(200)
 ok(await evaluate(`!!document.querySelector('input[placeholder="name.ipynb"]')`), 'the name input appeared')
 // The name input is React-controlled, so set it through the native setter and fire `input`;
@@ -219,7 +231,7 @@ await wait(100)
 // user does and is what this harness is for.
 // PRECONDITION, ASSERTED. Ungated, and the input is CONDITIONAL — FileManager only renders
 // this placeholder while `creating === 'notebook'` (web/src/components/FileManager.tsx), so it
-// exists only if the "📓 Notebook" menu click above actually landed. If that first step fails,
+// exists only if the "Notebook" menu click above actually landed. If that first step fails,
 // this line throws inside the page, Enter goes nowhere, no notebook is created, and the red
 // surfaces on whatever asserts the notebook exists — naming step two after step one's failure.
 // Verified 2026-08-25: the placeholder does render with that exact text, so this is fragility,
