@@ -293,8 +293,23 @@ for (let i = 0; i < 60; i++) {
 }
 ok(got42, 'cell ran through the UI and output 42 appeared')
 
-// Kernel status dot should have reached idle (title="kernel: idle").
-ok(await evaluate(`!!document.querySelector('[title="kernel: idle"], [title="kernel: busy"]')`), 'kernel status surfaced in header')
+// Kernel status in the notebook header. This looked for `[title="kernel: idle"]`, an
+// attribute nothing in web/src renders — NotebookView surfaces the status as a coloured dot
+// plus a STATUS_LABEL span inside the "Choose kernel" button (web/src/lib/kernelStatus.ts:
+// none/idle/busy/starting…/dead). So the check could not pass however healthy the kernel
+// was, and it went unnoticed for the same reason as the emoji above: this file needs
+// jupyter_server, which was unavailable here until 2026-08-28, so it SKIPped throughout.
+//
+// Scoped to the notebook HEADER rather than the whole page, and asserted against the labels
+// that mean a kernel is actually up. A bare innerText search for "idle" would also match the
+// sessions sidebar, which renders that word for every idle session — it would have passed
+// with no kernel at all, which is worse than the red it replaces.
+ok(await evaluate(`(() => {
+  const btn = [...document.querySelectorAll('button')].find((b) => b.title === 'Choose kernel')
+  if (!btn) return false
+  const t = btn.textContent || ''
+  return t.includes('idle') || t.includes('busy') || t.includes('starting')
+})()`), 'kernel status surfaced in the notebook header')
 
 ok(consoleErrors.length === 0, `no uncaught page errors${consoleErrors.length ? ': ' + consoleErrors.join(' | ') : ''}`)
 
