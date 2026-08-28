@@ -555,7 +555,15 @@ export function pathVisibleInSandbox(mounts: SandboxMount[], p: string): boolean
 // dest paths of the rw mounts (where the box writes), never a symlink's target, so a
 // malicious link can't launder itself into the writable set.
 function isUnsafeSymlinkMount(p: string, rwRoots: string[]): boolean {
-  if (!isSymlink(p)) return false
+  return symlinkMountRefusal(p, rwRoots) !== undefined
+}
+
+// The same computation as isUnsafeSymlinkMount, returning WHY rather than merely whether.
+// It is the primitive and the boolean above is the thin wrapper, not the other way round:
+// two copies of this rule would be free to drift, and the one that drifted would be the one
+// nobody was watching. See sessionDataMountPlan for what consumes the reason.
+function symlinkMountRefusal(p: string, rwRoots: string[]): MountExclusionReason | undefined {
+  if (!isSymlink(p)) return undefined
   // Test the parent BOTH WAYS — logical and realpath'd — and refuse if EITHER lands in a
   // box-writable root. Only the realpath'd form used to be probed, against roots that are
   // deliberately LOGICAL (see the note above). Those two agree only while no ancestor of
@@ -573,10 +581,13 @@ function isUnsafeSymlinkMount(p: string, rwRoots: string[]): boolean {
   const realParent = tryRealpath(logicalParent)
   const under = (dir: string): boolean => rwRoots.some((r) => dir === r || dir.startsWith(r + path.sep))
   const boxWritable = under(logicalParent) || (realParent !== null && under(realParent))
-  if (boxWritable) {
-    console.warn(`[sandbox] refusing symlinked mount source ${p} → ${tryRealpath(p) ?? '?'}: its parent is writable inside the box, so binding it would follow the link out of the sandbox (potential escape). Mount the real path instead.`)
-  }
-  return boxWritable
+  if (!boxWritable) return undefined
+  const message = `refusing symlinked mount source ${p} → ${tryRealpath(p) ?? '?'}: its parent is writable inside the box, so binding it would follow the link out of the sandbox (potential escape). Mount the real path instead.`
+  // Still warned, unchanged, so nothing that greps logs for this line loses it. The message
+  // is now ALSO returned — which is the whole of step (ii): the refusal, its subject and its
+  // justification were already computed here and then thrown at a console.
+  console.warn(`[sandbox] ${message}`)
+  return { code: 'box-writable-mount', message }
 }
 
 // The DATA mounts a session's box actually exposes: the obligatory rw config dirs
@@ -585,7 +596,57 @@ function isUnsafeSymlinkMount(p: string, rwRoots: string[]): boolean {
 // Mirrors wrapSandbox's data-mount set so an OUT-OF-BAND file operation done on a
 // session's behalf (e.g. the notebook MCP tools, which run UNSANDBOXED in the server
 // process) can be authorized against exactly what the box itself could reach.
+// Why a refused mount was refused. The `code` deliberately MATCHES the one in
+// sandboxPaths.ts, but this does NOT import that module's RefusalReason type, and that is a
+// decision rather than an oversight: sandboxPaths.ts is the unfinished path layer that
+// scratchpad/layer-not-wired-guard.mts exists to keep unwired, so importing from it here
+// would wire production code to it in the same change that was only asked to stop discarding
+// a reason. Unifying the two shapes is A2's job, done deliberately and in one place. Sharing
+// a five-character string costs nothing and commits to nothing.
+export interface MountExclusionReason {
+  code: 'box-writable-mount'
+  message: string
+}
+
+// A session's data mounts, plus the ones that were REFUSED and why.
+//
+// `sessionDataMounts` used to end `return full.filter((m) => !isUnsafeSymlinkMount(...))`, so
+// a refused mount simply vanished. Two consequences, and the second is the one that matters:
+// a caller could not tell "never requested" from "refused", and — the reason this API is a
+// precondition for wiring the path layer at all — OVER-REFUSAL BECAME UNMEASURABLE. A refusal
+// that drops its subject leaves nothing to count, so a rule that refuses too much looks
+// exactly like a rule that refuses correctly.
+//
+// ★ sessionDataMounts is now DERIVED from this (it returns `.active`) rather than computing
+//   the filter a second time. That is what stops the list and the plan from disagreeing —
+//   two implementations of one rule is how a guard ends up watching the copy that is right
+//   while the copy in use is wrong.
+export function sessionDataMountPlan(cfg: SandboxConfig, cwd: string): {
+  active: SandboxMount[]
+  excluded: { mount: SandboxMount; reason: MountExclusionReason }[]
+} {
+  const full = sessionDataMountCandidates(cfg, cwd)
+  // rwRoots are the LOGICAL rw dest paths (never a link's target), exactly as the box
+  // computes them — see isUnsafeSymlinkMount's note.
+  const rwRoots = full.filter((m) => m.mode === 'rw' && existsSync(m.path)).map((m) => path.resolve(m.path))
+  const active: SandboxMount[] = []
+  const excluded: { mount: SandboxMount; reason: MountExclusionReason }[] = []
+  for (const m of full) {
+    const reason = symlinkMountRefusal(m.path, rwRoots)
+    if (reason) excluded.push({ mount: m, reason })
+    else active.push(m)
+  }
+  return { active, excluded }
+}
+
 export function sessionDataMounts(cfg: SandboxConfig, cwd: string): SandboxMount[] {
+  return sessionDataMountPlan(cfg, cwd).active
+}
+
+// The full candidate set before any refusal is applied — everything sessionDataMounts used
+// to assemble inline. Split out only so the plan and the list share one assembly as well as
+// one filter.
+function sessionDataMountCandidates(cfg: SandboxConfig, cwd: string): SandboxMount[] {
   const baseline: SandboxMount[] = obligatoryMounts(cwd)
   const mounts = dedupeMounts([...baseline, ...cfg.mounts])
   // Include the same ro overlays the box gets (app source + settings.json), or the
@@ -600,8 +661,7 @@ export function sessionDataMounts(cfg: SandboxConfig, cwd: string): SandboxMount
   // otherwise realpath that mount ROOT to its target and trust it — authorizing an
   // out-of-band notebook write to a path the box itself refuses to bind. rwRoots are the
   // LOGICAL rw dest paths (never a link's target), exactly as the box computes them.
-  const rwRoots = full.filter((m) => m.mode === 'rw' && existsSync(m.path)).map((m) => path.resolve(m.path))
-  return full.filter((m) => !isUnsafeSymlinkMount(m.path, rwRoots))
+  return full
 }
 
 // Canonicalize a path for containment testing: realpath if it exists, else the

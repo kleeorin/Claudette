@@ -285,7 +285,10 @@ echo
 #             emphatically NOT an escape, and must never be reported as one.
 # Format: "<file>|<kind>|<one-line reason>"
 EXPECTED_RED=(
-  "viewof-precondition-guard.mts|unbuilt|documents the unbuilt viewOf precondition work"
+  # viewof-precondition-guard.mts was here as `unbuilt`. Step (ii) landed — sandbox.ts now
+  # exports sessionDataMountPlan and the guard is 4/4 — so it came off, in the same change
+  # that built it, exactly as the runner's healed-red alarm demanded. It is now an ORDINARY
+  # green: a red here is a real regression in the exclusion-reason API, not a to-do.
   # agent-pending-test.mts was listed here as `unbuilt` while F4 was only proposed. F4 IS
   # BUILT — agentKey/appliedAgentKey/agentPending are in agents.ts + sessionManager.ts +
   # shared/types.ts, and the test runs 14/14 green. Leaving it registered as an expected red
@@ -324,6 +327,14 @@ SUITE=(
   # showed as a silent success and the user just logged in again. Pure unit test, no deps.
   "none:result-error-classification-test.mts"
   "none:output-keys-test.mts"
+  # GROUP C. The live-file-sync watch registry: does the server notice a file moving on
+  # disk, and — the half that matters — does it stay quiet about everything else? Two of its
+  # checks earn it: the temp+rename swap (which is what git checkout and Claude's own Write
+  # tool do, and which a naive inode watch loses) and the negative control on a sibling file
+  # in the same watched directory, without which a registry that fires on every directory
+  # event passes everything else. Exits 77 if inotify is unavailable rather than reporting
+  # six failures for a missing prerequisite.
+  "none:live-file-sync-test.mts"
   # GROUP C. The unsaved-editor-buffer store: does a held buffer ever shadow a file that
   # changed on disk? The operator met this as "files open stale and don't record changes" —
   # nothing was failing to record; the new text was on disk and simply never displayed.
@@ -347,6 +358,17 @@ SUITE=(
   "none:review-fixes-test.mts"
   "none:iframe-output-adversarial-test.mts"
   "none:output-sanitizer-test.mts"
+  # The chat meta-bar sandbox chip's folder picker. `none:` even though it needs jsdom: the
+  # dependency is reported by the harness's own exit-77 runtime skip rather than by a probe
+  # here, and that is the stronger of the two messages — a probe would make a machine without
+  # jsdom skip SILENTLY at registration, where 77 says "I ran and could not verify".
+  "none:sandbox-chip-picker-guard.mts"
+  # Multi-select in the Files dock. Same `none:` reasoning as the picker guard above — the
+  # jsdom dependency reports itself through exit 77 rather than a probe here. Its [1b]
+  # header carries a caveat worth honouring: [1b] pins "a cross-folder selection does not
+  # re-bind", but TWO mechanisms enforce that and it cannot say which one held, so a green
+  # there is not evidence that the `sel.dir === dir` guard specifically still works.
+  "none:file-multiselect-guard.mts"
   # Hygiene lint, not a feature test: every file that BINDS a port must reap on every exit
   # path, and no two files may bind the same port. Both rules are why a SECURITY test
   # (auth-loopback) once reported 8 false failures against an unauthenticated server its

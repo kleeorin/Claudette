@@ -156,9 +156,20 @@ try {
 
   // Today's behaviour, recorded so the red above is anchored to something observed rather
   // than only to something missing. This uses the API that DOES exist.
+  // Anchors the result above to observed behaviour rather than only to a symbol's presence.
+  // This narration used to end "refused, but with no reason recorded and no way to count the
+  // refusal" — true when written, false the moment step (ii) landed, and left printing on
+  // every green run. Prose that outlives what it described is this repo's most expensive
+  // recurring bug, so it now reports what is ACTUALLY true at run time instead of asserting
+  // a state of the world from the past tense.
   const keptToday = sandbox.sessionDataMounts(nested, a).map((m) => path.resolve(m.path))
+  const planToday = HAVE_PLAN ? plan!(nested, a) : null
   console.log(`\n  today, sessionDataMounts() returns ${keptToday.length} mounts and the inner mount is`)
-  console.log(`  ${keptToday.includes(innerPath) ? 'PRESENT (unexpected — see mount-shadowing-guard.mts)' : 'absent — refused, but with no reason recorded and no way to count the refusal'}.`)
+  console.log(`  ${keptToday.includes(innerPath)
+    ? 'PRESENT (unexpected — see mount-shadowing-guard.mts).'
+    : `absent — refused, and the refusal is now recorded: ${planToday
+        ? JSON.stringify(planToday.excluded.map((e) => e.reason.code))
+        : 'no plan API'}.`}`)
 } finally {
   rmSync(root, { recursive: true, force: true })
 }
