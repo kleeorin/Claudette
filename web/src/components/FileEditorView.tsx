@@ -162,6 +162,12 @@ export function FileEditorView({ path, sessionId }: Props) {
   // once per path, so a value captured at subscribe time would be the answer from whenever
   // this file was opened — for the dirty flag specifically, always `false`.
   const reviewingRef = useRef(false)
+  // NOT for the same reason as reviewingRef, despite sitting next to it — an earlier
+  // comment here claimed it was, and a mutation proved otherwise: `doRefresh` is a
+  // useCallback keyed on [path] and this effect is keyed on [path], so the captured and
+  // current values are the same function by construction. Swapping `refreshRef.current()`
+  // for `doRefresh()` changes nothing measurable. Kept as cheap insurance against the
+  // callback's deps widening later, but it is insurance, not a fix for a live hazard.
   const refreshRef = useRef(doRefresh)
   refreshRef.current = doRefresh
   useEffect(() => {

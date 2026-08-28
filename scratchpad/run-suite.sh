@@ -369,6 +369,15 @@ SUITE=(
   # re-bind", but TWO mechanisms enforce that and it cannot say which one held, so a green
   # there is not evidence that the `sel.dir === dir` guard specifically still works.
   "none:file-multiselect-guard.mts"
+  # The CLIENT half of live file sync — the `watched` map / reconnect re-arm in
+  # web/src/api/client.ts and FileEditorView's subscription. Companion to
+  # live-file-sync-test.mts, which covers the SERVER half; neither one alone tells you the
+  # feature works. Same `none:` reasoning again — jsdom reports itself through exit 77.
+  # Two caveats from its header, repeated here so they survive the file being skimmed:
+  # [2a]/[2b] are tagged `setup` because no mutation can make them fail (`retry()` nulls the
+  # socket first), and `refreshRef` in FileEditorView is NOT load-bearing today — swapping it
+  # for `doRefresh` leaves all 45 green, so a green here is not evidence that the ref matters.
+  "none:file-live-sync-client-guard.mts"
   # Hygiene lint, not a feature test: every file that BINDS a port must reap on every exit
   # path, and no two files may bind the same port. Both rules are why a SECURITY test
   # (auth-loopback) once reported 8 false failures against an unauthenticated server its
