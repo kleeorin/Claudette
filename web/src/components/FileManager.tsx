@@ -5,6 +5,7 @@ import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
 import { errText } from '../lib/errText'
 import type { DirEntry } from '@claudette/shared'
 import { useDismissOnOutside, useEscape } from '../lib/useDismiss'
+import { useScrollMemory } from '../lib/scrollMemory'
 import { FileIcon, fileKind } from './FileIcon'
 
 // The files/dirs copied or cut in the browser — module-level so it survives a re-render
@@ -15,6 +16,17 @@ import { FileIcon, fileKind } from './FileIcon'
 // one, so paste has ONE implementation rather than a single path and a plural path free
 // to disagree about collisions, cut-clearing or partial failure.
 let fileClipboard: { items: { path: string; name: string }[]; mode: 'copy' | 'cut' } | null = null
+
+// The folder this pane was last showing, per session cwd. App.tsx renders
+// `<FileManager key={termCwd}>`, so switching sessions DESTROYS and rebuilds the whole
+// pane — `dir` re-initialised to the session's cwd and you lost your place every time.
+// Module-level so it outlives that remount.
+//
+// Keyed by cwd rather than sessionId deliberately, and the two are indistinguishable from
+// the outside: the remount granularity is already `key={termCwd}`, so two sessions sharing
+// a cwd never rebuild the pane and can never observe a difference. Keying by the same
+// thing that drives the remount keeps one concept instead of two that must agree.
+const lastDirByCwd = new Map<string, string>()
 
 // How the clipboard describes itself in a button title / label.
 function clipLabel(c: NonNullable<typeof fileClipboard>): string {
@@ -42,7 +54,10 @@ interface Props {
 type Creating = 'notebook' | 'file' | 'folder' | null
 
 export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNotebook, onClose }: Props) {
-  const [dir, setDir] = useState(initialPath)
+  // Resume where this cwd was left, not at its root. Lazy initialiser: `initialPath` is
+  // only the FALLBACK for a cwd never visited, and evaluating it eagerly would read the
+  // map on every render for a value used once.
+  const [dir, setDir] = useState(() => lastDirByCwd.get(initialPath) ?? initialPath)
   const [entries, setEntries] = useState<DirEntry[]>([])
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -93,13 +108,20 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   // try/finally: `api.fs.list` REJECTS on a dropped connection or a non-JSON body, and
   // an unguarded rejection left the dock on "Loading…" with no working way out (⟳ calls
   // straight back into here).
-  const load = useCallback(async (path?: string) => {
+  // Resolves TRUE if the listing landed. The caller that resumes a remembered folder needs
+  // to know, so it can fall back rather than strand the pane on an error.
+  const load = useCallback(async (path?: string): Promise<boolean> => {
     setLoading(true); setErr(null)
     try {
       const res = await api.fs.list(path)
-      if ('error' in res && res.error) { setErr(res.error); return }
+      if ('error' in res && res.error) { setErr(res.error); return false }
       if (!('error' in res)) {
         setDir(res.path); setEntries(res.entries)
+        // Record against the SESSION's cwd (`initialPath`), not the folder just loaded —
+        // the map answers "where was this session's pane left?", so the key must stay put
+        // while the value moves. Written on the RESOLVED path from the server, so a folder
+        // that failed to list is never remembered as somewhere we were.
+        lastDirByCwd.set(initialPath, res.path)
         // A refresh must not silently drop the selection (every file op calls load(), so
         // that would make "select 3, copy, then delete" impossible) — but it MUST drop
         // names that are no longer there, or a stale name survives a delete and the next
@@ -108,15 +130,31 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
         setSel((prev) => prev.dir === res.path
           ? { dir: res.path, names: new Set([...prev.names].filter((n) => live.has(n))) }
           : { dir: res.path, names: new Set() })
+        return true
       }
+      return false
     } catch (e) {
       setErr(errText(e, 'could not list this folder'))
+      return false
     } finally {
       setLoading(false)
     }
-  }, [])
+    // initialPath is the key `lastDirByCwd` is written under — a stale one would record
+    // this session's folder against a previous session's cwd.
+  }, [initialPath])
 
-  useEffect(() => { void load(initialPath) }, [initialPath, load])
+  // Open where this session's pane was last left. The remembered folder can be GONE by
+  // now — deleted, renamed, an unmounted drive — so a failure falls back to the session
+  // cwd and forgets it, rather than leaving the pane showing an error for a directory the
+  // user has no obvious way to navigate out of.
+  useEffect(() => {
+    const remembered = lastDirByCwd.get(initialPath)
+    void (async () => {
+      if (remembered && remembered !== initialPath && await load(remembered)) return
+      if (remembered && remembered !== initialPath) lastDirByCwd.delete(initialPath)
+      await load(initialPath)
+    })()
+  }, [initialPath, load])
   // Close the context menu on any outside click or Escape.
   useDismissOnOutside(!!menu, () => setMenu(null))
   // Same outside-click / Escape close for the "+ New" dropdown. The trigger stops
@@ -352,6 +390,13 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
     await load(dir)
   }
 
+  // Scroll position, per session AND per folder — the same shape as `git:${cwd}:changes`.
+  // Both halves are needed: keyed on cwd alone, walking into a subfolder would restore the
+  // parent's offset; keyed on dir alone, two sessions sitting in the same folder would
+  // fight over one position.
+  const listRef = useRef<HTMLDivElement | null>(null)
+  useScrollMemory(`files:${initialPath}:${dir}`, () => listRef.current)
+
   const actBtn = 'flex-1 text-[11px] py-1 rounded text-ctp-subtext hover:bg-ctp-surface0 hover:text-ctp-text transition-colors'
   const addItem = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2 text-xs'
 
@@ -481,7 +526,7 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
       )}
 
       {/* Listing */}
-      <div className="flex-1 min-h-0 overflow-y-auto py-1">
+      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto py-1">
         {loading && <div className="px-3 py-2 text-[12px] text-ctp-overlay">Loading…</div>}
         {err && <div className="px-3 py-2 text-[12px] text-ctp-red break-words">{err}</div>}
         {!loading && !err && visible.length === 0 && <div className="px-3 py-2 text-[12px] text-ctp-overlay">Empty folder.</div>}
