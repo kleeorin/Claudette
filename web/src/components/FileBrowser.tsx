@@ -5,6 +5,7 @@ import { crumbs, joinPath } from '../lib/paths'
 import { errText } from '../lib/errText'
 import type { DirEntry } from '@claudette/shared'
 import { useEscape } from '../lib/useDismiss'
+import { FileIcon } from './FileIcon'
 
 // A navigable FOLDER picker — choose a directory (a session's working dir, a sandbox
 // mount). Files are hidden; read-only browsing over GET /api/fs/list, and the caller
@@ -55,8 +56,15 @@ export function FileBrowser({ initialPath, onPick, onClose, accessory, confirmLa
   // Portal to <body>: this browser is often opened from inside the sidebar/dialog
   // subtree, and a transformed ancestor (the aside's drawer transform) would make
   // `position: fixed` resolve against that 288px box and clip the modal.
+  //
+  // `data-overlay-layer` is the other half of that portal, and it is load-bearing: an
+  // opener that dismisses itself on an outside click sees these clicks as outside,
+  // because the portal is not a DOM descendant of the thing that opened it. The marker
+  // lets such an opener recognise "a layer stacked ABOVE me" and stay put — see
+  // SandboxControl, where its absence made the chip's folder picker unusable. Keep it
+  // on the OUTERMOST node so the backdrop is covered too, not just the dialog card.
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+    <div data-overlay-layer className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
       <div
         className="w-[560px] max-w-[calc(100vw-2rem)] h-[560px] max-h-[calc(100vh-3rem)] flex flex-col rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop"
         onClick={(e) => e.stopPropagation()}
@@ -100,7 +108,7 @@ export function FileBrowser({ initialPath, onPick, onClose, accessory, confirmLa
               onClick={() => void load(joinPath(dir, e.name))}
               className="w-full flex items-center gap-2.5 px-5 py-1.5 text-left text-[13px] transition-colors hover:bg-ctp-surface0 text-ctp-subtext"
             >
-              <span className="shrink-0 w-4 text-center">📁</span>
+              <FileIcon kind="folder" />
               <span className="truncate font-mono">{e.name}</span>
               <span className="ml-auto text-ctp-surface2 text-xs">›</span>
             </button>

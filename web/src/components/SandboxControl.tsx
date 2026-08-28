@@ -25,9 +25,21 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
 
   const eff = effectiveState(session, sandboxAvailable)
 
+  // Click-away closes the popover — but a modal the popover itself OPENED is not
+  // "away". The editor's folder picker renders through a portal on <body>, so it is
+  // not a DOM descendant of `ref`, and the first click inside it used to close this
+  // popover, unmount SandboxEditor and take the picker's own state down with it:
+  // adding a mount from the chat chip was impossible. (The dock panel renders the same
+  // editor with no click-away handler, which is why it worked there.) So skip any
+  // target sitting in a layer stacked above us; `data-overlay-layer` marks those.
   useEffect(() => {
     if (!open) return
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Element | null
+      if (ref.current?.contains(t as Node)) return
+      if (t?.closest?.('[data-overlay-layer]')) return
+      setOpen(false)
+    }
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
   }, [open])
