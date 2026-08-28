@@ -128,8 +128,15 @@ judgement is on the record rather than merely implied.
 
 - `live-file-sync-test.mts` — drive `fileWatchRegistry` against a real tmpdir:
   1. plain `writeFile` → one `fs:changed` (not three — proves the debounce)
-  2. **temp + rename swap → `fs:changed`.** This is the assertion that fails against the naive
-     inode watch, so it is the one that earns the whole file.
+  2. **temp + rename swap → `fs:changed`, AND a write after the swap still fires.**
+     ⚠ CORRECTED 2026-08-28, after the mutation was actually run: this file originally said
+     the swap itself is what catches a naive inode watch. **It is not.** An inode watcher
+     still sees the rename that replaces it — the event reaches the old inode on its way
+     out — so that assertion stays GREEN under an inode-watching mutation. What an inode
+     watch loses is *everything afterwards*: it is left holding a replaced inode nothing
+     will ever write to again. So the pair is the assertion, and the second half is the one
+     that reds. It is also the truer description of the bug: the editor does not fail
+     loudly at `git checkout`, it goes quietly dead after it.
   3. `unlink` → `fs:removed`
   4. refcount: two watchers, one unwatch, the other still gets events
   5. last unwatch → no further events (proves the close, and that a closed tab stops costing)
