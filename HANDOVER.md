@@ -29,7 +29,33 @@ fix, Files multi-select, drawn file icons) · `web/src/components/FileIcon.tsx` 
 `scratchpad/` — two new guards, `safe-mutate.sh`, `live-file-sync-design.md`, and edits to
 `dom-env.mts`, `output-sanitizer-test.mts`, `run-suite.sh`.
 
-**Baselines: unchanged and still not re-takeable** — `web/dist` is STILL the 08-26 10:48
+### ★ BASELINE — 2026-08-28 09:59, `85 passed / 1 failed / 6 skipped`. Quotable.
+Clean: no contamination banner, **bucket 1 interpretable for the first time since 08-26**
+(`web/dist` 09:30:00 newer than every input), no unexpected failures, no runtime skips. The
+sole red is `authorizer-box-divergence-guard`, the documented expected red awaiting A2.
+
+**It took four runs to get one.** Two were contaminated mid-run by another session's writes
+(`web/dist` rebuilt during run 1, `scratchpad/` written during run 3) — `FP_TREES` is
+`web server/src shared/src scratchpad`, so a write anywhere in those four voids the total.
+Run 1 was worse than flagged: it **served two different bundles**, and nothing in its output
+says which side of the rebuild each bucket-1 harness fell on. The staleness banner samples
+ONCE at the start and cannot notice the bundle being replaced under it — a known hole, not
+yet fixed. **Before a full run, get every writing session to confirm it has stopped.**
+
+**⚠ THIS NUMBER IS SESSION-SPECIFIC IN TWO KNOWN WAYS.** Two harnesses answer differently
+depending on who runs them, and both were found the hard way:
+- **jupyter**: `prereqs: jupyter=no` here, so 6 entries SKIP. In a session where
+  `jupyter_server` imports they RUN — reported 5 green plus `notebook-ui-e2e` 13/13. So that
+  session would read ~91/1/0 for the same commit.
+- **`sandbox-fs-escape-fixes-test`**: 13/0 here, 12/1 where `CLAUDE_CONFIG_DIR` points inside
+  `~/.config/claudette` (a host-scrubbed config mirror), because `obligatoryMounts` binds it
+  rw while `sandboxPathAccess` refuses anything under `stateDirsToHide()`. Fail-closed, so the
+  symptom is a permission error, never an escape. Documented in that file's header.
+
+**Rule this earns: state which session measured a prereq before quoting it as a suite fact.**
+An environment-local truth reported as a tree fact cost three separate corrections in one day.
+
+**Older baselines: unchanged and still not re-takeable** — `web/dist` is STILL the 08-26 10:48
 bundle and three more `web/src` changes landed on top of it today. Last quotable: `79/2/6`.
 **Expect the next real baseline to move for a truthful reason:** `output-sanitizer-test.mts`
 now exits **77 (runtime skip)** instead of 0 when no DOM is present. That is a correction, not
