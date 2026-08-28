@@ -184,9 +184,14 @@ console.log(`\n${pass} passed, ${fail} failed, ${skipped} section(s) skipped`)
 // A failure is a failure whatever else was skipped, so it is tested first. Otherwise: if the
 // DOM half never ran, say SKIP (77) — see the header. PART 2's static guards passing is not
 // evidence about the sanitizer's behaviour, only about the routing that reaches it.
-if (fail > 0) process.exit(1)
-if (noDom) {
+if (noDom && fail === 0) {
   console.log('SKIP: the sanitizer BEHAVIOUR half (PART 1) did not run — no DOM. Only the static routing guards above were verified.')
-  process.exit(77)
 }
-process.exit(0)
+// ONE result-derived exit rather than three guarded bare literals. The behaviour is
+// identical — a failure still outranks the skip — but run-suite.sh's gate checks that a
+// suite member has an exit code DERIVED from its results, and it reads the exit argument
+// textually: `if (fail > 0) process.exit(1)` is result-dependent in fact and a bare literal
+// in form, so the gate flagged this file as unable to report failure. That was a false
+// positive, but the gate is right not to try to prove reachability from text — the shape it
+// can verify is this one, so this file uses it.
+process.exit(fail > 0 ? 1 : noDom ? 77 : 0)

@@ -1,4 +1,22 @@
 // Tests for the two filesystem-escape fixes found in the 2026-07-18 audit (SANDBOX.md
+//
+// ★ ONE CHECK HERE IS ENVIRONMENT-DEPENDENT, AND A RED IN IT IS NOT A PROPERTY OF THE TREE.
+// `path in the obligatory global ~/.claude: writable` compares two rules that can disagree
+// depending on where CLAUDE_CONFIG_DIR points:
+//   · obligatoryMounts() binds claudeConfigDir() rw, so the config dir is an active mount;
+//   · sandboxPathAccess() refuses anything under stateDirsToHide(), which is dataDir()
+//     (~/.config/claudette) — because the box sees those as empty directories.
+// If CLAUDE_CONFIG_DIR is set INSIDE ~/.config/claudette — which is what a host-scrubbed
+// config mirror does — the two collide and the authorizer refuses a path that is
+// simultaneously an active rw mount. It resolves FAIL-CLOSED, so the symptom is an
+// inexplicable permission error, never an escape.
+// MEASURED 2026-08-27: red with CLAUDE_CONFIG_DIR=~/.config/claudette/host-scrubbed-config/<id>,
+// and `env -u CLAUDE_CONFIG_DIR` → 13 passed / 0 failed on the same checkout. So the same
+// commit is green in one session and red in another.
+// Whether the TEST or the ARRANGEMENT is wrong is open and deliberately not decided here.
+// It is written down because a red only some sessions can reproduce is worth more than one
+// nobody can explain — but only if the file says which, or the next reader hunts a
+// regression that is not in the code.
 // "Symlinked-mount escape" + "Notebook-MCP escape"):
 //
 //   1. bwrap follows a symlinked --bind SOURCE and mounts its target. A confined box
