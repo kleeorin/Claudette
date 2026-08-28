@@ -117,11 +117,25 @@ await wait(500)
 
 // --- Feature 1: Up/Down history on s1 (active). Send three messages; the optimistic
 // echoes populate the transcript (s1 is unknown server-side, so no real turn runs).
+const clearBox = () => evaluate(`(()=>{const ta=document.querySelector('textarea');const s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;s.call(ta,'');ta.dispatchEvent(new Event('input',{bubbles:true}));return true})()`)
 const typeSend = async (text) => {
   await evaluate(`(()=>{const ta=document.querySelector('textarea');const s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;s.call(ta,${JSON.stringify(text)});ta.dispatchEvent(new Event('input',{bubbles:true}));return true})()`)
   await wait(120)
   await evaluate(`(()=>{const ta=document.querySelector('textarea');ta.focus();ta.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));return true})()`)
   await wait(180)
+  // EVERY SEND HERE FAILS, BY CONSTRUCTION — s1 is a phantom (see the comment above: it is
+  // unknown server-side), so `sendUserTurn` returns false and the server broadcasts
+  // `session:sendFailed`. Since d51a550 made that frame arrive and d9f4ae0 answered it,
+  // ChatView correctly puts the lost turn's text BACK in the composer. So a send no longer
+  // leaves an empty box, and this helper stopped meaning what its callers assume.
+  // Two things downstream broke, both of them the harness's premise rather than the app's
+  // behaviour: the box is non-empty with the caret at the END, and `recallPrev` only hijacks
+  // Up at level 0 when the caret is at position 0 (so multi-line drafts stay editable) — so
+  // no Up was ever hijacked; and level 0's saved draft became "third message" instead of ''.
+  // Clearing restores this helper's original meaning: leave the box as a DELIVERED send would.
+  await wait(260)   // let the sendFailed round-trip land before wiping it
+  await clearBox()
+  await wait(120)
 }
 await typeSend('first message')
 await typeSend('second message')
@@ -129,6 +143,7 @@ await typeSend('third message')
 const echoed = await evaluate(`['first message','second message','third message'].every(t=>document.body.innerText.includes(t))`)
 check('sent messages appear as user bubbles', echoed === true)
 
+await wait(400); await clearBox(); await wait(150)   // any straggling restore, wiped before recall
 const draftVal = () => evaluate(`document.querySelector('textarea').value`)
 const pressKey = (key) => evaluate(`(()=>{const ta=document.querySelector('textarea');ta.focus();ta.dispatchEvent(new KeyboardEvent('${'keydown'}',{key:${JSON.stringify(key)},bubbles:true,cancelable:true}));return true})()`)
 
