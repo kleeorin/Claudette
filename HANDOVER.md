@@ -1,5 +1,5 @@
 # Claudette — Handover
-_Last updated: 2026-08-24._
+_Last updated: 2026-08-27._
 
 <!-- Deliberately no "working tree is clean" line here. The previous one was stale the
      moment it was written and stayed wrong for a month, which is the same failure this
@@ -7,66 +7,157 @@ _Last updated: 2026-08-24._
      file cannot be. -->
 
 
-## ⛔ COORDINATOR HANDOVER — written 2026-08-25 at a context checkpoint. READ FIRST.
+## ⛔ COORDINATOR HANDOVER — rewritten 2026-08-27. READ FIRST. Supersedes the 08-25 block.
 
-### THE CRITICAL PATH IS ONE PERMISSION PROMPT. Everything below it is blocked on the operator.
-**`Landing` is blocked on a permission prompt** and is the ONLY session that can write `server/`
-(operator configuration; a new hire inherits the COORDINATOR's confinement, so **you cannot route
-around it by employing someone** — this was checked). Clearing that one prompt unblocks, in order:
-1. **Re-land the sandboxPaths header** — correctness-critical. The landed file still instructs the
-   **disproven depth-based** ownership rule, and step (i) is the next task against that file.
-   Recipe is idempotent; verify **348 lines**, body offset **260**, `grep -c 'DEPTH NEVER ENTERS'`
-   → 1, `grep -c 'refusal?: RefusalReason'` → 0.
-2. **Step (i)** — the ordering fault (two defects, one fix; Defect A proven against real bwrap).
-3. **Rebuild `web/dist`** — stale since 08-24 21:17 with `web/src` written many times since, so
-   **11 harnesses are NO SIGNAL in both directions** and no full-suite run is worth taking.
-4. **The `agentPending` two-liner** (see its section) and the process-level disk-vs-memory check.
-**Also operator-only: restart `:4319`** — the credential fix has still never executed.
-**`PM` is also blocked**, lower stakes (a 2B plan, nothing downstream).
+> The block that stood here was two days stale and had gone actively wrong (it described
+> `web/dist` as stale since 08-24, `run-suite.sh` as untracked, and a baseline of 64/7/6 —
+> none true now). Everything below the CORRECTIONS heading is older still: **treat it as
+> history, not as state.** `git status` and `git log` are authoritative; this file is not.
 
-### TEAM STATE AT CHECKPOINT
-| Session | Role | State | Holding |
-|---|---|---|---|
-| Landing | implementer (UNCONFINED) | ⛔ blocked | the entire `server/` queue above |
-| PM | planner | ⛔ blocked | slice 2B plan |
-| Architect | planner | idle | `agentPending` design done; step (i) design done |
-| Critic | reviewer | idle | last: the dock-bound review |
-| Devil | implementer | idle | last: the 103-file corpus audit |
-| QA | implementer | idle | owns `run-suite.sh`, the baseline, the taxonomy |
+### Status — 2026-08-27, second update (evening). HEAD is still `9af9bdf`; nothing pushed.
 
-**Two operator decisions are outstanding and nothing is blocked on them:** which of `stackH` / the
-dock / the content pane gives way (the stacked column clips 121px **at rest**), and the composer
-sitting 33px below the shell with a pending AskUserQuestion card. Both are `[open]`-tagged and now
-carry `STATUS:` lines.
+**Step (ii) is DONE, not half-applied** — the line above this said otherwise and was wrong by
+the evening. `viewof-precondition-guard.mts` is **4/4, exit 0** and `tsc -p server/tsconfig.json`
+is clean against the uncommitted `server/src/claude/sandbox.ts`. It still wants Landing's own
+read before committing, and when it commits, **remove its `EXPECTED_RED` entry from
+`run-suite.sh` in the SAME commit** (the guard's header asks for that). Its closing narration
+still prints "refused, but with no reason recorded" — now false; fix it in that commit.
 
-### ★ COORDINATION LESSONS — these are about being the coordinator, and they cost real time today
-1. **A brief written in shell vocabulary blocks a read-only role.** `planner` and `reviewer` have
-   `disallowedTools: WRITE_TOOLS`, which **includes `Bash`**. Saying *"do the grep first"* sent PM
-   into a permission prompt. **Say "use the Grep tool", never "grep"/"run"/"cat"/"ls".** The
-   coordinator writes every brief and sees no role's tool scope at write time.
-2. **A correction is not complete when the fix lands — only when every FROZEN COPY has been
-   reached.** A handover snapshots a claim; corrections propagate only to LIVE contexts. Four
-   stale-claim propagations today, and **the coordinator authored the worst one**. Issuing a
-   correction now includes asking *"does this sit inside a handover someone will resume from?"*
-3. **A context boundary erases the memory of having ACTED**, so you become the confident source of
-   a false claim about your own work. The `AgentDetail` wiring the coordinator declared missing was
-   written by its own predecessor session. **Attribute from the transcript store, never mtime.**
-4. **Verify before scoping a task.** Two planning assignments were for work already built; a
-   one-line check would have caught both. Later, `agentPending` was briefed as unbuilt and was
-   fully built. **Before assigning "build X", check whether X exists.**
-5. **Do not sequence teammates by hand — make the artifact self-validating.** Three attempts at
-   "hold still while I measure" failed. The tree fingerprint in `run-suite.sh` succeeded on its
-   first outing by making the RUN detect contamination itself.
-6. **The coordinator is not exempt from the rules it enforces.** Every one of the above was caught
-   by a teammate, not by self-review. Invite it, and act on it without hedging.
+**Uncommitted, and it is no longer one file.** `git status` is authoritative, but as of this
+writing: `server/src/claude/sandbox.ts` (above) · three `web/src` changes (sandbox-chip picker
+fix, Files multi-select, drawn file icons) · `web/src/components/FileIcon.tsx` (new) ·
+`scratchpad/` — two new guards, `safe-mutate.sh`, `live-file-sync-design.md`, and edits to
+`dom-env.mts`, `output-sanitizer-test.mts`, `run-suite.sh`.
 
-### WHAT TO DO FIRST ON RESUME
-Ask the operator about Landing's prompt before anything else — it is the whole queue. Then
-re-verify team state with `list_team` rather than trusting this table. **Do not schedule a full
-suite run until `web/dist` is rebuildable**; the last defensible baseline is **64/7/6** and the
-last measured run **67/8/6, contaminated and self-labelled**. Nothing in this repo is committed —
-`run-suite.sh` and `scratchpad/scroll-memory-check.mjs` are **untracked**, so a `git clean` would
-destroy the harness that enforces registration.
+**Baselines: unchanged and still not re-takeable** — `web/dist` is STILL the 08-26 10:48
+bundle and three more `web/src` changes landed on top of it today. Last quotable: `79/2/6`.
+**Expect the next real baseline to move for a truthful reason:** `output-sanitizer-test.mts`
+now exits **77 (runtime skip)** instead of 0 when no DOM is present. That is a correction, not
+a regression — it was reporting `10 passed, 0 failed`, exit 0, with every behavioural invariant
+of the notebook output sanitizer UNRUN. See the jsdom item below for why that is every machine.
+
+### ★ jsdom was never declared. The whole DOM-test seam has never run by default.
+`dom-env.mts`'s header claimed jsdom "is a devDependency (approved 2026-08-21)". It is **not in
+any `package.json`**, and in neither `node_modules` nor `web/node_modules`. The approval was
+recorded; the declaration was never made — so `npm i` was never going to fix it, and every
+`setupDom()` caller has taken the no-DOM path since the day it was written. Header and
+`NO_DOM_NOTE` are corrected. **Two registered harnesses cannot run for anyone on a clean
+checkout** until it is declared (needs a lockfile regeneration → Landing). Until then:
+`mkdir -p /tmp/deps && (cd /tmp/deps && npm i jsdom)` then
+`CLAUDETTE_JSDOM=/tmp/deps/node_modules/jsdom/lib/api.js npx tsx scratchpad/<test>.mts`.
+`/tmp` is per-sandbox private, so **every session needs its own copy**.
+
+### The critical path is still ONE permission prompt
+**`Landing` (session `2e41c0b7`) is blocked**, and is the only session that can write
+`server/src`, `shared/src`, `web/dist` or root `node_modules` — verified by `touch` from the
+coordinator, which gets `Read-only file system` on all four. Two messages are QUEUED and
+UNDELIVERED to it. Clearing the prompt unblocks, in order:
+1. **Rebuild `web/dist`.** Promoted to first: three UI changes today exist only in `web/src`,
+   so the built app shows none of them, and one of them (the folder icon) can only be checked
+   by eye. Also unblocks bucket 1 and a real baseline.
+2. **Confirm + commit step (ii)** (above).
+3. **Declare jsdom + regenerate the lockfile** (above).
+4. **Live file sync — the server half.** Fully designed in
+   [`scratchpad/live-file-sync-design.md`](scratchpad/live-file-sync-design.md); hand it over
+   intact, it needs no re-derivation. Makes `.md`/`.ts` editors follow the file on disk the way
+   notebooks already do. The client half is INERT without it, so the order is safe, but the
+   `WsServerMessage` union lives in `shared/src` — **types first**.
+5. **The connector timeout work** —
+   [`scratchpad/connector-timeout-design.md`](scratchpad/connector-timeout-design.md).
+6. **The vitest question** (below).
+`authorizer-box-divergence-guard` stays red until A2 — leave its `EXPECTED_RED` entry alone.
+
+### ★ Two rules about mutation testing, learned the expensive way today
+1. **A mutation that produces NO red is not a passing mutation — it is an uncovered branch
+   announcing itself.** Found a real hole this way: pruning applied to `copy` as well as `cut`
+   left all five clipboard assertions green, because nothing tested that a COPY clipboard
+   survives its paste (the ordinary case — copy once, paste three places).
+2. **The mirror: a red that cannot say WHICH mechanism held is not proof that either does.**
+   `file-multiselect-guard`'s `[1b]` is green with the `sel.dir === dir` guard deleted, because
+   `load()` already resets the name set. Two redundant defences, one test, no way to tell them
+   apart — so the first one "simplified away" looks free. The caveat is in `run-suite.sh`.
+
+### ★ Mutation-test a COPY, never the live file
+A snapshot-mutate-restore cycle destroyed ten review fixes another session applied while it
+ran, and the restore reported success. Restore does not reinstate the file you snapshotted —
+**it overwrites whatever is on disk now**. The md5 check afterwards *confirms* the loss rather
+than catching it: "matches my snapshot" is the exact signature of a destroyed concurrent edit.
+
+**The mechanism is established — do not carry this forward as a mystery.** The wreckage looked
+inexplicable (new comments sitting above old code, which no single restore seems able to
+produce) only under an unstated assumption: that both of the other session's edits fell on the
+same side of the restore. They did not. **The code edit landed BEFORE the last restore and was
+wiped; the comment edit landed AFTER it and survived. A whole-file restore produces exactly
+that chimera.** That is why `safe-mutate.sh`'s refuse-to-restore-on-drift case is *necessary*
+rather than merely prudent: the window between snapshot and restore is where the other author
+writes, and both sides of it are live. (Worth keeping with the finding: it took the mutating
+session owning the damage, the coordinator over-correcting to defend it and mis-recording the
+mechanism as unexplained, and then the mutating session correcting the coordinator back. The
+truth was in the third step, not the first two.)
+`scratchpad/safe-mutate.sh` turns it into a loud refusal (and also refuses a patch that matches
+NOTHING — which otherwise runs against the unmutated file and reads as "this assertion cannot
+be made to fail", a false finding about the test). A copy is still the preferred cycle.
+
+### ★ Checking whether a teammate is really blocked — THE OLD RULE HERE WAS WRONG
+An automated "X is BLOCKED on a permission prompt" notice is not reliable. The rule that stood
+here said: call `list_team`, believe the roster, escalate only when notice and roster agree.
+**That rule has now been falsified, and following it cost an hour of held-back work.**
+
+On 2026-08-27 the notice fired twice for `Landing` (`2e41c0b7`) and **the roster agreed both
+times** — `state: waiting`, `blockedOnPermissionPrompt: true`, checked deliberately on each
+occasion. The coordinator escalated to the operator four times. Landing was **not blocked**: it
+had been working continuously, and the tree proved it (`shared/src/ws.ts` written,
+`sandbox.ts` finished, the `EXPECTED_RED` tombstone in `run-suite.sh`).
+
+**Rule: the roster and the notice are the SAME signal and can both be stale. The tree is the
+only witness that cannot lie.** Before escalating a block, check whether the session's files
+have moved — `git status`, mtimes, the artifacts it was last asked for. A session that is
+producing work is not blocked, whatever two APIs say about it. Ask the teammate directly too;
+a queued message costs nothing and it can answer when it comes free.
+
+Note the asymmetry that makes this cheap: escalating a *false* block wastes the operator's
+attention and stalls a queue; NOT escalating a real one costs only the delay until the next
+check. Prefer the tree, then ask, then escalate.
+
+### ★ Session identity is scrambled — do not litigate it
+The roster's names and the occupants' self-descriptions disagree (the session the roster calls
+`Landing` believes it is QA and claims authorship of the harness fleet). A restart lost the role
+mapping. **Route by ACCESS, not by name** — what matters is which session can write which paths.
+Related: authorship cannot be recovered from a dirty tree. `ChatView.tsx`'s uncommitted work was
+attributed to Devil and was not Devil's; the correction came from the teammate, with evidence.
+**Never infer provenance from `git status`.**
+
+### Open, measured, unowned
+- **`shell-fixed-cost-probe`**: 33px composer clip, phone + keyboard up. Stable over three
+  baselines. Prints as `[open]`; passes.
+- **`App.tsx` residual**: the dock clip returns above `stackH ≈ 351` at `vvh` 508, and nothing
+  clamps a persisted `stackH` against `--vvh` on restore. Named in `eda4a76`.
+- **vitest**: `web/package.json` declares `"test": "vitest run"`, `web/src/store/sessions.test.tsx`
+  is committed with **7 cases**, and vitest is not installed. PM's finding: all 7 fail at mount
+  (mock drift), and **test 6 is vacuous** — it spreads a `ReadonlyMap` into a `string[]`, so its
+  central invariant can never fail. `web/tsconfig.json` excludes test files and vitest does not
+  typecheck, so **a naive install yields a green 7/7 that verifies nothing.** Sequence must be:
+  install → drop the `exclude` → let `tsc` find the vacuity → fix → then run. Root
+  `node_modules` is read-only; `web/node_modules` is writable.
+
+### Rules that generated most of today's value
+1. **A green you cannot explain is a finding.** Today: a harness that passed while its own log
+   said the run was not a verdict; a probe asserting a defect fixed before it was written; a
+   check comparing tuples to a string; a selector resolving to the assistant's echo.
+2. **Name the case you measured, inside the assertion.** One assertion was confidently wrong in
+   two opposite directions before landing on the narrow truth.
+3. **A control is what makes a measurement mean something.** A security finding was retracted
+   today because the same fixture returned the same result with the bug absent.
+4. **Reasoning and measurement are each self-validating only in one direction.** Marked claims
+   (`STATUS: reasoning, not executed`) were refuted twice by one cheap run each — and the marking
+   is what made them cheap to refute. Keep marking them.
+5. **The coordinator is not exempt.** Every one of the above was caught by a teammate or by a
+   control, not by self-review.
+
+### What to do first on resume
+`list_team`, then ask the operator about Landing's prompt — it is the whole queue. Do not start
+a full suite run while anyone is writing the tree; the run's own fingerprint will flag it and the
+number is wasted.
 
 ## ⚠ CORRECTIONS — 2026-08-24. READ BEFORE THE SECTIONS BELOW.
 
