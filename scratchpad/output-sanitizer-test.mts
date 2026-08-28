@@ -12,9 +12,18 @@
 // requests (<img src>, <style>, @import, <link>), which from kernel output is a
 // tracking / exfil / tailnet-SSRF channel. The afterSanitizeAttributes hook closes that.
 //
-// PART 1 needs a DOM (DOMPurify cannot run headless without one) and SKIPS cleanly when
-// no shim is installed. PART 2 is a dependency-free static guard on the ROUTING — that a
-// renderer added later cannot quietly divert output around the sanitizer.
+// PART 1 needs a DOM (DOMPurify cannot run headless without one) and SKIPS when no shim is
+// installed. PART 2 is a dependency-free static guard on the ROUTING — that a renderer added
+// later cannot quietly divert output around the sanitizer.
+//
+// ── EXIT 77, NOT 0, WHEN PART 1 COULD NOT RUN ────────────────────────────────────────
+// This file used to exit 0 in that case, and on a machine without jsdom — which is every
+// machine here, since jsdom is in neither package.json nor node_modules — run-suite counted
+// it PASS. A SECURITY test reporting coverage it did not perform: `10 passed, 0 failed,
+// 1 section(s) skipped`, exit 0, with every behavioural invariant of the sanitizer unrun.
+// 77 is the runner's RUNTIME-SKIP code, whose whole reason for existing is this case: "it
+// ran and could not verify its subject", printed loudly, rather than a green that lies.
+// A real FAILURE still outranks the skip — fail === 0 is checked first.
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -35,7 +44,9 @@ console.log('\n=== PART 1 — sanitizeHtml invariants ===\n')
 
 const dom = await setupDom()
 
+let noDom = false
 if (!dom) {
+  noDom = true
   skipped++
   for (const line of NO_DOM_NOTE) note(line)
 } else {
@@ -170,4 +181,12 @@ for (const abs of OUTPUT_SOURCES) {
 if (!OUTPUT_SOURCES.length) { skipped++; note('no output sources found — nothing to guard') }
 
 console.log(`\n${pass} passed, ${fail} failed, ${skipped} section(s) skipped`)
-process.exit(fail === 0 ? 0 : 1)
+// A failure is a failure whatever else was skipped, so it is tested first. Otherwise: if the
+// DOM half never ran, say SKIP (77) — see the header. PART 2's static guards passing is not
+// evidence about the sanitizer's behaviour, only about the routing that reaches it.
+if (fail > 0) process.exit(1)
+if (noDom) {
+  console.log('SKIP: the sanitizer BEHAVIOUR half (PART 1) did not run — no DOM. Only the static routing guards above were verified.')
+  process.exit(77)
+}
+process.exit(0)
