@@ -3,11 +3,12 @@ import type { ConversationMeta, PermissionMode, RewindPoint, RewindMode, Session
 import { useChat, isSubagentTool, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
-import { prettyPath } from '../lib/paths'
+import { prettyPath, isNotebookPath } from '../lib/paths'
 import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
 import { RewindPicker } from './RewindPicker'
 import { SandboxControl } from './SandboxControl'
+import { FileIcon, fileKind } from './FileIcon'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
 import { useMentionComplete } from '../hooks/useMentionComplete'
 import { loadDraft, saveDraft } from '../lib/drafts'
@@ -549,7 +550,7 @@ export function ChatView({ sessionId, visible = true }: {
                   onMouseDown={(e) => { e.preventDefault(); mention.apply(i) }}
                   className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 ${i === mention.sel ? 'bg-ctp-accent/15 text-ctp-text' : 'hover:bg-ctp-surface0/60 text-ctp-subtext'}`}
                 >
-                  <span aria-hidden>{it.isDir ? '📁' : '📄'}</span>
+                  <FileIcon kind={fileKind(it.isDir, isNotebookPath(it.name))} />
                   <span className="font-mono truncate">{it.name}{it.isDir ? '/' : ''}</span>
                 </button>
               ))}
