@@ -498,8 +498,22 @@ ok('core', '[6a] mid-review, a disk change is IGNORED — no read is issued',
    reads === readsBefore6, `reads +${reads - readsBefore6}`)
 ok('core', '[6b] …the diff still shows the base the user is deciding against',
    !txt().includes('CHANGED UNDER REVIEW'))
-ok('core', '[6c] …and no banner appears either: nothing is being asked of the user',
-   !staleBanner() && !goneBanner())
+// ★ [6c] WAS INVERTED ON 2026-08-28, AND THE OLD VERSION WAS PINNING A BUG.
+// It asserted `!staleBanner()` — that mid-review a disk change produces no banner at all.
+// That encoded the brief this file was written from, and the brief was wrong: "do not
+// refresh" and "do not remember" are different decisions, and only the first was ever
+// argued for. Dropping the event outright means the review resolves, `reviewing` goes
+// false, and nothing recalls that disk moved — so applyDecision reconstructs against a
+// baseText disk has already passed, and the Save silently overwrites someone else's write.
+// The tell that it was an oversight rather than a decision: `fs:removed` was never gated on
+// `reviewing`, so a deletion notified mid-review while a modification did not.
+// Now: the banner DOES appear (informing decides nothing), the refresh still does not
+// (that is what [6a]/[6b] pin), and the Reload control is WITHHELD — offering it would hand
+// the user the exact action the suppression exists to prevent.
+ok('core', '[6c] …but the banner DOES appear: the change is recorded, not discarded',
+   staleBanner() && !goneBanner())
+ok('core', "[6d] …with Reload withheld — informing is safe mid-review, acting is not",
+   !host.querySelector('button:not([aria-label])') || !txt().includes('Reload…'))
 await unmount()
 
 // ── [7] fs:removed → the in-memory copy is now the ONLY copy ──────────────────────────

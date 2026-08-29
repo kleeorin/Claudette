@@ -147,13 +147,30 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   // now — deleted, renamed, an unmounted drive — so a failure falls back to the session
   // cwd and forgets it, rather than leaving the pane showing an error for a directory the
   // user has no obvious way to navigate out of.
+  //
+  // The cancel guard is not about the setState calls — those are harmless no-ops after
+  // unmount. It is about `lastDirByCwd`, which is MODULE state the next instance is
+  // already using: switch away and back while the first load is still in flight, and a
+  // failing first instance would delete-then-overwrite the entry the second instance had
+  // just restored from, dropping the user at the cwd root. Costs a remembered position,
+  // never a file, but it is shared state written from an async tail.
   useEffect(() => {
+    let cancelled = false
     const remembered = lastDirByCwd.get(initialPath)
     void (async () => {
-      if (remembered && remembered !== initialPath && await load(remembered)) return
-      if (remembered && remembered !== initialPath) lastDirByCwd.delete(initialPath)
+      if (remembered && remembered !== initialPath) {
+        const ok = await load(remembered)
+        if (cancelled) return
+        if (ok) return
+        // Not distinguished from a TRANSIENT listing failure, deliberately: telling those
+        // apart means string-matching an error message, which is more fragile than the
+        // thing it would fix. The cost of getting it wrong is one forgotten position.
+        lastDirByCwd.delete(initialPath)
+      }
+      if (cancelled) return
       await load(initialPath)
     })()
+    return () => { cancelled = true }
   }, [initialPath, load])
   // Close the context menu on any outside click or Escape.
   useDismissOnOutside(!!menu, () => setMenu(null))

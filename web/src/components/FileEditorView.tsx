@@ -174,7 +174,16 @@ export function FileEditorView({ path, sessionId }: Props) {
     api.fs.watch(path)
     const offChanged = api.on.fsChanged((p) => {
       if (p !== path) return
-      if (reviewingRef.current) return
+      // Mid-review: suppress the REFRESH, but still record that disk moved. Those are two
+      // different decisions and only the first one was ever argued for. Dropping the event
+      // outright loses the fact silently: the review resolves, `reviewing` goes false, and
+      // nothing remembers anything happened — so applyDecision reconstructs against a
+      // baseText that disk has already moved past, and the Save writes over someone else's
+      // write with no warning. This is the one code path where a background agent is by
+      // definition active, which makes it the worst place to be silent.
+      // The tell that this was inconsistent rather than considered: `fs:removed` below was
+      // never gated on `reviewing`. A deletion notified mid-review; a modification did not.
+      if (reviewingRef.current) { setStaleOnDisk(true); return }
       // A save of our own comes back byte-identical, so this is a no-op rather than a
       // flicker — no server-side `writing` flag needed. Content comparison also stays
       // correct when someone else's write lands inside the same debounce window, which
@@ -415,11 +424,20 @@ export function FileEditorView({ path, sessionId }: Props) {
       )}
       {staleOnDisk && !goneFromDisk && (
         <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 text-[11px] bg-ctp-yellow/10 border-b border-ctp-yellow/30 text-ctp-yellow">
-          <span className="flex-1">Changed on disk since you started editing.</span>
-          <button
-            onClick={() => setConfirmRefresh(true)}
-            className="shrink-0 px-2 py-0.5 rounded bg-ctp-yellow/20 hover:bg-ctp-yellow/30 font-medium"
-          >Reload…</button>
+          <span className="flex-1">
+            Changed on disk since you started editing.
+            {reviewing && ' Finish reviewing the proposed change first.'}
+          </span>
+          {/* Reload is withheld mid-review, not merely discouraged: it is the exact action
+              the suppression above exists to prevent. Showing the banner informs without
+              deciding anything, which is what is safe here; offering Reload would hand the
+              user a button that swaps the document applyDecision is reconstructing against. */}
+          {!reviewing && (
+            <button
+              onClick={() => setConfirmRefresh(true)}
+              className="shrink-0 px-2 py-0.5 rounded bg-ctp-yellow/20 hover:bg-ctp-yellow/30 font-medium"
+            >Reload…</button>
+          )}
           <button
             onClick={() => setStaleOnDisk(false)}
             className="shrink-0 px-2 py-0.5 rounded hover:bg-ctp-yellow/15"

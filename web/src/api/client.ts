@@ -167,13 +167,22 @@ function connect(): void {
     // this is not a live bug — but the seed pattern invites one, so do not tidy these three
     // statements into a different order.
     everConnected = true
+    // Re-arm file watches BEFORE connected.emit. The server keys them per socket and
+    // released this page's on the old socket's close, so a watch that was delivered
+    // successfully is nonetheless gone; `watched` is the authoritative set (watch/unwatch
+    // never queue), making this a state re-sync rather than a replay of missed messages.
+    //
+    // ORDER IS LOAD-BEARING, for the same family of reason as the three statements above.
+    // `channel.emit` runs subscribers SYNCHRONOUSLY, so a subscriber that calls
+    // api.fs.watch(path) inside this emit would send its own fs:watch (n === 1) and then be
+    // re-sent by a loop iterating a `watched` that now contains it — two watches against a
+    // socket that will only ever send one unwatch. That is exactly the leak the sendLive
+    // note warns about, reached through a different door. No current subscriber does this
+    // (they route through React state and run after onopen returns), which is why it is a
+    // trap rather than a bug; re-arming first makes it unreachable instead of unlikely.
+    for (const path of watched.keys()) sock.send(JSON.stringify({ type: 'fs:watch', path }))
     connected.emit(true)
     for (const m of outbox.splice(0)) sock.send(JSON.stringify(m))
-    // Re-arm file watches. The server keys them per socket and released this page's on the
-    // old socket's close, so a watch that was delivered successfully is nonetheless gone.
-    // `watched` is the authoritative set (watch/unwatch never queue), so this is a full
-    // state re-sync rather than a replay of missed messages.
-    for (const path of watched.keys()) sock.send(JSON.stringify({ type: 'fs:watch', path }))
   }
   sock.onmessage = (e) => {
     let msg: WsServerMessage
@@ -435,7 +444,12 @@ export const api = {
       if (n === 1) sendLive({ type: 'fs:watch', path })
     },
     unwatch: (path: string) => {
-      const n = (watched.get(path) ?? 1) - 1
+      // Never watched → nothing to release. Without this, `(undefined ?? 1) - 1` is 0 and we
+      // send a real fs:unwatch for a path this client never held: harmless server-side, but
+      // a message that should not exist, and one a future per-socket assertion could trip on.
+      const held = watched.get(path)
+      if (held === undefined) return
+      const n = held - 1
       if (n > 0) { watched.set(path, n); return }
       watched.delete(path)
       sendLive({ type: 'fs:unwatch', path })
