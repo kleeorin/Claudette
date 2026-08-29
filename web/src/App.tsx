@@ -754,13 +754,41 @@ function Shell() {
     return { key: `f:${t.path}`, kind: 'file', id: '', label: basename(t.path), path: t.path, dirty: false }
   })
 
-  const contentNode = active?.kind === 'notebook'
-    ? <NotebookView key={active.id} notebookId={active.id} sessionId={activeId ?? undefined} />
-    : active?.kind === 'file'
-      ? <FileEditorView key={active.path} path={active.path} sessionId={activeId ?? undefined} />
-      : active?.kind === 'agent' && activeId
-        ? <AgentDetail key={active.id} sessionId={activeId} agentId={active.id} />
-        : null
+  // EVERY OPEN NOTEBOOK, IN EVERY SESSION, STAYS MOUNTED — the same trade the terminal dock
+  // below already makes, and for a measured reason. Rendering only the active tab meant a
+  // session switch unmounted NotebookView and rebuilt every cell's CodeMirror on the way
+  // back: measured at 124ms of blocked main thread for 50 code cells (1.4–2.4ms per cell,
+  // linear), against 5ms to tear the same 50 down. The cost is ALL in construction and it is
+  // one-directional — felt only on the way back — so keeping them mounted removes it rather
+  // than moving it. 50 markdown cells cost 9ms and build zero editors, which is what
+  // identified EditorView as the cost rather than React.
+  //
+  // Mounted is NOT the same as built: Cell defers EditorView construction until its notebook
+  // has been visible at least once (see Cell.tsx's `shown` latch), so a notebook restored on
+  // load or opened into a background session by Claude costs nothing until it is looked at.
+  // Without that, this change would have moved the 124ms from switch-back to page load and
+  // multiplied it by the number of restored notebooks, while building every editor inside
+  // `display:none` where CodeMirror measures a zero-height viewport.
+  const mountedNotebooks = Object.entries(bySession).flatMap(([sid, p]) =>
+    p.tabs.filter((t) => t.kind === 'notebook').map((t) => ({ sid, id: (t as Extract<Content, { kind: 'notebook' }>).id })),
+  )
+  const contentNode = (
+    <>
+      {mountedNotebooks.map(({ sid, id }) => {
+        const show = sid === activeId && active?.kind === 'notebook' && active.id === id
+        return (
+          <div key={`${sid}:${id}`} className={show ? 'h-full min-h-0' : 'hidden'}>
+            <NotebookView notebookId={id} sessionId={sid} visible={show} />
+          </div>
+        )
+      })}
+      {active?.kind === 'file'
+        ? <FileEditorView key={active.path} path={active.path} sessionId={activeId ?? undefined} />
+        : active?.kind === 'agent' && activeId
+          ? <AgentDetail key={active.id} sessionId={activeId} agentId={active.id} />
+          : null}
+    </>
+  )
 
   // `data-phone` is for the HARNESS ONLY, never for styling — and note it is an ATTRIBUTE:
   // this div's className stays byte-for-byte as it was, because index.css owns shell sizing
@@ -812,10 +840,14 @@ function Shell() {
           <div className={`flex-1 min-w-0 flex flex-col ${shownPane === 'dock' ? 'hidden' : ''}`}>
             {/* Upper region: Claude, plus content beside it when a tab is active. */}
             <div ref={splitRef} className={`flex-1 min-h-0 relative flex ${active && layout === 'side' ? 'flex-row' : 'flex-col'}`}>
-              {active && (
+              {/* Rendered whenever a content tab is open OR any notebook is mounted: the
+                  notebooks must outlive `active` going null (switching to Chat), or they
+                  unmount and the switch cost comes straight back. Hidden — not absent — in
+                  that case, so it stays out of the phone pane count. */}
+              {(active || mountedNotebooks.length > 0) && (
                 <div
                   data-testid="pane"
-                  className={`flex-1 min-h-0 min-w-0 ${layout === 'side' ? 'order-3' : ''} ${shownPane && shownPane !== 'content' ? 'hidden' : ''}`}
+                  className={`flex-1 min-h-0 min-w-0 ${layout === 'side' ? 'order-3' : ''} ${!active || (shownPane && shownPane !== 'content') ? 'hidden' : ''}`}
                 >
                   {contentNode}
                 </div>

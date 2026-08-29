@@ -41,7 +41,14 @@ function headingLevelOf(cellType: NbCellType, source: string): number {
 // the store, sends ops/locks/run intents, and reconciles per-cell. Toolbar adds
 // undo/redo, clear-outputs, a kernel picker + restart/interrupt with an accurate
 // status, cross-cell search (Ctrl+F), and a shortcut help overlay (?).
-export function NotebookView({ notebookId, sessionId }: { notebookId: string; sessionId?: string }) {
+export function NotebookView({ notebookId, sessionId, visible = true }: {
+  notebookId: string
+  sessionId?: string
+  // False while this notebook is mounted but another tab is on screen. Every open notebook
+  // now stays mounted across session switches (App.tsx), so this component can be alive and
+  // invisible — which it never was before. Defaults true so any other caller is unaffected.
+  visible?: boolean
+}) {
   const nb = useNotebooks()
   const doc = nb.open.find((d) => d.notebookId === notebookId)
   const locks = nb.locksFor(notebookId)
@@ -142,12 +149,18 @@ export function NotebookView({ notebookId, sessionId }: { notebookId: string; se
   // dep array at all and tore down + re-registered the window listener on every render.
   const nbRef = useRef(nb); nbRef.current = nb
   useEffect(() => {
+    // GATED ON `visible`, and this is a correctness fix rather than an optimisation. It is
+    // the only window-level listener in the notebook tree, and with every open notebook now
+    // mounted at once an ungated version means N notebooks each register it — so one Ctrl-S
+    // saves all of them, including notebooks belonging to sessions the user is not even
+    // looking at. Only the notebook on screen should answer for Ctrl-S.
+    if (!visible) return
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); nbRef.current.save(notebookId) }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [notebookId])
+  }, [notebookId, visible])
 
   // Focus the find field when the bar opens.
   useEffect(() => { if (find.open) find.inputRef.current?.focus() }, [find.open]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -720,6 +733,7 @@ export function NotebookView({ notebookId, sessionId }: { notebookId: string; se
           return (
             <Cell
               key={cell.id}
+              paneVisible={visible}
               cell={cell}
               index={i}
               selected={selected.has(cell.id) || selectedId === cell.id}

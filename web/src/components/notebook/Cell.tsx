@@ -16,6 +16,9 @@ interface Props {
   selected: boolean
   running: boolean
   locked: boolean          // any lock held on this cell (human is editing / pinned it)
+  // False while this cell's notebook is mounted but hidden behind another tab. Gates
+  // EditorView construction only — see the latch in the body.
+  paneVisible?: boolean
   pinned: boolean          // a sticky 'pin' lock
   onSelect: () => void
   onCodeChange: (code: string) => void
@@ -57,7 +60,7 @@ interface Props {
 const COMMIT_DEBOUNCE_MS = 500
 
 export function Cell(props: Props) {
-  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, minimized, onSelect, onReorder, onBeginEdit, onToggleCollapse, onToggleMinimize, onMenu } = props
+  const { cell, index, selected, running, locked, pinned, rendered, collapsible, collapsed, hiddenCount, minimized, onSelect, onReorder, onBeginEdit, onToggleCollapse, onToggleMinimize, onMenu, paneVisible = true } = props
   const editorRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const cbRef = useRef(props)
@@ -107,8 +110,28 @@ export function Cell(props: Props) {
     commit(code)
   }
 
+  // *** DO NOT BUILD AN EditorView WHILE THIS NOTEBOOK IS HIDDEN. ***
+  // Notebooks now stay mounted across session switches (App.tsx), which is what makes a
+  // switch back cost ~2ms instead of ~130ms at 50 code cells — the whole cost was
+  // construction, measured at 1.4–2.4ms per code cell and near-zero to tear down.
+  // But a notebook can become mounted while its session is NOT on screen, by two reachable
+  // routes: Claude's `open_notebook` tool (App.tsx's focusPane handler sets the pane for an
+  // ARBITRARY session id) and the layout restore on load, which reopens notebooks for every
+  // session at once. CodeMirror built inside `display:none` measures a zero-height viewport
+  // and lays out wrongly until something forces a re-measure — the same class of bug the
+  // TerminalView `visible` prop exists for, where xterm fits to a zero box.
+  //
+  // THE LATCH IS THE POINT, and it is why this is not simply `if (!paneVisible) return`.
+  // `shown` only ever goes false→true. Gating the effect on `paneVisible` directly would
+  // make hiding the notebook run this effect's CLEANUP and destroy all 50 editors, so the
+  // next switch back would rebuild them and the fix would buy nothing. Latching means:
+  // mounted-hidden builds nothing, first reveal builds once, and hiding afterwards keeps
+  // what was built.
+  const [shown, setShown] = useState(paneVisible)
+  useEffect(() => { if (paneVisible) setShown(true) }, [paneVisible])
+
   useEffect(() => {
-    if (!editorRef.current || !showEditor || isMinimized) return
+    if (!editorRef.current || !showEditor || isMinimized || !shown) return
     const lang: Extension[] = cell.cellType === 'markdown' ? [markdown()] : cell.cellType === 'code' ? [python()] : []
     // For markdown, running/leaving blurs the editor first — the blur handler is the
     // single "exit edit" path (commits the buffer, then NotebookView re-renders it).
@@ -158,7 +181,7 @@ export function Cell(props: Props) {
     viewRef.current = view
     cbRef.current.registerView(cell.id, view)
     return () => { cbRef.current.registerView(cell.id, null); view.destroy(); viewRef.current = null }
-  }, [cell.id, cell.cellType, showEditor, isMinimized]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cell.id, cell.cellType, showEditor, isMinimized, shown]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Push EXTERNAL source changes (a Claude edit, a reload) into the built editor —
   // but never while the user is typing here (focusedRef), and only when the text
