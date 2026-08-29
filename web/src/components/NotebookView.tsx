@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Overlay } from './Overlay'
 import { createPortal } from 'react-dom'
 import { EditorView } from '@codemirror/view'
 import type { KernelSpec, NbCellType } from '@claudette/shared'
@@ -875,8 +876,8 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
     ['?', 'This help'],
   ]
   useEscape(onClose)
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+  return (
+    <Overlay onClose={onClose}>
       <div className="w-[460px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
           <span className="text-sm font-semibold text-ctp-text">Keyboard shortcuts</span>
@@ -891,7 +892,6 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
           ))}
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }

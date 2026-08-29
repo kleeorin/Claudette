@@ -34,7 +34,15 @@ export function ClaudetteDeck({ onClose, cwd }: { onClose: () => void; cwd: stri
   // `position: fixed` descendants. Rendered in place, `inset-0` resolves to the SIDEBAR,
   // so the deck comes up squeezed into a 260px column instead of centred on the viewport.
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in">
+    <div data-overlay-layer className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in">
+      {/* Marked by hand, not via <Overlay>: this is a full-screen stacked layer with the
+          same click-away hazard, but a different CONSTRUCTION — a separate absolutely
+          positioned backdrop sibling plus a `relative` card, rather than container-click
+          with stopPropagation on the card. Expressing both shapes in one primitive would
+          mean two dismissal modes and two backdrop styles inside it, which is worse than
+          this one attribute. See Overlay.tsx for what the marker is for; the cursor-
+          positioned row/kernel menus deliberately do NOT carry it, because a menu is not a
+          layer over the whole screen and its own dismissal IS the click. */}
       {/* Click-away closes. Nothing here is a staged form — every control writes through
           immediately — so there is no half-finished edit to lose. */}
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />

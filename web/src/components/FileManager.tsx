@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Overlay } from './Overlay'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
@@ -697,8 +698,8 @@ function ConfirmDelete({ entries, onCancel, onConfirm }: { entries: DirEntry[]; 
   const dirs = entries.filter((e) => e.isDir).length
   const shown = entries.slice(0, NAMED)
   const rest = n - shown.length
-  return createPortal(
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>
+  return (
+    <Overlay z={70} onClose={onCancel}>
       <div className="w-[360px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop p-5" onClick={(e) => e.stopPropagation()}>
         <div className="text-sm font-semibold text-ctp-text mb-1.5">
           {n === 1 ? `Delete ${entries[0].isDir ? 'folder' : 'file'}?` : `Delete ${n} items?`}
@@ -726,7 +727,6 @@ function ConfirmDelete({ entries, onCancel, onConfirm }: { entries: DirEntry[]; 
           <button onClick={onConfirm} className="text-xs font-medium px-4 py-1.5 rounded-md bg-ctp-red text-ctp-base hover:brightness-110 active:brightness-95 transition">Delete</button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }

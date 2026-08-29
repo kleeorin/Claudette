@@ -1,5 +1,5 @@
-import { createPortal } from 'react-dom'
 import { useEscape } from '../lib/useDismiss'
+import { Overlay } from './Overlay'
 
 // Confirm gate for the "Allow all" (bypassPermissions) mode — shared by the chat
 // mode dropdown and the Permissions panel so the guard + wording are identical
@@ -7,8 +7,8 @@ import { useEscape } from '../lib/useDismiss'
 export function BypassConfirmDialog({ onConfirm, onCancel }: { onConfirm: () => void; onCancel: () => void }) {
   useEscape(onCancel)
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>
+  return (
+    <Overlay onClose={onCancel}>
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-red/40 bg-ctp-mantle shadow-pop p-5" onClick={(e) => e.stopPropagation()}>
         <div className="text-sm font-semibold text-ctp-red mb-1">Allow all tools?</div>
         <div className="text-xs text-ctp-subtext mb-4 leading-relaxed">
@@ -20,7 +20,6 @@ export function BypassConfirmDialog({ onConfirm, onCancel }: { onConfirm: () => 
           <button onClick={onConfirm} className="text-xs px-3 py-1.5 rounded-md bg-ctp-red/20 text-ctp-red font-medium hover:bg-ctp-red/30 transition">Allow all</button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }

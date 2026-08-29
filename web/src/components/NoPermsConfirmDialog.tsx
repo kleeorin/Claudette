@@ -1,5 +1,5 @@
-import { createPortal } from 'react-dom'
 import { useEscape } from '../lib/useDismiss'
+import { Overlay } from './Overlay'
 
 // Confirm gate for the "No permissions" profile — the strict inverse of "Allow all".
 // It strips every `allow` rule from the session's settings files and drops the mode to
@@ -8,8 +8,8 @@ import { useEscape } from '../lib/useDismiss'
 export function NoPermsConfirmDialog({ count, onConfirm, onCancel }: { count: number; onConfirm: () => void; onCancel: () => void }) {
   useEscape(onCancel)
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onCancel}>
+  return (
+    <Overlay onClose={onCancel}>
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-blue/40 bg-ctp-mantle shadow-pop p-5" onClick={(e) => e.stopPropagation()}>
         <div className="text-sm font-semibold text-ctp-blue mb-1">Switch to “No permissions”?</div>
         <div className="text-xs text-ctp-subtext mb-4 leading-relaxed">
@@ -26,7 +26,6 @@ export function NoPermsConfirmDialog({ count, onConfirm, onCancel }: { count: nu
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }

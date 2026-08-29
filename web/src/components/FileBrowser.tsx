@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, type ReactNode } from 'react'
-import { createPortal } from 'react-dom'
+import { Overlay } from './Overlay'
 import { api } from '../api/client'
 import { crumbs, joinPath } from '../lib/paths'
 import { errText } from '../lib/errText'
@@ -57,14 +57,13 @@ export function FileBrowser({ initialPath, onPick, onClose, accessory, confirmLa
   // subtree, and a transformed ancestor (the aside's drawer transform) would make
   // `position: fixed` resolve against that 288px box and clip the modal.
   //
-  // `data-overlay-layer` is the other half of that portal, and it is load-bearing: an
-  // opener that dismisses itself on an outside click sees these clicks as outside,
-  // because the portal is not a DOM descendant of the thing that opened it. The marker
-  // lets such an opener recognise "a layer stacked ABOVE me" and stay put — see
-  // SandboxControl, where its absence made the chip's folder picker unusable. Keep it
-  // on the OUTERMOST node so the backdrop is covered too, not just the dialog card.
-  return createPortal(
-    <div data-overlay-layer className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+  // The portal, the backdrop and `data-overlay-layer` now come from <Overlay>. That marker is
+  // load-bearing — an opener that dismisses itself on an outside click sees clicks in here as
+  // outside, because the portal is not a DOM descendant of whatever opened it; see
+  // SandboxControl, where its absence made the chip's folder picker unusable. It lives in
+  // Overlay.tsx so it cannot be forgotten by the next portal anyone writes.
+  return (
+    <Overlay onClose={onClose}>
       <div
         className="w-[560px] max-w-[calc(100vw-2rem)] h-[560px] max-h-[calc(100vh-3rem)] flex flex-col rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop"
         onClick={(e) => e.stopPropagation()}
@@ -132,7 +131,6 @@ export function FileBrowser({ initialPath, onPick, onClose, accessory, confirmLa
           </div>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }

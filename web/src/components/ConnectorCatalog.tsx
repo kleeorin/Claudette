@@ -384,7 +384,15 @@ function ConnectorForm({ existing, onCancel, onSaved }: {
   // Portalled for the same reason the deck is (see ClaudetteDeck) — and so it stacks above
   // the deck rather than inside its scroll container.
   return createPortal(
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+    <div data-overlay-layer className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+      {/* Marked by hand, not via <Overlay>: this is a full-screen stacked layer with the
+          same click-away hazard, but a different CONSTRUCTION — a separate absolutely
+          positioned backdrop sibling plus a `relative` card, rather than container-click
+          with stopPropagation on the card. Expressing both shapes in one primitive would
+          mean two dismissal modes and two backdrop styles inside it, which is worse than
+          this one attribute. See Overlay.tsx for what the marker is for; the cursor-
+          positioned row/kernel menus deliberately do NOT carry it, because a menu is not a
+          layer over the whole screen and its own dismissal IS the click. */}
       <div className="absolute inset-0 bg-black/60" onClick={onCancel} />
       <div className="relative w-full max-w-md rounded-lg bg-ctp-base border border-ctp-surface1 shadow-pop p-4 space-y-3 text-[11px] max-h-[85vh] overflow-y-auto">
         <div className="text-xs font-medium text-ctp-text">{editing ? `Edit ${existing.name}` : 'Add a connector'}</div>

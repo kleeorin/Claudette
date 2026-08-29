@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { Overlay } from './components/Overlay'
 import { createPortal } from 'react-dom'
 import { SessionsProvider, useSessions } from './store/sessions'
 import { ChatProvider, useChat, collectAgents, agentKey, isAgentLive, type AgentView } from './store/chat'
@@ -1030,8 +1031,8 @@ function CloseNotebookDialog({ target, onChoose }: {
   const { name, dirty, running } = target
   useEscape(() => onChoose('cancel'))
   const btn = 'text-xs px-3 py-1.5 rounded-md transition'
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={() => onChoose('cancel')}>
+  return (
+    <Overlay onClose={() => onChoose('cancel')}>
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop p-5" onClick={(e) => e.stopPropagation()}>
         <div className="text-sm font-semibold text-ctp-text mb-1 truncate">
           {running ? `“${name}” is still running` : `Save changes to “${name}”?`}
@@ -1053,8 +1054,7 @@ function CloseNotebookDialog({ target, onChoose }: {
           )}
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }
 
@@ -1404,8 +1404,8 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
   const cancelTrust = () => { setPendingTrust(false); setBusy(false) }
   const onEnter = (e: React.KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+  return (
+    <Overlay onClose={onClose}>
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
           <Mark className="w-4 h-4 text-ctp-accent" />
@@ -1463,8 +1463,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
           onCancel={cancelTrust}
         />
       )}
-    </div>,
-    document.body,
+    </Overlay>
   )
 }
 
@@ -1817,8 +1816,8 @@ function SubsessionDialog({ parent, onClose }: { parent: SessionInfo; onClose: (
   }
   const onEnter = (e: React.KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); void submit() } }
 
-  return createPortal(
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+  return (
+    <Overlay z={70} onClose={onClose}>
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
           <Mark className="w-4 h-4 text-ctp-accent" />
@@ -1848,8 +1847,7 @@ function SubsessionDialog({ parent, onClose }: { parent: SessionInfo; onClose: (
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }
 
@@ -1938,8 +1936,8 @@ function SessionInfoDialog({ session, roleName, parentName, onClose }: {
     )] as [string, React.ReactNode]] : []),
     ['Session id', <span className="font-mono break-all text-ctp-overlay">{session.id}</span>],
   ]
-  return createPortal(
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+  return (
+    <Overlay z={70} onClose={onClose}>
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
           <span className="text-sm font-semibold text-ctp-text truncate">{session.name}</span>
@@ -1954,8 +1952,7 @@ function SessionInfoDialog({ session, roleName, parentName, onClose }: {
           ))}
         </div>
       </div>
-    </div>,
-    document.body,
+    </Overlay>
   )
 }
 
