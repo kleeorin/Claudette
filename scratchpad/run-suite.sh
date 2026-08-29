@@ -78,6 +78,40 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# ---- FULL-RUN LOCK ------------------------------------------------------------------
+# A full run measures the tree; a write to the tree during it makes the number worthless.
+# On 2026-08-28 that happened twice in one morning between two sessions that each had a
+# standing instruction and no way to see the other's state. Neither was careless — the
+# collision was structural, and the fix is a fact both can read.
+#
+# ★ IT COVERS ALL FOUR FINGERPRINTED TREES, not just web/dist. The obvious guard is the
+# bundle, and the bundle is not what actually broke it: run 3 died on a `scratchpad/` write,
+# which is the tree nobody thinks of as production and the one every harness author touches.
+#
+# Advisory, deliberately. It cannot stop another process from writing — nothing here can —
+# so it does the one thing that helps: makes "is a run in flight?" answerable in one command
+# instead of inferred. Do NOT infer it from ports: :4321 is held only during the srv4321
+# block, a small window in a long run, so an empty listener list means nothing either way.
+#   bash scratchpad/run-suite.sh --lock-status
+LOCKFILE=/tmp/claudette-qa/.full-run.lock
+LOCK_STALE_S=3600     # a run that has not finished in an hour is assumed dead, not sacred
+lock_held() {
+  [ -f "$LOCKFILE" ] || return 1
+  local started; started=$(sed -n '1p' "$LOCKFILE" 2>/dev/null || echo 0)
+  case "$started" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(( $(date +%s) - started )) -lt "$LOCK_STALE_S" ]
+}
+if [ "${1:-}" = "--lock-status" ]; then
+  if lock_held; then
+    echo "A FULL SUITE RUN IS IN FLIGHT — do not write to web/, server/src, shared/src or scratchpad/."
+    sed -n '2,4p' "$LOCKFILE"
+    exit 1
+  fi
+  echo "No full run in flight. (Checked $LOCKFILE.)"
+  exit 0
+fi
+
+
 LOGDIR=/tmp/claudette-qa
 mkdir -p "$LOGDIR"
 # Nine scratchpad scripts write PNGs into this directory and NOT ONE of them creates it
@@ -133,6 +167,9 @@ echo "prereqs: chrome=$have_chrome jupyter=$have_jupyter claude=$have_claude"
 # edit changes what the harnesses talk TO, which is a different question, and one the tree
 # fingerprint below already answers.
 BUCKET1_STALE=no
+# Remembered so the END of the run can re-evaluate and disagree with this banner. See the
+# re-check after the suite loop for why a once-at-the-start sample is not enough.
+DIST_T0=$(stat -c %Y web/dist/index.html 2>/dev/null || echo 0)
 if [ -f web/dist/index.html ]; then
   # index.html specifically, as the bundle's build time: vite rewrites it on every build, so
   # it is the one file guaranteed to be stamped. NOT the oldest file in web/dist, which would
@@ -378,6 +415,12 @@ SUITE=(
   # socket first), and `refreshRef` in FileEditorView is NOT load-bearing today — swapping it
   # for `doRefresh` leaves all 45 green, so a green here is not evidence that the ref matters.
   "none:file-live-sync-client-guard.mts"
+  # Chrome, ~3 min: how much does switching sessions cost when a notebook is open? It
+  # REPORTS timings (machine-dependent, never asserted) but ASSERTS one timing-independent
+  # invariant — a session switch builds and destroys zero cell editors — which is exactly
+  # what 1bd56af established. Exits 77 when no browser is reachable, so a machine without
+  # Chrome says "could not verify" rather than showing a false red.
+  "chrome:notebook-switch-cost-probe.mjs"
   # Hygiene lint, not a feature test: every file that BINDS a port must reap on every exit
   # path, and no two files may bind the same port. Both rules are why a SECURITY test
   # (auth-loopback) once reported 8 false failures against an unauthenticated server its
@@ -723,7 +766,24 @@ MSG
   fi
 fi
 
-pass=0; fail=0; skip=0; failed=(); ran_logs=(); rtskipped=()
+# Take the lock for a FULL run only. A single-file run produces no baseline and has no
+# claim on anybody else's writes, so making it block them would train people to ignore it.
+FULL_RUN=no
+if [ $# -eq 0 ]; then
+  if lock_held && [ "${ALLOW_CONCURRENT_RUN:-0}" != "1" ]; then
+    echo "REFUSING TO START: another full suite run is already in flight."
+    sed -n '2,4p' "$LOCKFILE"
+    echo "Two concurrent runs contend on the shared :4321 server and on $LOGDIR, and both"
+    echo "numbers come out junk. Wait for it, or ALLOW_CONCURRENT_RUN=1 if you know it is dead."
+    exit 1
+  fi
+  FULL_RUN=yes
+  { date +%s; echo "  started: $(date '+%F %T')  pid $$"; echo "  host-pid $$ — ask the other sessions before writing"; echo "  covers: web/ server/src shared/src scratchpad/"; } > "$LOCKFILE"
+  # Released on EVERY exit path, or the next run refuses for an hour over a lock nobody holds.
+  trap 'rm -f "$LOCKFILE"' EXIT INT TERM
+fi
+
+pass=0; fail=0; skip=0; failed=(); ran_logs=(); rtskipped=(); b1_ran=()
 
 # ---- GATE: a suite member must be ABLE to report failure -------------------------
 # `connectors-gpu-adversarial-test.mts` printed its findings and then called an
@@ -822,6 +882,11 @@ for entry in "${SUITE[@]}"; do
   # — the log directory persists between runs, so globbing it would report findings from a
   # file that did not run this time, which is the stale-data trap in its purest form.
   ran_logs+=("$LOGDIR/$name.log")
+  # Bucket-1 membership + the wall-clock at which this entry finished. Only used if the
+  # bundle turns out to have been replaced mid-run, but it has to be collected as we go —
+  # after the fact there is no way to know when any given harness ran.
+  case "${entry%%:*}" in srv4321*) b1_ran+=("$f|$(date +%s)") ;; esac
+  case "${entry#*:}" in terminal-ui-e2e.mjs|notebook-ui-e2e.mjs) b1_ran+=("$f|$(date +%s)") ;; esac
   if [ $rc -eq 0 ]; then
     printf 'PASS  %-42s %3ds\n' "$f" "$dur"; pass=$((pass+1)); passed_files+=("$f")
   elif [ $rc -eq 77 ]; then
@@ -881,6 +946,63 @@ if [ ${#unexp[@]} -gt 0 ]; then
 else
   [ $fail -gt 0 ] && echo "  no unexpected failures — every red in this run is a documented one."
 fi
+# ---- DID THE BUNDLE MOVE UNDER THE RUN? ---------------------------------------------
+# The banner at the top samples ONCE, before anything runs. That is not enough, and the gap
+# produced a positively misleading output rather than a merely missing one: on 2026-08-28 a
+# rebuild landed mid-run, so the run served the OLD bundle to everything before it and the
+# NEW bundle to everything after. The opening banner said NO SIGNAL — honest about the
+# instant it was computed, wrong about the run it was describing, and there was nothing
+# anywhere to say the two differed. A caveat that is true at 09:23 and false at 09:53 is
+# worse than no caveat, because it reads as a considered verdict on the whole run.
+DIST_T1=$(stat -c %Y web/dist/index.html 2>/dev/null || echo 0)
+if [ "$DIST_T0" != "$DIST_T1" ]; then
+  echo
+  echo "!!! THE BUNDLE WAS REPLACED DURING THIS RUN — web/dist went from"
+  echo "!!!   $(date -d @"$DIST_T0" '+%F %T') to $(date -d @"$DIST_T1" '+%F %T')."
+  echo "!!! The bucket-1 banner at the top of this run describes the bundle as it was BEFORE"
+  echo "!!! the rebuild and is not a verdict on the run. Harnesses that ran either side of it"
+  echo "!!! were served DIFFERENT BUILDS, so bucket 1 is not one result — it is two."
+  # Name the split rather than implying it is recoverable by squinting. Each entry's finish
+  # time was recorded as it ran; anything that finished before the new bundle's mtime was
+  # served the old one. An entry that STRADDLES the rebuild cannot be classified at all and
+  # is said so explicitly.
+  if [ ${#b1_ran[@]} -gt 0 ]; then
+    echo "!!! Which bucket-1 harnesses fell on which side (by finish time):"
+    for r in "${b1_ran[@]}"; do
+      rf="${r%%|*}"; rt="${r#*|}"
+      if [ "$rt" -lt "$DIST_T1" ]; then printf '!!!   %-40s OLD bundle\n' "$rf"
+      else printf '!!!   %-40s new bundle\n' "$rf"; fi
+    done
+    echo "!!! (finish times, so an entry that was RUNNING across the rebuild is listed under the"
+    echo "!!!  new bundle while having started on the old one — that one is unclassifiable, not new.)"
+  else
+    echo "!!! No bucket-1 harnesses ran, so nothing was actually served either bundle."
+  fi
+  BUCKET1_STALE=yes
+fi
+# Even with the bundle untouched, the INPUTS can move under a run and flip the verdict — a
+# source write at minute two makes an "interpretable" opening banner wrong for everything
+# after it. Re-run the same comparison and only speak up if the answer changed, so a normal
+# run stays quiet.
+if [ -f web/dist/index.html ]; then
+  b1_end_stale=no
+  for root in web shared/src; do
+    [ -d "$root" ] || continue
+    n=$(find "$root" -type d \( -path web/dist -o -path web/node_modules \) -prune -o \
+          -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+    [ -n "$n" ] || continue
+    t="${n%%.*}"
+    [ "$DIST_T1" -lt "$t" ] && b1_end_stale=yes
+  done
+  if [ "$b1_end_stale" = yes ] && [ "$BUCKET1_STALE" = no ]; then
+    echo
+    echo "!!! BUCKET 1 STARTED INTERPRETABLE AND ENDED STALE — a bundle input was written"
+    echo "!!!   during the run. The opening banner is wrong for every harness that ran after"
+    echo "!!!   that write, and the tree fingerprint below names what moved."
+    BUCKET1_STALE=yes
+  fi
+fi
+
 # ---- CENSUS: measured-but-unowned findings, and harnesses that could not verify ------
 # Three separate files now pass while their logs carry a defect they measured and chose not
 # to fail on (an `[open]` line). That is the right trade — the alternative is a permanent

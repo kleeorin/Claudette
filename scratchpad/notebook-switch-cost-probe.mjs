@@ -1,12 +1,19 @@
 // notebook-switch-cost-probe — HOW MUCH does a session switch cost when a notebook is open,
 // and does that cost scale with the number of CODE cells?
 //
-// This is a MEASUREMENT, not a test and not a fix. It asserts nothing about whether the
-// number is acceptable; it exists so that a decision between three candidate fixes is made
-// against a number instead of a reading. Exit code is 0 whenever the measurement itself
-// succeeded — a slow app is a result, not a failure. It exits non-zero only when it could
-// not measure (no Chrome, no server, a fixture that never rendered), because "I could not
-// verify" must never be spelled the same way as "I verified".
+// It began as a pure MEASUREMENT — it existed so a choice between three candidate fixes was
+// made against a number instead of a reading — and the timings still are: a slow machine is
+// a result, not a failure, so nothing here asserts on a millisecond count. Since the fix it
+// measured landed (1bd56af) it also carries ONE structural assertion, at the bottom: a
+// session switch must build and destroy zero cell editors. That is the invariant the fix
+// established and it does not vary with hardware.
+//
+//   exit 0   measured, and the invariant holds
+//   exit 1   a session switch rebuilt cell editors — the regression is back, or the
+//            artifact under test predates the fix
+//   exit 2   could not measure (no server, a fixture that never rendered)
+//   exit 77  runtime skip: no browser. "I could not verify" must never be spelled the
+//            same way as "I verified", in either direction.
 //
 // Run:  node scratchpad/notebook-switch-cost-probe.mjs
 //
@@ -69,13 +76,17 @@
 // down and N rebuilt", which is the whole question.
 //
 // ── WHAT THIS RUN IS AND IS NOT EVIDENCE ABOUT ────────────────────────────────────────
-// • It drives `web/dist`, the BUILT bundle. At the time of writing dist was built before
-//   HEAD, but the only commit to `web/src` in between touched FileEditorView's review path
-//   and NOTHING on the notebook render path (App.tsx's contentNode, NotebookView,
-//   notebook/Cell.tsx) — checked with `git log --since=<dist mtime> -- <those paths>`, which
-//   returned empty. So the stale bundle is measurement-equivalent FOR THIS QUESTION. That is
-//   a narrower claim than "dist is fresh" and it is the one that is true. RE-CHECK IT before
-//   trusting a later run; uncommitted `web/src` edits are in NO build.
+// • It drives `web/dist`, the BUILT bundle, unless PROBE_MODE=dev.
+//   ★ THAT CLAIM WENT STALE AND THE WAY IT WENT STALE IS THE WARNING. When the original
+//   numbers were taken, dist predated HEAD but the only commit in between touched
+//   FileEditorView, so the bundle was measurement-equivalent FOR THAT QUESTION — a narrower
+//   claim than "dist is fresh", deliberately, and it was true. It stopped being true the
+//   moment 1bd56af landed, because that commit changes the very code path this measures and
+//   dist has not been rebuilt since. A run against dist today therefore measures the
+//   PRE-FIX app and correctly exits 1. So: re-derive the claim, never inherit it. Run
+//   `git log --since="$(date -r web/dist/index.html)" -- web/src/App.tsx
+//   web/src/components/NotebookView.tsx web/src/components/notebook/` before quoting a
+//   number, and remember uncommitted `web/src` edits are in NO build at all.
 // • Headless Chrome with --disable-gpu is SLOWER than the operator's real browser. Absolute
 //   numbers are an upper bound on a desktop and are not a user-facing latency figure. The
 //   SHAPE across cell counts is what this probe is for, and the shape is not affected.
@@ -85,15 +96,32 @@
 //   the mount cost this probe measures does not depend on where the doc came from.
 import { spawn } from 'child_process'
 import { mkdtemp } from 'fs/promises'
+import { readdirSync, realpathSync, accessSync, constants } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { WebSocket } from 'ws'
 
-const PORT = 4501
+const PORT = 4501          // the backend
+const WEB_PORT = 5501      // the vite dev server, PROBE_MODE=dev only
 const DEVTOOLS = 9364
-const APP = `http://127.0.0.1:${PORT}`
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 const die = (msg, extra = '') => { console.error(`\n[could not measure] ${msg}${extra ? '\n' + extra : ''}`); process.exit(2) }
+// A MISSING DEPENDENCY IS NOT A FAILURE, and must not be spelled like one. 77 is
+// run-suite.sh's runtime-skip code: "I ran and could not verify". Exiting 2 for a machine
+// with no browser would report a regression that was never measured.
+const skip = (msg, extra = '') => { console.log(`\n[skip] ${msg}${extra ? '\n' + extra : ''}`); process.exit(77) }
+
+// ── WHICH ARTIFACT AM I MEASURING? ────────────────────────────────────────────────────
+// dist (default) — the built bundle in web/dist, which is what users actually run. Use this
+//   for any number you intend to quote.
+// dev            — a vite dev server over the WORKING TREE. Slower and unminified, so its
+//   absolute timings are NOT comparable with dist's; what it is for is verifying a change
+//   that is committed but not yet built. This probe's own fix-verification was done this
+//   way, because web/dist lagged the fix by a rebuild that belonged to another session.
+//   Compare dev against dev and dist against dist, never across.
+const MODE = process.env.PROBE_MODE ?? 'dist'
+if (MODE !== 'dist' && MODE !== 'dev') die(`PROBE_MODE must be 'dist' or 'dev', got ${JSON.stringify(MODE)}`)
+const APP = MODE === 'dev' ? `http://127.0.0.1:${WEB_PORT}` : `http://127.0.0.1:${PORT}`
 
 // --- our own server, and PROVEN to be ours -------------------------------------------
 // Isolated data dir: without one the server relaunches every persisted session from the
@@ -115,19 +143,47 @@ server.stdout.on('data', (d) => { ownLog += d })
 server.stderr.on('data', (d) => { ownLog += d })
 server.on('exit', (c) => { exited = c })
 
-// ★ CHROME_BIN, AND WHY A CONFINED SESSION MUST SET IT. `/usr/bin/google-chrome` on this
-// machine is a symlink chain ending at `/opt/google/chrome/google-chrome`, and `/opt` is
-// outside a sandboxed session's mounts — so from inside a box the symlink resolves to
-// nothing and `spawn` fails with ENOENT on a path that plainly exists. That reads exactly
-// like "Chrome is not installed", which is false and would send the next person hunting.
-// It is a MOUNT gap, not a missing package. Two ways out: have the operator mount `/opt`,
-// or fetch a private browser, which needs no permission at all and is what this was
-// measured with:
-//   mkdir -p /tmp/qa-chrome && (cd /tmp/qa-chrome && npx @puppeteer/browsers install chrome@stable)
-//   CHROME_BIN=/tmp/qa-chrome/chrome/linux-*/chrome-linux64/chrome node scratchpad/notebook-switch-cost-probe.mjs
-// `/tmp` is per-sandbox private, so every session needs its own copy.
+let vite = null   // only PROBE_MODE=dev assigns it; the exit reaper closes over it either way
+
+// ★ RESOLVING A BROWSER, AND WHY THE OBVIOUS PATH IS A TRAP.
+// `/usr/bin/google-chrome` on this machine is a symlink chain ending in
+// `/opt/google/chrome/google-chrome`, and `/opt` is outside a sandboxed session's mounts —
+// so from inside a box the link resolves to nothing and `spawn` fails with ENOENT on a path
+// that plainly exists and that `ls` will happily show you. That reads as "Chrome is not
+// installed", which is false, and it costs the next person an hour. It is a MOUNT gap.
+// The repo now bundles a Chrome for Testing under `.chrome-headless/` (gitignored, so it is
+// per-checkout) precisely because that is the only browser a confined session can reach.
+// This resolution order is deliberately the SAME LIST run-suite.sh probes, so a standalone
+// run and a suite run pick the same binary — a harness that quietly disagrees with the
+// runner about which browser it used is a harness whose numbers cannot be compared.
+// Failing to find one is a SKIP (77), never a failure: no browser means unmeasured, and
+// unmeasured must not be spelled like a regression.
+const CHROME_CANDIDATES = [
+  ...(() => {
+    try {
+      return readdirSync('.chrome-headless/chrome')
+        .map((d) => join('.chrome-headless/chrome', d, 'chrome-linux64/chrome'))
+    } catch { return [] }
+  })(),
+  '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium',
+]
+const resolveChrome = () => {
+  if (process.env.CHROME_BIN) return process.env.CHROME_BIN
+  for (const c of CHROME_CANDIDATES) {
+    // realpath FIRST: the dangling-symlink case above is exactly what a bare existsSync misses.
+    try { const real = realpathSync(c); accessSync(real, constants.X_OK); return real } catch {}
+  }
+  return null
+}
 const chromeDir = await mkdtemp(join(tmpdir(), 'chrome-nbswitch-'))
-const chromeBin = process.env.CHROME_BIN ?? '/usr/bin/google-chrome'
+const chromeBin = resolveChrome()
+if (!chromeBin) skip('no browser: no usable Chrome found', [
+  '  Looked at: ' + CHROME_CANDIDATES.join(', '),
+  '  A path listed there can EXIST and still be unusable from a sandboxed session, because',
+  '  the system Chrome is a symlink into /opt, which is outside our mounts. Fetch one:',
+  '    npx @puppeteer/browsers install chrome@stable --path "$PWD/.chrome-headless"',
+  '  or point CHROME_BIN at an existing copy.',
+].join('\n'))
 const chrome = spawn(chromeBin, [
   '--headless=new', `--remote-debugging-port=${DEVTOOLS}`, `--user-data-dir=${chromeDir}`,
   '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--window-size=1400,900',
@@ -139,10 +195,17 @@ const chrome = spawn(chromeBin, [
 ], { stdio: 'pipe', detached: true })
 // A failed spawn arrives as an 'error' EVENT, not a throw: without this handler it lands on
 // the unhandledRejection hook below as a raw stack, which buries the one line that matters.
-chrome.on('error', (e) => die(
-  `could not start Chrome at ${chromeBin} (${e.code ?? e.message})`,
+chrome.on('error', (e) => skip(
+  `no browser: could not start Chrome at ${chromeBin} (${e.code ?? e.message})`,
   e.code === 'ENOENT'
-    ? '  The path may exist but resolve outside this sandbox — see the CHROME_BIN note in the header.'
+    ? [
+        '  The path may exist and still fail: /usr/bin/google-chrome is a symlink into /opt,',
+        '  which is outside a sandboxed session\'s mounts, so it resolves to nothing from in',
+        '  there. That is a MOUNT gap, not a missing package. Fetch a private browser:',
+        '    mkdir -p /tmp/qa-chrome && (cd /tmp/qa-chrome && npx @puppeteer/browsers install chrome@stable)',
+        '    CHROME_BIN=/tmp/qa-chrome/chrome/linux-*/chrome-linux64/chrome node scratchpad/notebook-switch-cost-probe.mjs',
+        '  /tmp is per-sandbox private, so every session needs its own copy.',
+      ].join('\n')
     : ''))
 
 // Reap by process GROUP on EVERY exit path. `npx` forks the real node, so killing the
@@ -151,9 +214,17 @@ chrome.on('error', (e) => die(
 // "server exited before listening" on the next run. See scratchpad/port-and-reap-lint.mts.
 const reapChrome = () => { try { process.kill(-chrome.pid, 'SIGKILL') } catch { try { chrome.kill('SIGKILL') } catch {} } }
 const reapServer = () => { try { process.kill(-server.pid, 'SIGKILL') } catch { try { server.kill('SIGKILL') } catch {} } }
-process.on('exit', () => { reapChrome(); reapServer() })
+// ★ AN EXIT HANDLER THAT THROWS REPLACES THE EXIT CODE IT WAS SUPPOSED TO PRESERVE.
+// A refactor briefly left `vite` undeclared while this closure still referenced it. The run
+// printed its three red assertions and reached `process.exit(1)` correctly — and then this
+// handler threw on the way out, turning a clean, correct "regression detected" into an
+// uncaught ReferenceError and exit 7. The verdict was right there in the output and the
+// exit code disagreed with it. Reapers run on the failure path by definition, so anything
+// they touch must be defined even in the modes that never create it.
+const reapVite = () => { if (!vite) return; try { process.kill(-vite.pid, 'SIGKILL') } catch { try { vite.kill('SIGKILL') } catch {} } }
+process.on('exit', () => { reapChrome(); reapServer(); reapVite() })
 for (const sig of ['SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection']) {
-  process.on(sig, (e) => { reapChrome(); reapServer(); if (e) console.error(e); process.exit(2) })
+  process.on(sig, (e) => { reapChrome(); reapServer(); reapVite(); if (e) console.error(e); process.exit(2) })
 }
 
 let owned = false
@@ -164,6 +235,30 @@ for (let i = 0; i < 100; i++) {
 }
 if (!owned) die(`our server never reported ready (exit=${exited})`, ownLog.slice(-1500) || '(no output)')
 
+// In dev mode the browser talks to vite, which proxies /api and /ws back to the server
+// spawned above (web/vite.config.ts). Spawned AFTER the backend is confirmed ready so the
+// proxy never races an absent upstream.
+if (MODE === 'dev') {
+  vite = spawn('npx', ['vite'], {
+    cwd: join(process.cwd(), 'web'),
+    env: { ...process.env, HOST: '127.0.0.1', WEB_PORT: String(WEB_PORT), PORT: String(PORT) },
+    stdio: 'pipe', detached: true,
+  })
+  let viteLog = '', viteExited = null
+  vite.stdout.on('data', (d) => { viteLog += d })
+  vite.stderr.on('data', (d) => { viteLog += d })
+  vite.on('exit', (c) => { viteExited = c })
+  vite.on('error', (e) => die(`could not start vite (${e.code ?? e.message})`))
+  let up = false
+  for (let i = 0; i < 120; i++) {
+    if (/ready in|Local:/.test(viteLog)) { up = true; break }
+    if (viteExited !== null) break
+    await wait(250)
+  }
+  if (!up) die(`the vite dev server never came up (exit=${viteExited})`, viteLog.slice(-1500) || '(no output)')
+}
+
+
 // --- CDP -----------------------------------------------------------------------------
 let wsUrl = null
 for (let i = 0; i < 40 && !wsUrl; i++) {
@@ -173,7 +268,7 @@ for (let i = 0; i < 40 && !wsUrl; i++) {
   } catch {}
   if (!wsUrl) await wait(250)
 }
-if (!wsUrl) die('no CDP target — is Chrome installed? (CHROME_BIN overrides the path)')
+if (!wsUrl) skip('no browser: Chrome started but never opened a CDP target')
 
 const cdp = new WebSocket(wsUrl)
 await new Promise((res, rej) => { cdp.on('open', res); cdp.on('error', rej) })
@@ -244,8 +339,23 @@ window.__probe = {
     return true
   },
 }
-window.__cm = () => document.querySelectorAll('.cm-editor').length
-window.__cells = () => document.querySelectorAll('[data-cell-id]').length
+// ★ VISIBLE counts, not PRESENT counts, and the distinction is the whole of this file's
+// 2026-08-29 revision. Until the keep-mounted fix, a notebook belonging to a session you had
+// switched away from was REMOVED from the document, so 'is it present' and 'is it on screen'
+// were the same question and the probe asked the cheap one. They are no longer the same:
+// every open notebook now stays mounted and App.tsx hides it with a 'hidden' wrapper.
+// Presence was only ever a PROXY for visibility, so the readiness contract is unchanged in
+// meaning — 'the notebook is no longer on screen' — and only its implementation moves.
+// offsetParent is null for anything inside a display:none ancestor, which is exactly what
+// Tailwind's 'hidden' sets, so this reads the same fact the user's eyes do.
+// It also works against BOTH builds: pre-fix the nodes are absent (0 visible), post-fix they
+// are present but hidden (0 visible). One predicate, both behaviours — so the difference
+// between them shows up in the NUMBERS rather than in whether the probe can run at all.
+const vis = (sel) => [...document.querySelectorAll(sel)].filter((e) => e.offsetParent !== null).length
+window.__cm = () => vis('.cm-editor')
+window.__cells = () => vis('[data-cell-id]')
+window.__cmPresent = () => document.querySelectorAll('.cm-editor').length
+window.__cellsPresent = () => document.querySelectorAll('[data-cell-id]').length
 // The active session row carries \`bg-ctp-surface0\` as a class TOKEN. Matched with
 // classList.contains, never a substring test on className: the INACTIVE rows carry
 // \`hover:bg-ctp-surface0/50\`, which contains that string, so a substring match would call
@@ -428,7 +538,41 @@ const spread = Math.max(...pc) / Math.max(0.01, Math.min(...pc))
 console.log(`  A roughly CONSTANT ms/cell means the total is LINEAR in cell count; a total that`)
 console.log(`  is flat would show ms/cell falling ~50× across this range. Spread here: ${spread.toFixed(1)}×.`)
 
+// ── THE ONE ASSERTION ─────────────────────────────────────────────────────────────────
+// Everything above is a measurement and stays one: timings are machine-, browser- and
+// build-dependent, so asserting on a millisecond count would produce a test that fails on a
+// slow laptop and passes on a fast one, which is worse than no test.
+//
+// THIS is timing-independent and it is the invariant the fix actually established: a session
+// switch must not construct or destroy a single cell editor. Before the fix it was N built
+// and N torn per round trip at N code cells; after, it is 0/0 at every count, because every
+// open notebook stays mounted and each cell latches its editor on first visibility.
+// One structural fact, checked in both directions and in every fixture — which is what makes
+// this file a regression test rather than a stopwatch.
+//
+// ★ VERIFIED IN BOTH DIRECTIONS, 2026-08-29, because an assertion never seen to fail is not
+// evidence. Against the PRE-FIX bundle still in web/dist it reports 50 built / 50 torn at 50
+// code cells and exits 1; against the post-fix working tree (PROBE_MODE=dev) it reports 0/0
+// everywhere and exits 0. A guard proven only in the passing direction cannot tell you which
+// of the two it is measuring.
+console.log('\n── regression assertion ' + '─'.repeat(38))
+let violations = 0
+for (const r of results) {
+  // max, not median: one rebuilt editor in one round trip out of six is still the bug.
+  const worst = Math.max(r.builtAway.max, r.tornAway.max, r.builtBack.max, r.tornBack.max)
+  const ok = worst === 0
+  if (!ok) violations++
+  console.log(`  ${ok ? '✅' : '❌'} ${r.label.padEnd(20)} a session switch builds or destroys no editor` +
+              (ok ? '' : `  — worst round trip: ${r.builtBack.max} built / ${r.tornAway.max} torn`))
+}
+
 cdpDone = true
 try { cdp.close() } catch {}
-console.log('\n[measured] this probe asserts nothing — read the shape line above.\n')
+if (violations) {
+  console.log(`\n${violations} fixture(s) rebuilt cell editors on a session switch — the keep-mounted`)
+  console.log(`fix in 1bd56af is not in the artifact this run measured (${MODE}).`)
+  console.log(`If that artifact is web/dist, check it has been rebuilt since the fix landed.\n`)
+  process.exit(1)
+}
+console.log('\n[measured] the timings above are reported, not asserted — read the shape line.\n')
 process.exit(0)
