@@ -5,9 +5,22 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": []
   },
-  "include": ["src"],
-  // Vitest owns the test files and supplies their types (see vitest.config.ts). Excluding
-  // them here keeps `npm run typecheck` and `npm run build` working before the test deps
-  // are installed — otherwise a staged, not-yet-runnable test breaks the production build.
-  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+  // TEST FILES ARE TYPECHECKED. They were excluded, for a reason that was true when it was
+  // written and stopped being true on 2026-08-31: vitest was undeclared, so including tests
+  // would have broken `npm run build` on any checkout. Now that vitest and
+  // @testing-library/react are real devDependencies, `npm i` supplies their types and the
+  // exclusion only hides things.
+  //
+  // IT HID SOMETHING REAL. `vitest` does not typecheck, so between this `exclude` and an
+  // uninstallable runner there were two independent reasons no tool ever looked at
+  // sessions.test.tsx — and it contained an assertion that could not fail: it spread a
+  // ReadonlyMap into a `string[]`, then asked whether that array of [key, value] PAIRS
+  // `.includes()` a plain session id, which is false for every possible input. One `tsc`
+  // run with this line removed found it immediately. That is the argument for the order
+  // this was done in — install, drop the exclude, let tsc speak, fix, and only THEN run —
+  // because installing and running first yields a green 7/7 that verifies nothing.
+  //
+  // The cost, stated: `npm run build` now depends on the test deps being installed. That is
+  // correct now that they are declared, and was not before.
+  "include": ["src"]
 }

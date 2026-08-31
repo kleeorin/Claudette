@@ -38,12 +38,28 @@ const H = vi.hoisted(() => {
     }
     return ch
   }
+  // THE SOCKET'S TWO LIVENESS QUESTIONS, kept faithful rather than stubbed to a constant.
+  // `SessionsProvider` seeds `wasDown = api.hasEverConnected() && !api.isConnected()`, and
+  // the real client answers those from two different pieces of state: `everConnected` is set
+  // once in `sock.onopen` and NEVER cleared, while `isConnected()` reads the socket's current
+  // readyState. That difference is the entire point of having both — readyState cannot tell
+  // "never connected yet" from "was connected and dropped". Driving both off the `conn`
+  // channel the test already emits on keeps one source of truth, so a test that emits
+  // `conn(true)` then `conn(false)` gets `ever=true, up=false` exactly as a real drop would,
+  // instead of a pair of frozen booleans that agree with nothing.
+  const conn = makeChannel<[boolean]>()
+  const connState = { ever: false, up: false }
+  const rawEmit = conn.emit.bind(conn)
+  conn.emit = (up: boolean) => { if (up) connState.ever = true; connState.up = up; rawEmit(up) }
+  const rawReset = conn.reset.bind(conn)
+  conn.reset = () => { connState.ever = false; connState.up = false; rawReset() }
   return {
     lists: makeChannel<[SessionInfo[]]>(),
     states: makeChannel<[string, SessionState]>(),
     readies: makeChannel<[string, string]>(),
     exits: makeChannel<[string, boolean, string]>(),
-    conn: makeChannel<[boolean]>(),
+    conn,
+    connState,
     created: [] as Array<{ id: string }>,
   }
 })
@@ -51,6 +67,12 @@ const H = vi.hoisted(() => {
 vi.mock('../api/client', () => ({
   getHealth: async () => ({ ok: true, version: 't', ts: 0, sandboxAvailable: false, gpuDevices: [], homeDir: '/home/t' }),
   api: {
+    // ★ ADDED 2026-08-31, AND THEIR ABSENCE IS WHY ALL SEVEN CASES FAILED AT MOUNT. The
+    // store started calling these when the reconnect seed was added; the mock was written
+    // before that and could not notice, because the suite had never been run. Mock drift is
+    // silent for exactly as long as nothing executes the mock.
+    hasEverConnected: () => H.connState.ever,
+    isConnected: () => H.connState.up,
     on: {
       list: H.lists.on, stateChange: H.states.on, ready: H.readies.on,
       exit: H.exits.on, connected: H.conn.on,
@@ -85,7 +107,13 @@ const commits: Array<{ activeId: string | null; attention: string[] }> = []
 function Probe() {
   renders++
   ctx = useSessions()
-  commits.push({ activeId: ctx.activeId, attention: [...ctx.attention] })
+  // `.keys()`, not the map itself. `attention` is a ReadonlyMap, so spreading it yields
+  // [key, value] PAIRS — and test 6 then asked whether a `string[]` of pairs `.includes()` a
+  // plain string id, which is false for every possible input. The suite could not run, so
+  // nothing caught it; the type error that says so was masked by tsconfig's `exclude` of
+  // test files, and vitest does not typecheck. Three layers of green over an assertion that
+  // had no way to fail.
+  commits.push({ activeId: ctx.activeId, attention: [...ctx.attention.keys()] })
   return null
 }
 
@@ -203,17 +231,49 @@ describe('SessionsProvider wiring', () => {
   })
 })
 
-// ════════ TWO THINGS TO EXPECT ON THE FIRST RUN ════════
-// THIS FILE HAS NEVER BEEN EXECUTED. It was written while vitest could not be installed
-// (node_modules was read-only), so it is staged, not passing. Treat a green first run as
-// news, not as confirmation.
+// ════════ FIRST EXECUTED 2026-08-31 — WHAT THAT RUN FOUND ════════
+// This file was committed with 7 cases and had NEVER been executed: `web/package.json`
+// declared `"test": "vitest run"` and vitest was installed nowhere. The note that stood here
+// predicted two things about the first run and was wrong about both; what actually happened
+// is more useful, so it replaces the prediction rather than sitting beside it.
 //
-// 1. The top-level `await import('./sessions')` requires the file to be treated as an ES
-//    module with top-level await — standard under vitest, but if it complains, move it to a
-//    `beforeAll` or use a static import (the vi.mock call is hoisted above both either way).
-// 2. Test 4 asserts an exact render count and is the most brittle line here. React may
-//    legitimately batch or re-render for reasons unrelated to the store. If it proves flaky,
-//    weaken it to an identity check on the sessions array rather than a render count —
-//    which tests the same claim one layer lower and is not at the mercy of the scheduler.
-//    Do NOT simply delete it: the identity preservation it guards is what keeps H2's
-//    workaround from having to spread further.
+// 1. ALL SEVEN FAILED AT MOUNT, on `api.hasEverConnected is not a function`. The store began
+//    calling it when the reconnect seed was added; this mock predates that. Mock drift is
+//    silent for exactly as long as nothing runs the mock — the fake cannot notice that the
+//    real thing grew a method. Fixed by giving the fake both liveness questions and driving
+//    them off the `conn` channel the tests already emit on, so there is one source of truth.
+// 2. TEST 6 COULD NOT FAIL. See the note on the Probe above. Found by `tsc`, in one run,
+//    the moment web/tsconfig.json stopped excluding test files — never by running the suite,
+//    because vitest does not typecheck and the assertion was green either way.
+// 3. The top-level `await import('./sessions')` was fine. Test 4 was not flaky.
+//
+// ════════ ALL SEVEN ARE FALSIFIABLE, AND THAT WAS MEASURED ════════
+// A suite that has just gone from "never ran" to "7 passed" has not yet earned anything: the
+// two states look identical from the outside. Each case was therefore made to fail on
+// purpose, against a COPY of the store and reducer (never the live files — a restore
+// clobbers a concurrent editor), with a control mutation that matched no text and was
+// refused before running, since a patch that silently matches nothing runs the UNMUTATED
+// code and reads as "this assertion cannot fail".
+//
+//   test 1  subscription deps [] -> [store]                        → red (also reds test 3)
+//   test 2  cleanup drops one unsubscribe                          → red
+//   test 3  'ready' clobbers a running session to idle             → red
+//   test 4  patchSessions rebuilds the array when nothing changed  → red   ← see below
+//   test 5  isFresh keyed on `store` instead of `store.fresh`      → red
+//   test 6  withActive stops clearing the attention flag           → red, on `bad`
+//   test 7  'created' does not mark the session fresh              → red
+//
+// ★ TEST 6 REDDENS ON ITS CENTRAL ASSERTION, not merely its trailing one:
+//   `expected [ { activeId: 'b', attention: ['b'] } ] to deeply equal []`. That is the
+//   same-commit invariant actually being enforced, which it never was before today.
+//
+// ★ TEST 4 IS NARROWER THAN IT LOOKS, and this is worth knowing before trusting it.
+//   Deleting `case 'state'`'s `return state` early-out does NOT redden it: the reducer's
+//   state object churns, the provider re-renders, but `value`'s useMemo absorbs it because
+//   `sessions`, `activeId` and `attention` all keep their identity — so no CONSUMER
+//   re-renders, which is precisely what this test measures and says it measures. What does
+//   redden it is identity churn one level down, in `patchSessions`. So this case guards the
+//   memo, not the reducer's early-out. That early-out is not uncovered — it is pinned by
+//   `scratchpad/session-reducer-test.mts` (F1.7, "redundant waiting→waiting returns the SAME
+//   state object"), which is the division of labour this file's header describes. Two tests,
+//   two layers, neither redundant; do not "simplify" either into the other.
