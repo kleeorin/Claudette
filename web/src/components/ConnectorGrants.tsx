@@ -74,14 +74,36 @@ export function ConnectorGrants({ session, compact = false, bare = false }: { se
       <div className="space-y-1">
         {catalog.map((c) => {
           const on = granted.includes(c.id)
+          // BLOCKED, not merely discouraged. `needsSetup` means the vendor requires an OAuth
+          // client only the operator can create, so this grant CANNOT work — and the two
+          // alternatives are both worse: letting it switch on fails at connect with an error
+          // that looks like ours, and hiding the row makes the connector undiscoverable. A
+          // disabled control plus the reason is the honest third option.
+          // It never blocks REVOKING: if a connector is already granted and its OAuth client
+          // is later deleted, the operator must still be able to take the grant away.
+          const blocked = !!c.needsSetup && !on
           return (
-            <label key={c.id} className="flex items-start gap-2 cursor-pointer select-none">
-              <input type="checkbox" checked={on} disabled={busy} onChange={() => toggle(c.id)} className="accent-ctp-accent mt-[1px]" />
+            <label key={c.id} className={`flex items-start gap-2 select-none ${blocked ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
+              <input
+                type="checkbox"
+                checked={on}
+                disabled={busy || blocked}
+                onChange={() => toggle(c.id)}
+                className="accent-ctp-accent mt-[1px] disabled:opacity-40"
+              />
               <span className="leading-snug min-w-0 flex-1">
-                <span className={on ? 'text-ctp-text' : 'text-ctp-subtext'}>{c.name}</span>
+                <span className={on ? 'text-ctp-text' : blocked ? 'text-ctp-overlay' : 'text-ctp-subtext'}>{c.name}</span>
                 <code className="text-ctp-overlay ml-1.5">{c.id}</code>
-                {c.health === 'needs-auth' && <span className="text-ctp-yellow ml-1.5" title={c.lastError}>needs auth</span>}
+                {c.needsSetup && <span className="text-ctp-yellow ml-1.5">needs setup</span>}
+                {c.health === 'needs-auth' && !c.needsSetup && <span className="text-ctp-yellow ml-1.5" title={c.lastError}>needs auth</span>}
                 {c.health === 'error' && <span className="text-ctp-red ml-1.5" title={c.lastError}>error</span>}
+                {blocked && (
+                  <span className="block text-ctp-yellow/90">
+                    Can’t be granted yet — it needs an OAuth client you create, added under
+                    <b> Claudette → Connectors</b>. Google requires one per product; there is no
+                    automatic registration.
+                  </span>
+                )}
                 {/* Read-only roles get the whole server denied until it has been probed —
                     worth saying HERE, where the grant is made, not only in the catalog. */}
                 {on && !c.tools && (

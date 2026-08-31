@@ -96,8 +96,28 @@ export function ConnectorCatalog({ cwd }: { cwd: string }) {
                   <span className="text-ctp-text font-medium truncate">{c.name}</span>
                   <code className="text-ctp-overlay shrink-0">{c.id}</code>
                   <span className="text-ctp-overlay shrink-0">{c.transport}</span>
+                  {/* THREE STATES, and this badge is the third one. `needsSetup` is not
+                      "disabled" (the operator chose not to grant it) and not "error" (it was
+                      dialled and something went wrong): it CANNOT be granted yet, because the
+                      vendor requires an OAuth client only the operator can create. Saying so
+                      here is what makes blocking the toggle below legible rather than broken. */}
+                  {c.needsSetup && (
+                    <span
+                      className="shrink-0 px-1.5 rounded bg-ctp-yellow/15 text-ctp-yellow text-[10px] font-medium"
+                      title="This connector needs an OAuth client you create — see below"
+                    >needs setup</span>
+                  )}
                   <button onClick={() => setEditing(c)} className="ml-auto text-ctp-overlay hover:text-ctp-text px-1 shrink-0">edit</button>
-                  <button onClick={() => void remove(c.id)} disabled={busy} className="text-ctp-overlay hover:text-ctp-red px-1 shrink-0" title="Remove from the catalog">×</button>
+                  {/* A built-in has no stored definition to delete — it lives in code and is
+                      merged in on read — so × HIDES it, and hiding is reversible. Offering
+                      "remove" would either silently do nothing or imply a permanence that
+                      does not exist. */}
+                  <button
+                    onClick={() => void remove(c.id)}
+                    disabled={busy}
+                    className="text-ctp-overlay hover:text-ctp-red px-1 shrink-0"
+                    title={c.builtin ? 'Hide this built-in connector (reversible)' : 'Remove from the catalog'}
+                  >×</button>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-ctp-overlay pl-3.5">
                   {c.urlDisplay && <span className="font-mono">{c.urlDisplay}</span>}
@@ -116,6 +136,17 @@ export function ConnectorCatalog({ cwd }: { cwd: string }) {
                   </span>
                   {!!c.inUseBy && <span>granted to {c.inUseBy} session{c.inUseBy === 1 ? '' : 's'}</span>}
                 </div>
+                {c.builtin && !c.needsSetup && (
+                  <div className="pl-3.5 text-ctp-overlay">built in — shipped with Claudette, not added here</div>
+                )}
+                {c.needsSetup && (
+                  <div className="pl-3.5 text-ctp-yellow/90 leading-snug">
+                    Needs an OAuth client you create (Google Cloud Console → Web application),
+                    with this product's scopes on the consent screen. Add it under OAuth clients
+                    below, then point this connector at it with <span className="text-ctp-text">edit</span>.
+                    Until then it cannot be granted to a session.
+                  </div>
+                )}
                 {c.importedFrom && <div className="pl-3.5 text-ctp-overlay truncate" title={c.importedFrom}>imported from {c.importedFrom}</div>}
                 {c.lastError && <div className="pl-3.5 text-ctp-red/90">{c.lastError}</div>}
                 {!!c.inUseBy && (
