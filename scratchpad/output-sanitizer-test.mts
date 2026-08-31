@@ -30,11 +30,8 @@ import { fileURLToPath } from 'url'
 import { setupDom, NO_DOM_NOTE } from './dom-env.mts'
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-let pass = 0, fail = 0, skipped = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
+let skipped = 0
 const note = (s: string) => console.log(`   ${s}`)
 
 // ════════════════════════════════════════════════════════════════════════════

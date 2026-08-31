@@ -5,11 +5,7 @@
 //   npx tsx scratchpad/output-keys-test.mts
 import { outputKeys } from '../web/src/components/notebook/outputKeys'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 const outs = (n: number) => Array.from({ length: n }, (_, i) => ({ id: i }))
 
 // 1. Below the cap, appending never disturbs an existing key.

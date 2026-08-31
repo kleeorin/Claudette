@@ -55,11 +55,7 @@ import type { SandboxConfig, SandboxMount } from '../shared/src/types'
 
 const PLAN_EXPORT = 'sessionDataMountPlan'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 interface Exclusion { mount: SandboxMount; reason: { code: string; message?: string } }
 interface MountPlan { active: SandboxMount[]; excluded: Exclusion[] }

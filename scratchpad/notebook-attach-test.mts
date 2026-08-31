@@ -27,11 +27,7 @@
 // currently be executed at all. Hence this, in the style of session-reducer-test.mts.
 import { attachNewNotebooks } from '../web/src/lib/notebookAttach'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const local = () => true
 const remote = () => false

@@ -32,11 +32,7 @@ import { findNearestPython } from '../server/src/jupyter/jupyterManager'
 import { pathInWritableMount, sandboxAvailable } from '../server/src/claude/sandbox'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'claudette-chain-')))
 try {

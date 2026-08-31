@@ -35,11 +35,7 @@ const { connectorServers, connectorDenyRules, connectorKey } = await import('../
 const { normalizeGrants } = await import('../server/src/claude/sessionManager')
 const { connectorIdError, toolNameUsable, denyAllRule, composedToolName } = await import('../shared/src/connectors')
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 console.log(`(catalog isolated in ${DATA})\n`)
 
 // --- 1. Id validation ---------------------------------------------------------

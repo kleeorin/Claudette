@@ -14,11 +14,7 @@ import { wrapCommand, sandboxAvailable } from '../server/src/claude/sandbox'
 import { DENY_ALL_SANDBOX } from '../server/src/claude/sessionConfinement'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 if (!sandboxAvailable()) {
   console.log('(host cannot sandbox — live confinement not exercised)')

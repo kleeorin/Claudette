@@ -16,11 +16,7 @@ import path from 'path'
 import { sandboxPathAccess, wrapCommand, sandboxAvailable } from '../server/src/claude/sandbox'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 function modeAtDest(args: string[], p: string): 'rw' | 'ro' | 'none' {
   let mode: 'rw' | 'ro' | 'none' = 'none'
   for (let i = 0; i < args.length - 2; i++) {

@@ -26,11 +26,7 @@ import { SessionConfinement } from '../server/src/claude/sessionConfinement'
 import type { AppControlMcpServer, McpTool, McpToolResult } from '../server/src/mcp/appControlServer'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unowned-'))
 const proj = path.join(root, 'proj')

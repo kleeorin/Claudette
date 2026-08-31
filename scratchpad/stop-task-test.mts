@@ -13,11 +13,7 @@ import { ClaudeEngine } from '../server/src/claude/claudeEngine'
 import { parseTaskStarted, taskIdOfNotification } from '../shared/src/tasks'
 import type { ClaudeEvent } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // --- 1. The wire parsers pair task_id with tool_use_id -----------------------

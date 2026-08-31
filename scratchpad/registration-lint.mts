@@ -27,6 +27,7 @@ const SELF = path.basename(fileURLToPath(import.meta.url))
 // test gets quietly buried, which would defeat the whole check.
 const NON_TESTS: Record<string, string> = {
   'dom-env.mts': 'DOM shim imported by other tests; asserts nothing itself',
+  'assert.mjs': 'THE shared assertion helper — exports check() plus the pass/fail/open\n    counters as ESM live bindings, and asserts nothing itself. It is .mjs, not .mts, because\n    run-suite.sh runs every .mjs harness under plain node, which cannot import TypeScript;\n    this way both halves of the directory can share one helper. It deliberately does NOT own\n    process.exit — see its header — so the result-dependent-exit gate still reads every\n    harness textually.',
   'trust-gate.mjs': 'shared helper imported by the harnesses that create a session through\n    the UI — answers the "Trust this folder?" dialog and waits for the composer. Exports two\n    functions and asserts nothing itself.',
   'nested-mount-shadowing-probe.mts': 'documentation probe — prints observations and a bounded\n    hypothesis, has NO process.exit, so it can never report failure. run-suite.sh\'s gate caught\n    it when I wrongly registered it: a test that cannot fail sits green forever, which is the\n    very class this lint exists to stop.',
   'print-sandbox-prompt.mts': 'printer — emits the sandbox system prompt, no assertions',

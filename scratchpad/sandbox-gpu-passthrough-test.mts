@@ -22,11 +22,7 @@ import {
 import { normalizeSandbox } from '../server/src/claude/sessionManager'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sbxgpu-'))
 const proj = path.join(root, 'proj')

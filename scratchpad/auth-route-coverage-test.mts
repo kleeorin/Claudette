@@ -54,11 +54,7 @@ import { registerGitRoutes } from '../server/src/git/gitApi'
 import { registerConnectorRoutes } from '../server/src/connectors/connectorApi'
 import { registerUsageRoutes } from '../server/src/usage/usageApi'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 // Constructed directly rather than via resolveAuth(), which touches ~/.config and can
 // exit the process. The token is never presented, so every probe below is unauthenticated

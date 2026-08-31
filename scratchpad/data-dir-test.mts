@@ -17,11 +17,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, readdirSync, lstatS
 import { tmpdir } from 'os'
 import path from 'path'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 // Each case needs a FRESH module instance: migrateLegacy runs once per process.
 let seq = 0

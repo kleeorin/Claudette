@@ -54,11 +54,7 @@ const { readRoleNotes, appendRoleNote } = await import('../server/src/mcp/teamNo
 import type { McpTool, McpToolResult, AppControlMcpServer } from '../server/src/mcp/appControlServer'
 import type { ClaudeEvent, SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // ============================================================================

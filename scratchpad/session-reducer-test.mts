@@ -26,11 +26,7 @@ import {
 } from '../web/src/store/sessionReducer'
 import type { SessionInfo } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const sess = (id: string, over: Partial<SessionInfo> = {}): SessionInfo => ({
   id, name: id, cwd: '/w', rootDir: '/w', state: 'idle', ...over,

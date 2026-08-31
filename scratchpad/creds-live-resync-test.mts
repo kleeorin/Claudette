@@ -30,11 +30,7 @@ process.env.CLAUDETTE_DATA_DIR = path.join(real, 'claudette')
 const { scrubbedHostConfigDir, releaseHostConfigDir, resyncMirrorCreds, watchedMirrorCount } =
   await import('../server/src/claude/configProtection')
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const CREDS = '.credentials.json'
 const realCreds = path.join(real, CREDS)

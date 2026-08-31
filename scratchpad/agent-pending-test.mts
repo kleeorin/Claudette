@@ -45,11 +45,7 @@ process.env.FAKE_TURN_MS = '50'
 const { SessionManager } = await import('../server/src/claude/sessionManager')
 const { AGENTS, agentKey } = await import('../server/src/claude/agents')
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 const sessions = new SessionManager({})

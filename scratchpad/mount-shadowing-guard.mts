@@ -26,11 +26,7 @@ import { viewOf, boxCanReach, resolveReach } from '../server/src/claude/sandboxP
 import type { ResolvedMount, LogicalPath, RealPath } from '../server/src/claude/sandboxPaths'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'claudette-shadow-')))
 try {

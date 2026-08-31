@@ -22,11 +22,7 @@ import { normalizeSandbox } from '../server/src/claude/sessionManager'
 import type { SandboxConfig } from '../shared/src/types'
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 // Poison the env so any leak is unmistakable.
 process.env.CLAUDETTE_TOKEN = 'SECRET_TOKEN_SHOULD_NEVER_APPEAR'
 process.env.MY_DB_PASSWORD = 'hunter2'

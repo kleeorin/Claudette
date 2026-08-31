@@ -17,11 +17,7 @@ import { SessionConfinement } from '../server/src/claude/sessionConfinement'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'toctou-'))
 const proj = path.join(root, 'proj'); fs.mkdirSync(proj, { recursive: true })

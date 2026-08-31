@@ -23,11 +23,7 @@ import path from 'path'
 import { wrapCommand, sandboxAvailable } from '../server/src/claude/sandbox'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, ok: boolean, extra = '') => {
-  ok ? pass++ : fail++
-  console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { check, passed as pass, failed as fail } from './assert.mjs'
 
 if (!sandboxAvailable()) {
   console.log('SKIP — host cannot sandbox (bwrap/userns unavailable); no argv is produced here')
