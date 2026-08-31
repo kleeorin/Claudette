@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, chmodSy
 import path from 'path'
 import { dataDir } from '../util/dataDir'
 import { errMessage } from '../util/errMessage'
-import { BUILTIN_CONNECTORS } from './builtins'
+import { BUILTIN_CONNECTORS, BUILTIN_SETUP_HINT } from './builtins'
 import {
   type ConnectorDef, type ConnectorView, type ConnectorTool, type ConnectorHealth,
   type OAuthClient, type AccountConnector, connectorIdError, accountConnectorNameError, MAX_TOOL_NAME_LEN,
@@ -286,7 +286,11 @@ export function toView(d: ConnectorDef, inUseBy?: number): ConnectorView {
     // client and there is no usable one yet. Checking that the ref RESOLVES (not merely
     // that it is set) is the point — deleting the OAuth client must put the row straight
     // back into needs-setup, and a stored flag would have said "configured" forever.
-    ...(d.requiresOAuthClient && !oauthClientUsable(d.oauthClientRef) ? { needsSetup: true } : {}),
+    ...(d.requiresOAuthClient && !oauthClientUsable(d.oauthClientRef)
+      // The hint rides along with the state it explains, and ONLY with it: a setup hint on a
+      // row that needs no setup is a instruction to do nothing, which reads as a fault.
+      ? { needsSetup: true, ...(BUILTIN_SETUP_HINT[d.id] ? { setupHint: BUILTIN_SETUP_HINT[d.id] } : {}) }
+      : {}),
     importedFrom: d.importedFrom,
     health: h?.health ?? 'disconnected',
     lastError: h?.lastError,

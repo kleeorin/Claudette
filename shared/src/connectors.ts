@@ -143,6 +143,12 @@ export interface ConnectorView {
   // Recomputed on every read from `requiresOAuthClient` + whether `oauthClientRef` still
   // resolves, so saving or deleting an OAuth client can never leave it disagreeing.
   needsSetup?: boolean
+  // What the operator must DO about `needsSetup`, per product. Carried on the view rather
+  // than duplicated in web/src: the text lives beside the definitions it describes
+  // (BUILTIN_SETUP_HINT in server/src/connectors/builtins.ts) so it cannot drift from them,
+  // and copying it into the client would recreate exactly the drift that placement avoids.
+  // Absent for anything that does not need setup.
+  setupHint?: string
   health: ConnectorHealth
   lastError?: string
   tools?: ConnectorTool[]

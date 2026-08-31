@@ -141,10 +141,14 @@ export function ConnectorCatalog({ cwd }: { cwd: string }) {
                 )}
                 {c.needsSetup && (
                   <div className="pl-3.5 text-ctp-yellow/90 leading-snug">
-                    Needs an OAuth client you create (Google Cloud Console → Web application),
-                    with this product's scopes on the consent screen. Add it under OAuth clients
-                    below, then point this connector at it with <span className="text-ctp-text">edit</span>.
-                    Until then it cannot be granted to a session.
+                    {/* Prefer the server's per-product wording. It lives beside the built-in
+                        definitions so it cannot drift from them; the fallback is here only for
+                        a built-in that declares requiresOAuthClient without a hint, which
+                        should not happen but should not render blank if it does. */}
+                    {c.setupHint ?? 'Needs an OAuth client you create, with this product’s scopes on the consent screen.'}
+                    {' '}Add it under OAuth clients below, then point this connector at it with{' '}
+                    <span className="text-ctp-text">edit</span>. Until then it cannot be granted
+                    to a session.
                   </div>
                 )}
                 {c.importedFrom && <div className="pl-3.5 text-ctp-overlay truncate" title={c.importedFrom}>imported from {c.importedFrom}</div>}

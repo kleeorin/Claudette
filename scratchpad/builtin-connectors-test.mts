@@ -89,6 +89,18 @@ ok('[4d] DELETING that client puts it straight back to needs-setup (derived, not
   view('gmail')?.needsSetup === true,
   view('gmail')?.needsSetup === true ? '' : '← a stale stored flag would report configured forever')
 
+// ── [4e] the hint travels WITH the state it explains ───────────────────────────────
+// Carried on the view rather than duplicated in web/src: the text lives beside the
+// definitions (BUILTIN_SETUP_HINT) so it cannot drift from them, and a copy in the client
+// would recreate exactly the drift that placement avoids.
+store.setBuiltinOverride('gmail', { oauthClientRef: undefined })
+store.removeOAuthClient('goog')
+ok('[4e] a needs-setup row carries its per-product setupHint',
+  !!view('gmail')?.setupHint && view('gmail')!.setupHint!.includes('Gmail'),
+  JSON.stringify(view('gmail')?.setupHint))
+ok('[4e2] …and a row that needs NO setup carries none (an instruction to do nothing reads as a fault)',
+  view('confluence')?.setupHint === undefined)
+
 // ── [5] an edit is an OVERRIDE, not a stored copy ──────────────────────────────────
 // This is the assertion that catches the whole design silently reverting to seeding.
 ok('[5] editing a built-in writes an override, and NO connector def, to disk',
