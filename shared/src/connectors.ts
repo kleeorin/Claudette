@@ -67,6 +67,22 @@ export interface ConnectorDef {
   // Where this came from, so the UI can explain a row the user didn't type. Set by the
   // import of a pre-existing CLI config.
   importedFrom?: string
+  // ── BUILT-IN CONNECTORS ────────────────────────────────────────────────────────────
+  // Shipped in code (server/src/connectors/builtins.ts) and merged into the catalog at
+  // READ time, never seeded into connectors.json. Seeding would freeze a copy at first
+  // run: correct a URL later and every existing install keeps the broken one, with no
+  // signal that it is stale. Merging means built-ins get fixes, and the operator's
+  // changes live in a small override layer patched over the top.
+  builtin?: true
+  // This vendor requires the OPERATOR to create their own OAuth client — there is no
+  // Dynamic Client Registration, so the connector CANNOT work out of the box. A property
+  // of the vendor, hence declared here and static.
+  // ★ NOTE THIS IS THE REQUIREMENT, NOT THE STATE. Whether setup is outstanding is
+  // DERIVED (see ConnectorView.needsSetup) from this plus whether an oauthClientRef is
+  // set and still resolves. A stored "needsSetup" flag would be a second source of truth
+  // for something already determined, and would go stale the moment a client is saved or
+  // deleted — the one failure this file has the most scar tissue about.
+  requiresOAuthClient?: true
   // The tool list learned by the last probe, PERSISTED with the definition rather than
   // held only in memory. launch() is synchronous and runs from restore() at boot with
   // nothing connected, so a read-only role's deny list has to be computable without
@@ -113,6 +129,20 @@ export interface ConnectorView {
   oauthClientRef?: string
   enabledByDefault?: boolean
   importedFrom?: string
+  // Shipped by us rather than typed by the operator. The UI uses this to explain a row
+  // nobody added, and to offer "hide" instead of "delete" — a built-in cannot be deleted
+  // because it is not stored; hiding records an override.
+  builtin?: true
+  // ★ DERIVED, never stored: this built-in needs an operator-created OAuth client and does
+  // not have a usable one yet. It is a THIRD state, distinct from both disabled and error:
+  //   · disabled — the operator chose not to grant it
+  //   · needsSetup — it cannot be granted yet, and the UI must block the toggle rather
+  //     than let it switch on and fail at connect (undiagnosable), or hide the row
+  //     (undiscoverable)
+  //   · error — it was dialled and something went wrong
+  // Recomputed on every read from `requiresOAuthClient` + whether `oauthClientRef` still
+  // resolves, so saving or deleting an OAuth client can never leave it disagreeing.
+  needsSetup?: boolean
   health: ConnectorHealth
   lastError?: string
   tools?: ConnectorTool[]

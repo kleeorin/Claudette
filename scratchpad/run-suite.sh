@@ -372,6 +372,12 @@ SUITE=(
   # event passes everything else. Exits 77 if inotify is unavailable rather than reporting
   # six failures for a missing prerequisite.
   "none:live-file-sync-test.mts"
+  # GROUP C. Built-in connectors (Confluence + five Google Workspace). Every check is one
+  # question — "is this still a MERGE, or has something quietly turned it into a COPY?" —
+  # because seeding is what regression looks like here and it is invisible from the UI on
+  # the day it happens. [4d] is the sharp one: deleting the OAuth client must put the row
+  # back to needs-setup, which only holds while that state is DERIVED rather than stored.
+  "none:builtin-connectors-test.mts"
   # GROUP C. The unsaved-editor-buffer store: does a held buffer ever shadow a file that
   # changed on disk? The operator met this as "files open stale and don't record changes" —
   # nothing was failing to record; the new text was on disk and simply never displayed.

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, chmodSy
 import path from 'path'
 import { dataDir } from '../util/dataDir'
 import { errMessage } from '../util/errMessage'
+import { BUILTIN_CONNECTORS } from './builtins'
 import {
   type ConnectorDef, type ConnectorView, type ConnectorTool, type ConnectorHealth,
   type OAuthClient, type AccountConnector, connectorIdError, accountConnectorNameError, MAX_TOOL_NAME_LEN,
@@ -32,9 +33,29 @@ interface Catalog {
   // deliberate operator act preceded by the pre-flight report, because it is the switch
   // that makes a hand-configured MCP server stop appearing in sessions.
   strict: boolean
+  // The operator's changes to BUILT-IN connectors, keyed by built-in id. A PATCH, never a
+  // copy of the definition — a copy is what seeding would have been, and it would stop the
+  // built-in ever receiving a fix. Only fields the operator actually changed live here.
+  builtinOverrides: Record<string, BuiltinOverride>
 }
 
-const EMPTY: Catalog = { connectors: [], oauthClients: [], accountConnectors: [], strict: false }
+export interface BuiltinOverride {
+  // The operator does not want to see this row. Built-ins cannot be DELETED — they are not
+  // stored, so there is nothing to remove — and a delete button that silently did nothing
+  // on the next read would be worse than no button. Hiding is the honest verb.
+  hidden?: boolean
+  enabledByDefault?: boolean
+  oauthClientRef?: string
+  // Learned tool classification. A user connector persists this on its def in
+  // connectors.json; a built-in has no stored def, so it lives here — and it MUST be
+  // persisted, not held in a Map. launch() is synchronous and runs from restore() at boot
+  // with nothing dialled, so a read-only role's deny list has to be computable without
+  // waiting on a probe. An in-memory Map would make every built-in contribute zero denials
+  // for the whole first turn after a restart — fail-open, at exactly the wrong moment.
+  tools?: ConnectorTool[]
+}
+
+const EMPTY: Catalog = { connectors: [], oauthClients: [], accountConnectors: [], strict: false, builtinOverrides: {} }
 
 const file = (): string => path.join(dataDir(), 'connectors.json')
 
@@ -66,6 +87,8 @@ function load(): Catalog {
       // Default FALSE on a malformed/absent value. Defaulting to true would silently cut
       // every session off from its configured servers because a field failed to parse.
       strict: parsed.strict === true,
+      builtinOverrides: (parsed.builtinOverrides && typeof parsed.builtinOverrides === 'object')
+        ? parsed.builtinOverrides as Record<string, BuiltinOverride> : {},
     }
     return cache
   } catch (e) {
@@ -88,12 +111,40 @@ function persist(c: Catalog): void {
 
 // --- reads -------------------------------------------------------------------------
 
+// The catalog as everything downstream sees it: the operator's own connectors, plus the
+// built-ins we ship, merged HERE rather than seeded into the file. Every consumer
+// (connectorApi, the deny-rule builder, launch()) goes through this, so a built-in is a
+// first-class connector everywhere without any of them knowing built-ins exist.
 export function listConnectors(): ConnectorDef[] {
-  return [...load().connectors]
+  const c = load()
+  const own = [...c.connectors]
+  const ownIds = new Set(own.map((x) => x.id))
+  const merged = [...own]
+  for (const b of BUILTIN_CONNECTORS) {
+    // A user-defined connector with the same id WINS OUTRIGHT and the built-in disappears.
+    // Not a field-by-field merge: blending two definitions the operator believes are
+    // separate produces behaviour neither of them describes.
+    if (ownIds.has(b.id)) continue
+    const ov = c.builtinOverrides[b.id]
+    if (ov?.hidden) continue
+    // Spread the override LAST so the operator's choices win, but only for the fields they
+    // actually set — everything else (url, transport, name) keeps tracking what we ship,
+    // which is the entire point of not seeding.
+    merged.push({
+      ...b,
+      ...(ov?.enabledByDefault !== undefined ? { enabledByDefault: ov.enabledByDefault } : {}),
+      ...(ov?.oauthClientRef !== undefined ? { oauthClientRef: ov.oauthClientRef } : {}),
+      // Classification is persisted per-connector for user entries; for a built-in it lives
+      // in the health/tools side-channel the same way, so read it back here.
+      ...(ov?.tools ? { tools: ov.tools } : {}),
+    })
+  }
+  return merged
 }
 
+
 export function getConnector(id: string): ConnectorDef | undefined {
-  return load().connectors.find((c) => c.id === id)
+  return listConnectors().find((c) => c.id === id)
 }
 
 export function listOAuthClients(): OAuthClient[] {
@@ -105,7 +156,11 @@ export function getOAuthClient(id: string): OAuthClient | undefined {
 }
 
 export function toolsOf(id: string): ConnectorTool[] | undefined {
-  return load().connectors.find((d) => d.id === id)?.tools
+  // Through getConnector, NOT the raw stored list. A built-in's classification lives in the
+  // override layer, so reading `load().connectors` directly returned undefined for every
+  // built-in — and this function feeds the read-only role's deny rules, so that would have
+  // been silently FAIL-OPEN: a built-in contributing no denials at all, with nothing to see.
+  return getConnector(id)?.tools
 }
 
 export function listAccountConnectors(): AccountConnector[] {
@@ -172,9 +227,14 @@ export function setTools(id: string, list: ConnectorTool[]): void {
   }))
   const c = load()
   const def = c.connectors.find((d) => d.id === id)
-  if (!def) return          // classification for a connector that no longer exists
-  def.tools = list
-  persist(c)                // classification is durable
+  if (def) { def.tools = list; persist(c); return }   // classification is durable
+  // A BUILT-IN has no stored def; its classification goes in the override layer. Guarded on
+  // the id actually being a built-in so a probe for a connector that no longer exists still
+  // does nothing, exactly as before.
+  if (BUILTIN_CONNECTORS.some((b) => b.id === id)) {
+    c.builtinOverrides[id] = { ...c.builtinOverrides[id], tools: list }
+    persist(c)
+  }
 }
 
 // --- redaction ---------------------------------------------------------------------
@@ -206,6 +266,13 @@ export function toView(d: ConnectorDef, inUseBy?: number): ConnectorView {
     command: d.command,
     oauthClientRef: d.oauthClientRef,
     enabledByDefault: d.enabledByDefault,
+    ...(d.builtin ? { builtin: true as const } : {}),
+    // DERIVED on every read, never stored: the vendor needs an operator-created OAuth
+    // client and there is no usable one yet. Checking that the ref RESOLVES (not merely
+    // that it is set) is the point — deleting the OAuth client must put the row straight
+    // back into needs-setup, and a stored flag would have said "configured" forever.
+    ...(d.requiresOAuthClient && !(d.oauthClientRef && getOAuthClient(d.oauthClientRef))
+      ? { needsSetup: true } : {}),
     importedFrom: d.importedFrom,
     health: h?.health ?? 'disconnected',
     lastError: h?.lastError,
@@ -317,10 +384,38 @@ export function saveConnector(input: ConnectorDef): SaveResult {
   return { ok: true, def }
 }
 
+// Edit a BUILT-IN. Deliberately its own function rather than a branch inside
+// saveConnector: through saveConnector the two cases are indistinguishable — "change the
+// built-in's OAuth client" and "create my own connector that happens to use the id
+// `confluence`" arrive as the same call, and guessing between them silently does the wrong
+// one. Measured: a harness case creating a user connector called `confluence` was swallowed
+// as an override, and the operator's definition vanished.
+// Only fields an operator can meaningfully change are accepted; url/transport/name keep
+// tracking what we ship, which is the entire reason built-ins are not seeded.
+export function setBuiltinOverride(id: string, patch: BuiltinOverride): ConnectorDef | undefined {
+  if (!BUILTIN_CONNECTORS.some((b) => b.id === id)) return undefined
+  const c = load()
+  c.builtinOverrides[id] = { ...c.builtinOverrides[id], ...patch }
+  persist(c)
+  return getConnector(id)
+}
+
 export function removeConnector(id: string): boolean {
   const c = load()
   const next = c.connectors.filter((x) => x.id !== id)
-  if (next.length === c.connectors.length) return false
+  if (next.length === c.connectors.length) {
+    // Nothing stored under that id — but it may be a BUILT-IN, which cannot be deleted
+    // because it is not stored. Record the dismissal instead, so "remove" does what the
+    // operator meant (the row goes away) rather than silently doing nothing and having it
+    // reappear on the next read. Reversible: clear the override and it returns.
+    if (BUILTIN_CONNECTORS.some((b) => b.id === id)) {
+      c.builtinOverrides[id] = { ...c.builtinOverrides[id], hidden: true }
+      health.delete(id)
+      persist(c)
+      return true
+    }
+    return false
+  }
   c.connectors = next
   health.delete(id)   // the tools went with the def
   persist(c)
