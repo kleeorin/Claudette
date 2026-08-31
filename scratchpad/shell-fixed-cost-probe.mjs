@@ -234,9 +234,38 @@ ok('COST: …and that pushes the composer a further 250px below the visible view
 // AskUserQuestion card at 390x844 and the keyboard up, the composer's bottom is ALREADY below
 // the shell, which is overflow-hidden — so the bottom of the composer is clipped with nothing
 // to scroll to it. ask-card-height-probe.mjs asserts that the card's own Submit is reachable,
-// and it is; nothing asserted anything about the composer underneath it. NOT fixed here: which
-// band should give up the 33px (the card's 0.55 cap, the transcript's floor, or the composer)
-// is a layout-policy call, not a bug with one obvious repair.
+// and it is; nothing asserted anything about the composer underneath it.
+//
+// *** NOT THE stackH FAMILY. *** This was checked, not assumed, because the two findings sit
+// in the same viewport machinery and look like one bug. c0bf98f ("bound the stacked column on
+// every render") fixes the OTHER one: a persisted `stackH` validated at WRITE time by the
+// divider's max() and trusted at READ time, which goes stale the moment --vvh shrinks under
+// it. Measured across two frozen git-archive snapshots differing in exactly App.tsx and
+// lib/visualViewport.ts, HEAD 9cbc2d0 vs c0bf98f: EVERY number below identical, to the pixel.
+// Delta zero. `effStackH`'s three consumers all sit inside the stacked-split branch, and this
+// scenario opens no content pane and no terminal — `active` is null, `dockShown` false, so
+// none of them render.
+//   The zero was verified against a dead-instrument reading rather than believed: both
+//   snapshots symlink ONE web/node_modules, so a shared vite cache was a live explanation for
+//   "nothing changed". Counting symbols in the served /src/App.tsx separates them — HEAD
+//   391254 bytes with 0 occurrences of boundStackH/useVisibleHeight/effStackH, c0bf98f 395712
+//   with 3 of each. Different code genuinely ran. A result indistinguishable from a dead
+//   instrument is not yet a result.
+//   Side effect worth recording: c0bf98f's useVisibleHeight() IS exercised here. Its
+//   MutationObserver watches documentElement's style attribute, which is exactly what this
+//   probe writes when it sets --vvh — the "a harness simulating a keyboard" case its own
+//   comment anticipates. The hook fires correctly; it simply has no consumer in this scenario.
+//
+// So this is a CHAT-COLUMN BAND BUDGET, independent of the stacked column: the transcript's
+// floor + the card at its 0.55 cap + the composer sum to 541 against a 508px overflow-hidden
+// shell. No persisted value, no restore, no stacked layout — it reproduces on a fresh session
+// with nothing open. Common ancestor with c0bf98f ("a layout computed against a viewport that
+// then shrank"), different bug, disjoint fixes.
+//
+// OPEN ON PURPOSE, AND NOT UNFINISHED WORK: which of the three bands gives up the 33px — the
+// card's 0.55 cap, the transcript's floor, or the composer — is a PRODUCT call about what a
+// phone user loses first when the keyboard is up. It is not an engineering question with one
+// obvious repair, and it should not be closed by whoever next reads this file.
 ok('PRE-EXISTING, unowned: with a pending card + keyboard up, the composer fits inside the shell',
    phone.base.composer.bottom <= phone.base.shellBottom,
    `composer ends at ${phone.base.composer.bottom}, shell ends at ${phone.base.shellBottom} — ${phone.base.composer.bottom - phone.base.shellBottom}px clipped by overflow-hidden. Desktop is clean (composer ${desk.base.composer.bottom} in a ${desk.base.shellBottom}px shell), so this is phone + keyboard only.`,
