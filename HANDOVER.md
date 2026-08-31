@@ -29,7 +29,35 @@ fix, Files multi-select, drawn file icons) · `web/src/components/FileIcon.tsx` 
 `scratchpad/` — two new guards, `safe-mutate.sh`, `live-file-sync-design.md`, and edits to
 `dom-env.mts`, `output-sanitizer-test.mts`, `run-suite.sh`.
 
-### ★ BASELINE — 2026-08-28 09:59, `85 passed / 1 failed / 6 skipped`. Quotable.
+### ★ BASELINE — 2026-08-31, TWO sessions, published side by side
+| | coordinator | Landing |
+|---|---|---|
+| | **87 / 1 / 6** | **90 / 2 / 2** |
+
+Both clean: no contamination banner, bucket 1 interpretable at both ends (`web/dist`
+11:25:53), lock taken and released, **no unexpected failures in either**. The sole
+tree-level red in both is `authorizer-box-divergence-guard`, the documented expected red
+awaiting A2.
+
+**NEITHER IS "THE" SUITE, and the gap is fully attributed to four enumerated environment
+deltas** — not to the code:
+1. **jupyter** — absent here, so 6 entries SKIP; present there, so they run (+5 passed,
+   plus `notebook-ui-e2e` 13/13).
+2. **`CLAUDE_CONFIG_DIR`** — `~/.claude` here (`sandbox-fs-escape-fixes-test` 13/0), a
+   host-scrubbed mirror there (12/1). Same commit, green in one session, red in the other.
+3. **CLI authentication** — working here, broken there, so `real-turn-browser-test` and
+   `interrupt-test` runtime-SKIP in that session only.
+4. **Process visibility** — `pgrep` sees host PIDs there, only PID 1/2 here.
+
+Three `[open]`s in both, all deliberate: the 15s handshake budget, the **concurrency cap**
+(the bound the total-duration guard is easy to mistake for and does not provide), and the
+33px composer clip — now proven NOT to be the `stackH` family, and open as a product call
+about which band gives way.
+
+**Rule this pair earns: state which session measured a prereq before quoting it as a suite
+fact.** An environment-local truth reported as a tree fact cost three corrections in a day.
+
+### Previous baseline — 2026-08-28 09:59, `85 passed / 1 failed / 6 skipped`.
 Clean: no contamination banner, **bucket 1 interpretable for the first time since 08-26**
 (`web/dist` 09:30:00 newer than every input), no unexpected failures, no runtime skips. The
 sole red is `authorizer-box-divergence-guard`, the documented expected red awaiting A2.
