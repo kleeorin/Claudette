@@ -68,6 +68,15 @@ ok('[4a] Confluence does NOT need setup (Atlassian does Dynamic Client Registrat
   view('confluence')?.needsSetup !== true)
 ok('[4b] a Google entry DOES need setup (Google has no DCR)',
   view('gmail')?.needsSetup === true)
+// ★ A HALF-CONFIGURED CLIENT MUST NOT COUNT. saveOAuthClient requires a clientId but not a
+// secret, so "the ref resolves" is a weaker test than "a flow could complete". If this
+// cleared needsSetup, the UI would unblock the toggle and the operator would land in the
+// fail-at-connect state that was rejected in favour of blocking.
+store.saveOAuthClient({ id: 'half', name: 'H', clientId: 'cid', clientSecret: '' })
+store.setBuiltinOverride('gmail', { oauthClientRef: 'half' })
+ok('[4b2] an OAuth client with NO SECRET does not count as configured',
+  view('gmail')?.needsSetup === true,
+  view('gmail')?.needsSetup === true ? '' : '← the toggle would unblock into a connect that cannot succeed')
 store.saveOAuthClient({ id: 'goog', name: 'G', clientId: 'cid', clientSecret: 'sec' })
 store.setBuiltinOverride('gmail', { oauthClientRef: 'goog' })
 ok('[4c] pointing it at a saved OAuth client clears needs-setup',

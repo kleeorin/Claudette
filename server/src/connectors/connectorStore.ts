@@ -252,6 +252,21 @@ function urlDisplay(url?: string): string | undefined {
   }
 }
 
+// Is there an OAuth client here that could actually complete a flow? Deliberately stricter
+// than "the ref resolves": saveOAuthClient requires a clientId but NOT a clientSecret, so a
+// half-configured client resolves happily. Treating that as configured would clear
+// needsSetup, unblock the toggle, and land the operator in the fail-at-connect state that
+// was explicitly rejected in favour of blocking — the worst of the three to diagnose.
+// ★ ASSUMPTION, stated so it can be revised rather than rediscovered: this requires a
+// SECRET, which is right for the Google Web application clients these built-ins need. A
+// public/PKCE client legitimately has no secret, so if one is ever supported this is the
+// line to change — not the rule that a resolving ref means configured.
+function oauthClientUsable(ref?: string): boolean {
+  if (!ref) return false
+  const c = getOAuthClient(ref)
+  return !!c?.clientId?.trim() && !!c?.clientSecret?.trim()
+}
+
 export function toView(d: ConnectorDef, inUseBy?: number): ConnectorView {
   const h = health.get(d.id)
   return {
@@ -271,8 +286,7 @@ export function toView(d: ConnectorDef, inUseBy?: number): ConnectorView {
     // client and there is no usable one yet. Checking that the ref RESOLVES (not merely
     // that it is set) is the point — deleting the OAuth client must put the row straight
     // back into needs-setup, and a stored flag would have said "configured" forever.
-    ...(d.requiresOAuthClient && !(d.oauthClientRef && getOAuthClient(d.oauthClientRef))
-      ? { needsSetup: true } : {}),
+    ...(d.requiresOAuthClient && !oauthClientUsable(d.oauthClientRef) ? { needsSetup: true } : {}),
     importedFrom: d.importedFrom,
     health: h?.health ?? 'disconnected',
     lastError: h?.lastError,
