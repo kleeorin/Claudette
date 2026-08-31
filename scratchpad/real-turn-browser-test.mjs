@@ -134,15 +134,48 @@ console.log('samples:\n  ' + samples.join('\n  '))
 }
 check('Stop/interrupt was visible during the turn', sawStop)
 check('indicator SURVIVED init (Stop still up >2.5s in)', sawRunningAfterInit)
-const answered = await evaluate(`document.body.innerText.toLowerCase().includes('hello')`)
-check('turn actually completed (assistant answered)', answered)
+// ★ THIS ASSERTION WAS VACUOUS AND ALWAYS GREEN. It searched document.body for 'hello' —
+// and the PROMPT this harness types is "Run the bash command echo hello, then …", so the
+// word was on screen from the instant the user's own bubble rendered. It could not fail:
+// not when the assistant said nothing, not when the turn died on an auth-failure frame,
+// not with the whole transcript feature removed. A check that passes for a reason
+// unrelated to its name reports nothing.
+// It now asks the DOM for an ASSISTANT item specifically, via the `data-kind` marker on
+// the transcript row (harness-only, same contract as App.tsx's `data-phone`).
+const answered = await evaluate(`(() => {
+  const a = [...document.querySelectorAll('[data-kind="text"]')]
+  return a.some((el) => (el.innerText || '').trim().length > 0)
+})()`)
+check('turn actually completed (the ASSISTANT produced text)', answered)
 const endState = await footerState()
 check('after the turn, footer returns to idle', endState === 'idle', `state=${endState}`)
 const stopGone = await hasStop()
 check('after the turn, Stop is gone', stopGone === false)
 
+// ── A CREDENTIAL IS A PREREQUISITE, NOT A PRODUCT BEHAVIOUR ──────────────────────────
+// If the CLI is not logged in the turn dies instantly on an auth-failure frame: the whole
+// "turn" completes in ~200ms, the session goes idle well before the 2.5s threshold, and
+// `indicator SURVIVED init` fails for a reason that has nothing to do with the indicator.
+// Reporting that as a test result names the wrong thing — and the suite's own rule is that
+// a prerequisite problem must never be reported as a failure. So: exit 77, the runner's
+// runtime-skip code, which lands in the SKIP column with the reason attached.
+// Detected from the page rather than from the CLI, because that is what this harness can
+// see; an auth failure surfaces as an error bubble, and chat.tsx documents that the frame
+// itself arrives labelled subtype:'success', so the label cannot be trusted for this.
+const authFailed = await evaluate(`(() => {
+  const t = (document.body.innerText || '').toLowerCase()
+  return t.includes('authentication_failed') || t.includes('not logged in') || t.includes('please run /login')
+})()`)
 cdpDone = true   // deliberate teardown from here — the CDP close below is expected
 reapChrome()
 const passed = results.filter(Boolean).length
 console.log(`\n${passed}/${results.length} passed`)
+if (authFailed) {
+  console.error('\n[skip] the CLI is not logged in, so this run is not a verdict on the working indicator.')
+  console.error('   The turn dies on the auth-failure frame in ~200ms, so the session is idle before the')
+  console.error('   2.5s threshold and the init check fails for an unrelated reason. Fix the credential,')
+  console.error('   then re-run — re-running until it goes green proves nothing.')
+  console.error(`   (assertions this run, for information only: ${passed}/${results.length})`)
+  process.exit(77)
+}
 process.exit(passed === results.length ? 0 : 1)

@@ -156,7 +156,12 @@ export function ChatView({ sessionId, visible = true }: {
       return true
     })
     return shown.map((it, i) => (
-      <div key={it.id} className={gapClass(it, shown[i - 1])}>
+      // `data-kind` is for HARNESSES ONLY, never for styling — the same contract as
+      // App.tsx's `data-phone`. real-turn-browser-test asserted "the assistant answered" by
+      // searching document.body for a word that was in the PROMPT, so it was green from the
+      // moment the user's own bubble rendered and could not fail. A transcript with no
+      // role marker forces every browser harness into that kind of proxy.
+      <div key={it.id} data-kind={it.kind} className={gapClass(it, shown[i - 1])}>
         <Item item={it} />
       </div>
     ))
