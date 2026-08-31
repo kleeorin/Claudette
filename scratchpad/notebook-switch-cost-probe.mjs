@@ -572,7 +572,13 @@ if (violations) {
   console.log(`\n${violations} fixture(s) rebuilt cell editors on a session switch — the keep-mounted`)
   console.log(`fix in 1bd56af is not in the artifact this run measured (${MODE}).`)
   console.log(`If that artifact is web/dist, check it has been rebuilt since the fix landed.\n`)
-  process.exit(1)
+} else {
+  console.log('\n[measured] the timings above are reported, not asserted — read the shape line.\n')
 }
-console.log('\n[measured] the timings above are reported, not asserted — read the shape line.\n')
-process.exit(0)
+// ONE result-dependent exit, not two guarded bare literals. The two-literal form IS
+// result-dependent in fact, but run-suite's gate reads the exit argument TEXTUALLY and
+// cannot see that — it flagged this file as "cannot report failure", exactly as it flagged
+// output-sanitizer-test for the same shape. Softening the gate to accept a bare exit(1)
+// would gut it: an unreachable exit(1) beside a final exit(0) is the thing it exists to
+// catch. So the file adopts the shape the gate can verify. Same behaviour either way.
+process.exit(violations ? 1 : 0)

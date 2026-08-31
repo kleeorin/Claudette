@@ -780,7 +780,12 @@ if [ $# -eq 0 ]; then
   FULL_RUN=yes
   { date +%s; echo "  started: $(date '+%F %T')  pid $$"; echo "  host-pid $$ — ask the other sessions before writing"; echo "  covers: web/ server/src shared/src scratchpad/"; } > "$LOCKFILE"
   # Released on EVERY exit path, or the next run refuses for an hour over a lock nobody holds.
-  trap 'rm -f "$LOCKFILE"' EXIT INT TERM
+  # ★ INT/TERM must EXIT, not merely unlock. Measured 2026-08-29: with a handler that only
+  # removed the file, `kill -TERM` ran it and the run CARRIED ON — still going, now with no
+  # lock, which is worse than either state on its own. bash runs a trap and resumes unless
+  # the handler itself exits.
+  trap 'rm -f "$LOCKFILE"' EXIT
+  trap 'rm -f "$LOCKFILE"; exit 130' INT TERM
 fi
 
 pass=0; fail=0; skip=0; failed=(); ran_logs=(); rtskipped=(); b1_ran=()
@@ -961,12 +966,25 @@ if [ "$DIST_T0" != "$DIST_T1" ]; then
   echo "!!!   $(date -d @"$DIST_T0" '+%F %T') to $(date -d @"$DIST_T1" '+%F %T')."
   echo "!!! The bucket-1 banner at the top of this run describes the bundle as it was BEFORE"
   echo "!!! the rebuild and is not a verdict on the run. Harnesses that ran either side of it"
-  echo "!!! were served DIFFERENT BUILDS, so bucket 1 is not one result — it is two."
+  echo "!!! were served DIFFERENT BUILDS."
   # Name the split rather than implying it is recoverable by squinting. Each entry's finish
   # time was recorded as it ran; anything that finished before the new bundle's mtime was
   # served the old one. An entry that STRADDLES the rebuild cannot be classified at all and
   # is said so explicitly.
   if [ ${#b1_ran[@]} -gt 0 ]; then
+    # Only a genuine STRADDLE makes bucket 1 two results. A rebuild that lands before the
+    # bucket-1 block (or after it) leaves every entry on one side, and saying "it is two"
+    # there would be a false alarm in a message whose whole purpose is precision.
+    b1_old=0; b1_new=0
+    for r in "${b1_ran[@]}"; do
+      [ "${r#*|}" -lt "$DIST_T1" ] && b1_old=$((b1_old+1)) || b1_new=$((b1_new+1))
+    done
+    if [ "$b1_old" -gt 0 ] && [ "$b1_new" -gt 0 ]; then
+      echo "!!! bucket 1 is NOT ONE RESULT — $b1_old ran on the old bundle, $b1_new on the new."
+    else
+      echo "!!! All $((b1_old + b1_new)) bucket-1 harnesses fell on the SAME side, so they agree with"
+      echo "!!! each other — but the run is still fingerprint-contaminated and is not a baseline."
+    fi
     echo "!!! Which bucket-1 harnesses fell on which side (by finish time):"
     for r in "${b1_ran[@]}"; do
       rf="${r%%|*}"; rt="${r#*|}"
