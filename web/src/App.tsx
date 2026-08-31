@@ -26,6 +26,7 @@ import { pruneDrafts } from './lib/drafts'
 import { useNotifications, type NotificationsApi } from './lib/notifications'
 import { basename, prettyPath } from './lib/paths'
 import { MD_PX, usePhone } from './lib/breakpoint'
+import { useVisibleHeight } from './lib/visualViewport'
 import { attachNewNotebooks } from './lib/notebookAttach'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 
@@ -206,6 +207,33 @@ const STACK_CONTENT_MIN_PX = 200
 // assumed: chrome 32, divider 4.
 const STACK_CHROME_PX = 32 + 4 + 1
 
+// THE STACKED COLUMN'S OWN CEILING — ONE rule, used by the drag AND by every render.
+//
+// eda4a76 bounded the dock against this column but named its own residual: above stackH ~351
+// at vvh 508 the clip returns, because DOCK_MIN_PX caps how far the dock can give way — and
+// "nothing clamps a persisted stackH against --vvh on restore". Reproduced at stackH 400,
+// vvh 508: column 521, bottom 557 against a 508px shell, 49px of terminal clipped, dock
+// pinned at its 120 floor, content pane squeezed to 0.
+//
+// THE CLASS OF BUG, which is the part worth remembering: the constraint was enforced at WRITE
+// time (the divider's `max()` while dragging) and never at READ time. A value validated when
+// it is set and trusted forever after stops being valid the moment the context moves —
+// restore onto a shorter viewport, or an on-screen keyboard shrinking --vvh under a value
+// that was legal when it was saved.
+//
+// So this is applied on every render, not on load: a load-time clamp would fix restore and
+// still miss the keyboard, which is the case eda4a76 was about in the first place.
+//
+// Returns the LARGEST stackH that leaves room for the content pane and for a dock at its
+// floor. `Math.max` with the drag's own minimum keeps a very short viewport from inverting
+// the bound — a floor beats a ceiling here, because a 160px chat is usable and a negative
+// one is not.
+const STACK_MIN_PX = 160
+function boundStackH(px: number, vvh: number, dockShown: boolean): number {
+  const ceiling = vvh - STACK_CHROME_PX - STACK_CONTENT_MIN_PX - (dockShown ? DOCK_MIN_PX + 1 : 0)
+  return Math.max(STACK_MIN_PX, Math.min(px, ceiling))
+}
+
 const boundedDockH = (px: number, reservePx: number = DOCK_RESERVE_PX) =>
   `min(${px}px, max(${DOCK_MIN_PX}px, calc(var(--vvh, 100vh) - ${reservePx}px)))`
 
@@ -264,6 +292,7 @@ function Shell() {
   const termsRef = useRef(termsBySession); termsRef.current = termsBySession
 
   const isPhone = usePhone()
+  const vvh = useVisibleHeight()
   // The pane the USER last asked for. NOT derived from `active` — see the comment on the
   // handlers below, which is the single most important decision in this slice.
   //
@@ -336,12 +365,17 @@ function Shell() {
   // gets a named flag both the container and each TerminalView's `visible` prop read — keeping
   // that prop truthful is what stops xterm from fitting to a zero box.
   const dockVisible = dockShown && (!isPhone || shownPane === 'terminal')
+  // The stackH actually USED this render. `stackH` itself stays unclamped in state and in
+  // persistence, so the user's dragged size re-expands when the viewport allows it again —
+  // the same principle as the dock's transient CSS bound, and the reason a saved 600px dock
+  // still measures 600 at rest.
+  const effStackH = boundStackH(stackH, vvh, dockShown)
   // Computed ONCE and used at BOTH sites below. Computing it twice is exactly how the column
   // came to reserve a different height than the dock occupied — a gap below the terminal
   // instead of a clipped one. Keeping it a single value makes that divergence unrepresentable.
   const dockHeightCss = boundedDockH(
     termH,
-    active && layout === 'stack' ? STACK_CHROME_PX + STACK_CONTENT_MIN_PX + stackH : DOCK_RESERVE_PX,
+    active && layout === 'stack' ? STACK_CHROME_PX + STACK_CONTENT_MIN_PX + effStackH : DOCK_RESERVE_PX,
   )
   const setTermPane = (sid: string, fn: (p: TermPane) => TermPane) =>
     setTermsBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_TERM) }))
@@ -857,7 +891,10 @@ function Shell() {
                 <div
                   {...(layout === 'side'
                     ? dividerProps({ axis: 'x', get: () => sideW, set: setSideW, sign: 1, min: 300, max: () => (splitRef.current?.getBoundingClientRect().width ?? 1200) - 320 })
-                    : dividerProps({ axis: 'y', get: () => stackH, set: setStackH, sign: -1, min: 160, max: () => (splitRef.current?.getBoundingClientRect().height ?? 800) - 200 }))}
+                    // Same bound as the render (boundStackH), asked for its ceiling by
+                    // passing an unbounded request. The previous `splitRef.height - 200` was
+                    // blind to the dock, which is half of why eda4a76's residual existed.
+                    : dividerProps({ axis: 'y', get: () => stackH, set: setStackH, sign: -1, min: STACK_MIN_PX, max: () => boundStackH(Number.MAX_SAFE_INTEGER, vvh, dockShown) }))}
                   title="Drag to resize"
                   className={`hidden md:block shrink-0 bg-ctp-surface0 hover:bg-ctp-accent/60 active:bg-ctp-accent transition-colors touch-none ${layout === 'side' ? 'w-1 cursor-col-resize order-2' : 'h-1 cursor-row-resize'}`}
                 />
@@ -883,7 +920,7 @@ function Shell() {
                   // It must add the dock's BOUNDED height, not the raw `termH`: bounding one
                   // and not the other would make the column reserve space the dock no longer
                   // occupies, which is a gap below the terminal instead of a clipped one.
-                  ? (layout === 'side' ? { width: sideW } : { height: dockShown ? `calc(${stackH}px + ${dockHeightCss} + 1px)` : stackH })
+                  ? (layout === 'side' ? { width: sideW } : { height: dockShown ? `calc(${effStackH}px + ${dockHeightCss} + 1px)` : effStackH })
                   : undefined}
               >
                 <div data-testid="pane" className={`flex-1 min-h-0 ${shownPane && shownPane !== 'chat' ? 'hidden' : ''}`}>

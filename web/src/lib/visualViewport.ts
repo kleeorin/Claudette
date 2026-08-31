@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from 'react'
 // THE VISIBLE height of the window, published as a CSS custom property.
 //
 // Why this exists as a shared module rather than a fix in one component. On iOS the software
@@ -66,4 +67,48 @@ export function trackVisibleHeight(): () => void {
     vv?.removeEventListener('scroll', publish)
     window.removeEventListener('resize', publish)
   }
+}
+
+// --- reading the visible height FROM React -------------------------------------------
+// A subscription, unlike the CSS consumers above, because some bounds cannot be expressed in
+// CSS: App.tsx clamps the stacked column's `stackH` and derives the terminal dock's reserve
+// from the SAME number, and two `calc()` strings cannot share an intermediate value.
+// Computing it twice is how the column once reserved a height the dock no longer occupied.
+//
+// *** IT READS `--vvh` ITSELF, NOT `visualViewport.height`. ***
+// That looks like the indirect choice and it is the correct one: it makes the JS bound and
+// every CSS bound read ONE value rather than two that merely usually agree. They can come
+// apart — anything that sets `--vvh` without moving the visual viewport (a harness
+// simulating a keyboard, a future feature reserving space) would leave a JS bound reading
+// the raw viewport while the CSS around it used the published number, and the two would
+// disagree about the same layout. Reading the published variable makes that impossible.
+// `visibleHeight()` remains the fallback for the window before the first publish.
+//
+// The MutationObserver watches the style attribute the publisher writes, so the store tracks
+// the variable however it is set. That is cheap despite `publish()` running on every
+// visualViewport `scroll`: useSyncExternalStore re-renders only when the SNAPSHOT changes,
+// and a pan republishes the same number, so a scroll costs one Object.is comparison and no
+// render.
+function readPublished(): number {
+  if (typeof document === 'undefined') return 0
+  const raw = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(PROP))
+  return Number.isFinite(raw) && raw > 0 ? raw : visibleHeight()
+}
+
+function subscribeHeight(onChange: () => void): () => void {
+  const vv = window.visualViewport
+  vv?.addEventListener('resize', onChange)
+  window.addEventListener('resize', onChange)
+  const mo = new MutationObserver(onChange)
+  mo.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] })
+  return () => {
+    vv?.removeEventListener('resize', onChange)
+    window.removeEventListener('resize', onChange)
+    mo.disconnect()
+  }
+}
+
+/** The visible viewport height, re-rendering the caller when it changes. */
+export function useVisibleHeight(): number {
+  return useSyncExternalStore(subscribeHeight, readPublished, () => 0)
 }
