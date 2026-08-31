@@ -36,6 +36,15 @@ const LAYOUT_H = 844
 // overflows once the keyboard leaves 508px. A smaller value makes the two checks below pass
 // vacuously — measured at 380 they did exactly that, which is how this constant got chosen.
 const SAVED_TERM_H = 600
+// ABOVE THE THRESHOLD ON PURPOSE. eda4a76 bounded the dock against the stacked column but
+// named its own residual: the dock's 120px floor caps how far it can give way, so at vvh 508
+// the clip returns once stackH passes ~351 — and nothing clamped a PERSISTED stackH against
+// the current viewport. Derivation: with the dock floored, the column is stackH + 121, and it
+// clips when 36 (chrome+divider) + stackH + 121 > 508. Measured before the clamp landed, at
+// this exact seed: column 521, bottom 557 against a 508px shell, 49px of terminal cut off.
+// A seed of 280 leaves the column at 401 and never clips, so the clip assertion below would
+// pass with the clamp reverted and prove nothing. This number is what makes it load-bearing.
+const SAVED_STACK_H = 400
 const PORTRAIT_KB = 508   // 844 - a ~336px iOS keyboard (the ask-card-height-probe allowance)
 const wait = (ms) => new Promise(r => setTimeout(r, ms))
 let failed = 0, passed = 0, open_ = 0
@@ -119,7 +128,7 @@ await send('Page.navigate', { url: `${APP}/?token=${TOKEN}` })
 for (let i = 0; i < 60; i++) { if (await ev(`document.body.innerText.includes('Xterm')`)) break; await wait(250) }
 await ev(`localStorage.setItem('claudette:layout:v1', JSON.stringify({
   v: 1, layout: 'stack', seq: 0, terms: {}, content: {},
-  sizes: { sideW: 420, stackH: 280, dockW: 320, termH: ${SAVED_TERM_H}, sidebarW: 288 } }))`)
+  sizes: { sideW: 420, stackH: ${SAVED_STACK_H}, dockW: 320, termH: ${SAVED_TERM_H}, sidebarW: 288 } }))`)
 await send('Page.reload')
 for (let i = 0; i < 60; i++) { if (await ev(`document.body.innerText.includes('Xterm')`)) break; await wait(250) }
 await wait(1200)
@@ -367,6 +376,31 @@ if (colRest.err || colKb.err) {
   // THE HALF THAT PROVES THE SQUEEZE WAS NOT JUST MOVED. Capping the column alone would also
   // read as "not clipped" while leaving the content pane at 0 and the chat at 11px — the same
   // budget failure one element over. At rest the content pane must get its full reserve back.
+  // ── THE PERSISTED-stackH CLAMP (c0bf98f) ────────────────────────────────────────────
+  // TWO assertions on purpose: the OUTCOME above (nothing clipped) and the MECHANISM here.
+  // The outcome alone would also be satisfied by something that shrank the dock further or
+  // moved the overflow somewhere unmeasured, so this pins WHICH term gave way.
+  //
+  // The bug was a constraint enforced at WRITE time and never at READ time: the divider's
+  // max() bounded stackH while dragging, and a stackH restored from persistence was never
+  // re-checked against the CURRENT viewport. Restore onto a shorter screen, or open a
+  // keyboard under a value that was legal when saved, and it silently stopped holding.
+  // The clamp runs on every render, which is why the keyboard case is covered and not just
+  // restore — a load-time clamp would fix the one and miss the other.
+  //
+  // At vvh 508 the ceiling is 508 - 37 - 200 - 121 = 150, below the 160px floor, so the
+  // floor wins and the chat lands at ~160 rather than the saved 400. Reverting boundStackH
+  // puts it back at ~400 and reds this and the clip assertion above together.
+  const kbClamped = colKb.chatH < 200 && colKb.chatH > 120
+  ok('fix', 'a persisted stackH too tall for the CURRENT viewport is clamped on read',
+     kbClamped,
+     kbClamped
+       ? `chat ${colKb.chatH}px with the keyboard up, from a saved ${SAVED_STACK_H}px — clamped to the floor, not trusted`
+       : `chat ${colKb.chatH}px with the keyboard up, from a saved ${SAVED_STACK_H}px — NOT clamped: the saved value is being trusted against a viewport that cannot hold it`)
+  ok('today', 'CONTROL: at rest the same saved stackH is NOT clamped (the bound is conditional)',
+     colRest.chatH > 300,
+     `chat ${colRest.chatH}px at rest (--vvh 844), from a saved ${SAVED_STACK_H}px — untouched, so the clamp is not a blanket shrink`)
+
   ok('fix', 'the content pane gets its reserve back at rest, rather than the clip moving to it',
      colRest.contentH >= 200,
      `content pane ${colRest.contentH}px at rest (was 0px), chat ${colRest.chatH}px, dock ${colRest.dockH}px`)
@@ -396,13 +430,32 @@ if (colRest.err || colKb.err) {
 }
 
 // ── DESKTOP NO-REGRESSION ──────────────────────────────────────────────────────────────
-// The bound must be inert where the viewport was never the problem. 1440x900 leaves
-// 900-164=736px of allowance, so a 600px dock is untouched.
+// The bound must be inert where the viewport was never the problem.
+//
+// *** THIS EXPECTATION BELONGS TO ONE SPECIFIC STATE, AND THE PROBE NOW PUTS IT THERE. ***
+// The dock's reserve is DOCK_RESERVE_PX (164) only while no content tab is open; with one
+// open in 'stack' it becomes chrome + content-min + stackH, which is a different and equally
+// correct number. At 1440x900:
+//   NO content tab  → allowance 900-164 = 736 → dock keeps its saved 600.   ← asserted here
+//   content tab OPEN → allowance 900-(37+200+stackH) → a SMALLER dock.      ← also correct
+// This assertion used to run on whichever of those the earlier sections happened to leave
+// behind — the file section above opens demo.py and never closes it — so it was passing on an
+// incidental condition rather than the one its name claims. It read 600 for a long time by
+// luck, and any change that shifted when state settled flipped it to the other value and
+// looked like a regression it was not. Selecting Chat first pins the state the 600 belongs to.
 await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false })
 await wait(600)
 await setVvh(900)
+const backToChat = await ev(`(() => {
+  const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Chat')
+  if (!b) return false
+  b.click(); return true
+})()`)
+await wait(1500)
+ok('today', 'PRECONDITION: the content tab was closed, so this measures the no-tab state',
+   backToChat === true, backToChat ? '' : 'could not find the Chat tab — the 600 below would be measuring the other state')
 const desk = await ev(MEASURE)
-ok('today', 'DESKTOP 1440x900: the bound is inert, the saved dock height is untouched',
+ok('today', 'DESKTOP 1440x900, NO content tab: the bound is inert, the saved dock height is untouched',
    desk.dockH === SAVED_TERM_H, `dock ${desk.dockH}px of a saved ${SAVED_TERM_H}px`)
 
 console.log(`\n${failed ? '❌' : '✅'} ${passed} passed, ${failed} failed` + (open_ ? `, ${open_} OPEN (measured, deliberately not fixed — see ⚠️  above)` : ''))
