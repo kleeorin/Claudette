@@ -90,6 +90,16 @@ const upstream = http.createServer((req, res) => {
     setTimeout(() => res.socket?.destroy(), 20)
     return
   }
+  if (mode === 'drip') {
+    // Headers out, then one chunk every 2s forever. This is the SSE-that-opens-and-dies
+    // case, and it is the one an IDLE timeout can never catch however small you set it —
+    // every drip resets it. It also exercises the POST-HEADER failure path by
+    // construction, since the status is already sent by the time the guard fires.
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    const t = setInterval(() => { try { res.write(': keepalive\n\n') } catch { clearInterval(t) } }, 2000)
+    req.on('close', () => clearInterval(t))
+    return
+  }
   // 'silent': accept the request and never answer (slowloris upstream).
 })
 await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', () => r()))
@@ -104,7 +114,16 @@ const probe = (mode: string, ms: number): Promise<string> => new Promise((resolv
   const req = http.request(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-mode': mode } }, (res) => {
     let b = ''
     res.on('data', (c) => (b += c))
-    res.on('end', () => { clearTimeout(timer); resolve(`completed ${res.statusCode} (${b.length}B)`) })
+    res.on('end', () => {
+      clearTimeout(timer)
+      // Surface WHETHER THE BODY CARRIES A JSON-RPC ERROR, not just its length. Once the
+      // head is out the status can no longer say anything, so the body is the only channel
+      // left — and "200, 209 bytes" is exactly as consistent with a truncated stream as
+      // with a diagnosable failure. This is the difference the post-header fix makes.
+      let rpc = ''
+      try { const m = b.match(/\{"jsonrpc".*\}/); if (m && JSON.parse(m[0])?.error) rpc = ' +rpc-error' } catch { /* not our frame */ }
+      resolve(`completed ${res.statusCode} (${b.length}B)${rpc}`)
+    })
     res.on('error', (e) => { clearTimeout(timer); resolve(`res error ${(e as Error).message}`) })
   })
   req.on('error', (e) => { clearTimeout(timer); resolve(`req error ${(e as Error).message}`) })
@@ -134,24 +153,40 @@ attack('A: upstream never answers AND SENDS NOTHING — is that case bounded?',
   !r3.startsWith('HUNG') && took >= 5,
   `${r3} after ${took}s` + (took < 5 && !r3.startsWith('HUNG')
     ? ' ← returned instantly: that is a broken fixture, not a bounded request' : ''))
+// A4: THE DRIP. Was an `[open]` citing a manual measurement from 2026-08-27 — static prose
+// that would have gone on claiming "not bounded" after the guard landed, because nothing
+// re-measured it. It is a live case now, which is the only form of that claim worth having.
+const t4 = Date.now()
+const r4 = await probe('drip', 60_000)
+const took4 = Math.round((Date.now() - t4) / 1000)
+// ALSO asserts the body carries a JSON-RPC error. The status was already sent as 200 by the
+// upstream before the guard fired, so a client that only reads the status sees success; the
+// error has to be IN THE BODY or the session gets a truncated stream indistinguishable from
+// a network fault, which is what this path used to hand it.
+attack('A: a DRIPPING upstream (a chunk every 2s) — is the TOTAL duration bounded, WITH a diagnosable error?',
+  !r4.startsWith('HUNG') && took4 >= 5 && r4.includes('+rpc-error'),
+  `${r4} after ${took4}s` + (r4.startsWith('HUNG')
+    ? ' ← no idle timeout can bound this; only a total-duration guard can' : ''))
+
 // Not a finding — a measured fact with no owner, printed where it cannot be missed. Same
-// pattern as scratchpad/shell-fixed-cost-probe.mjs. The number is the point: the decision in
-// front of the operator is "is 120s right for a tools/list handshake", not "is this test ok".
+// pattern as scratchpad/shell-fixed-cost-probe.mjs. The number is the point.
 if (!r3.startsWith('HUNG')) {
-  console.log(`\n⚠  [open] MEASURED, unowned: a SILENT upstream ties up this call for ${took}s`)
-  console.log('   before the 504 (connectorProxy.ts:48, UPSTREAM_TIMEOUT_MS = 120_000). That is the')
-  console.log('   full handshake budget for a tools/list — the tool call is dead for two minutes and')
-  console.log('   the session cannot tell. Bounded is not the same as reasonable. This file asserts')
-  console.log('   only the bound; the VALUE is a product decision and deliberately not asserted here.')
-  console.log('')
-  console.log('⚠  [open] MEASURED 2026-08-27, unowned, and WORSE: a DRIPPING upstream is not bounded')
-  console.log('   AT ALL. upstream.setTimeout() is Node\'s SOCKET IDLE timeout, so any byte resets it.')
-  console.log('   A fixture emitting one chunked keepalive every 5s was STILL OPEN after 150s (29')
-  console.log('   drips), well past the 120s ceiling. So no resource bound exists for a stream that')
-  console.log('   trickles — the SSE-that-opens-and-dies case. The fix is a separate TOTAL-duration')
-  console.log('   guard (a plain setTimeout on the request, cleared on end), NOT a different idle')
-  console.log('   value; no choice of UPSTREAM_TIMEOUT_MS can bound this. Re-verify with SLOW=1.')
+  console.log(`\n⚠  [open] MEASURED, unowned: a SILENT upstream still ties up this call for ${took}s`)
+  console.log('   before the 504. That is now the FAST-SET budget (connectorProxy.ts, FAST_TIMEOUT_MS')
+  console.log('   = 15_000) rather than the 120s ceiling, so a handshake no longer costs two minutes —')
+  console.log('   but bounded is still not the same as reasonable, and whether 15s is right for a')
+  console.log('   tools/list is a product decision this file deliberately does not assert.')
 }
+// ★ THE BOUND THAT STILL DOES NOT EXIST. Recorded as its own [open] because the total-duration
+// guard is easy to mistake for it, and that mistake would close the question wrongly.
+console.log('')
+console.log('⚠  [open] NOT BUILT, and NOT what the total-duration guard provides: a CONCURRENCY CAP.')
+console.log('   The guard bounds ONE connection\'s lifetime. With unbounded concurrency an adversary')
+console.log('   opens more of them, and the cap lands on legitimate long streams instead of on the')
+console.log('   attack — the wrong way round. The instrument that bounds the RESOURCE is a cap on')
+console.log('   N in-flight upstream requests per session and/or per connector: not evadable by')
+console.log('   classification, does not kill long streams, and bounds fd cost directly. Nothing')
+console.log('   in connectorProxy.ts limits how many upstream requests one session may have open.')
 void modes
 
 // B. Deny-rule injection backstop against catalog state that never went through

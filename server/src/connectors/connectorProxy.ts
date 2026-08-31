@@ -45,7 +45,18 @@ const STRIP_REQUEST = new Set([
 const STRIP_RESPONSE = new Set(['connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'content-length'])
 
 // How long we wait for an upstream to respond before giving up on it.
+// THE CEILING. Every request gets this; recognition may only ever SHORTEN it.
+// ★ THIS NUMBER MUST NEVER RISE, and no branch below may exceed it. The session writes the
+// request body, so the session controls classification — that is safe only while
+// classification can nothing but shorten the bound. Give `tools/call` 600s "because tool
+// calls run long" and a session gains a longer socket pin by a classification it chooses,
+// and the refinement becomes a regression. Monotonic, or not at all.
 const UPSTREAM_TIMEOUT_MS = 120_000
+// The fast set: handshake methods that have no legitimate reason to take two minutes.
+// Adding a method here is always safe by the monotonicity argument above, so this set can
+// grow without re-litigating the design.
+const FAST_TIMEOUT_MS = 15_000
+const FAST_METHOD_RE = /"method"\s*:\s*"(tools\/list|initialize|resources\/list|prompts\/list)"/
 // How much of a JSON reply we are willing to hold in memory to classify it. Well past any
 // honest tools/list; a reply larger than this is not classified rather than buffered.
 const MAX_CLASSIFY_BYTES = 2 * 1024 * 1024
@@ -127,6 +138,13 @@ export class ConnectorProxy {
     // Set from the request body below, before any response arrives (the upstream cannot
     // answer before it has been sent the call).
     let wantsToolList = false
+    // Hoisted because BOTH timeout callbacks live out here while the values they need are
+    // computed inside handlers. `upstreamContentType` in particular is assigned where
+    // `classifiable` is computed, inside the response handler — the design flags forgetting
+    // that as the most likely thing to get wrong.
+    let reqId: string | number | null = null
+    let upstreamContentType = ''
+    let budgetMs = UPSTREAM_TIMEOUT_MS
     const agent = target.protocol === 'https:' ? https : http
     let upstream: http.ClientRequest
     try {
@@ -160,7 +178,9 @@ export class ConnectorProxy {
         // is not inside any try/catch, i.e. it would take the server down. Streaming also
         // means an SSE reply no longer needs a separate path.
         res.writeHead(status, out)
-        let captured = ''
+        upstreamContentType = contentType
+        const capChunks: Buffer[] = []
+        let capBytes = 0
         // pipe(), not a hand-rolled `up.on('data', c => res.write(c))`: that ignored
         // res.write's return value and never paused the source, so a fast upstream feeding
         // a slow consumer buffered the whole reply in res's internal write queue. The
@@ -169,9 +189,15 @@ export class ConnectorProxy {
         // ends `res` for us; the data listener alongside it still sees every chunk.
         up.pipe(res)
         up.on('data', (c: Buffer) => {
-          if (classifiable && wantsToolList && captured.length < MAX_CLASSIFY_BYTES) captured += c
+          // Same Buffer fix as the request tee. Here it is correctness / catalog hygiene
+          // only — NOT security or availability — but it is what keeps a future widening of
+          // TOOL_NAME_RE (today ASCII-only, and nothing says it must stay so) from turning
+          // into a live bug: with the corruption gone, widening becomes a non-event.
+          // And MAX_CLASSIFY_BYTES is a MEMORY bound, so a string-length test against it
+          // was under-enforcing a guard rather than merely being imprecise.
+          if (classifiable && wantsToolList && capBytes < MAX_CLASSIFY_BYTES) { capChunks.push(c); capBytes += c.length }
         })
-        up.on('end', () => { if (captured) this.learnTools(def.id, captured) })
+        up.on('end', () => { if (capBytes) this.learnTools(def.id, Buffer.concat(capChunks).toString('utf8')) })
         // A server-initiated abort emits neither 'end' nor 'error' on the request, so
         // without this the client's call hung forever and the socket pair stayed pinned.
         up.on('aborted', () => { res.destroy() })
@@ -189,14 +215,56 @@ export class ConnectorProxy {
       if (!res.headersSent) this.deny(res, 502, `connector "${def.id}" is unreachable: ${errMessage(e)}`)
       else res.destroy()
     })
-    // An upstream that accepts the connection and then never answers used to hang the
-    // session's tool call indefinitely — there was no timeout anywhere in this proxy.
-    upstream.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
-      setHealth(def.id, 'error', `upstream did not respond within ${UPSTREAM_TIMEOUT_MS / 1000}s`)
+    // ── POST-HEADER FAILURE ──────────────────────────────────────────────────────────
+    // Once the head is out the status cannot change, so `res.destroy()` handed the session a
+    // truncated body with no status and no message — indistinguishable from a network fault,
+    // and this is the LIKELIER real-world stall (an SSE stream that opens and then dies).
+    // Put the error where the client will still read it: in the body.
+    const failAfterHeaders = (msg: string): void => {
+      if (upstreamContentType.includes('text/event-stream')) {
+        // Leading blank line FIRST: the stall can land mid-frame, and a blank line
+        // terminates whatever was in flight. If nothing was, parsers dispatch an empty
+        // event and ignore it — safe either way, and it costs two bytes. JSON.stringify
+        // never emits a literal newline, so the body cannot split the frame.
+        res.end(`\n\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: reqId, error: { code: -32000, message: msg } })}\n\n`)
+      } else {
+        // A half-written JSON body cannot be repaired by appending to it. end() rather than
+        // destroy(): a parse error beats a socket error, because it is diagnosable.
+        res.end()
+      }
+    }
+    const onIdleTimeout = (): void => {
+      setHealth(def.id, 'error', `upstream stalled for ${budgetMs / 1000}s`)
       upstream.destroy()
       if (!res.headersSent) this.deny(res, 504, `connector "${def.id}" did not respond in time`)
-      else res.destroy()
-    })
+      else failAfterHeaders(`connector "${def.id}" stalled for ${budgetMs / 1000}s`)
+    }
+    // ── TOTAL-DURATION GUARD, separate from the idle one and NOT a substitute for it ───
+    // `upstream.setTimeout` is a SOCKET IDLE timeout: any byte resets it. So an upstream
+    // that drips one chunk every few seconds is never idle and is never bounded, however
+    // small the idle value — measured at STILL OPEN after 150s across 29 drips. Only a
+    // wall-clock bound on the whole exchange catches that.
+    // ⚠ THIS IS NOT A RESOURCE BOUND AND MUST NOT BE RECORDED AS ONE. It bounds ONE
+    // connection's lifetime. With unbounded concurrency an adversary simply opens more, and
+    // the cap lands on legitimate long streams instead of on them — the wrong way round.
+    // The instrument that bounds the resource is a CONCURRENCY CAP (N in-flight upstream
+    // requests per session and/or per connector), which does not exist. See the [open] in
+    // scratchpad/rt2-connectors-c.mts.
+    const onTotalTimeout = (): void => {
+      setHealth(def.id, 'error', `upstream exceeded the ${budgetMs / 1000}s total budget`)
+      upstream.destroy()
+      if (!res.headersSent) this.deny(res, 504, `connector "${def.id}" exceeded its time budget`)
+      else failAfterHeaders(`connector "${def.id}" exceeded its ${budgetMs / 1000}s time budget`)
+    }
+    // Armed with the CEILING here and re-armed shorter at req.on('end') once the body has
+    // identified the method. Cleared on every terminal path, or a settled request keeps a
+    // timer (and this closure) alive for up to two minutes.
+    let totalTimer: NodeJS.Timeout = setTimeout(onTotalTimeout, UPSTREAM_TIMEOUT_MS)
+    const clearTotal = (): void => clearTimeout(totalTimer)
+    upstream.on('close', clearTotal)
+    upstream.on('error', clearTotal)
+    res.on('close', clearTotal)
+    upstream.setTimeout(UPSTREAM_TIMEOUT_MS, onIdleTimeout)
     // Tee a bounded prefix of the REQUEST so we know whether this call was a tools/list.
     // learnTools used to run on EVERY JSON reply, so a tools/call response carrying
     // `result.tools` could silently rewrite the persisted classification at a moment of
@@ -207,9 +275,34 @@ export class ConnectorProxy {
     // calls pinned N upstream sockets for two minutes each — and `release()` doesn't touch
     // requests already in flight.
     res.on('close', () => { if (!res.writableEnded) upstream.destroy() })
-    let reqHead = ''
-    req.on('data', (c: Buffer) => { if (reqHead.length < REQ_SNIFF_BYTES) reqHead += c })
-    req.on('end', () => { wantsToolList = TOOLS_LIST_RE.test(reqHead) })
+    // Buffers, concatenated ONCE — not `reqHead += c`. `+=` stringifies each chunk on its
+    // own, so a multi-byte codepoint split across a chunk boundary becomes two U+FFFD. That
+    // is a PRECONDITION of jsonRpcId below, not tidiness: measured, the corrupted string
+    // still PARSES (every structural JSON byte is ASCII and unsplittable, so corruption can
+    // only land inside a string value where U+FFFD is legal) and therefore yields a WRONG
+    // id rather than no id. Also note the cap was a STRING-length test against a byte-named
+    // constant, which admits more bytes than intended for multi-byte content.
+    const reqChunks: Buffer[] = []
+    let reqBytes = 0
+    req.on('data', (c: Buffer) => {
+      if (reqBytes >= REQ_SNIFF_BYTES) return
+      reqChunks.push(c); reqBytes += c.length
+    })
+    req.on('end', () => {
+      const head = Buffer.concat(reqChunks).toString('utf8')
+      wantsToolList = TOOLS_LIST_RE.test(head)
+      reqId = jsonRpcId(head, reqBytes >= REQ_SNIFF_BYTES)
+      // RE-ARM SHORTER, now that the body has told us what this call is. The timeouts were
+      // armed with the ceiling when the request was created, because classification is only
+      // available here — the body IS the classifier, and it arrives after the socket does.
+      // setTimeout() replaces a pending timer, so this can only tighten the bound.
+      if (FAST_METHOD_RE.test(head)) {
+        budgetMs = FAST_TIMEOUT_MS
+        upstream.setTimeout(FAST_TIMEOUT_MS, onIdleTimeout)
+        clearTimeout(totalTimer)
+        totalTimer = setTimeout(onTotalTimeout, FAST_TIMEOUT_MS)
+      }
+    })
     req.pipe(upstream)
   }
 
@@ -245,6 +338,24 @@ export class ConnectorProxy {
     res.writeHead(status, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message } }))
   }
+}
+
+// The JSON-RPC id out of a request-body prefix, or null when it cannot be known.
+// ★ PARSE, DO NOT REGEX. `"id"` appears legitimately inside tool arguments, so a
+// first-match regex returns the wrong one — and A WRONG ID IS WORSE THAN NO ID, because a
+// client may settle a DIFFERENT pending call with it. Everything ambiguous returns null,
+// which is exactly what deny() already emits and what no client can mis-route:
+//   · truncated past REQ_SNIFF_BYTES → null (the prefix may not contain the real id)
+//   · a batch (array) → null (no single id to answer)
+//   · a notification (no id) → null
+function jsonRpcId(body: string, truncated: boolean): string | number | null {
+  if (truncated) return null
+  try {
+    const v: unknown = JSON.parse(body)
+    if (Array.isArray(v) || v === null || typeof v !== 'object') return null
+    const id = (v as { id?: unknown }).id
+    return typeof id === 'string' || typeof id === 'number' ? id : null
+  } catch { return null }
 }
 
 // The `result.tools` array out of a captured reply, or null. Handles BOTH shapes a
