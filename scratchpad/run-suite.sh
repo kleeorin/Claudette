@@ -123,7 +123,25 @@ LOCK_STALE_S=3600     # a run that has not finished in an hour is assumed dead, 
 # process is gone — and attribution is now the whole point, because "in flight" means
 # SOMEONE ELSE'S run and a dead holder in another session cannot be probed (see the process
 # -visibility delta: pgrep sees host PIDs in one session and only PID 1/2 in another).
-SESSION_ID="$(basename "${CLAUDE_CONFIG_DIR:-unknown-session}")"
+# ★ THIS DEGRADED TO A USELESS CONSTANT AND WAS SHIPPED THAT WAY — fixed 2026-09-01.
+# It was `basename "$CLAUDE_CONFIG_DIR"`, which is a real session uuid ONLY in a session that
+# has a scrubbed config mirror (…/host-scrubbed-config/<uuid>). Every other session has plain
+# `~/.claude`, so the field read `session: .claude` — identical for all of them, and useless
+# for the one job it exists to do. It was verified in the single session where it happens to
+# work, which is the CLAUDE_CONFIG_DIR environment delta reappearing inside a new mechanism.
+# The rule it breaks is the one this file already records: A FACT ABOUT WHAT DIFFERS BETWEEN
+# SESSIONS IS A FACT ABOUT EVERY MECHANISM BUILT ON IT.
+# So: use the uuid when there genuinely is one, and otherwise say `unidentified` rather than
+# a name that looks specific and is not. An honest "unidentified holder, started 18:26, pid
+# 66529" beats a false one — the pid and start time below are what actually disambiguate.
+# ⚠ And pid is only unique WITHIN a session's PID view: process visibility differs between
+# sessions here (one sees host pids, another only its own), so treat pid+start as a
+# disambiguator for humans, not as a key to look a process up by.
+_sid="$(basename "${CLAUDE_CONFIG_DIR:-}" 2>/dev/null)"
+case "$_sid" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-*) SESSION_ID="$_sid" ;;
+  *) SESSION_ID="unidentified" ;;
+esac
 lock_held() {
   [ -f "$LOCKFILE" ] || return 1
   local started; started=$(sed -n '1p' "$LOCKFILE" 2>/dev/null || echo 0)
