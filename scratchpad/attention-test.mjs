@@ -66,8 +66,7 @@ async function evaluate(expression) {
 }
 async function waitFor(expr, ms = 15000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await evaluate(expr)) return true; await wait(200) } throw new Error(`timeout: ${expr}`) }
 
-const results = []
-const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results } from './assert.mjs'
 // Count the red attention dots (the "needs attention" light uses a red pulsing dot with that title).
 const attentionCount = () => evaluate(`document.querySelectorAll('[title="Finished — needs your attention"]').length`)
 const clickSession = (name) => evaluate(`(()=>{const d=[...document.querySelectorAll('div')].find(x=>x.className.includes('cursor-pointer')&&x.textContent&&x.textContent.includes(${JSON.stringify(name)}));if(!d)return false;d.click();return true})()`)

@@ -57,6 +57,25 @@ export let passed = 0
 export let failed = 0
 export let open = 0
 
+// ── THE ARRAY SHAPE, for the harnesses that count with an array instead of a counter ──────
+// Fourteen harnesses derive their exit from `results` rather than from a counter:
+//   const passed = results.filter(Boolean).length
+//   process.exit(passed === results.length ? 0 : 1)
+// `results` holds ONE BOOLEAN per assertion, deliberately, and that choice is load-bearing.
+//
+// *** WHY NOT AN ARRAY OF {name, ok} OBJECTS, WHICH IS THE OBVIOUS CHOICE. ***
+// Because `results.filter(Boolean)` is written in eleven of those files, and EVERY OBJECT IS
+// TRUTHY. Unifying on objects would silently turn that line into "count them all", making
+// `passed === results.length` permanently true and those eleven harnesses exit 0 forever —
+// a silent always-green in browser tests nobody reads line by line. The single most
+// dangerous edit available in this refactor, and it is avoided by keeping booleans rather
+// than by remembering to rewrite eleven derivations correctly.
+//
+// The three harnesses that DID want objects only ever read `.length` off the filtered list,
+// so they import `failures` instead and their exit lines are likewise untouched.
+export const results = []
+export const failures = []
+
 /**
  * Record one assertion.
  *
@@ -67,7 +86,12 @@ export let open = 0
  *              for a defect that is MEASURED and deliberately not fixed, so the suite stays
  *              green while the finding stays visible.
  */
-export function check(name, cond, extra = '', tag = '') {
+const HOUSE = { pass: '✅', fail: '❌', open: '⚠️ ', gap: ' ', indent: '' }
+
+// The one place an assertion is recorded. `check` and any vocabulary from `withMarks` both
+// come through here, so the guard, the counters, the array shape and the line format cannot
+// drift apart between them.
+function record(marks, name, cond, extra, tag) {
   if (typeof name !== 'string') {
     throw new TypeError(
       `check(): the first argument must be the assertion NAME (a string), got ${typeof name}. ` +
@@ -82,19 +106,53 @@ export function check(name, cond, extra = '', tag = '') {
       `Pass Boolean(x) or an explicit comparison such as x.length > 0.`,
     )
   }
+  const isOpen = !cond && tag === 'open'
   if (cond) passed++
-  else if (tag === 'open') open++
+  else if (isOpen) open++
   else failed++
-  // Byte-identical to the 28 call sites this replaced, deliberately: the migration was
-  // verified by diffing per-entry suite output, and a changed separator would have buried
-  // a real difference under 616 cosmetic ones.
-  const mark = cond ? '✅' : tag === 'open' ? '⚠️ ' : '❌'
-  console.log(`${mark} ${tag ? `[${tag}] ` : ''}${name}${extra ? ' — ' + extra : ''}`)
+  results.push(Boolean(cond))
+  if (!cond && !isOpen) failures.push({ name })
+  // Byte-identical to the call sites this replaced, deliberately: the migration is verified by
+  // diffing per-entry output, and a changed separator would bury a real difference under
+  // hundreds of cosmetic ones.
+  const mark = cond ? marks.pass : isOpen ? (marks.open ?? HOUSE.open) : marks.fail
+  console.log(`${marks.indent ?? ''}${mark}${marks.gap ?? ' '}${tag ? `[${tag}] ` : ''}${name}${extra ? ' — ' + extra : ''}`)
 }
 
-/** Reset the counters. For a harness that runs several independent rounds in one process. */
+/**
+ * Record one assertion.
+ *
+ * @param name  what is being asserted — MUST be a string (rule 1)
+ * @param cond  whether it holds — must NOT be a string (rule 2)
+ * @param extra detail appended after an em dash
+ * @param tag   optional marker; `'open'` counts separately and prints ⚠️ instead of ❌, for a
+ *              defect that is MEASURED and deliberately not fixed, so the suite stays green
+ *              while the finding stays visible.
+ */
+export function check(name, cond, extra = '', tag = '') {
+  record(HOUSE, name, cond, extra, tag)
+}
+
+/** Reset the counters and the arrays. For a harness running several rounds in one process. */
 export function reset() {
   passed = 0
   failed = 0
   open = 0
+  results.length = 0
+  failures.length = 0
+}
+
+// ── A DIFFERENT MARK VOCABULARY, kept explicit rather than normalised away ────────────────
+// Two security harnesses print `✅ blocked` / `🚨 SUCCEEDED` instead of ✅ / ❌, because for
+// them the mark IS the finding: the assertion is "the escape was refused", and a reader
+// skimming a run must not see a bare ✅ where the file meant "blocked". Restyling them to the
+// house marks would have been the quiet kind of behaviour change — output that still looks
+// right and no longer says the same thing. So the vocabulary is a parameter, not a default,
+// and each harness names its own at the point of use.
+//
+// `gap` exists because those two separate mark from name by TWO spaces, and `indent` because
+// several harnesses indent the whole line by two. Both are preserved rather than tidied, so
+// their output stays byte-identical and the diff that verifies this refactor stays readable.
+export function withMarks(marks) {
+  return (name, cond, extra = '', tag = '') => record({ ...HOUSE, ...marks }, name, cond, extra, tag)
 }

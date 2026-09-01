@@ -24,11 +24,11 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-let pass = 0, fail = 0, skipped = 0
-const check = (name: string, blocked: boolean, extra = '') => {
-  blocked ? pass++ : fail++
-  console.log(`${blocked ? '✅ blocked' : '🚨 SUCCEEDED'}  ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { withMarks, passed as pass, failed as fail } from './assert.mjs'
+// The mark IS the finding here — see withMarks in assert.mjs. `✅ blocked` and not a bare ✅,
+// so a reader skimming a run cannot mistake "the escape was refused" for "a test passed".
+const check = withMarks({ pass: '✅ blocked', fail: '🚨 SUCCEEDED', gap: '  ' })
+let skipped = 0
 const note = (s: string) => console.log(`   ${s}`)
 
 // ════════════════════════════════════════════════════════════════════════════

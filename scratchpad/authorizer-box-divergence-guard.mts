@@ -28,11 +28,7 @@ import path from 'path'
 import { execFileSync } from 'child_process'
 import { sandboxPathAccess, wrapCommand } from '../server/src/claude/sandbox'
 
-let fail = 0
-const check = (label: string, ok: boolean, detail = ''): void => {
-  console.log(`${ok ? '✅' : '❌'} ${label}${detail ? ` — ${detail}` : ''}`)
-  if (!ok) fail++
-}
+import { check, failed as fail } from './assert.mjs'
 
 // A missing bwrap is a MISSING PREREQUISITE, not a failure. The suite must never go red for one.
 try { execFileSync('bwrap', ['--version'], { stdio: 'pipe' }) } catch {

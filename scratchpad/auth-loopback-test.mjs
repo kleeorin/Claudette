@@ -16,8 +16,7 @@ import { WebSocket } from 'ws'
 const PORT = 4322
 const APP = `http://127.0.0.1:${PORT}`
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-const results = []
-const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results } from './assert.mjs'
 
 const cfgDir = await mkdtemp(join(tmpdir(), 'claudette-cfg-'))
 const dataDir = await mkdtemp(join(tmpdir(), 'claudette-data-'))

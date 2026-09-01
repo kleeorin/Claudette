@@ -72,8 +72,7 @@ const clickText = (t) => evaluate(`(()=>{const b=[...document.querySelectorAll('
 const hasStop = () => evaluate(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='Stop')`)
 const footerState = () => evaluate(`(()=>{const s=[...document.querySelectorAll('span')].find(s=>['idle','running','waiting','exited'].includes(s.textContent.trim().toLowerCase()));return s?s.textContent.trim().toLowerCase():null})()`)
 
-const results = []
-const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results } from './assert.mjs'
 
 await send('Page.enable')
 await send('Emulation.setDeviceMetricsOverride', { width: 1300, height: 900, deviceScaleFactor: 1, mobile: false })

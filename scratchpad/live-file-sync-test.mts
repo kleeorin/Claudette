@@ -31,11 +31,9 @@ import { tmpdir } from 'os'
 import path from 'path'
 import { FileWatchRegistry, type WatchEvent } from '../server/src/fs/fileWatchRegistry'
 
-let pass = 0, fail = 0
-const ok = (name: string, cond: boolean, extra = ''): void => {
-  cond ? pass++ : fail++
-  console.log(`  ${cond ? '✅' : '❌'} ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed as pass, failed as fail } from './assert.mjs'
+// Indented two spaces, as this file has always printed. See withMarks in assert.mjs.
+const ok = withMarks({ indent: '  ' })
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 // Comfortably above the registry's 50ms debounce. inotify delivery is not instant and a
 // tight budget here would make this file flaky for reasons that have nothing to do with the

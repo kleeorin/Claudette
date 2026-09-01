@@ -127,8 +127,7 @@ await wait(300)
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 const noteCount = () => evaluate(`window.__notes.length`)
 const notes = () => evaluate(`window.__notes.map(n=>n.title)`)
-const results = []
-const check = (name, ok, extra = '') => { results.push({ name, ok }); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results, failures as failed } from './assert.mjs'
 
 // 1. Before opt-in: a full turn cycle must produce NOTHING.
 await feed({ type: 'session:state', id: SID, state: 'running' })
@@ -184,6 +183,5 @@ check('permission note tagged by session', last && last.tag === SID, JSON.string
 
 cdpDone = true   // deliberate teardown from here — the CDP close below is expected
 reapChrome()
-const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

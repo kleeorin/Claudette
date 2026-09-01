@@ -141,8 +141,7 @@ await send('Page.enable')
 await send('Page.addScriptToEvaluateOnNewDocument', { source: SHIM })
 await send('Page.navigate', { url: `${APP}/` })
 
-const results = []
-const check = (name, ok, extra = '') => { results.push({ name, ok }); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results, failures as failed } from './assert.mjs'
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 
 try {
@@ -181,6 +180,5 @@ try {
   for (const d of [tmpHome, workDir, dataDir, buildDir]) await rm(d, { recursive: true, force: true }).catch(() => {})
 }
 
-const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

@@ -114,8 +114,7 @@ async function evaluate(expression) {
 }
 async function waitFor(expr, ms = 20000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await evaluate(expr)) return true; await wait(200) } throw new Error(`timeout: ${expr}`) }
 
-const results = []
-const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results } from './assert.mjs'
 
 const SHIM = `
   // A previous run's drafts/history would otherwise seed this one (same origin).

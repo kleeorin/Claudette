@@ -29,11 +29,9 @@ process.env.CLAUDETTE_DATA_DIR = DATA
 const store = await import('../server/src/connectors/connectorStore')
 const { BUILTIN_CONNECTORS } = await import('../server/src/connectors/builtins')
 
-let pass = 0, fail = 0
-const ok = (name: string, cond: boolean, extra = ''): void => {
-  cond ? pass++ : fail++
-  console.log(`  ${cond ? '✅' : '❌'} ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed as pass, failed as fail } from './assert.mjs'
+// Indented two spaces, as this file has always printed. See withMarks in assert.mjs.
+const ok = withMarks({ indent: '  ' })
 const view = (id: string) => {
   const d = store.listConnectors().find((c) => c.id === id)
   return d ? store.toView(d) : undefined

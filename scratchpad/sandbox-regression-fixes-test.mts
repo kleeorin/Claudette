@@ -20,11 +20,11 @@ import os from 'os'
 import path from 'path'
 import type { SandboxConfig } from '../shared/src/types'
 
-let pass = 0, fail = 0
-const check = (name: string, blocked: boolean, extra = '') => {
-  blocked ? pass++ : fail++
-  console.log(`${blocked ? '✅ blocked' : '🚨 SUCCEEDED'}  ${name}${extra ? ' — ' + extra : ''}`)
-}
+import { withMarks, passed as pass, failed as fail } from './assert.mjs'
+// The mark IS the finding here — see withMarks in assert.mjs. `✅ blocked` and not a
+// bare ✅, so a reader skimming a run cannot mistake "the escape was refused" for
+// "a test passed", and `gap: '  '` keeps the two-space column this file has always used.
+const check = withMarks({ pass: '✅ blocked', fail: '🚨 SUCCEEDED', gap: '  ' })
 
 // sandbox.ts memoizes appSourceRoot() and the which() cache at module scope, so each case
 // that needs a different CLAUDETTE_APP_ROOT must load a FRESH module instance. Same

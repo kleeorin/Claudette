@@ -34,8 +34,8 @@ import { WebSocket } from 'ws'
 const PORT = 4487, WEB_PORT = 5287, CDP = 9368, TOKEN = 'refresh-probe'
 const APP = `http://127.0.0.1:${WEB_PORT}`, API = `http://127.0.0.1:${PORT}`
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-let pass = 0, fail = 0
-const ok = (n, c, x = '') => { c ? pass++ : fail++; console.log(`  ${c ? '✅' : '❌'} ${n}${x ? ` — ${x}` : ''}`) }
+import { withMarks, passed as pass, failed as fail } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 const DATA = await mkdtemp(join(tmpdir(), 'refresh-data-'))
 const PROJ = await mkdtemp(join(tmpdir(), 'refresh-proj-'))

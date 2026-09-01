@@ -166,8 +166,7 @@ await send('Page.addScriptToEvaluateOnNewDocument', { source: SHIM })
 await send('Emulation.setDeviceMetricsOverride', { width: 1500, height: 950, deviceScaleFactor: 1, mobile: false })
 await send('Page.navigate', { url: `${APP}/` })
 
-const results = []
-const check = (name, ok, extra = '') => { results.push({ name, ok }); console.log(`${ok ? '✅' : '❌'} ${name}${extra ? ' — ' + extra : ''}`) }
+import { check, results, failures as failed } from './assert.mjs'
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 
 try {
@@ -313,6 +312,5 @@ try {
   await rm(buildDir, { recursive: true, force: true }).catch(() => {})
 }
 
-const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

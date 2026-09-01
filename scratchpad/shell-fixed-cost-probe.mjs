@@ -163,17 +163,11 @@ const apply = async (mode) => {
   return await ev(BANDS)
 }
 
-let failed = 0, passed = 0, open_ = 0
+import { withMarks, passed, failed, open as open_ } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 // [open] marks a defect this probe MEASURED but deliberately did not fix: it prints with its
 // numbers and does not fail the run, so the suite stays green while the finding stays visible.
 // Same convention as scratchpad/xterm-vvh-probe.mjs.
-const ok = (name, cond, extra = '', tag = '') => {
-  if (cond) passed++
-  else if (tag === 'open') open_++
-  else failed++
-  const mark = cond ? '✅' : tag === 'open' ? '⚠️ ' : '❌'
-  console.log(`  ${mark} ${tag ? `[${tag}] ` : ''}${name}${extra ? ` — ${extra}` : ''}`)
-}
 
 // PRECONDITIONS, asserted rather than logged — same reason as xterm-vvh-probe.mjs. The card is
 // located by a TAILWIND CLASS FRAGMENT (`border-ctp-blue`, inherited from ask-card-height-probe)
