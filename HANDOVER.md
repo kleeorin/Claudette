@@ -29,7 +29,37 @@ fix, Files multi-select, drawn file icons) · `web/src/components/FileIcon.tsx` 
 `scratchpad/` — two new guards, `safe-mutate.sh`, `live-file-sync-design.md`, and edits to
 `dom-env.mts`, `output-sanitizer-test.mts`, `run-suite.sh`.
 
-### ★ BASELINE — 2026-08-31, TWO sessions, published side by side
+### ★ BASELINE — 2026-09-01, TWO sessions AT THE SAME COMMIT, taken minutes apart
+| | coordinator | session `2e41c0b7` |
+|---|---|---|
+| | **87 / 1 / 6** | **90 / 2 / 2** |
+
+Both clean: zero contamination flags, bucket 1 interpretable at both ends, lock taken and
+released, **no unexpected failures in either**. Sole tree-level red in both is
+`authorizer-box-divergence-guard`, the documented expected red awaiting A2.
+
+**The first pair measured at ONE commit.** The previous pair was taken days and several
+commits apart and should not have been published as a comparison; this one can be, and the
+whole gap is still the four environment deltas (jupyter, `CLAUDE_CONFIG_DIR`, CLI auth,
+process visibility) — not the code.
+
+**This is also the first baseline over the completed assertion refactor** (82 harnesses on
+`scratchpad/assert.mjs`, `197fd77`→`82593bb`). **Zero guard trips in either session** — no
+`TypeError` in any of the 188 logs. And the totals are IDENTICAL to the pre-refactor pair.
+That is the useful result: a refactor that moves 82 files and shows up in the numbers is one
+that changed behaviour. This one did not.
+
+Also confirmed here: `ratelimit-test` is stable rather than alternating (`0eb9bb7` stopped it
+asserting on a branch nothing takes), and `notebook-ui-e2e` passes — its earlier red was the
+mid-rewrite artefact, not a finding.
+
+**Protocol that produced this, after three voided runs:** every other session confirms it is
+holding, the coordinator corroborates with a tree read, and only then does the runner start.
+The confirmations are the guarantee; the tree read is a snapshot and a snapshot is exactly
+what failed before — true at 09:37:37, false at 09:38:45. The lock is the net for the case
+where someone forgets, which has happened once and was caught.
+
+### Previous baseline — 2026-08-31, two sessions, DIFFERENT commits
 | | coordinator | Landing |
 |---|---|---|
 | | **87 / 1 / 6** | **90 / 2 / 2** |
