@@ -213,6 +213,87 @@ attributed to Devil and was not Devil's; the correction came from the teammate, 
 a full suite run while anyone is writing the tree; the run's own fingerprint will flag it and the
 number is wasted.
 
+## SERVER-SIDE / HARNESS SESSION — handover, 2026-08-31. Session `2e41c0b7`.
+
+Written by the session that holds write access to `server/src`, `shared/src` and root
+`node_modules`. Thin on purpose: everything already in this file, in the code, or in git is
+LINKED, not restated.
+
+### Status
+All assigned work is landed and committed by the coordinator. Owned and in the tree:
+connector upstream timeouts (`862c0e5`), built-in connectors (`833a165` + `3c54d2a` +
+`9cbc2d0`), live-file-sync server half (`abc994a`), sandbox migration step (ii) (`4667875`),
+the suite's full-run lock + end-of-run bundle banner (`3f73437`, `8e80a10`), jsdom (`4d403d8`)
+and the vitest root install (`8dbed06`).
+
+**My baseline: `90 passed / 2 failed / 2 skipped` (94 entries), zero contamination flags.**
+It PREDATES QA's uncommitted 29-file `assert.mjs` refactor and should not be quoted against
+the post-refactor tree. Both remaining non-green entries are known: the documented
+`EXPECTED_RED|closed` awaiting A2, and `sandbox-fs-escape-fixes-test`, which is red only in
+this session (see deltas).
+
+### ★ THE FIVE ENVIRONMENT DELTAS — the most expensive thing on this page
+Sessions do NOT share an environment, and a suite figure is a property of the session that
+measured it. **State the session with every count, prereq or skip, or state none.** Three
+separate times a session-local fact was reported as a tree fact; each cost a wrong diagnosis.
+
+| input | session `2e41c0b7` | coordinator |
+|---|---|---|
+| `jupyter_server` | present (2.20.0) — 6 entries RUN | absent — 6 entries SKIP |
+| `CLAUDE_CONFIG_DIR` | inside `~/.config/claudette` → `sandbox-fs` 12/1 | `~/.claude` → 13/0 |
+| CLI authentication | **broken** — 2 runtime skips | working |
+| process visibility | `pgrep` sees host PIDs | only PID 1/2 |
+| **`/tmp`** | plain dir on `/` | bwrap `--tmpfs`, private |
+
+`ss` DOES see other sessions' listeners in both (that is why the foreign-`:4321` guard
+works); `pgrep` does not. Do not collapse those into one claim.
+
+### ★ NEXT STEP — move the full-run lock out of `/tmp`. Blocked on QA's run publishing.
+`/tmp` is not shared between sessions, so `.full-run.lock` is a **different file in every
+session** and the lock cannot do the cross-session job it was built for. Worse, it fails
+*asymmetrically* — a pair of sessions that happened to share ground would see it work.
+Move to a gitignored `.suite-run.lock` at the **repo root** (the one place all sessions
+provably see the same bytes). Record session id (`CLAUDE_CONFIG_DIR` basename), start epoch,
+pid, covered trees. **Keep** the `exit 130` INT/TERM trap and the 1h staleness — the latter
+becomes load-bearing, since a dead holder in another session cannot be probed. Put the tmpfs
+reason IN THE HEADER or someone moves it back for tidiness. It stays **advisory** either way.
+
+⚠ Do not edit `scratchpad/run-suite.sh` while any session is mid-run — `scratchpad` is
+fingerprinted. The repo root is NOT (`FP_TREES="web server/src shared/src scratchpad"`), so
+editing this file during a run is safe.
+
+### Gotchas that actually bit
+- **Mutation-test a COPY, never the live file**, for anything under `web/`: the bucket-1
+  banner compares *mtime*, so even a byte-identical revert leaves it stale. The fingerprint
+  compares *content*. They answer different questions and disagree on exactly this case.
+- **Never infer "a run is in flight" from a port.** `:4321` is held only during the srv4321
+  block. Use log mtimes or ask.
+- A **rebuild mid-run** splits bucket 1 across two bundles. The end-of-run banner now names
+  which harnesses fell on which side; an entry *straddling* the rebuild is unclassifiable.
+- **`npm i` at the root can move transitive versions under the `scratchpad` harnesses** —
+  re-run the DOM/React ones (`output-sanitizer`, `sandbox-chip-picker`) after any install.
+- Declaration follows the **consumer** (jsdom → root, because its consumers are root-level
+  `npx tsx` scripts; vitest → `web/`, its own test script). Physical install is forced to the
+  root by the workspace hoist regardless.
+
+### The recurring failure, stated so the next session can avoid it
+Twice I found an environment fact and applied it only to the instance that produced it —
+not to the class. I established on day one that `/tmp` was not shared, reported it, and then
+built a cross-session lock in `/tmp`. **A fact about what is shared is a fact about every
+mechanism built on it**; re-derive it whenever placing state, not only when a read fails.
+
+### Open, unowned, deliberately not failed on
+The **concurrency cap** (`rt2-connectors-c` `[open]`) — the bound the total-duration guard is
+easy to mistake for and does not provide. Also open: the 15s handshake budget value, and
+`shell-fixed-cost-probe`'s 33px composer clip.
+
+### References
+`scratchpad/run-suite.sh` header (the interpretability taxonomy, the gate, the census),
+`scratchpad/connector-timeout-design.md`, `scratchpad/live-file-sync-design.md`,
+`server/src/connectors/builtins.ts` (why built-ins are merged, not seeded).
+
+---
+
 ## ⚠ CORRECTIONS — 2026-08-24. READ BEFORE THE SECTIONS BELOW.
 
 A team swept this document and the tree against each other. Many claims below were stale **in

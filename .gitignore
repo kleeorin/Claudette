@@ -12,3 +12,7 @@ out/
 
 # Local Claude Code session config (per-machine permissions).
 .claude/
+
+# The full-run lock (scratchpad/run-suite.sh). In the repo because sessions do NOT share
+# /tmp — see that file's header. Never committed.
+.suite-run.lock

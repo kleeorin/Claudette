@@ -84,27 +84,58 @@ cd "$(dirname "$0")/.."
 # standing instruction and no way to see the other's state. Neither was careless — the
 # collision was structural, and the fix is a fact both can read.
 #
-# ★ IT COVERS ALL FOUR FINGERPRINTED TREES, not just web/dist. The obvious guard is the
-# bundle, and the bundle is not what actually broke it: run 3 died on a `scratchpad/` write,
-# which is the tree nobody thinks of as production and the one every harness author touches.
+# ★★ THE LOCK LIVES IN THE REPO, AND MOVING IT TO /tmp FOR TIDINESS BREAKS IT SILENTLY. ★★
+# It was in /tmp/claudette-qa/ until 2026-08-31, where it could not work: sessions do not
+# share /tmp. Measured, not assumed — while one session held the lock, another's
+# `--lock-status` reported "no run in flight", and that was an ABSENT FILE, not a stale one.
+# They were never observing the same thing.
 #
-# Advisory, deliberately. It cannot stop another process from writing — nothing here can —
-# so it does the one thing that helps: makes "is a run in flight?" answerable in one command
-# instead of inferred. Do NOT infer it from ports: :4321 is held only during the srv4321
-# block, a small window in a long run, so an empty listener list means nothing either way.
+# ★ AND THE MECHANISM IS NOT EVEN THE SAME ON BOTH SIDES, which is what makes this worth a
+# paragraph rather than a line. In the coordinator's session /tmp is a bwrap `--tmpfs`,
+# private by construction. In Landing's it is not a mount at all — no /tmp line in
+# /proc/self/mountinfo, `df -T /tmp` reports the ext4 root. So the lock did not fail
+# uniformly: A PAIR OF SESSIONS THAT HAPPENED TO SHARE GROUND WOULD SEE IT WORK AND CONCLUDE
+# IT WORKS. A coordination primitive that succeeds for some pairs and silently fails for
+# others is worse than one that fails for all of them, because "it worked when I tested it"
+# is a reachable and wrong conclusion. That sentence is the whole reason this is not in /tmp.
+#
+# The repo is the one place every session provably sees the same bytes — it is how we collide
+# in the first place, which is exactly the argument for putting the collision detector there.
+# (The LOG directory stays in /tmp deliberately: per-session logs are fine, and arguably
+# better. Only the lock needs to be shared.)
+#
+# ★ IT IS ADVISORY, AND THE REPO-ROOT LOCATION DOES NOT CHANGE THAT. It makes "is someone
+# else's run in flight?" answerable in one command. It cannot stop a session that does not
+# ask, and nothing here can. Do not read the move as buying more safety than that.
 #   bash scratchpad/run-suite.sh --lock-status
-LOCKFILE=/tmp/claudette-qa/.full-run.lock
+#
+# ★ IT COVERS ALL FOUR FINGERPRINTED TREES, not just web/dist. The obvious guard is the
+# bundle, and the bundle is not what actually broke it: one contaminated run died on a
+# `scratchpad/` write, which is the tree nobody thinks of as production and the one every
+# harness author touches.
+#
+# Do NOT infer a run from a port: :4321 is held only during the srv4321 block, a small window
+# in a long run, so an empty listener list means nothing either way.
+LOCKFILE=".suite-run.lock"      # repo root — cd'd to above. Gitignored.
 LOCK_STALE_S=3600     # a run that has not finished in an hour is assumed dead, not sacred
+# Who we are. The CLAUDE_CONFIG_DIR basename is a REAL, stable per-session id; a generated
+# one would be fresh every invocation and could not answer "whose run is this" after the
+# process is gone — and attribution is now the whole point, because "in flight" means
+# SOMEONE ELSE'S run and a dead holder in another session cannot be probed (see the process
+# -visibility delta: pgrep sees host PIDs in one session and only PID 1/2 in another).
+SESSION_ID="$(basename "${CLAUDE_CONFIG_DIR:-unknown-session}")"
 lock_held() {
   [ -f "$LOCKFILE" ] || return 1
   local started; started=$(sed -n '1p' "$LOCKFILE" 2>/dev/null || echo 0)
   case "$started" in ''|*[!0-9]*) return 1 ;; esac
   [ $(( $(date +%s) - started )) -lt "$LOCK_STALE_S" ]
 }
+lock_owner() { sed -n '2p' "$LOCKFILE" 2>/dev/null; }
 if [ "${1:-}" = "--lock-status" ]; then
   if lock_held; then
     echo "A FULL SUITE RUN IS IN FLIGHT — do not write to web/, server/src, shared/src or scratchpad/."
-    sed -n '2,4p' "$LOCKFILE"
+    sed -n '2,5p' "$LOCKFILE"
+    case "$(lock_owner)" in *"$SESSION_ID"*) echo "  (that is THIS session's own run)" ;; esac
     exit 1
   fi
   echo "No full run in flight. (Checked $LOCKFILE.)"
@@ -777,14 +808,19 @@ fi
 FULL_RUN=no
 if [ $# -eq 0 ]; then
   if lock_held && [ "${ALLOW_CONCURRENT_RUN:-0}" != "1" ]; then
-    echo "REFUSING TO START: another full suite run is already in flight."
-    sed -n '2,4p' "$LOCKFILE"
+    echo "REFUSING TO START: a full suite run is already in flight."
+    sed -n '2,5p' "$LOCKFILE"
     echo "Two concurrent runs contend on the shared :4321 server and on $LOGDIR, and both"
     echo "numbers come out junk. Wait for it, or ALLOW_CONCURRENT_RUN=1 if you know it is dead."
     exit 1
   fi
   FULL_RUN=yes
-  { date +%s; echo "  started: $(date '+%F %T')  pid $$"; echo "  host-pid $$ — ask the other sessions before writing"; echo "  covers: web/ server/src shared/src scratchpad/"; } > "$LOCKFILE"
+  { date +%s
+    echo "  session: $SESSION_ID"
+    echo "  started: $(date '+%F %T')  pid $$"
+    echo "  covers:  web/ server/src shared/src scratchpad/ — do not write to these"
+    echo "  stale after ${LOCK_STALE_S}s; a dead holder in another session cannot be probed"
+  } > "$LOCKFILE"
   # Released on EVERY exit path, or the next run refuses for an hour over a lock nobody holds.
   # ★ INT/TERM must EXIT, not merely unlock. Measured 2026-08-29: with a handler that only
   # removed the file, `kill -TERM` ran it and the run CARRIED ON — still going, now with no
