@@ -53,6 +53,66 @@
 // keeps working, and keeps reading as the gate expects, without being touched. Verified under
 // both plain node and tsx before anything was migrated onto it.
 
+// ── WRITING THE DETAIL, AND THE ONE WAY IT GOES WRONG ────────────────────────────────────
+// `extra` is appended after an em dash. A bare STRING prints on BOTH paths:
+//
+//     check('rows re-fit', kb.rows < rest.rows, `rows ${a} → ${b}`)
+//        ✅ rows re-fit — rows 30 → 16          ❌ rows re-fit — rows 30 → 30
+//
+// That is right for a MEASUREMENT, which is what the detail almost always is, and it is why
+// the default was left alone. Green detail is not decoration: `0 of 4 rendered` is how a
+// divider check is known to be non-vacuous, `401` is how an auth test shows it really saw a
+// 401 rather than skipping, and `dock 600px of a saved 600px` is how an at-rest control
+// proves a bound is conditional rather than a blanket shrink.
+//
+// IT GOES WRONG when the string is phrased as an EXPLANATION OF THE FAILURE, because it then
+// appears beside ✅ asserting the opposite of what happened:
+//
+//     ✅ mid-browse, the restore DECLINES — it wrote into a box the user is browsing with
+//
+// Nothing is wrong; the line says something is. It is read on the day it goes red, when it
+// will still be wrong. Three real instances, all one author's, all caught only by re-reading
+// the actual output — knowing about the trap never once prevented writing it.
+//
+// So pass an OBJECT when the two genuinely differ:
+//
+//     check('the restore declines mid-browse', box === '',
+//           { pass: 'box still empty', fail: `box holds ${JSON.stringify(box)} — it wrote into a box the user is browsing with` })
+//
+// ── WHY THE DEFAULT IS NOT "FAIL-ONLY", WHICH WAS PROPOSED AND REJECTED ───────────────────
+// The obvious stronger fix is to make `extra` print only on failure, so a single string
+// cannot lie. It was designed, adopted, and then withdrawn ON THE NUMBERS — recorded here so
+// it is not re-proposed from the same three anecdotes in six months:
+//
+//     490 of ~1,090 green lines in the corpus carry detail        (42%)
+//      11 of those 490 match a failure-phrasing keyword grep
+//       0 of those 11 are actually lies — every one is a factual statement of what was
+//         measured (`openPath stores resolve(path), never realpath`, `it does not guess`)
+//
+// So the trade was: silence ~490 informative lines, or take a 490-line restoration sweep, to
+// close a class with NO live occurrences. The rule had been inferred from three self-observed
+// cases and was about to be applied to ~1,264 call sites.
+//
+// *** THE COMPARISON THAT DECIDES IT, because the guard above ALSO had zero live instances: ***
+// the argument-order footgun had none either — but its fix was FREE. A runtime check, no
+// output change, no sweep, and 82 files became structurally safe. This one would have cost
+// the evidence a green run provides. **Zero live instances is not an argument against a fix;
+// it is an argument against a fix that COSTS something.** Weigh the cost before the elegance.
+//
+// ── AN ASIDE THAT IS NOT ABOUT ASSERTIONS, PUT HERE BECAUSE THIS IS THE FILE EVERY HARNESS
+//    AUTHOR NOW OPENS ─────────────────────────────────────────────────────────────────────
+// `pgrep -f run-suite.sh` and `pkill -f run-suite.sh` MATCH THEIR OWN COMMAND LINE. Two people
+// hit this in one week: one saw a phantom survivor after killing a run, the other killed their
+// own shell mid-command. Use the bracket form, which cannot match itself:
+//
+//     ps -eo pid,args | grep -c "[r]un-suite.sh"
+//
+// AND THE CAVEAT THAT MATTERS MORE: this session runs under `--unshare-pid`, so a process
+// check is only ever evidence about THIS sandbox. It can never tell you whether another
+// session is running something. Same family as `/tmp` looking shared while being per-session,
+// and as a lock reporting "no run in flight" while another session held one: an instrument
+// answering a different question than the one asked.
+
 export let passed = 0
 export let failed = 0
 export let open = 0
@@ -81,7 +141,9 @@ export const failures = []
  *
  * @param name  what is being asserted — MUST be a string (rule 1)
  * @param cond  whether it holds — must NOT be a string (rule 2)
- * @param extra detail appended after an em dash
+ * @param extra detail appended after an em dash. A STRING prints on both the pass and the
+ *              fail path. An OBJECT `{ pass, fail }` prints whichever applies — use it when
+ *              the two genuinely differ, and omit either key to print nothing on that path.
  * @param tag   optional marker; `'open'` counts separately and prints ⚠️ instead of ❌,
  *              for a defect that is MEASURED and deliberately not fixed, so the suite stays
  *              green while the finding stays visible.
@@ -116,7 +178,10 @@ function record(marks, name, cond, extra, tag) {
   // diffing per-entry output, and a changed separator would bury a real difference under
   // hundreds of cosmetic ones.
   const mark = cond ? marks.pass : isOpen ? (marks.open ?? HOUSE.open) : marks.fail
-  console.log(`${marks.indent ?? ''}${mark}${marks.gap ?? ' '}${tag ? `[${tag}] ` : ''}${name}${extra ? (marks.sep ?? ' — ') + extra : ''}`)
+  // A bare string prints on BOTH paths, byte-identically to before. An object is the opt-in
+  // for when the two genuinely differ — see "WRITING THE DETAIL" in the header.
+  const detail = extra && typeof extra === 'object' ? (cond ? extra.pass : extra.fail) : extra
+  console.log(`${marks.indent ?? ''}${mark}${marks.gap ?? ' '}${tag ? `[${tag}] ` : ''}${name}${detail ? (marks.sep ?? ' — ') + detail : ''}`)
 }
 
 /**
@@ -124,7 +189,9 @@ function record(marks, name, cond, extra, tag) {
  *
  * @param name  what is being asserted — MUST be a string (rule 1)
  * @param cond  whether it holds — must NOT be a string (rule 2)
- * @param extra detail appended after an em dash
+ * @param extra detail appended after an em dash. A STRING prints on both the pass and the
+ *              fail path. An OBJECT `{ pass, fail }` prints whichever applies — use it when
+ *              the two genuinely differ, and omit either key to print nothing on that path.
  * @param tag   optional marker; `'open'` counts separately and prints ⚠️ instead of ❌, for a
  *              defect that is MEASURED and deliberately not fixed, so the suite stays green
  *              while the finding stays visible.
