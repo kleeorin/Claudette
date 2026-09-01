@@ -67,10 +67,59 @@ async function waitFor(expr, ms = 15000) { const t0 = Date.now(); while (Date.no
 
 import { check, results } from './assert.mjs'
 
+// ── WHY THIS SHIM ALSO STUBS /api/usage — read this before deleting it ───────────────
+// This test injects `rate_limit_event` frames and asserts on the chip they produce. But
+// ChatView does not merge the two sources, it PREFERS one:
+//
+//     const limits = (usageChips.length ? usageChips : streamChips)     // ChatView.tsx:1070
+//
+// `usageChips` comes from `useUsage()`, which polls GET /api/usage — on MOUNT, on
+// `visibilitychange`, and every 60s. So the injected fixtures are consulted ONLY when the
+// polled list is empty. Without this stub the test asserts on the FALLBACK branch while the
+// primary branch is live, and it is green only when the poll happens to return nothing.
+//
+// *** THAT IS WHY IT LOOKED LIKE A FLAKE AND IS NOT ONE. *** /api/usage answers with the
+// operator's REAL account quota (see the isolation note below), which varies run to run: when
+// the call yields windows the fixtures are ignored and the test reds with live values in the
+// diagnostic (`● Session 52%`, `Weekly 12%` — never the 41/91 this file injects); when it
+// yields nothing the fixtures are used and it passes. Same code, opposite results, no timing
+// involved. Re-running it was never going to converge.
+//
+// The stub returns an EMPTY window list, which is the point: it makes `usageChips` empty BY
+// CONSTRUCTION so the fixtures are the only source. Making the fixture merely arrive first
+// would still be green-by-luck — a race won is not a branch removed.
+//
+// ── AND AN ISOLATION FINDING THIS EXPOSED, which is NOT this file's to fix ────────────
+// run-suite starts the shared :4321 server with a throwaway data dir:
+//     env -u CLAUDETTE_TOKEN CLAUDETTE_NO_AUTH=1 CLAUDETTE_DATA_DIR="$(mktemp -d)"
+// That dir isolates nothing here. server/src/usage/usageApi.ts:13 reads
+//     const CREDS = join(homedir(), '.claude', '.credentials.json')
+// derived from homedir() and IGNORING CLAUDETTE_DATA_DIR, then makes an authenticated call to
+// https://api.anthropic.com/api/oauth/usage. Measured 2026-09-01: that file exists and holds a
+// live `sk-ant-` token, and `/api/usage` returns `{windows: []}` ONLY when there is no token —
+// so every full suite run has been making authenticated calls on the operator's real account.
+// One direct probe of a fresh throwaway server returned `{"windows":[],"fetchedAt":…}`; that
+// does NOT refute the above, it is the same intermittency described earlier — it means that
+// call yielded no windows, not that no token was read.
+//
+// ── TWO TESTS, TWO CAUSES — do not close the other one by association ─────────────────
+// `real-turn-browser-test.mjs` also failed once in this group and was lumped in with this as
+// "one srv4321 flake". It is NOT the same cause: it fails on Stop-indicator timing and never
+// reads the usage chip. That one is still unexplained and still open.
 const SHIM = `
   const RealWS = window.WebSocket;
   class CapWS extends RealWS { constructor(...a){ super(...a); if(String(a[0]).includes('/ws')) window.__appws=this; } }
   window.WebSocket = CapWS;
+  const realFetch = window.fetch;
+  window.fetch = (input, init) => {
+    const url = String(input && input.url ? input.url : input);
+    if (url.includes('/api/usage')) {
+      window.__usageStubHits = (window.__usageStubHits || 0) + 1;
+      return Promise.resolve(new Response(JSON.stringify({ windows: [], fetchedAt: Date.now() }),
+        { status: 200, headers: { 'content-type': 'application/json' } }));
+    }
+    return realFetch(input, init);
+  };
 `
 await send('Page.enable')
 await send('Page.addScriptToEvaluateOnNewDocument', { source: SHIM })
@@ -98,6 +147,14 @@ await wait(400)
 // Match the CHIP, not its wrapper. `querySelectorAll('span')` returns document order, so a
 // plain find() hit the flex container that holds the chips — same text, no title attribute,
 // which is why the tooltip read as null even though RateChip sets one. Require `span[title]`.
+// PRECONDITION: the /api/usage stub actually engaged. Without this, a shim that silently
+// stopped working (a renamed route, a transport that is no longer window.fetch) would put
+// this file straight back to asserting on the fallback branch while the live one wins —
+// green again for the old wrong reason, and nothing in the output would say so.
+const stubHits = await evaluate(`window.__usageStubHits ?? 0`)
+check('PRECONDITION: /api/usage was stubbed, so the injected fixtures are the only source',
+      typeof stubHits === 'number' && stubHits > 0, `stub served ${stubHits} request(s)`)
+
 const CHIP = `[...document.querySelectorAll('span[title]')].find(s=>/Session/.test(s.textContent)&&/%/.test(s.textContent)&&s.textContent.length<40)`
 const chipText = await evaluate(`(()=>{const el=${CHIP};return el?el.textContent.replace(/\\s+/g,' ').trim():null})()`)
 console.log('chip text:', JSON.stringify(chipText))
