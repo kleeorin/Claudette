@@ -139,10 +139,37 @@ export interface SessionStoreState {
   // otherwise look identical — both are an active id absent from the incoming list — and
   // which must be handled in OPPOSITE directions: keep the selection vs. move it.
   unacked: ReadonlySet<string>
+  // Recency rank per session, for ordering the sidebar most-recently-active first.
+  //
+  // A COUNTER, not a clock. We only ever need relative order, and a monotonic sequence gives
+  // exactly that while keeping the reducer PURE — `Date.now()` inside a reducer makes every
+  // transition unreproducible and untestable, which is the property this file exists to have.
+  // It also sidesteps a clock that can move backwards.
+  activity: ReadonlyMap<string, number>
+  activitySeq: number
 }
 
 export const initialSessionStore: SessionStoreState = {
   sessions: [], activeId: null, attention: new Map(), prevState: new Map(), fresh: new Set(), unacked: new Set(),
+  activity: new Map(), activitySeq: 0,
+}
+
+// Mark a session as having just done something. Applied to the transitions that represent
+// the SESSION acting — state changes (which cover starting work, going to waiting for a
+// permission prompt, and finishing), ready, exit, and being created.
+//
+// ★ NOT applied to `markBusy`. That is the optimistic flip fired when YOU send a turn, and
+// promoting on it would mean the list reorders as you type rather than as sessions act. The
+// server's real `state` event lands a round trip later and promotes it then — so the session
+// still rises, from its own work rather than from your keystroke. That distinction is the
+// operator's, made explicitly.
+// Also not applied to `list`, `patch` or `setActive`: a re-report, a field update and a
+// selection are not the session doing anything.
+function bump(state: SessionStoreState, id: string): Pick<SessionStoreState, 'activity' | 'activitySeq'> {
+  const seq = state.activitySeq + 1
+  const activity = new Map(state.activity)
+  activity.set(id, seq)
+  return { activity, activitySeq: seq }
 }
 
 export type SessionStoreAction =
@@ -252,7 +279,23 @@ function withActive(state: SessionStoreState, id: string | null): SessionStoreSt
   return { ...state, activeId: id, attention }
 }
 
+// Which transitions count as the SESSION acting. See `bump` for why markBusy is absent.
+const ACTIVITY_ACTIONS = new Set(['state', 'ready', 'exit', 'created'])
+
+// The activity rank rides on an invariant this file already treats as load-bearing: a
+// transition that changed nothing returns `state` ITSELF. So "did anything happen?" is
+// answerable by identity, and a redundant re-report — a running→running state event, a
+// `ready` for a session already running — cannot promote a session that did nothing. That
+// is why the bump is applied HERE rather than inside each case: the cases already decide,
+// correctly and in one place, whether anything happened.
 export function reduceSessionStore(state: SessionStoreState, action: SessionStoreAction): SessionStoreState {
+  const next = reduceStore(state, action)
+  if (next === state || !ACTIVITY_ACTIONS.has(action.type)) return next
+  const id = action.type === 'created' ? action.session.id : 'id' in action ? action.id : null
+  return id ? { ...next, ...bump(next, id) } : next
+}
+
+function reduceStore(state: SessionStoreState, action: SessionStoreAction): SessionStoreState {
   switch (action.type) {
     case 'list': {
       // Default the selection to the first session once one exists — but NEVER clobber an

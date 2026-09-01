@@ -91,13 +91,16 @@ interface ContextValue {
   // corrupt the store silently. THE ONE TYPE-LEVEL CHANGE IN THIS FILE — if any consumer
   // needs a mutable Set the typecheck will say so, and that consumer is the bug.
   attention: ReadonlyMap<string, AttentionReason>
+  // Recency rank per session — a monotonic counter, not a clock, because only relative
+  // order is needed. Drives the sidebar's most-recently-active-first ordering.
+  activity: ReadonlyMap<string, number>
 }
 
 const SessionsContext = createContext<ContextValue | null>(null)
 
 export function SessionsProvider({ children }: { children: ReactNode }) {
   const [store, dispatch] = useReducer(reduceSessionStore, initialSessionStore)
-  const { sessions, activeId, attention } = store
+  const { sessions, activeId, attention, activity } = store
   // State that is NOT part of the session machine: connection status and three facts
   // fetched once at startup. Deliberately left as plain useState — folding them into the
   // reducer would put non-transitional data behind a transition vocabulary.
@@ -264,8 +267,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // permanently stable (they close over nothing but `dispatch`), so this list is shorter
   // in practice than it looks.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention }),
-    [sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention],
+    () => ({ sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention, activity }),
+    [sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention, activity],
   )
   return (
     <SessionsContext.Provider value={value}>
