@@ -213,7 +213,7 @@ attributed to Devil and was not Devil's; the correction came from the teammate, 
 a full suite run while anyone is writing the tree; the run's own fingerprint will flag it and the
 number is wasted.
 
-## SERVER-SIDE / HARNESS SESSION — handover, 2026-08-31. Session `2e41c0b7`.
+## SERVER-SIDE / HARNESS SESSION — handover, 2026-08-31 (2nd update). Session `2e41c0b7`.
 
 Written by the session that holds write access to `server/src`, `shared/src` and root
 `node_modules`. Thin on purpose: everything already in this file, in the code, or in git is
@@ -225,6 +225,10 @@ connector upstream timeouts (`862c0e5`), built-in connectors (`833a165` + `3c54d
 `9cbc2d0`), live-file-sync server half (`abc994a`), sandbox migration step (ii) (`4667875`),
 the suite's full-run lock + end-of-run bundle banner (`3f73437`, `8e80a10`), jsdom (`4d403d8`)
 and the vitest root install (`8dbed06`).
+
+The lock move landed as `a58d49c`. **Nothing of mine is uncommitted** except this block —
+and note the coordinator commits fast, so a "currently uncommitted" list written here is
+stale within minutes. Read `git status` and `git log`, not this sentence.
 
 **My baseline: `90 passed / 2 failed / 2 skipped` (94 entries), zero contamination flags.**
 It PREDATES QA's uncommitted 29-file `assert.mjs` refactor and should not be quoted against
@@ -248,19 +252,48 @@ separate times a session-local fact was reported as a tree fact; each cost a wro
 `ss` DOES see other sessions' listeners in both (that is why the foreign-`:4321` guard
 works); `pgrep` does not. Do not collapse those into one claim.
 
-### ★ NEXT STEP — move the full-run lock out of `/tmp`. Blocked on QA's run publishing.
-`/tmp` is not shared between sessions, so `.full-run.lock` is a **different file in every
-session** and the lock cannot do the cross-session job it was built for. Worse, it fails
-*asymmetrically* — a pair of sessions that happened to share ground would see it work.
-Move to a gitignored `.suite-run.lock` at the **repo root** (the one place all sessions
-provably see the same bytes). Record session id (`CLAUDE_CONFIG_DIR` basename), start epoch,
-pid, covered trees. **Keep** the `exit 130` INT/TERM trap and the 1h staleness — the latter
-becomes load-bearing, since a dead holder in another session cannot be probed. Put the tmpfs
-reason IN THE HEADER or someone moves it back for tidiness. It stays **advisory** either way.
+### ★ NEXT STEP 1 — DONE. The lock's central claim is VERIFIED ACROSS SESSIONS.
+The lock moved out of `/tmp` to a gitignored `.suite-run.lock` at the repo root (`a58d49c`).
+Five states were proven **within** one session: no-run, acquisition-with-attribution,
+second-run refusal, `kill -TERM` → `Exit 130` with release, and a 2h-old lock ignored.
+
+**The cross-session claim — the only one that matters — was then verified by handshake, and
+this block is updated rather than left standing as an open item.** At 18:17:37 on 2026-08-31
+this session took the lock; at 18:18:08 the coordinator ran `--lock-status` in its own session
+and read back this session's id, start time and pid, and again straight from the file. The
+insistence on a DIRECT observation was right: "I can see your file edits" and "I see your lock
+while you hold it" are not the same statement, and it was the first that got accepted about
+`/tmp` and cost three contaminated runs.
+
+It paid for itself within nine minutes — and by failing usefully. **QA wrote 33 files into
+`scratchpad/` between 18:19:37 and 18:24:52, inside this session's run window, voiding it.**
+It had not run `--lock-status` first, and said so unprompted with the timestamps. So the
+mechanism works and the discipline of consulting it does not yet. Take the lock; also CHECK it.
+
+### ⚠ KNOWN FLAW IN THE LOCK, found by using it — the session field is usually wrong
+It reads `session:` from the `CLAUDE_CONFIG_DIR` basename. That is a real id only in a session
+with a host-scrubbed config mirror (`…/host-scrubbed-config/<uuid>`); everywhere else it is
+plain `~/.claude` and the field prints **`.claude`** — identical for every such holder, and
+attribution is the whole reason the field exists. Observed live: QA's run held the lock and
+identified itself as `.claude`.
+
+This is the `CLAUDE_CONFIG_DIR` environment delta reappearing inside a NEW mechanism, one
+block after the lesson that should have prevented it. The identifier was verified in the one
+session where it happens to work. Fix by falling back to pid (already present and unique on
+this host) and reporting `unknown` rather than a name that looks specific and is not.
+
+### ★ NEXT STEP 2 — the concurrency cap. Coordinator is scoping it; do not invent a bound.
+The most valuable unbuilt thing in the tree, and the one most likely to be mistaken for
+already-done: the total-duration guard in `connectorProxy.ts` looks like it from a distance
+and is NOT it. The guard bounds ONE connection's lifetime; with unbounded concurrency an
+adversary opens more, and the cap lands on legitimate long streams instead. The real
+instrument is a cap on N in-flight upstream requests per session and/or per connector.
+Carried as an `[open]` in `scratchpad/rt2-connectors-c.mts`. Wait for the scoping rather than
+picking a number and defending it afterwards.
 
 ⚠ Do not edit `scratchpad/run-suite.sh` while any session is mid-run — `scratchpad` is
 fingerprinted. The repo root is NOT (`FP_TREES="web server/src shared/src scratchpad"`), so
-editing this file during a run is safe.
+editing `HANDOVER.md` or `.gitignore` during a run is safe.
 
 ### Gotchas that actually bit
 - **Mutation-test a COPY, never the live file**, for anything under `web/`: the bucket-1
