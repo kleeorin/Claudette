@@ -40,11 +40,8 @@ const DESKTOP = { width: 1440, height: 900 }
 const PHONE = { width: 390, height: 844 }  // iPhone 14-ish; below Tailwind's md (768)
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-let failed = 0, passed = 0
-const ok = (tag, name, cond, extra = '') => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 await rm(GO, { force: true })
 await rm(GO_EDIT, { force: true })
 
@@ -285,7 +282,7 @@ console.log('\n[1] desktop shell (1440×900)')
 // ═══════════════════════════════════════════════════════════════════════════════
 await setViewport(DESKTOP); await evaluate(HELPERS)
 const dDividers = await evaluate(`window.__qa.visibleDividers().length`)
-ok('today', 'desktop shows pointer-drag dividers', dDividers > 0, `${dDividers} visible`)
+ok('desktop shows pointer-drag dividers', dDividers > 0, `${dDividers} visible`, 'today')
 const dScrollerOk = await evaluate(`!!window.__qa.scroller()`)
 // NAME THE HOOK SEPARATELY. `!!scroller()` passes under EITHER path — hook or class-scan
   // fallback — so removing or renaming data-testid="transcript-scroller" is invisible while
@@ -295,13 +292,11 @@ const dScrollerOk = await evaluate(`!!window.__qa.scroller()`)
   // an older checkout for no gain) and not a warning (lost in output nobody reads when the
   // suite is green). An assertion whose truth-value can change without this file being
   // edited has to be NAMED.
-  ok('today', 'the transcript exposes its test hook',
-    await evaluate(`!!document.querySelector('[data-testid="transcript-scroller"]')`))
+  ok('the transcript exposes its test hook', await evaluate(`!!document.querySelector('[data-testid="transcript-scroller"]')`), '', 'today')
   // …and assert IDENTITY, not mere existence: scroller() returning SOMETHING is satisfied by
   // any overflowing element on the page.
-  ok('today', 'scroller() resolves to that hook, not some other overflowing element',
-    await evaluate(`(() => { const h = document.querySelector('[data-testid="transcript-scroller"]');
-      return !!h && window.__qa.scroller() === h })()`))
+  ok('scroller() resolves to that hook, not some other overflowing element', await evaluate(`(() => { const h = document.querySelector('[data-testid="transcript-scroller"]');
+      return !!h && window.__qa.scroller() === h })()`), '', 'today')
 
 // ═══════════════════════════════════════════════════════════════════════════════
 console.log('\n[2] phone shell (390×844) — WITH every pane actually open')
@@ -335,12 +330,12 @@ const onAlpha = await evaluate(`(() => {
   if (!el) return false
   el.click(); return true
 })()`)
-ok('today', 'PRECONDITION: a session is selected (the Terminal toggle is inert without one)', onAlpha)
+ok('PRECONDITION: a session is selected (the Terminal toggle is inert without one)', onAlpha, '', 'today')
 const termOpened = await clickByText('Terminal')
-ok('today', 'PRECONDITION: the Terminal toolbar button opened a terminal', termOpened)
+ok('PRECONDITION: the Terminal toolbar button opened a terminal', termOpened, '', 'today')
 await waitFor(`!!document.querySelector('.xterm-rows')`, 30000)
 const filesOpened = await clickByText('Files')
-ok('today', 'PRECONDITION: the Files dock opened', filesOpened)
+ok('PRECONDITION: the Files dock opened', filesOpened, '', 'today')
 await wait(900)
 // FileManager opens on DOUBLE click — a single click only selects the row.
 const fileOpened = await evaluate(`(() => {
@@ -349,7 +344,7 @@ const fileOpened = await evaluate(`(() => {
   el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }))
   return true
 })()`)
-ok('today', 'PRECONDITION: demo.py opened as a content tab', fileOpened)
+ok('PRECONDITION: demo.py opened as a content tab', fileOpened, '', 'today')
 await wait(1500)
 
 // (d) DESKTOP GUARD, and it is not optional: without it "hide everything, always" satisfies the
@@ -357,23 +352,20 @@ await wait(1500)
 await evaluate(HELPERS)
 const dPanes = await evaluate(`window.__qa.visiblePanes().length`)
 const dPaneCount = await evaluate(`window.__qa.panes().length`)
-ok('today', 'desktop 1440×900 with tab+dock+terminal open shows MULTIPLE panes', dPanes >= 3,
-  `${dPanes} of ${dPaneCount} visible — a phone rule that leaked to desktop would show 1`)
+ok('desktop 1440×900 with tab+dock+terminal open shows MULTIPLE panes', dPanes >= 3, `${dPanes} of ${dPaneCount} visible — a phone rule that leaked to desktop would show 1`, 'today')
 
 await setViewport(PHONE); await evaluate(HELPERS)
 const pDividers = await evaluate(`window.__qa.visibleDividers().length`)
 const pDividerTotal = await evaluate(`window.__qa.dividers().length`)
-ok('phone', 'NO pointer-drag divider is visible at phone width', pDividers === 0,
-  pDividers > 0 ? `${pDividers} of ${pDividerTotal} still visible — drag targets are unusable on touch`
-                : `0 of ${pDividerTotal} rendered — non-vacuous only because all ${pDividerTotal} exist`)
+ok('NO pointer-drag divider is visible at phone width', pDividers === 0, pDividers > 0 ? `${pDividers} of ${pDividerTotal} still visible — drag targets are unusable on touch`
+                : `0 of ${pDividerTotal} rendered — non-vacuous only because all ${pDividerTotal} exist`, 'phone')
 
 const paneCount = await evaluate(`window.__qa.panes().length`)
 const visPanes = await evaluate(`window.__qa.visiblePanes().length`)
 if (paneCount === 0) {
-  ok('phone', 'exactly one pane is visible at phone width', false,
-    'no [data-testid="pane"] elements — the phone layout must add this hook (see header)')
+  ok('exactly one pane is visible at phone width', false, 'no [data-testid="pane"] elements — the phone layout must add this hook (see header)', 'phone')
 } else {
-  ok('phone', 'exactly one pane is visible at phone width', visPanes === 1, `${visPanes} of ${paneCount} visible`)
+  ok('exactly one pane is visible at phone width', visPanes === 1, `${visPanes} of ${paneCount} visible`, 'phone')
 }
 
 // SECOND divider measurement, in the TERMINAL pane — and it is not redundant.
@@ -392,9 +384,8 @@ await setViewport(PHONE); await evaluate(HELPERS)
 const tDividers = await evaluate(`window.__qa.visibleDividers().length`)
 const tDividerTotal = await evaluate(`window.__qa.dividers().length`)
 const tPanes = await evaluate(`window.__qa.visiblePanes().length`)
-ok('phone', 'NO divider is visible in the TERMINAL pane either', tDividers === 0,
-  tDividers > 0 ? `${tDividers} of ${tDividerTotal} visible` : `0 of ${tDividerTotal} rendered — this is the state that covers the terminal-dock divider's gate`)
-ok('phone', 'still exactly one pane in the terminal state', tPanes === 1, `${tPanes} visible`)
+ok('NO divider is visible in the TERMINAL pane either', tDividers === 0, tDividers > 0 ? `${tDividers} of ${tDividerTotal} visible` : `0 of ${tDividerTotal} rendered — this is the state that covers the terminal-dock divider's gate`, 'phone')
+ok('still exactly one pane in the terminal state', tPanes === 1, `${tPanes} visible`, 'phone')
 
 // Return to the chat pane so [3]–[5] start from a known one. THREE things depend on this and
 // it is not a tidy-up:
@@ -434,8 +425,7 @@ for (const [mode, vp] of [['desktop', DESKTOP], ['phone', PHONE]]) {
   const backToAlpha = await clickSession('Alpha')
   await wait(500)
   const switched = gotAlpha && gotBeta && backToAlpha
-  ok(mode === 'desktop' ? 'today' : 'phone', `${mode}: both sessions are selectable`, switched,
-    switched ? '' : `Alpha=${gotAlpha} Beta=${gotBeta} back=${backToAlpha}`)
+  ok(`${mode}: both sessions are selectable`, switched, switched ? '' : `Alpha=${gotAlpha} Beta=${gotBeta} back=${backToAlpha}`, mode === 'desktop' ? 'today' : 'phone')
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -450,7 +440,7 @@ await setViewport(DESKTOP); await evaluate(HELPERS)
 await clickSession('Alpha'); await wait(500)
 await writeFile(GO, 'go')                      // release the permission request
 const cardUp = await waitFor(`!!window.__qa.permCard()`, 25000)
-ok('today', 'a pending permission card renders', cardUp)
+ok('a pending permission card renders', cardUp, '', 'today')
 
 if (cardUp) {
   await evaluate(HELPERS)
@@ -459,8 +449,7 @@ if (cardUp) {
     const c = window.__qa.permCard(), s = window.__qa.scroller()
     return !!(c && s && s.contains(c))
   })()`)
-  ok('fix', 'the permission card is NOT inside the scrolling transcript', !insideScroller,
-    insideScroller ? 'it is a descendant of the scroll container — it can be scrolled away while the session blocks' : '')
+  ok('the permission card is NOT inside the scrolling transcript', !insideScroller, insideScroller ? 'it is a descendant of the scroll container — it can be scrolled away while the session blocks' : '', 'fix')
 
   // (b) BEHAVIOURAL — scroll the transcript up by one viewport and look again.
   const scrolled = await evaluate(`(() => {
@@ -472,8 +461,7 @@ if (cardUp) {
   })()`)
   await wait(400)
   const stillThere = await evaluate(`window.__qa.inViewport(window.__qa.permCard())`)
-  ok('fix', 'after scrolling the transcript up one viewport, the card is still on screen', stillThere,
-    scrolled <= 0 ? `(transcript did not scroll: delta=${scrolled} — assertion inconclusive)` : `scrolled ${scrolled}px away`)
+  ok('after scrolling the transcript up one viewport, the card is still on screen', stillThere, scrolled <= 0 ? `(transcript did not scroll: delta=${scrolled} — assertion inconclusive)` : `scrolled ${scrolled}px away`, 'fix')
 
   // (c) Answerable at BOTH widths, in the RESTING state — the card is useless if its
   // buttons are off-screen. Scroll back to the bottom first: (b) above deliberately
@@ -499,17 +487,15 @@ if (cardUp) {
       const s = window.__qa.scroller()
       return s ? Math.round(s.getBoundingClientRect().height) : -1
     })()`)
-    ok('today', `${mode}: PRECONDITION: the transcript scroller is laid out, so scroll-to-bottom took effect`,
-      scrollerBoxH > 0,
-      scrollerBoxH === 0 ? 'scroller() returned a display:none element — writes to it no-op, so the result below is INCONCLUSIVE, not a pass'
-        : scrollerBoxH < 0 ? 'no scroller at all' : `box ${scrollerBoxH}px`)
+    ok(`${mode}: PRECONDITION: the transcript scroller is laid out, so scroll-to-bottom took effect`, scrollerBoxH > 0, scrollerBoxH === 0 ? 'scroller() returned a display:none element — writes to it no-op, so the result below is INCONCLUSIVE, not a pass'
+        : scrollerBoxH < 0 ? 'no scroller at all' : `box ${scrollerBoxH}px`, 'today')
     const answerable = await evaluate(`(() => {
       const c = window.__qa.permCard()
       if (!c) return false
       const btn = [...c.querySelectorAll('button')].find((b) => window.__qa.visible(b))
       return !!btn && window.__qa.inViewport(btn)
     })()`)
-    ok(mode === 'desktop' ? 'today' : 'phone', `${mode}: the card has a reachable answer button (at rest)`, answerable)
+    ok(`${mode}: the card has a reachable answer button (at rest)`, answerable, '', mode === 'desktop' ? 'today' : 'phone')
   }
 }
 
@@ -526,8 +512,7 @@ const afterCross = await evaluate(`document.body.innerText.includes('Beta')`)
 await setViewport(DESKTOP); await evaluate(HELPERS)
 await wait(600)
 const backAgain = await evaluate(`document.body.innerText.includes('Beta')`)
-ok('phone', 'the selected session survives crossing 768px in both directions',
-  beforeCross && afterCross && backAgain, `before=${beforeCross} phone=${afterCross} back=${backAgain}`)
+ok('the selected session survives crossing 768px in both directions', beforeCross && afterCross && backAgain, `before=${beforeCross} phone=${afterCross} back=${backAgain}`, 'phone')
 
 // ═══════════════════════════════════════════════════════════════════════════════
 console.log('\n[6] the 768px boundary is ONE number')
@@ -542,10 +527,8 @@ for (const [w, expectPhone] of [[768, false], [767, true]]) {
   await setViewport({ width: w, height: 900 }); await evaluate(HELPERS)
   const dataPhone = await evaluate(`document.querySelector('[data-phone]')?.getAttribute('data-phone') ?? '(absent)'`)
   const divs = await evaluate(`window.__qa.visibleDividers().length`)
-  ok('today', `${w}px: JS side (data-phone) says ${expectPhone}`, dataPhone === String(expectPhone),
-    `got ${dataPhone}`)
-  ok('today', `${w}px: CSS side (md:-gated dividers) agrees`, expectPhone ? divs === 0 : divs > 0,
-    `${divs} divider(s) visible`)
+  ok(`${w}px: JS side (data-phone) says ${expectPhone}`, dataPhone === String(expectPhone), `got ${dataPhone}`, 'today')
+  ok(`${w}px: CSS side (md:-gated dividers) agrees`, expectPhone ? divs === 0 : divs > 0, `${divs} divider(s) visible`, 'today')
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -568,8 +551,7 @@ await writeFile(GO_EDIT, 'go')
 // Wait for the machine-side open to actually land, so a green below cannot mean "nothing
 // happened yet". The tab appearing in the strip IS the machine-side open.
 const machineOpened = await waitFor(`[...document.querySelectorAll('button')].some((b) => b.textContent.trim() === 'demo.py')`, 25000)
-ok('today', 'PRECONDITION: the Edit request machine-opened a content tab', machineOpened,
-  machineOpened ? '' : `tab never appeared (present before: ${tabsBefore}, panes before: ${paneBefore})`)
+ok('PRECONDITION: the Edit request machine-opened a content tab', machineOpened, machineOpened ? '' : `tab never appeared (present before: ${tabsBefore}, panes before: ${paneBefore})`, 'today')
 
 if (machineOpened) {
   await evaluate(HELPERS)
@@ -581,8 +563,7 @@ if (machineOpened) {
     const sc = window.__qa.scroller()
     return !!sc && window.__qa.visible(sc) && window.__qa.visiblePanes().length === 1
   })()`)
-  ok('fix', 'a machine-opened tab does NOT displace the chat pane at phone', chatStillShown,
-    chatStillShown ? '' : 'the content pane took the screen — the permission card approving this very edit is now hidden')
+  ok('a machine-opened tab does NOT displace the chat pane at phone', chatStillShown, chatStillShown ? '' : 'the content pane took the screen — the permission card approving this very edit is now hidden', 'fix')
 
   // (ii) the consequence that actually costs the user: the card must remain answerable.
   const cardReachable = await evaluate(`(() => {
@@ -591,7 +572,7 @@ if (machineOpened) {
     const btn = [...c.querySelectorAll('button')].find((b) => window.__qa.visible(b))
     return !!btn && window.__qa.inViewport(btn)
   })()`)
-  ok('fix', 'the edit permission card is still answerable at phone', cardReachable)
+  ok('the edit permission card is still answerable at phone', cardReachable, '', 'fix')
 
   // (iii) MainTabs must highlight from the SHOWN pane, not from `active`. They legitimately
   //       disagree here — that is the whole point — so a strip highlighting `active` would
@@ -600,7 +581,7 @@ if (machineOpened) {
     const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Chat')
     return !!b && b.className.includes('border-ctp-accent')
   })()`)
-  ok('fix', 'the tab strip highlights Chat, not the machine-opened tab', chatTabOn)
+  ok('the tab strip highlights Chat, not the machine-opened tab', chatTabOn, '', 'fix')
 }
 
 // ---- done -----------------------------------------------------------------------

@@ -7,8 +7,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
 
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 
 const dir = await mkdtemp(join(tmpdir(), 'opfocus-'))
 const docs = new NotebookDocManager()
@@ -21,41 +20,41 @@ const last = () => seen[seen.length - 1]
 
 // addCell (human) → focus the NEW last cell, reveal (structural)
 docs.applyOp({ op: 'addCell', notebookId: nid, cellType: 'code', source: 'a' }, 'human')
-ok(last().cid === cells()[cells().length - 1].id && last().reveal === true, 'addCell → new cell, reveal=true')
+ok('addCell → new cell, reveal=true', last().cid === cells()[cells().length - 1].id && last().reveal === true)
 
 const c0 = cells()[0].id
 // editCell (human) → that cell, NO reveal (typing/undo must not yank scroll)
 docs.applyOp({ op: 'editCell', notebookId: nid, cellId: c0, source: 'x' }, 'human')
-ok(last().cid === c0 && last().reveal === false, 'human editCell → cell, reveal=false')
+ok('human editCell → cell, reveal=false', last().cid === c0 && last().reveal === false)
 
 // editCell (claude) → that cell, reveal (show the user Claude's change)
 docs.applyOp({ op: 'editCell', notebookId: nid, cellId: c0, source: 'y' }, 'claude')
-ok(last().cid === c0 && last().reveal === true, 'claude editCell → cell, reveal=true')
+ok('claude editCell → cell, reveal=true', last().cid === c0 && last().reveal === true)
 
 // insertCell (human) at index 1 → focus the inserted cell, reveal
 docs.applyOp({ op: 'insertCell', notebookId: nid, index: 1, cellType: 'markdown' }, 'human')
-ok(last().cid === cells()[1].id && last().reveal === true, 'insertCell → inserted cell, reveal=true')
+ok('insertCell → inserted cell, reveal=true', last().cid === cells()[1].id && last().reveal === true)
 
 // moveCell → follow the moved cell, reveal
 const moved = cells()[0].id
 docs.applyOp({ op: 'moveCell', notebookId: nid, cellId: moved, toIndex: 2 }, 'human')
-ok(last().cid === moved && last().reveal === true, 'moveCell → moved cell, reveal=true')
+ok('moveCell → moved cell, reveal=true', last().cid === moved && last().reveal === true)
 
 // setCellType → that cell, reveal
 docs.applyOp({ op: 'setCellType', notebookId: nid, cellId: moved, cellType: 'markdown' }, 'human')
-ok(last().cid === moved && last().reveal === true, 'setCellType → cell, reveal=true')
+ok('setCellType → cell, reveal=true', last().cid === moved && last().reveal === true)
 
 // deleteCell → focus the cell that slid into the deleted slot, reveal
 const before = cells().map((c) => c.id)
 docs.applyOp({ op: 'deleteCell', notebookId: nid, cellId: before[0] }, 'human')
-ok(last().cid === before[1] && last().reveal === true, 'deleteCell → neighbor in the slot, reveal=true')
+ok('deleteCell → neighbor in the slot, reveal=true', last().cid === before[1] && last().reveal === true)
 
 // A locked cell (Claude edit refused) must NOT emit a focus.
 const target = cells()[0].id
 docs.claimCell(nid, target, 'pin')
 const n = seen.length
 const r = docs.applyOp({ op: 'editCell', notebookId: nid, cellId: target, source: 'z' }, 'claude')
-ok(!r.ok && seen.length === n, 'refused (locked) edit emits no opFocus')
+ok('refused (locked) edit emits no opFocus', !r.ok && seen.length === n)
 
 docs.close(nid)
 console.log(failed ? `\n${failed} FAILED` : '\nALL PASSED')

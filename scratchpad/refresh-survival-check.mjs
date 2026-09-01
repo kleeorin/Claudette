@@ -185,11 +185,8 @@ const GRACE_MS = 30_000                      // MUST track paneManager.ts SWEEP_
 const VIEW = { width: 1440, height: 900 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-let failed = 0, passed = 0
-const ok = (tag, name, cond, extra = '') => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 const DATA = await mkdtemp(join(tmpdir(), 'rsurv-data-'))
 const PROJ = await mkdtemp(join(tmpdir(), 'rsurv-proj-'))
@@ -300,8 +297,7 @@ const beta = await mkSession('Beta')
 // comment.
 const listed = await apiGet('/api/session/list')
 const order = (listed.sessions ?? listed).map((s) => s.id)
-ok('today', 'precondition: Alpha is sessions[0], so Alpha is the ACTIVE session and Beta owns the notebook',
-  order[0] === alpha.id, `sessions[0]=${order[0]?.slice(0, 8)} alpha=${alpha.id.slice(0, 8)}`)
+ok('precondition: Alpha is sessions[0], so Alpha is the ACTIVE session and Beta owns the notebook', order[0] === alpha.id, `sessions[0]=${order[0]?.slice(0, 8)} alpha=${alpha.id.slice(0, 8)}`, 'today')
 
 const mkPane = (cwd, sessionId) => apiPost('/api/pane/create', { cwd, cols: 80, rows: 24, sessionId })
 const A1 = (await mkPane(DIR_A1, alpha.id)).id
@@ -470,11 +466,11 @@ console.log('\n[1] first load — restore from the seeded layout (PRE-GRACE)')
 // ═══════════════════════════════════════════════════════════════════════════════
 {
   const tabs = await evaluate(`window.__rs.termTabs()`)
-  ok('today', 'restored dock shows Alpha 2 terminals (the dead entry dropped by reconcile)', tabs === 2, `${tabs} tabs`)
+  ok('restored dock shows Alpha 2 terminals (the dead entry dropped by reconcile)', tabs === 2, `${tabs} tabs`, 'today')
   const ids = await evaluate(`window.__rs.termIdsOf(${JSON.stringify(alpha.id)})`)
-  ok('today', 'the dead pane id is gone from the re-persisted layout', Array.isArray(ids) && !ids.includes(DEAD), JSON.stringify(ids?.map((i) => i?.slice(0, 8))))
+  ok('the dead pane id is gone from the re-persisted layout', Array.isArray(ids) && !ids.includes(DEAD), JSON.stringify(ids?.map((i) => i?.slice(0, 8))), 'today')
   const live = (await apiGet('/api/pane/list')).panes.map((p) => p.id)
-  ok('today', 'pre-grace: all three live ptys still exist', [A1, A2, B1].every((i) => live.includes(i)), `${live.length} live`)
+  ok('pre-grace: all three live ptys still exist', [A1, A2, B1].every((i) => live.includes(i)), `${live.length} live`, 'today')
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -485,8 +481,7 @@ const sleepFor = GRACE_MS + 1500 - age
 console.log(`\n… aging the panes past SWEEP_GRACE_MS (${Math.max(0, Math.ceil(sleepFor / 1000))}s) — without this every check below is vacuous`)
 if (sleepFor > 0) await wait(sleepFor)
 const liveBeforeReload = (await apiGet('/api/pane/list')).panes.map((p) => p.id)
-ok('today', 'aged past the grace window and still alive (the standing claim held them)',
-  [A1, A2, B1].every((i) => liveBeforeReload.includes(i)), `age=${Math.round((Date.now() - bornAt) / 1000)}s`)
+ok('aged past the grace window and still alive (the standing claim held them)', [A1, A2, B1].every((i) => liveBeforeReload.includes(i)), `age=${Math.round((Date.now() - bornAt) / 1000)}s`, 'today')
 
 // ═══════════════════════════════════════════════════════════════════════════════
 console.log('\n[2] RELOAD past the grace window — the load-bearing block')
@@ -500,27 +495,24 @@ await boot()
   // H3 / H5 family. A regression in either posts a keep-set that is empty or missing
   // entries, and past the grace the server kills what nobody claims. One red here does
   // NOT say which hazard broke — see the header.
-  ok('today', 'H3/H5 family: Alpha terminal 1 survived the reload', live.includes(A1))
-  ok('today', 'H3/H5 family: Alpha terminal 2 survived the reload', live.includes(A2))
-  ok('today', 'H3/H5 family: the BACKGROUND session Beta kept its terminal too', live.includes(B1))
-  ok('today', 'the dead id did not resurrect as a pty', !live.includes(DEAD))
+  ok('H3/H5 family: Alpha terminal 1 survived the reload', live.includes(A1), '', 'today')
+  ok('H3/H5 family: Alpha terminal 2 survived the reload', live.includes(A2), '', 'today')
+  ok('H3/H5 family: the BACKGROUND session Beta kept its terminal too', live.includes(B1), '', 'today')
+  ok('the dead id did not resurrect as a pty', !live.includes(DEAD), '', 'today')
 
   const tabs = await evaluate(`window.__rs.termTabs()`)
-  ok('today', 'the tab strip shows both of Alpha terminals after the reload', tabs === 2, `${tabs} tabs`)
+  ok('the tab strip shows both of Alpha terminals after the reload', tabs === 2, `${tabs} tabs`, 'today')
 
   const aIds = await evaluate(`window.__rs.termIdsOf(${JSON.stringify(alpha.id)})`)
   const bIds = await evaluate(`window.__rs.termIdsOf(${JSON.stringify(beta.id)})`)
-  ok('today', 'Alpha layout still holds exactly its two live pane ids',
-    Array.isArray(aIds) && aIds.length === 2 && aIds.includes(A1) && aIds.includes(A2), JSON.stringify(aIds?.map((i) => i?.slice(0, 8))))
-  ok('today', 'Beta layout still holds its one live pane id',
-    Array.isArray(bIds) && bIds.length === 1 && bIds[0] === B1, JSON.stringify(bIds?.map((i) => i?.slice(0, 8))))
+  ok('Alpha layout still holds exactly its two live pane ids', Array.isArray(aIds) && aIds.length === 2 && aIds.includes(A1) && aIds.includes(A2), JSON.stringify(aIds?.map((i) => i?.slice(0, 8))), 'today')
+  ok('Beta layout still holds its one live pane id', Array.isArray(bIds) && bIds.length === 1 && bIds[0] === B1, JSON.stringify(bIds?.map((i) => i?.slice(0, 8))), 'today')
 
   // Reattach: the pty's PRE-RELOAD output must be replayed into the fresh xterm. The
   // marker is stamped per-pane (each pane has its own cwd), so this also proves the
   // right pane was reattached — not merely that a terminal is on screen.
   const replayed = await waitFor(`(window.__rs.xtermText() || '').includes('PANE-MARKER p-a1')`, 15000)
-  ok('today', 'the reattached xterm replayed THIS pane pre-reload scrollback', replayed,
-    replayed ? '' : (await evaluate(`(window.__rs.xtermText() || '').slice(0, 200)`)))
+  ok('the reattached xterm replayed THIS pane pre-reload scrollback', replayed, replayed ? '' : (await evaluate(`(window.__rs.xtermText() || '').slice(0, 200)`)), 'today')
 
   // …and EXACTLY ONCE. `includes()` above is blind to the failure it is most likely to
   // meet: the attach snapshot is the WHOLE buffer rather than a delta, so an effect that
@@ -548,8 +540,7 @@ await boot()
   const markerSpread = await evaluate(
     `[...document.querySelectorAll('.xterm-rows')].map((r) => ((r.innerText || r.textContent || '').match(/PANE-MARKER p-a1/g) || []).length)`)
   const markerCount = Array.isArray(markerSpread) ? markerSpread.reduce((a, b) => a + b, 0) : -1
-  ok('today', '…and replayed it ONCE, not twice (attach is idempotent)', markerCount === 1,
-    `marker appears ${markerCount}× across ${Array.isArray(markerSpread) ? markerSpread.length : '?'} xterm element(s): [${markerSpread}]; the SERVER pty snapshot has it ${snapMarkers}× (>1 ⇒ not a client bug); attach replies carried [${attachLog}]`)
+  ok('…and replayed it ONCE, not twice (attach is idempotent)', markerCount === 1, `marker appears ${markerCount}× across ${Array.isArray(markerSpread) ? markerSpread.length : '?'} xterm element(s): [${markerSpread}]; the SERVER pty snapshot has it ${snapMarkers}× (>1 ⇒ not a client bug); attach replies carried [${attachLog}]`, 'today')
 
   // H4 — the ONE thing the state-shaped fixture cannot see (see the header entry). The
   // two-flag form posts pane.list and does not prune until it has returned; the one-flag
@@ -562,17 +553,15 @@ await boot()
   // list returned", so a run where no prune fires at all reds too — correctly, since that is
   // also a broken reconcile. Naming it "no prune before the list" would send the reader
   // hunting an early prune that never happened.
-  ok('today', 'H4: a pane.prune is posted, and only after the reconcile list returned',
-    firstListDone >= 0 && firstPrune > firstListDone,
-    Array.isArray(ord) ? ord.join(' → ') : String(ord))
+  ok('H4: a pane.prune is posted, and only after the reconcile list returned', firstListDone >= 0 && firstPrune > firstListDone, Array.isArray(ord) ? ord.join(' → ') : String(ord), 'today')
 
   // H6 — cleanly attributable, no grace dependency. Beta's notebook is reopened by path
   // during restore and marked seen; if that marking is lost, the newly-opened effect
   // attaches it to whatever session is ACTIVE, which is Alpha.
   const aTabs = await evaluate(`window.__rs.tabsOf(${JSON.stringify(alpha.id)})`)
   const bTabs = await evaluate(`window.__rs.tabsOf(${JSON.stringify(beta.id)})`)
-  ok('today', 'H6: Beta got its notebook back', Array.isArray(bTabs) && bTabs.some((t) => t.kind === 'notebook' && t.path === NB), JSON.stringify(bTabs))
-  ok('today', 'H6: Alpha did NOT gain Beta notebook', Array.isArray(aTabs) && !aTabs.some((t) => t.kind === 'notebook'), JSON.stringify(aTabs))
+  ok('H6: Beta got its notebook back', Array.isArray(bTabs) && bTabs.some((t) => t.kind === 'notebook' && t.path === NB), JSON.stringify(bTabs), 'today')
+  ok('H6: Alpha did NOT gain Beta notebook', Array.isArray(aTabs) && !aTabs.some((t) => t.kind === 'notebook'), JSON.stringify(aTabs), 'today')
 }
 
 // Print the holes with the results, so a green run cannot be read as "all six hazards

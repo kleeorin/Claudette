@@ -70,11 +70,8 @@
 //   contract is broken; the two-line diff says which.
 import { setupDom, NO_DOM_NOTE } from './dom-env.mts'
 
-let passed = 0, failed = 0
-const ok = (tag: string, name: string, cond: boolean, extra = ''): void => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 const done = (): never => {
   console.log(`\n${passed} passed / ${failed} failed`)
   process.exit(failed === 0 ? 0 : 1)
@@ -184,9 +181,9 @@ const pickerOpen = (): boolean => !!pickerHeading()
 
 // ═══ [0] PRECONDITIONS ═══════════════════════════════════════════════════════════════
 console.log('\n[0] preconditions — can this harness reach the thing it claims to test?')
-ok('setup', '[0a] SandboxControl rendered its chip', !!byText(/sandbox/i))
+ok('[0a] SandboxControl rendered its chip', !!byText(/sandbox/i), '', 'setup')
 await click(byText(/sandbox/i)!)
-ok('setup', '[0b] clicking the chip opens the popover', popoverOpen())
+ok('[0b] clicking the chip opens the popover', popoverOpen(), '', 'setup')
 
 if (!popoverOpen()) {
   console.log('  ⚠ the popover never opened — nothing below could be measured, so it did not run.')
@@ -201,11 +198,10 @@ outside.textContent = 'an ordinary element, in no overlay'
 document.body.appendChild(outside)
 
 await mousedown(byText(/Add a folder/i)!)
-ok('core', '[2a] a mousedown INSIDE the popover does NOT close it', popoverOpen())
+ok('[2a] a mousedown INSIDE the popover does NOT close it', popoverOpen(), '', 'core')
 
 await mousedown(outside)
-ok('core', '[2b] a mousedown on an ordinary element outside DOES close it', !popoverOpen(),
-  popoverOpen() ? '← the click-away handler is not closing at all; every [1] below would pass vacuously' : '')
+ok('[2b] a mousedown on an ordinary element outside DOES close it', !popoverOpen(), popoverOpen() ? '← the click-away handler is not closing at all; every [1] below would pass vacuously' : '', 'core')
 
 // ═══ [1] THE REGRESSION TEST ═════════════════════════════════════════════════════════
 // ★ EACH CASE RE-ESTABLISHES THE STATE FIRST. The first version dispatched all three
@@ -228,19 +224,16 @@ const openPicker = async (): Promise<boolean> => {
   return popoverOpen() && pickerOpen()
 }
 
-ok('setup', '[0c] the popover and picker can be (re-)opened after the controls above closed them',
-  await openPicker())
+ok('[0c] the popover and picker can be (re-)opened after the controls above closed them', await openPicker(), '', 'setup')
 
 const backdrop0 = pickerRoot()
-ok('setup', '[0d] the picker was located by its heading, without using the marker under test', !!backdrop0)
+ok('[0d] the picker was located by its heading, without using the marker under test', !!backdrop0, '', 'setup')
 
 // The premise of the entire bug: the portal is NOT a DOM descendant of the popover. Asserted
 // rather than assumed — if a refactor stopped portalling, these clicks would be "inside" by
 // ordinary containment and every [1] would pass while testing nothing at all.
 const popoverRoot = byText(/Add a folder/i)?.closest('div.relative') ?? container
-ok('setup', '[0e] PREMISE: the picker really is outside the popover subtree (it is a portal)',
-  !!backdrop0 && !popoverRoot.contains(backdrop0),
-  backdrop0?.parentElement === document.body ? 'portal root is a direct child of <body>' : '')
+ok('[0e] PREMISE: the picker really is outside the popover subtree (it is a portal)', !!backdrop0 && !popoverRoot.contains(backdrop0), backdrop0?.parentElement === document.body ? 'portal root is a direct child of <body>' : '', 'setup')
 
 if (!backdrop0) {
   console.log('  ⚠ the picker was not measurable — section [1] did not run.')
@@ -264,9 +257,8 @@ const dispatchCase = async (tag: string, what: string, pick: (root: HTMLElement)
   }
   await mousedown(target)
   const stillOpen = popoverOpen()
-  ok('core', `[${tag}] mousedown on ${what} leaves the popover open`, stillOpen,
-    stillOpen ? '' : '← the popover closed, so SandboxEditor unmounted and took the picker with it')
-  ok('core', `[${tag}'] …and the picker is still in the document`, pickerOpen())
+  ok(`[${tag}] mousedown on ${what} leaves the popover open`, stillOpen, stillOpen ? '' : '← the popover closed, so SandboxEditor unmounted and took the picker with it', 'core')
+  ok(`[${tag}'] …and the picker is still in the document`, pickerOpen(), '', 'core')
 }
 
 await dispatchCase('1a', 'the picker BACKDROP (the portal root)', (r) => r)

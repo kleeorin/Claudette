@@ -40,11 +40,8 @@ const VISIBLE_H = LAYOUT_H - KEYBOARD_PX   // 508
 const SCALE = LAYOUT_H / VISIBLE_H         // pick the zoom that makes the visible height match
 
 const wait = (ms) => new Promise(r => setTimeout(r, ms))
-let failed = 0, passed = 0
-const ok = (tag, name, cond, extra = '') => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 if (!process.env.CHROME_BIN) { console.error('SKIP: CHROME_BIN unset'); process.exit(0) }
 const dir = await mkdtemp(join(tmpdir(), 'vvpan-chrome-'))
@@ -151,19 +148,14 @@ console.log(`\nlayout viewport ${LAYOUT_H}px, app told it has ${VISIBLE_H}px (--
 
 // ── [geo] 1. the mechanism exists at all ───────────────────────────────────────────────
 const flat = await ev(MEASURE)
-ok('geo', 'baseline: visual viewport == layout viewport', flat.vvH === flat.innerH && flat.offTop === 0,
-   `vvH ${flat.vvH} innerH ${flat.innerH} offTop ${flat.offTop}`)
+ok('baseline: visual viewport == layout viewport', flat.vvH === flat.innerH && flat.offTop === 0, `vvH ${flat.vvH} innerH ${flat.innerH} offTop ${flat.offTop}`, 'geo')
 await send('Emulation.setPageScaleFactor', { pageScaleFactor: SCALE })
 await wait(300)
 const zoomed = await ev(MEASURE)
-ok('geo', 'visual viewport can be made SHORTER than the layout viewport',
-   zoomed.vvH < zoomed.innerH && zoomed.innerH === LAYOUT_H,
-   `vvH ${zoomed.vvH} < innerH ${zoomed.innerH}`)
+ok('visual viewport can be made SHORTER than the layout viewport', zoomed.vvH < zoomed.innerH && zoomed.innerH === LAYOUT_H, `vvH ${zoomed.vvH} < innerH ${zoomed.innerH}`, 'geo')
 await panDown()
 const panned = await ev(MEASURE)
-ok('geo', 'the visual viewport PANS: offsetTop > 0 while scrollY stays 0',
-   panned.offTop > 0 && panned.scrollY === 0,
-   `offTop ${panned.offTop}, scrollY ${panned.scrollY}`)
+ok('the visual viewport PANS: offsetTop > 0 while scrollY stays 0', panned.offTop > 0 && panned.scrollY === 0, `offTop ${panned.offTop}, scrollY ${panned.scrollY}`, 'geo')
 
 // ── [geo] 2. the symptom the index.css comment predicts ────────────────────────────────
 // Pan DOWN. The window slides toward the bottom of the layout viewport while #root, sized to
@@ -171,12 +163,8 @@ ok('geo', 'the visual viewport PANS: offsetTop > 0 while scrollY stays 0',
 // panning down keeps the COMPOSER in view (it is at the bottom of #root) and pushes the
 // TOPBAR out. An earlier draft asserted the composer went out of view and went red for that
 // reason; the check was wrong, not the app.
-ok('geo', 'panned window lands BELOW #root — the "bare canvas" case is real',
-   panned.canvasExposedPx > 0,
-   `${panned.canvasExposedPx}px of window below #root (window ${panned.winTop}..${panned.winBottom}, #root ends ${panned.rootBottom})`)
-ok('geo', 'and the app content panned out of the window is the TOP band, not the bottom one',
-   !panned.topbarVisible && panned.composerVisible,
-   `topbar ${panned.topbarTop}..${panned.topbarBottom} visible=${panned.topbarVisible}, composer visible=${panned.composerVisible}, window ${panned.winTop}..${panned.winBottom}`)
+ok('panned window lands BELOW #root — the "bare canvas" case is real', panned.canvasExposedPx > 0, `${panned.canvasExposedPx}px of window below #root (window ${panned.winTop}..${panned.winBottom}, #root ends ${panned.rootBottom})`, 'geo')
+ok('and the app content panned out of the window is the TOP band, not the bottom one', !panned.topbarVisible && panned.composerVisible, `topbar ${panned.topbarTop}..${panned.topbarBottom} visible=${panned.topbarVisible}, composer visible=${panned.composerVisible}, window ${panned.winTop}..${panned.winBottom}`, 'geo')
 
 // ── [geo] 3. AT REST the app and the visible window are the SAME BOX ────────────────────
 // This is the part that reframes the whole question. With --vvh applied, #root occupies
@@ -186,9 +174,7 @@ ok('geo', 'and the app content panned out of the window is the TOP band, not the
 // a reason to.
 await panTop()
 const rest = await ev(MEASURE)
-ok('geo', 'at rest the visible window and #root are the same box (nothing to reveal)',
-   rest.offTop === 0 && rest.rootTop === rest.winTop && rest.rootBottom === rest.winBottom,
-   `window ${rest.winTop}..${rest.winBottom}, #root ${rest.rootTop}..${rest.rootBottom}`)
+ok('at rest the visible window and #root are the same box (nothing to reveal)', rest.offTop === 0 && rest.rootTop === rest.winTop && rest.rootBottom === rest.winBottom, `window ${rest.winTop}..${rest.winBottom}, #root ${rest.rootTop}..${rest.rootBottom}`, 'geo')
 
 // ── [geo] 4. THE QUESTION: what does `position: fixed; inset: 0` actually do? ───────────
 // TWO DIFFERENT RULES, and conflating them is how this stayed open. Applied WITHOUT reloading
@@ -217,15 +203,9 @@ console.log(row('fixed; inset:0 (literal)', vLiteral))
 console.log(row('fixed; inset:0; h:--vvh', vWithVvh))
 console.log('')
 
-ok('geo', 'the fixed rules took effect at all',
-   vLiteral.position === 'fixed' && vWithVvh.position === 'fixed' && vUnfixed.position === 'static',
-   `${vUnfixed.position} / ${vLiteral.position} / ${vWithVvh.position}`)
-ok('geo', 'keeping --vvh: `position: fixed` changes NOTHING about the pan',
-   vWithVvh.canvasExposedPx === vUnfixed.canvasExposedPx && vWithVvh.composerBottom === vUnfixed.composerBottom,
-   `identical to unfixed (canvasExposed ${vWithVvh.canvasExposedPx}px both) — fixed positions against the LAYOUT viewport, which is the very box the visual viewport pans inside, so it cannot escape a pan`)
-ok('geo', 'literal `inset:0` removes the canvas — BY DISCARDING --vvh, not by stopping the pan',
-   vLiteral.canvasExposedPx === 0 && vLiteral.rootH === LAYOUT_H && vLiteral.composerBottom > VISIBLE_H,
-   `shell grows back to ${vLiteral.rootH}px and the composer returns to ${vLiteral.composerBottom} — under the keyboard, the exact defect --vvh was added to fix`)
+ok('the fixed rules took effect at all', vLiteral.position === 'fixed' && vWithVvh.position === 'fixed' && vUnfixed.position === 'static', `${vUnfixed.position} / ${vLiteral.position} / ${vWithVvh.position}`, 'geo')
+ok('keeping --vvh: `position: fixed` changes NOTHING about the pan', vWithVvh.canvasExposedPx === vUnfixed.canvasExposedPx && vWithVvh.composerBottom === vUnfixed.composerBottom, `identical to unfixed (canvasExposed ${vWithVvh.canvasExposedPx}px both) — fixed positions against the LAYOUT viewport, which is the very box the visual viewport pans inside, so it cannot escape a pan`, 'geo')
+ok('literal `inset:0` removes the canvas — BY DISCARDING --vvh, not by stopping the pan', vLiteral.canvasExposedPx === 0 && vLiteral.rootH === LAYOUT_H && vLiteral.composerBottom > VISIBLE_H, `shell grows back to ${vLiteral.rootH}px and the composer returns to ${vLiteral.composerBottom} — under the keyboard, the exact defect --vvh was added to fix`, 'geo')
 
 // ── [geo] 5. prove the measurement discriminates ───────────────────────────────────────
 // A check that can only ever print one answer is the `[hole]` ask-card-height-probe already
@@ -235,12 +215,8 @@ ok('geo', 'literal `inset:0` removes the canvas — BY DISCARDING --vvh, not by 
 await ev(`document.getElementById('root').className = ''`)
 await panTop()
 const unpanned = await ev(MEASURE)
-ok('geo', 'CONTROL: un-panning flips the measures back (they are not constants)',
-   unpanned.offTop === 0 && unpanned.topbarVisible && unpanned.canvasExposedPx === 0,
-   `offTop ${unpanned.offTop}, topbarVisible ${unpanned.topbarVisible}, canvasExposed ${unpanned.canvasExposedPx}px`)
-ok('geo', 'CONTROL: the same measure DOES separate the two fixed rules',
-   vLiteral.canvasExposedPx !== vUnfixed.canvasExposedPx,
-   `literal ${vLiteral.canvasExposedPx}px vs unfixed ${vUnfixed.canvasExposedPx}px`)
+ok('CONTROL: un-panning flips the measures back (they are not constants)', unpanned.offTop === 0 && unpanned.topbarVisible && unpanned.canvasExposedPx === 0, `offTop ${unpanned.offTop}, topbarVisible ${unpanned.topbarVisible}, canvasExposed ${unpanned.canvasExposedPx}px`, 'geo')
+ok('CONTROL: the same measure DOES separate the two fixed rules', vLiteral.canvasExposedPx !== vUnfixed.canvasExposedPx, `literal ${vLiteral.canvasExposedPx}px vs unfixed ${vUnfixed.canvasExposedPx}px`, 'geo')
 
 // ── [trigger] 6. does the browser pan BY ITSELF to reveal a focused input? ──────────────
 // The closest reachable analogue to iOS's keyboard auto-pan. It needs a configuration where
@@ -254,13 +230,10 @@ const beforeFocus = await ev(MEASURE)
 await ev(`document.getElementById('inp').focus()`)
 await wait(800)
 const afterFocus = await ev(MEASURE)
-ok('trigger', 'pre-fix shell: the composer really is outside the visible window first',
-   !beforeFocus.composerVisible,
-   `composer ${beforeFocus.composerTop}..${beforeFocus.composerBottom}, window ${beforeFocus.winTop}..${beforeFocus.winBottom}`)
+ok('pre-fix shell: the composer really is outside the visible window first', !beforeFocus.composerVisible, `composer ${beforeFocus.composerTop}..${beforeFocus.composerBottom}, window ${beforeFocus.winTop}..${beforeFocus.winBottom}`, 'trigger')
 const autoPanned = afterFocus.offTop !== beforeFocus.offTop || afterFocus.composerVisible
-ok('trigger', 'browser auto-pans the VISUAL viewport to reveal a focused input', autoPanned,
-   `offTop ${beforeFocus.offTop} → ${afterFocus.offTop}; composerVisible ${beforeFocus.composerVisible} → ${afterFocus.composerVisible}; scrollY ${afterFocus.scrollY}` +
-   (autoPanned ? '' : ' — NOT reproducible headlessly; the TRIGGER stays device-only even though the geometry above is settled'))
+ok('browser auto-pans the VISUAL viewport to reveal a focused input', autoPanned, `offTop ${beforeFocus.offTop} → ${afterFocus.offTop}; composerVisible ${beforeFocus.composerVisible} → ${afterFocus.composerVisible}; scrollY ${afterFocus.scrollY}` +
+   (autoPanned ? '' : ' — NOT reproducible headlessly; the TRIGGER stays device-only even though the geometry above is settled'), 'trigger')
 
 await send('Emulation.setPageScaleFactor', { pageScaleFactor: 1 })
 console.log(`\n${failed ? '❌' : '✅'} ${passed} passed, ${failed} failed`)

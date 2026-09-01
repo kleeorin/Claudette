@@ -14,8 +14,7 @@ import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager'
 import { emptyNotebookText } from '../server/src/notebook/ipynb'
 
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 
 const dir = await mkdtemp(join(tmpdir(), 'claudette-lock-'))
 const path = join(dir, 'n.ipynb')
@@ -41,8 +40,8 @@ for (const [label, mk] of [
   const { docs, id, ids, doc } = await fixture()
   const before = doc.cells.length
   const r = docs.applyOp({ ...mk(ids), notebookId: id } as never, 'claude')
-  ok(!r.ok && r.code === 'locked', `claude ${label} naming a pinned cell is REFUSED (${r.ok ? 'allowed!' : r.error})`)
-  ok(doc.cells.length === before && doc.cells.some((c) => c.id === ids[1]), `claude ${label}: pinned cell still present, doc untouched`)
+  ok(`claude ${label} naming a pinned cell is REFUSED (${r.ok ? 'allowed!' : r.error})`, !r.ok && r.code === 'locked')
+  ok(`claude ${label}: pinned cell still present, doc untouched`, doc.cells.length === before && doc.cells.some((c) => c.id === ids[1]))
   docs.close(id)
 }
 
@@ -50,8 +49,8 @@ for (const [label, mk] of [
 {
   const { docs, id, ids, doc } = await fixture()
   const r = docs.applyOp({ op: 'deleteCells', notebookId: id, cellIds: [ids[2], ids[3]] }, 'claude')
-  ok(r.ok, `claude deleteCells over UNLOCKED cells still succeeds (${r.ok ? 'ok' : r.error})`)
-  ok(!doc.cells.some((c) => c.id === ids[2] || c.id === ids[3]), 'the unlocked cells were actually removed')
+  ok(`claude deleteCells over UNLOCKED cells still succeeds (${r.ok ? 'ok' : r.error})`, r.ok)
+  ok('the unlocked cells were actually removed', !doc.cells.some((c) => c.id === ids[2] || c.id === ids[3]))
   docs.close(id)
 }
 
@@ -59,9 +58,9 @@ for (const [label, mk] of [
 {
   const { docs, id, ids, doc } = await fixture()
   const r = docs.applyOp({ op: 'deleteCells', notebookId: id, cellIds: [ids[1], ids[2]] }, 'human')
-  ok(r.ok, `human deleteCells including their OWN pinned cell still succeeds (${r.ok ? 'ok' : r.error})`)
-  ok(!doc.cells.some((c) => c.id === ids[1]), 'the pinned cell was removed for the human')
-  ok(docs.locks(id).every((l) => l.cellId !== ids[1]), 'and its now-dangling lock was dropped')
+  ok(`human deleteCells including their OWN pinned cell still succeeds (${r.ok ? 'ok' : r.error})`, r.ok)
+  ok('the pinned cell was removed for the human', !doc.cells.some((c) => c.id === ids[1]))
+  ok('and its now-dangling lock was dropped', docs.locks(id).every((l) => l.cellId !== ids[1]))
   docs.close(id)
 }
 
@@ -69,7 +68,7 @@ for (const [label, mk] of [
 {
   const { docs, id } = await fixture()
   const r = docs.applyOp({ op: 'insertCells', notebookId: id, index: 0, cells: [{ cellType: 'code', source: 'x' }] }, 'claude')
-  ok(r.ok, `claude insertCells (targets no existing cell) is not gated (${r.ok ? 'ok' : r.error})`)
+  ok(`claude insertCells (targets no existing cell) is not gated (${r.ok ? 'ok' : r.error})`, r.ok)
   docs.close(id)
 }
 

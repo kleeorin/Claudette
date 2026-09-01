@@ -10,8 +10,7 @@ import { WebSocket } from 'ws'
 
 const PORT = 4331
 const APP = `http://127.0.0.1:${PORT}`
-let failed = 0
-const ok = (c, m) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 const nbDir = await mkdtemp(join(tmpdir(), 'nbui-'))
 const nbPath = join(nbDir, 'ui.ipynb')
@@ -171,7 +170,7 @@ for (let i = 0; i < 40; i++) {
   if (ready) break
   await wait(250)
 }
-ok(await evaluate(`document.body.innerText.includes('Files')`), 'app shell rendered')
+ok('app shell rendered', await evaluate(`document.body.innerText.includes('Files')`))
 
 // --- create a notebook through the Files dock --------------------------------
 // The old single click on a tab-strip "+ notebook" button is GONE, and this is genuine
@@ -203,17 +202,15 @@ const clickExact = async (label) => evaluate(
             if (!b) return false; b.click(); return true })()`)
 
 // …and assert on the STATE each click was supposed to produce, not on the click landing.
-ok(await clickExact('Files'), 'Files dock opened')
+ok('Files dock opened', await clickExact('Files'))
 await wait(400)
-ok(await evaluate(`!!document.querySelector('input[placeholder="Filter…"], button[title="Add to this folder"]')`),
-  'Files dock actually rendered (not just a click that landed somewhere)')
-ok(await clickExact('+ New ▾'), '"+ New ▾" menu opened')
+ok('Files dock actually rendered (not just a click that landed somewhere)', await evaluate(`!!document.querySelector('input[placeholder="Filter…"], button[title="Add to this folder"]')`))
+ok('"+ New ▾" menu opened', await clickExact('+ New ▾'))
 await wait(200)
-ok(await evaluate(`[...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Notebook')`),
-  'the add-menu is open and offers a Notebook item')
-ok(await clickExact('Notebook'), '"Notebook" chosen')
+ok('the add-menu is open and offers a Notebook item', await evaluate(`[...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Notebook')`))
+ok('"Notebook" chosen', await clickExact('Notebook'))
 await wait(200)
-ok(await evaluate(`!!document.querySelector('input[placeholder="name.ipynb"]')`), 'the name input appeared')
+ok('the name input appeared', await evaluate(`!!document.querySelector('input[placeholder="name.ipynb"]')`))
 // The name input is React-controlled, so set it through the native setter and fire `input`;
 // assigning .value alone leaves React's state untouched and submitCreate() reads ''.
 await evaluate(`(() => {
@@ -241,7 +238,7 @@ const nameInputReady = await evaluate(`(() => {
   if (!i) return false
   i.focus(); return true
 })()`)
-ok(nameInputReady, 'PRECONDITION: the notebook-name input is open and focused')
+ok('PRECONDITION: the notebook-name input is open and focused', nameInputReady)
 await send('Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, key: 'Enter', text: '\r' })
 await send('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, key: 'Enter' })
 await wait(600)
@@ -249,7 +246,7 @@ await wait(600)
 const createErr = await evaluate(`(document.body.innerText.match(/(cannot|failed|already exists)[^\\n]*/i) || [])[0] || ''`)
 if (createErr) console.log('   (create reported: ' + createErr + ')')
 await wait(800)
-ok(await evaluate(`document.body.innerText.includes('ui.ipynb')`), 'the notebook was created and is listed in the Files dock')
+ok('the notebook was created and is listed in the Files dock', await evaluate(`document.body.innerText.includes('ui.ipynb')`))
 
 // OPEN IT WITH A DOUBLE-CLICK. Creating a notebook does NOT open a content tab — the row
 // that appears is a FILE-BROWSER ROW, not a tab (its class is the dock's list-row class and
@@ -271,7 +268,7 @@ for (let i = 0; i < 40; i++) {
   if (cmReady) break
   await wait(250)
 }
-ok(cmReady, 'notebook view rendered with a cell editor')
+ok('notebook view rendered with a cell editor', cmReady)
 
 // --- type into the first cell and run it --------------------------------------
 await evaluate(`document.querySelector('.cm-content').focus()`)
@@ -291,7 +288,7 @@ for (let i = 0; i < 60; i++) {
   if (got42) break
   await wait(500)
 }
-ok(got42, 'cell ran through the UI and output 42 appeared')
+ok('cell ran through the UI and output 42 appeared', got42)
 
 // Kernel status in the notebook header. This looked for `[title="kernel: idle"]`, an
 // attribute nothing in web/src renders — NotebookView surfaces the status as a coloured dot
@@ -304,14 +301,14 @@ ok(got42, 'cell ran through the UI and output 42 appeared')
 // that mean a kernel is actually up. A bare innerText search for "idle" would also match the
 // sessions sidebar, which renders that word for every idle session — it would have passed
 // with no kernel at all, which is worse than the red it replaces.
-ok(await evaluate(`(() => {
+ok('kernel status surfaced in the notebook header', await evaluate(`(() => {
   const btn = [...document.querySelectorAll('button')].find((b) => b.title === 'Choose kernel')
   if (!btn) return false
   const t = btn.textContent || ''
   return t.includes('idle') || t.includes('busy') || t.includes('starting')
-})()`), 'kernel status surfaced in the notebook header')
+})()`))
 
-ok(consoleErrors.length === 0, `no uncaught page errors${consoleErrors.length ? ': ' + consoleErrors.join(' | ') : ''}`)
+ok(`no uncaught page errors${consoleErrors.length ? ': ' + consoleErrors.join(' | ') : ''}`, consoleErrors.length === 0)
 
 // --- teardown -----------------------------------------------------------------
 cdpDone = true   // deliberate teardown from here — the CDP close below is expected

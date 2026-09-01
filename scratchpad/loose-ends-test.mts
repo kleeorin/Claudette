@@ -12,8 +12,7 @@ import { WebSocket } from 'ws'
 const PORT = 4333
 const APP = `http://127.0.0.1:${PORT}`
 const CWD = process.cwd()
-let failed = 0
-const ok = (c, m) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 // A token is ALWAYS required, even on loopback (SANDBOX.md control-plane escape). The
 // same token is pinned across BOTH boots so the restore-after-restart leg keeps working.
@@ -87,31 +86,31 @@ await waitHealth()
 // Create a session (spawns real claude). claudeSessionId exists upfront, so the
 // set persists on create — no need to wait for a model turn.
 const { id } = await post('/api/session/create', { name: 'loose-ends', cwd: CWD })
-ok(!!id, 'session created')
+ok('session created', !!id)
 
 // P1.19 — persistence: the set is saved on create.
 let saved = await pollSaved((s) => Array.isArray(s) && s.length === 1)
-ok(saved && saved.length === 1, 'sessions.json has 1 saved session')
-ok(saved?.[0]?.cwd === CWD && !!saved?.[0]?.claudeSessionId, 'saved session has cwd + claudeSessionId')
+ok('sessions.json has 1 saved session', saved && saved.length === 1)
+ok('saved session has cwd + claudeSessionId', saved?.[0]?.cwd === CWD && !!saved?.[0]?.claudeSessionId)
 const origClaudeId = saved[0].claudeSessionId
 
 // P1.4 — live permission-mode switch; the mode is persisted for restore.
 const modeRes = await post('/api/session/setMode', { id, mode: 'plan' })
-ok(['live', 'relaunched', 'restart'].includes(modeRes.applied), `setMode → applied=${modeRes.applied}`)
+ok(`setMode → applied=${modeRes.applied}`, ['live', 'relaunched', 'restart'].includes(modeRes.applied))
 saved = await pollSaved((s) => s[0]?.permissionMode === 'plan')
-ok(saved?.[0]?.permissionMode === 'plan', 'permission mode persisted (plan)')
+ok('permission mode persisted (plan)', saved?.[0]?.permissionMode === 'plan')
 
 // P1.14 — conversation routes (list + read-back shape).
 const conv = await getj(`/api/session/conversations?cwd=${encodeURIComponent(CWD)}`)
-ok(Array.isArray(conv.conversations), 'conversations route returns an array')
+ok('conversations route returns an array', Array.isArray(conv.conversations))
 const readBack = await getj(`/api/session/conversation?cwd=${encodeURIComponent(CWD)}&id=does-not-exist`)
-ok(Array.isArray(readBack.events) && readBack.events.length === 0, 'conversation read-back of unknown id → empty events')
+ok('conversation read-back of unknown id → empty events', Array.isArray(readBack.events) && readBack.events.length === 0)
 
 // P1.14 — /clear (restartFresh): the claude session id rotates to a fresh one.
 const rf = await post('/api/session/restartFresh', { id })
-ok(rf.ok === true, 'restartFresh route ok')
+ok('restartFresh route ok', rf.ok === true)
 saved = await pollSaved((s) => s[0]?.claudeSessionId && s[0].claudeSessionId !== origClaudeId)
-ok(saved && saved[0].claudeSessionId !== origClaudeId, '/clear started a FRESH conversation (new claudeSessionId)')
+ok('/clear started a FRESH conversation (new claudeSessionId)', saved && saved[0].claudeSessionId !== origClaudeId)
 
 killServer(server)
 await wait(1500)
@@ -121,7 +120,7 @@ server = boot()
 await waitHealth()
 await wait(500)
 const list = (await getj('/api/session/list')).sessions
-ok(list.length >= 1 && list.some((s) => s.cwd === CWD && s.name === 'loose-ends'), 'restored the session on restart (P1.19)')
+ok('restored the session on restart (P1.19)', list.length >= 1 && list.some((s) => s.cwd === CWD && s.name === 'loose-ends'))
 
 // cleanup: destroy the restored session, then kill.
 for (const s of list) await post('/api/session/destroy', { id: s.id }).catch(() => {})

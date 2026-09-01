@@ -10,8 +10,7 @@ import { WebSocket } from 'ws'
 
 const PORT = 4332
 const APP = `http://127.0.0.1:${PORT}`
-let failed = 0
-const ok = (c, m) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ISOLATE THE DATA DIR. These were the only two Chrome harnesses that did not, so they
@@ -159,7 +158,7 @@ async function evaluate(expression) {
 await send('Page.enable'); await send('Runtime.enable')
 await send('Page.navigate', { url: APP })
 for (let i = 0; i < 40; i++) { if (await evaluate(`document.body.innerText.includes('Terminal')`)) break; await wait(250) }
-ok(await evaluate(`document.body.innerText.includes('Terminal')`), 'app shell + Terminal tab rendered')
+ok('app shell + Terminal tab rendered', await evaluate(`document.body.innerText.includes('Terminal')`))
 
 // …and wait for the SESSION to be selected, which is the precondition the Terminal toggle
 // actually depends on. Asserted separately from the tab above because the tab renders with
@@ -167,7 +166,7 @@ ok(await evaluate(`document.body.innerText.includes('Terminal')`), 'app shell + 
 // auto-selects the first session it receives (store/sessions.tsx), so this needs no click.
 let sessionUp = false
 for (let i = 0; i < 40; i++) { sessionUp = await evaluate(`document.body.innerText.includes('Terminal e2e')`); if (sessionUp) break; await wait(250) }
-ok(sessionUp, 'a session exists and is selected (Terminal is inert without one)')
+ok('a session exists and is selected (Terminal is inert without one)', sessionUp)
 
 // Click the Terminal tab.
 // PRECONDITION, ASSERTED rather than assumed. This lookup is gated by nothing above it, and it
@@ -184,12 +183,12 @@ const termClicked = await evaluate(`(() => {
   if (!b) return false
   b.click(); return true
 })()`)
-ok(termClicked, 'PRECONDITION: a <button> labelled "Terminal" exists and was clicked')
+ok('PRECONDITION: a <button> labelled "Terminal" exists and was clicked', termClicked)
 
 // Wait for xterm to attach + the pty prompt to arrive.
 let xtermReady = false
 for (let i = 0; i < 40; i++) { xtermReady = await evaluate(`!!document.querySelector('.xterm-rows')`); if (xtermReady) break; await wait(250) }
-ok(xtermReady, 'xterm terminal attached')
+ok('xterm terminal attached', xtermReady)
 await wait(800) // let the shell start + prompt render
 
 // Type a command into xterm's hidden textarea, then Enter.
@@ -210,8 +209,8 @@ for (let i = 0; i < 40; i++) {
   if (n >= 2) { got = true; break }
   await wait(250)
 }
-ok(got, 'typed command executed in the shell and its output rendered (round-trip)')
-ok(errors.length === 0, `no uncaught page errors${errors.length ? ': ' + errors.join(' | ') : ''}`)
+ok('typed command executed in the shell and its output rendered (round-trip)', got)
+ok(`no uncaught page errors${errors.length ? ': ' + errors.join(' | ') : ''}`, errors.length === 0)
 
 // THE NO-SESSION PATH, asserted here because THIS TEST'S OWN FIX HID IT.
 // The original bug was that toggleTerm opens `if (!activeId) return`, so with no session the
@@ -233,7 +232,7 @@ for (let i = 0; i < 40; i++) {
   if (termDisabled) break
   await wait(250)
 }
-ok(termDisabled, 'with no session the Terminal button is DISABLED, not enabled-and-inert')
+ok('with no session the Terminal button is DISABLED, not enabled-and-inert', termDisabled)
 
 cdpDone = true   // deliberate teardown from here — the CDP close below is expected
 cdp.close(); chrome.kill(); try { process.kill(-server.pid, 'SIGKILL') } catch { server.kill() }

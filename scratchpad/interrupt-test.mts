@@ -11,8 +11,7 @@ import { WebSocket } from 'ws'
 const PORT = 4334
 const APP = `http://127.0.0.1:${PORT}`
 const CWD = process.cwd()
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 // A token is ALWAYS required, even on loopback (SANDBOX.md control-plane escape). Pin a
 // throwaway one on the spawned server and present it on every HTTP request AND the WS
@@ -62,7 +61,7 @@ async function waitHealth() { for (let i = 0; i < 60; i++) { try { if ((await fe
 await waitHealth()
 
 const { id } = await post('/api/session/create', { name: 'interrupt', cwd: CWD })
-ok(!!id, 'session created')
+ok('session created', !!id)
 // Nothing below can work without a session; bail loudly rather than emitting a cascade
 // of failures that all describe the same root cause.
 if (!id) { console.error('no session id — aborting (see the POST status above)'); kill(); process.exit(1) }
@@ -144,7 +143,7 @@ send({ type: 'session:send', id, text: 'Write a very detailed 3000-word essay on
 
 // Wait until it's actively running.
 for (let i = 0; i < 80; i++) { if (state === 'running') break; await wait(250) }
-ok(state === 'running', `session reached 'running' (states so far: ${states.join('→') || 'none'})`)
+ok(`session reached 'running' (states so far: ${states.join('→') || 'none'})`, state === 'running')
 
 // Wait until generation is genuinely in flight, then interrupt.
 //
@@ -164,20 +163,20 @@ for (let i = 0; i < 80; i++) { if (frames > 0) break; await wait(250) }
 // the post-interrupt assertion vacuous, since nothing was flowing to stop.
 await wait(2500)
 const framesAtInterrupt = frames
-ok(framesAtInterrupt > 0, `generation was streaming before interrupt (${framesAtInterrupt} frames, ${textLen} chars)`)
+ok(`generation was streaming before interrupt (${framesAtInterrupt} frames, ${textLen} chars)`, framesAtInterrupt > 0)
 send({ type: 'session:interrupt', id })
 
 // It should return to idle promptly.
 let backToIdle = false
 for (let i = 0; i < 40; i++) { if (state === 'idle') { backToIdle = true; break } await wait(250) }
-ok(backToIdle, `session returned to 'idle' after interrupt (final state: ${state})`)
+ok(`session returned to 'idle' after interrupt (final state: ${state})`, backToIdle)
 
 // And generation should have stopped: no further frames once it reports idle. A couple of
 // already-in-flight frames may still land, so allow a small tail rather than demanding 0.
 const framesAfterIdle = frames
 await wait(1500)
 const grewAfter = frames - framesAfterIdle
-ok(grewAfter <= 2, `generation stopped after interrupt (grew ${grewAfter} frames post-idle)`)
+ok(`generation stopped after interrupt (grew ${grewAfter} frames post-idle)`, grewAfter <= 2)
 
 ws.close()
 await post('/api/session/destroy', { id }).catch(() => {})

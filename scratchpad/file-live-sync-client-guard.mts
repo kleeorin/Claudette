@@ -139,11 +139,8 @@ register('data:text/javascript,' + encodeURIComponent(CSS_STUB_HOOK), import.met
 
 import { setupDom, NO_DOM_NOTE } from './dom-env.mts'
 
-let passed = 0, failed = 0
-const ok = (tag: string, name: string, cond: boolean, extra = ''): void => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 const done = (): never => {
   console.log(`\n${passed} passed / ${failed} failed`)
   process.exit(failed === 0 ? 0 : 1)
@@ -257,7 +254,7 @@ const reconnect = async (): Promise<StubWS> => {
 console.log('\n── part A: the transport (web/src/api/client.ts) ───────────────────────────')
 
 client.ensureWs()
-ok('setup', '[0a] the client opened exactly one socket', sockets.length === 1, `sockets=${sockets.length}`)
+ok('[0a] the client opened exactly one socket', sockets.length === 1, `sockets=${sockets.length}`, 'setup')
 live().open()
 clearWire()
 
@@ -269,19 +266,17 @@ clearWire()
 // banner, no visible difference from a file nobody has touched.
 client.api.fs.watch(PATH)
 client.api.fs.watch(OTHER)
-ok('setup', '[1a] a watch on a live socket goes straight out', count('fs:watch', PATH) === 1)
-ok('setup', '[1b] …and so does a second, different path', count('fs:watch', OTHER) === 1)
+ok('[1a] a watch on a live socket goes straight out', count('fs:watch', PATH) === 1, '', 'setup')
+ok('[1b] …and so does a second, different path', count('fs:watch', OTHER) === 1, '', 'setup')
 
 clearWire()
 await reconnect()
-ok('core', '[1c] after a reconnect the first path is re-armed', count('fs:watch', PATH) === 1,
-   'nothing retained this message: it was DELIVERED. Only `watched` can bring it back')
-ok('core', '[1d] …and so is the second', count('fs:watch', OTHER) === 1)
+ok('[1c] after a reconnect the first path is re-armed', count('fs:watch', PATH) === 1, 'nothing retained this message: it was DELIVERED. Only `watched` can bring it back', 'core')
+ok('[1d] …and so is the second', count('fs:watch', OTHER) === 1, '', 'core')
 // Counts EVERY frame, not just the watches: the re-arm is a state re-SYNC, so two watches
 // and nothing else is the whole of what a reconnect may put on the wire. An earlier version
 // also asserted `count('fs:unwatch') === 0` separately; that is this assertion's remainder.
-ok('core', '[1e] …exactly once each and nothing else — two frames, no more',
-   wire().length === 2, `frames=${JSON.stringify(wire())}`)
+ok('[1e] …exactly once each and nothing else — two frames, no more', wire().length === 2, `frames=${JSON.stringify(wire())}`, 'core')
 
 // ── [2] WATCHES MUST NEVER BE QUEUED ──────────────────────────────────────────────────
 // `send` outboxes anything it cannot deliver and flushes on connect. `sendLive` drops it.
@@ -300,14 +295,12 @@ client.api.fs.watch(DOWN)
 // Removing sendLive's readyState check entirely leaves both green (mutation C7, 17/0). They
 // pin the state [2c] is measured FROM; they do not test the code that produces it. Calling
 // that `core` would be claiming coverage this file does not have.
-ok('setup', '[2a] a watch taken while the socket is DOWN puts nothing on the wire',
-   count('fs:watch', DOWN) === 0)
-ok('setup', '[2b] …and nothing else either', sent.length === 0, `frames=${JSON.stringify(wire())}`)
+ok('[2a] a watch taken while the socket is DOWN puts nothing on the wire', count('fs:watch', DOWN) === 0, '', 'setup')
+ok('[2b] …and nothing else either', sent.length === 0, `frames=${JSON.stringify(wire())}`, 'setup')
 
 for (let i = 0; i < 60 && sockets[sockets.length - 1].readyState !== StubWS.CONNECTING; i++) await sleep(50)
 live().open()
-ok('core', '[2c] …and on reconnect it arrives EXACTLY ONCE, not once queued + once re-armed',
-   count('fs:watch', DOWN) === 1, `count=${count('fs:watch', DOWN)}`)
+ok('[2c] …and on reconnect it arrives EXACTLY ONCE, not once queued + once re-armed', count('fs:watch', DOWN) === 1, `count=${count('fs:watch', DOWN)}`, 'core')
 
 // ── [3] ONE WATCH PER PATH PER SOCKET ─────────────────────────────────────────────────
 // Two editors on one file each call watch/unwatch. The wire contract is one watch and one
@@ -318,28 +311,22 @@ const SHARED = '/root/shared.txt'
 clearWire()
 client.api.fs.watch(SHARED)
 client.api.fs.watch(SHARED)
-ok('core', '[3a] two editors on one path produce ONE fs:watch', count('fs:watch', SHARED) === 1,
-   `count=${count('fs:watch', SHARED)}`)
+ok('[3a] two editors on one path produce ONE fs:watch', count('fs:watch', SHARED) === 1, `count=${count('fs:watch', SHARED)}`, 'core')
 client.api.fs.unwatch(SHARED)
-ok('core', '[3b] the first editor closing sends NO unwatch — someone is still looking',
-   count('fs:unwatch', SHARED) === 0)
+ok('[3b] the first editor closing sends NO unwatch — someone is still looking', count('fs:unwatch', SHARED) === 0, '', 'core')
 clearWire()
 await reconnect()
-ok('core', '[3c] a reconnect while both hold it re-arms it once, not twice',
-   count('fs:watch', SHARED) === 1, `count=${count('fs:watch', SHARED)}`)
+ok('[3c] a reconnect while both hold it re-arms it once, not twice', count('fs:watch', SHARED) === 1, `count=${count('fs:watch', SHARED)}`, 'core')
 clearWire()
 client.api.fs.unwatch(SHARED)
-ok('core', '[3d] the last editor closing sends the one fs:unwatch',
-   count('fs:unwatch', SHARED) === 1)
+ok('[3d] the last editor closing sends the one fs:unwatch', count('fs:unwatch', SHARED) === 1, '', 'core')
 
 // The mirror of [1c], and the one that catches a leak rather than a loss: once the count
 // reaches zero the path must leave `watched` entirely, or every future reconnect re-arms a
 // watch nobody holds and no unwatch will ever follow.
 clearWire()
 await reconnect()
-ok('core', '[3e] a fully-unwatched path is NOT re-armed on the next reconnect',
-   count('fs:watch', SHARED) === 0,
-   'a path left in `watched` after its last unwatch is re-armed forever')
+ok('[3e] a fully-unwatched path is NOT re-armed on the next reconnect', count('fs:watch', SHARED) === 0, 'a path left in `watched` after its last unwatch is re-armed forever', 'core')
 
 // An unwatch taken while the socket is down is moot for the same reason the re-arm is
 // needed — the server released everything when the socket closed — but it must still
@@ -351,8 +338,7 @@ client.api.fs.unwatch(DROPPED)                   // dropped on the floor, by des
 for (let i = 0; i < 60 && sockets[sockets.length - 1].readyState !== StubWS.CONNECTING; i++) await sleep(50)
 clearWire()
 live().open()
-ok('core', '[3f] a path unwatched DURING an outage is not resurrected by the reconnect',
-   count('fs:watch', DROPPED) === 0, `frames=${JSON.stringify(wire())}`)
+ok('[3f] a path unwatched DURING an outage is not resurrected by the reconnect', count('fs:watch', DROPPED) === 0, `frames=${JSON.stringify(wire())}`, 'core')
 
 // Leave the client in a known state for part B: only the paths part A still holds.
 client.api.fs.unwatch(PATH)
@@ -360,8 +346,7 @@ client.api.fs.unwatch(OTHER)
 client.api.fs.unwatch(DOWN)
 clearWire()
 await reconnect()
-ok('setup', '[3g] part A leaves no watches behind', count('fs:watch') === 0,
-   `frames=${JSON.stringify(wire())}`)
+ok('[3g] part A leaves no watches behind', count('fs:watch') === 0, `frames=${JSON.stringify(wire())}`, 'setup')
 
 if (process.env.QA_LS_CLIENT) {
   console.log('\n[note] QA_LS_CLIENT is set, so part B is SKIPPED: FileEditorView imports the')
@@ -429,16 +414,13 @@ const dirtyDot = (): boolean => !!host.querySelector('[title="Unsaved changes"]'
 
 // ── [4] CLEAN + fs:changed → take disk silently ───────────────────────────────────────
 await mount()
-ok('setup', '[4s] the editor mounted on the disk text', cm()?.state.doc.toString() === DISK)
-ok('core', '[4a] mounting sends exactly one fs:watch for the open path',
-   count('fs:watch', PATH) === 1 && count('fs:watch') === 1, `frames=${JSON.stringify(wire())}`)
+ok('[4s] the editor mounted on the disk text', cm()?.state.doc.toString() === DISK, '', 'setup')
+ok('[4a] mounting sends exactly one fs:watch for the open path', count('fs:watch', PATH) === 1 && count('fs:watch') === 1, `frames=${JSON.stringify(wire())}`, 'core')
 DISK = 'someone else wrote this'
 await deliver({ type: 'fs:changed', path: PATH })
-ok('core', '[4b] a clean buffer takes the new disk text silently',
-   cm()?.state.doc.toString() === DISK, `doc=${JSON.stringify(cm()?.state.doc.toString())}`)
-ok('core', '[4c] …with no banner: nothing was at risk, so there is nothing to ask',
-   !staleBanner() && !goneBanner())
-ok('core', '[4d] …and the buffer is clean afterwards, not falsely dirty', !dirtyDot())
+ok('[4b] a clean buffer takes the new disk text silently', cm()?.state.doc.toString() === DISK, `doc=${JSON.stringify(cm()?.state.doc.toString())}`, 'core')
+ok('[4c] …with no banner: nothing was at risk, so there is nothing to ask', !staleBanner() && !goneBanner(), '', 'core')
+ok('[4d] …and the buffer is clean afterwards, not falsely dirty', !dirtyDot(), '', 'core')
 await unmount()
 
 // ── [5] DIRTY + fs:changed → flag it, never clobber ───────────────────────────────────
@@ -452,24 +434,19 @@ await unmount()
 DISK = 'baseline before editing'
 await mount()
 await typeInto('MY UNSAVED EDIT')
-ok('setup', '[5s] the buffer is dirty', dirtyDot() && cm()?.state.doc.toString() === 'MY UNSAVED EDIT')
+ok('[5s] the buffer is dirty', dirtyDot() && cm()?.state.doc.toString() === 'MY UNSAVED EDIT', '', 'setup')
 DISK = 'A RIVAL WROTE THIS'
 const readsBefore5 = reads
 await deliver({ type: 'fs:changed', path: PATH })
-ok('core', '[5a] a dirty buffer gets the "changed on disk" banner', staleBanner())
-ok('core', '[5b] …and the unsaved buffer is INTACT',
-   cm()?.state.doc.toString() === 'MY UNSAVED EDIT', `doc=${JSON.stringify(cm()?.state.doc.toString())}`)
-ok('core', '[5c] …the disk text was NOT applied', !txt().includes('A RIVAL WROTE THIS'))
-ok('core', '[5d] …and no read was issued at all: it did not even try',
-   reads === readsBefore5, `reads +${reads - readsBefore5}`)
+ok('[5a] a dirty buffer gets the "changed on disk" banner', staleBanner(), '', 'core')
+ok('[5b] …and the unsaved buffer is INTACT', cm()?.state.doc.toString() === 'MY UNSAVED EDIT', `doc=${JSON.stringify(cm()?.state.doc.toString())}`, 'core')
+ok('[5c] …the disk text was NOT applied', !txt().includes('A RIVAL WROTE THIS'), '', 'core')
+ok('[5d] …and no read was issued at all: it did not even try', reads === readsBefore5, `reads +${reads - readsBefore5}`, 'core')
 await click(byText('Keep mine'))
-ok('core', '[5e] "Keep mine" dismisses the banner and keeps the buffer',
-   !staleBanner() && cm()?.state.doc.toString() === 'MY UNSAVED EDIT')
+ok('[5e] "Keep mine" dismisses the banner and keeps the buffer', !staleBanner() && cm()?.state.doc.toString() === 'MY UNSAVED EDIT', '', 'core')
 await deliver({ type: 'fs:changed', path: PATH })
 await click(byText('Reload…'))
-ok('core', '[5f] "Reload…" asks before discarding — it is not a one-click data loss',
-   docTxt().includes('Discard unsaved changes?') && cm()?.state.doc.toString() === 'MY UNSAVED EDIT',
-   `dialog=${docTxt().includes('Discard unsaved changes?')}`)
+ok('[5f] "Reload…" asks before discarding — it is not a one-click data loss', docTxt().includes('Discard unsaved changes?') && cm()?.state.doc.toString() === 'MY UNSAVED EDIT', `dialog=${docTxt().includes('Discard unsaved changes?')}`, 'core')
 await unmount()
 
 // ── [6] REVIEWING + fs:changed → do nothing at all ────────────────────────────────────
@@ -489,15 +466,12 @@ await deliver({
   },
 }, 140)
 const reloadBtn = host.querySelector('[aria-label="Reload from disk"]')
-ok('setup', '[6s] review mode is live — the ⟳ button is disabled for the same reason',
-   reloadBtn?.disabled === true && txt().includes('Claude proposes changes'))
+ok('[6s] review mode is live — the ⟳ button is disabled for the same reason', reloadBtn?.disabled === true && txt().includes('Claude proposes changes'), '', 'setup')
 DISK = 'CHANGED UNDER REVIEW'
 const readsBefore6 = reads
 await deliver({ type: 'fs:changed', path: PATH })
-ok('core', '[6a] mid-review, a disk change is IGNORED — no read is issued',
-   reads === readsBefore6, `reads +${reads - readsBefore6}`)
-ok('core', '[6b] …the diff still shows the base the user is deciding against',
-   !txt().includes('CHANGED UNDER REVIEW'))
+ok('[6a] mid-review, a disk change is IGNORED — no read is issued', reads === readsBefore6, `reads +${reads - readsBefore6}`, 'core')
+ok('[6b] …the diff still shows the base the user is deciding against', !txt().includes('CHANGED UNDER REVIEW'), '', 'core')
 // ★ [6c] WAS INVERTED ON 2026-08-28, AND THE OLD VERSION WAS PINNING A BUG.
 // It asserted `!staleBanner()` — that mid-review a disk change produces no banner at all.
 // That encoded the brief this file was written from, and the brief was wrong: "do not
@@ -510,10 +484,8 @@ ok('core', '[6b] …the diff still shows the base the user is deciding against',
 // Now: the banner DOES appear (informing decides nothing), the refresh still does not
 // (that is what [6a]/[6b] pin), and the Reload control is WITHHELD — offering it would hand
 // the user the exact action the suppression exists to prevent.
-ok('core', '[6c] …but the banner DOES appear: the change is recorded, not discarded',
-   staleBanner() && !goneBanner())
-ok('core', "[6d] …with Reload withheld — informing is safe mid-review, acting is not",
-   !host.querySelector('button:not([aria-label])') || !txt().includes('Reload…'))
+ok('[6c] …but the banner DOES appear: the change is recorded, not discarded', staleBanner() && !goneBanner(), '', 'core')
+ok("[6d] …with Reload withheld — informing is safe mid-review, acting is not", !host.querySelector('button:not([aria-label])') || !txt().includes('Reload…'), '', 'core')
 await unmount()
 
 // ── [7] fs:removed → the in-memory copy is now the ONLY copy ──────────────────────────
@@ -522,23 +494,18 @@ await mount()
 await typeInto('THE ONLY SURVIVING COPY')
 DISK = ''                                        // as a read of a deleted file would come back
 await deliver({ type: 'fs:removed', path: PATH })
-ok('core', '[7a] a removal gets its own banner', goneBanner())
-ok('core', '[7b] …and the buffer is KEPT — it is the only copy left',
-   cm()?.state.doc.toString() === 'THE ONLY SURVIVING COPY',
-   `doc=${JSON.stringify(cm()?.state.doc.toString())}`)
-ok('core', '[7c] …nothing was re-read from a file that is gone',
-   !txt().includes('about to be deleted'))
+ok('[7a] a removal gets its own banner', goneBanner(), '', 'core')
+ok('[7b] …and the buffer is KEPT — it is the only copy left', cm()?.state.doc.toString() === 'THE ONLY SURVIVING COPY', `doc=${JSON.stringify(cm()?.state.doc.toString())}`, 'core')
+ok('[7c] …nothing was re-read from a file that is gone', !txt().includes('about to be deleted'), '', 'core')
 await unmount()
 
 DISK = 'both banners fixture'
 await mount()
 await typeInto('EDITED THEN DELETED')
 await deliver({ type: 'fs:changed', path: PATH })
-ok('setup', '[7s] the stale banner is up', staleBanner())
+ok('[7s] the stale banner is up', staleBanner(), '', 'setup')
 await deliver({ type: 'fs:removed', path: PATH })
-ok('core', '[7d] a removal SUPERSEDES the stale banner rather than stacking with it',
-   goneBanner() && !staleBanner(),
-   '"changed on disk" is not news once the file is gone, and two banners is not a choice')
+ok('[7d] a removal SUPERSEDES the stale banner rather than stacking with it', goneBanner() && !staleBanner(), '"changed on disk" is not news once the file is gone, and two banners is not a choice', 'core')
 await unmount()
 
 // ── [8] NEGATIVE CONTROLS ─────────────────────────────────────────────────────────────
@@ -551,20 +518,16 @@ await mount()
 DISK = 'A DIFFERENT FILE CHANGED'
 const readsBefore8 = reads
 await deliver({ type: 'fs:changed', path: OTHER })
-ok('core', '[8a] an fs:changed for a DIFFERENT path is ignored completely',
-   reads === readsBefore8 && !txt().includes('A DIFFERENT FILE CHANGED'),
-   `reads +${reads - readsBefore8}`)
+ok('[8a] an fs:changed for a DIFFERENT path is ignored completely', reads === readsBefore8 && !txt().includes('A DIFFERENT FILE CHANGED'), `reads +${reads - readsBefore8}`, 'core')
 await deliver({ type: 'fs:removed', path: OTHER })
-ok('core', '[8b] …and so is an fs:removed for a different path', !goneBanner())
+ok('[8b] …and so is an fs:removed for a different path', !goneBanner(), '', 'core')
 
 clearWire()
 await unmount()
-ok('core', '[8c] unmounting releases the watch', count('fs:unwatch', PATH) === 1,
-   `frames=${JSON.stringify(wire())}`)
+ok('[8c] unmounting releases the watch', count('fs:unwatch', PATH) === 1, `frames=${JSON.stringify(wire())}`, 'core')
 clearWire()
 await reconnect()
-ok('core', '[8d] …and the released path is not re-armed by a later reconnect',
-   count('fs:watch') === 0, `frames=${JSON.stringify(wire())}`)
+ok('[8d] …and the released path is not re-armed by a later reconnect', count('fs:watch') === 0, `frames=${JSON.stringify(wire())}`, 'core')
 
 // The effect is keyed on `path`, so switching files inside one mounted tab has to swap the
 // subscription. A `[]` dep list would leave the tab watching the file it opened with and
@@ -578,14 +541,11 @@ await act(async () => {
     React.createElement(editor.FileEditorView, { path: OTHER })))
 })
 await settle()
-ok('core', '[8e] switching the open path releases the old watch', count('fs:unwatch', PATH) === 1,
-   `frames=${JSON.stringify(wire())}`)
-ok('core', '[8f] …and takes one on the new path', count('fs:watch', OTHER) === 1)
+ok('[8e] switching the open path releases the old watch', count('fs:unwatch', PATH) === 1, `frames=${JSON.stringify(wire())}`, 'core')
+ok('[8f] …and takes one on the new path', count('fs:watch', OTHER) === 1, '', 'core')
 DISK = 'THE NEW FILE CHANGED'
 await deliver({ type: 'fs:changed', path: OTHER })
-ok('core', '[8g] …and it is the NEW path the editor now follows',
-   cm()?.state.doc.toString() === 'THE NEW FILE CHANGED',
-   `doc=${JSON.stringify(cm()?.state.doc.toString())}`)
+ok('[8g] …and it is the NEW path the editor now follows', cm()?.state.doc.toString() === 'THE NEW FILE CHANGED', `doc=${JSON.stringify(cm()?.state.doc.toString())}`, 'core')
 await unmount()
 
 // A frame the client cannot parse must not take the socket down with it — every message
@@ -595,8 +555,7 @@ await act(async () => { live().onmessage?.({ data: 'not json {' }) })
 await settle()
 DISK = 'STILL LISTENING'
 await deliver({ type: 'fs:changed', path: PATH })
-ok('core', '[8h] a malformed frame does not deafen the socket to the next one',
-   cm()?.state.doc.toString() === 'STILL LISTENING')
+ok('[8h] a malformed frame does not deafen the socket to the next one', cm()?.state.doc.toString() === 'STILL LISTENING', '', 'core')
 await unmount()
 
 done()

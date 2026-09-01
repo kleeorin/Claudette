@@ -188,11 +188,8 @@ async function waitFor(expr, ms = 20000) {
   throw new Error(`timeout waiting for: ${expr}`)
 }
 
-let failures = 0
-const check = (ok, label, extra = '') => {
-  console.log(`  ${ok ? '✅' : '❌'} ${label}${extra ? ` — ${extra}` : ''}`)
-  if (!ok) failures++
-}
+import { withMarks, failed as failures } from './assert.mjs'
+const check = withMarks({ indent: '  ' })
 
 // Real key events, so we exercise the actual Ctrl/Cmd-F path rather than calling a
 // handler directly.
@@ -257,17 +254,17 @@ await openTab('demo.py')
 await waitFor(`!!document.querySelector('.cm-content')`)
 await key('f', { ctrl: true })
 await wait(400)
-check(await evaluate(`!!document.querySelector('input[placeholder^="Find"]')`), 'Ctrl+F opens the bar')
+check('Ctrl+F opens the bar', await evaluate(`!!document.querySelector('input[placeholder^="Find"]')`))
 await focusFindField()
 await typeInto('alpha')
 await wait(500)
-check((await counter()) === '1/4', 'plain query counts 4 matches', await counter())
-check(await evaluate(`!!document.querySelector('.cm-find-match-active')`), 'active match is highlighted')
+check('plain query counts 4 matches', (await counter()) === '1/4', await counter())
+check('active match is highlighted', await evaluate(`!!document.querySelector('.cm-find-match-active')`))
 await shot('1-code-find')
 
 await key('Enter', { code: 'Enter', keyCode: 13 })
 await wait(300)
-check((await counter()) === '2/4', 'Enter steps to the next match', await counter())
+check('Enter steps to the next match', (await counter()) === '2/4', await counter())
 
 // regex
 await clickTitled('Regular expression')
@@ -277,7 +274,7 @@ await evaluate(`(() => { const i=[...document.querySelectorAll('input')].find(x=
 await focusFindField()
 await typeInto('alpha|beta')
 await wait(500)
-check((await counter()) === '1/7', 'regex alpha|beta counts 7', await counter())
+check('regex alpha|beta counts 7', (await counter()) === '1/7', await counter())
 await shot('2-code-regex')
 
 // replace all, then read the doc back
@@ -287,8 +284,7 @@ await wait(200)
 await clickBtn('All')
 await wait(600)
 const codeAfter = await evaluate(`document.querySelector('.cm-content').innerText`)
-check(!codeAfter.includes('alpha') && !codeAfter.includes('beta') && (codeAfter.match(/ZZ/g) || []).length === 7,
-  'replace-all rewrote all 7 matches', JSON.stringify(codeAfter.slice(0, 60)))
+check('replace-all rewrote all 7 matches', !codeAfter.includes('alpha') && !codeAfter.includes('beta') && (codeAfter.match(/ZZ/g) || []).length === 7, JSON.stringify(codeAfter.slice(0, 60)))
 await shot('3-code-replaced')
 // Leave the file as it was — undo, so the dirty marker doesn't confuse later steps.
 await evaluate(`document.querySelector('.cm-content').focus()`)
@@ -301,12 +297,12 @@ await openTab('notes.md')
 await waitFor(`!!document.querySelector('.milkdown-host .ProseMirror')`)
 await key('f', { ctrl: true })
 await wait(400)
-check(await evaluate(`!!document.querySelector('input[placeholder^="Find in document"]')`), 'Ctrl+F opens the bar in markdown')
+check('Ctrl+F opens the bar in markdown', await evaluate(`!!document.querySelector('input[placeholder^="Find in document"]')`))
 await focusFindField()
 await typeInto('target')
 await wait(600)
-check((await counter()) === '1/3', 'markdown finds 3 matches across blocks', await counter())
-check(await evaluate(`!!document.querySelector('.pm-find-match-active')`), 'markdown active match is highlighted')
+check('markdown finds 3 matches across blocks', (await counter()) === '1/3', await counter())
+check('markdown active match is highlighted', await evaluate(`!!document.querySelector('.pm-find-match-active')`))
 await shot('4-markdown-find')
 
 // --- 3. CsvTableView ---------------------------------------------------------
@@ -315,21 +311,20 @@ await openTab('sample.csv')
 await waitFor(`!!document.querySelector('.claudette-rdg .rdg')`)
 await key('f', { ctrl: true })
 await wait(400)
-check(await evaluate(`!!document.querySelector('input[placeholder^="Find in cells"]')`), 'Ctrl+F opens the bar in the CSV grid')
+check('Ctrl+F opens the bar in the CSV grid', await evaluate(`!!document.querySelector('input[placeholder^="Find in cells"]')`))
 await focusFindField()
 await typeInto('widget')
 await wait(600)
-check((await counter()) === '1/4', 'case-insensitive finds 4 cell matches', await counter())
-check(await evaluate(`document.querySelectorAll('.rdg-find-match').length >= 2`), 'matching cells are tinted',
-  String(await evaluate(`document.querySelectorAll('.rdg-find-match').length`)))
-check(await evaluate(`!!document.querySelector('.rdg-find-active')`), 'the current cell is marked')
+check('case-insensitive finds 4 cell matches', (await counter()) === '1/4', await counter())
+check('matching cells are tinted', await evaluate(`document.querySelectorAll('.rdg-find-match').length >= 2`), String(await evaluate(`document.querySelectorAll('.rdg-find-match').length`)))
+check('the current cell is marked', await evaluate(`!!document.querySelector('.rdg-find-active')`))
 await shot('5-csv-find')
 
 await clickTitled('Match case')
 await wait(500)
 // The query typed above is lowercase "widget", so matching case drops the two
 // capital-W cells and keeps only "blue widget" / "green widget".
-check((await counter()) === '1/2', 'Match case narrows to the 2 lowercase cells', await counter())
+check('Match case narrows to the 2 lowercase cells', (await counter()) === '1/2', await counter())
 await shot('6-csv-case')
 
 await evaluate(`(() => { const i=[...document.querySelectorAll('input')].find(x=>(x.placeholder||'').startsWith('Replace')); i.focus(); return true })()`)
@@ -340,12 +335,9 @@ await wait(700)
 const csvText = await evaluate(`document.querySelector('.claudette-rdg .rdg').innerText`)
 // Case-sensitive replace must hit BOTH lowercase cells and NEITHER capital-W one.
 const cells = csvText.split('\n').map((s) => s.trim())
-check(
-  cells.filter((c) => c === 'blue Sprocket' || c === 'green Sprocket').length === 2
+check('case-sensitive replace-all hit only the lowercase cells', cells.filter((c) => c === 'blue Sprocket' || c === 'green Sprocket').length === 2
   && cells.filter((c) => c === 'Widget').length === 2
-  && !cells.some((c) => c.includes('widget')),
-  'case-sensitive replace-all hit only the lowercase cells',
-  JSON.stringify(cells.filter(Boolean).join('|').slice(0, 90)))
+  && !cells.some((c) => c.includes('widget')), JSON.stringify(cells.filter(Boolean).join('|').slice(0, 90)))
 await shot('7-csv-replaced')
 
 // --- 4. NotebookView ---------------------------------------------------------
@@ -359,12 +351,12 @@ if (!nbUp) {
   await evaluate(`document.querySelector('[data-cell-id] .cm-content')?.focus()`)
   await key('f', { ctrl: true })
   await wait(400)
-  check(await evaluate(`!!document.querySelector('input[placeholder^="Find in cells"]')`), 'Ctrl+F opens the notebook bar')
+  check('Ctrl+F opens the notebook bar', await evaluate(`!!document.querySelector('input[placeholder^="Find in cells"]')`))
   await focusFindField()
   await typeInto('target')
   await wait(700)
-  check((await counter()) === '1/3', 'notebook finds 3 matches across 2 cells', await counter())
-  check(await evaluate(`!!document.querySelector('.cm-find-match-active')`), 'notebook active match is highlighted')
+  check('notebook finds 3 matches across 2 cells', (await counter()) === '1/3', await counter())
+  check('notebook active match is highlighted', await evaluate(`!!document.querySelector('.cm-find-match-active')`))
   await shot('8-notebook-find')
 
   // Notebook replace goes through the server's editCell op (not the cell editors), so
@@ -375,16 +367,15 @@ if (!nbUp) {
   await clickBtn('All')
   await wait(1500)
   const nbText = await evaluate(`[...document.querySelectorAll('[data-cell-id] .cm-content')].map(e => e.innerText).join('\\n')`)
-  check((nbText.match(/goal/g) || []).length === 3 && !nbText.includes('target'),
-    'notebook replace-all rewrote all 3 matches across both cells', JSON.stringify(nbText.replace(/\n/g, '|')))
+  check('notebook replace-all rewrote all 3 matches across both cells', (nbText.match(/goal/g) || []).length === 3 && !nbText.includes('target'), JSON.stringify(nbText.replace(/\n/g, '|')))
   await shot('9-notebook-replaced')
 
   // Esc closes the bar and drops the highlights.
   await focusFindField()
   await key('Escape', { code: 'Escape', keyCode: 27 })
   await wait(400)
-  check(!(await evaluate(`!!document.querySelector('input[placeholder^="Find in cells"]')`)), 'Escape closes the bar')
-  check(!(await evaluate(`!!document.querySelector('.cm-find-match')`)), 'closing clears the highlights')
+  check('Escape closes the bar', !(await evaluate(`!!document.querySelector('input[placeholder^="Find in cells"]')`)))
+  check('closing clears the highlights', !(await evaluate(`!!document.querySelector('.cm-find-match')`)))
 }
 
 console.log(`\nshots in ${OUT}`)

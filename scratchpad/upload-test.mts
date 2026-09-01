@@ -20,8 +20,7 @@ import { registerFsRoutes } from '../server/src/fs/fsApi'
 
 const PORT = 4344
 const APP = `http://127.0.0.1:${PORT}`
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 
 const dir = await mkdtemp(join(tmpdir(), 'claudette-upload-'))
 const app = Fastify({ logger: false })
@@ -42,31 +41,31 @@ async function upload(name: string, body: Uint8Array | string) {
 // 1. small file round-trip
 {
   const r = await upload('small.txt', 'hello upload\n')
-  ok(r.json?.ok === true, `small file accepted (status ${r.status}, body ${JSON.stringify(r.json)})`)
+  ok(`small file accepted (status ${r.status}, body ${JSON.stringify(r.json)})`, r.json?.ok === true)
   const back = await readFile(join(dir, 'small.txt'), 'utf8').catch(() => null)
-  ok(back === 'hello upload\n', 'small file landed on disk with the right bytes')
+  ok('small file landed on disk with the right bytes', back === 'hello upload\n')
 }
 
 // 2. > Fastify's default 1 MB bodyLimit — the passthrough parser should bypass it
 {
   const big = new Uint8Array(3 * 1024 * 1024).fill(65)
   const r = await upload('big.bin', big)
-  ok(r.json?.ok === true, `3 MB file accepted — bodyLimit does NOT apply to the octet-stream parser (status ${r.status}, body ${JSON.stringify(r.json)})`)
+  ok(`3 MB file accepted — bodyLimit does NOT apply to the octet-stream parser (status ${r.status}, body ${JSON.stringify(r.json)})`, r.json?.ok === true)
   const back = await readFile(join(dir, 'big.bin')).catch(() => null)
-  ok(back?.length === big.length, `3 MB file landed whole (${back?.length ?? 0} of ${big.length} bytes)`)
+  ok(`3 MB file landed whole (${back?.length ?? 0} of ${big.length} bytes)`, back?.length === big.length)
 }
 
 // 3. collision is reported, not silently swallowed
 {
   const r = await upload('small.txt', 'second\n')
-  ok(r.json?.ok === false && /already exists/.test(r.json?.error ?? ''), `re-upload of an existing name is refused with a clear error (${JSON.stringify(r.json)})`)
+  ok(`re-upload of an existing name is refused with a clear error (${JSON.stringify(r.json)})`, r.json?.ok === false && /already exists/.test(r.json?.error ?? ''))
 }
 
 // 4. a name with path components can't traverse out of `dir`
 {
   const r = await upload('../escaped.txt', 'nope\n')
   const escaped = await readFile(join(dir, '..', 'escaped.txt'), 'utf8').catch(() => null)
-  ok(escaped === null, `basename() strips traversal — nothing written outside dir (${JSON.stringify(r.json)})`)
+  ok(`basename() strips traversal — nothing written outside dir (${JSON.stringify(r.json)})`, escaped === null)
 }
 
 // 5. THE CLIENT-SIDE BUG, simulated. FileManager's onChange used to do:
@@ -88,12 +87,12 @@ async function upload(name: string, body: Uint8Array | string) {
   const broken = makeInput()
   const captured = broken.files       // OLD: grab the live list…
   broken.value = ''                   // …then reset the input
-  ok(Array.from(captured).length === 0, `OLD order (capture live FileList, then clear) yields 0 files — the silent no-op`)
+  ok(`OLD order (capture live FileList, then clear) yields 0 files — the silent no-op`, Array.from(captured).length === 0)
 
   const fixed = makeInput()
   const picked = Array.from(fixed.files)  // NEW: snapshot to an array first…
   fixed.value = ''                        // …then reset
-  ok(picked.length === 1, `NEW order (snapshot to an array, then clear) yields ${picked.length} file — upload proceeds`)
+  ok(`NEW order (snapshot to an array, then clear) yields ${picked.length} file — upload proceeds`, picked.length === 1)
 }
 
 // 6. The batch loop must not be able to strand the "+ New" button. uploadFiles now
@@ -108,7 +107,7 @@ async function upload(name: string, body: Uint8Array | string) {
     }
   }
   await run().catch(() => {})
-  ok(uploading === null, 'a rejected upload still clears the progress state (button not left disabled)')
+  ok('a rejected upload still clears the progress state (button not left disabled)', uploading === null)
 }
 
 await app.close()

@@ -143,11 +143,8 @@ const TASK_TOOL_ID = 'tu-probe-agent-1'
 const AGENT_DESC = 'Trace the scroll path'
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-let failed = 0, passed = 0
-const ok = (tag, name, cond, extra = '') => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 const DATA = await mkdtemp(join(tmpdir(), 'scroll-data-'))
 const PROJ = await mkdtemp(join(tmpdir(), 'scroll-proj-'))
@@ -513,38 +510,34 @@ async function openInDock(file, which) {
 // ═══════════════════════════════════════════════════════════════════════════════
 console.log('\n[1] the CODE EDITOR (CodeEditor / CodeMirror)')
 // ═══════════════════════════════════════════════════════════════════════════════
-ok('setup', 'Alpha is the active session on load', await evaluate(`!!document.querySelector('aside')`))
-ok('setup', 'long.py opened in Alpha', await openInDock('long.py', 'code'))
+ok('Alpha is the active session on load', await evaluate(`!!document.querySelector('aside')`), '', 'setup')
+ok('long.py opened in Alpha', await openInDock('long.py', 'code'), '', 'setup')
 const maxScroll = await evaluate(`(() => { const el = window.__sm.codeScroller(); return el ? Math.round(el.scrollHeight - el.clientHeight) : -1 })()`)
-ok('setup', 'the editor actually scrolls, and A_OFFSET is well short of the end',
-  maxScroll > A_OFFSET * 2, `max=${maxScroll} target=${A_OFFSET}`)
+ok('the editor actually scrolls, and A_OFFSET is well short of the end', maxScroll > A_OFFSET * 2, `max=${maxScroll} target=${A_OFFSET}`, 'setup')
 await setScroll('code', A_OFFSET)
 const aSet = await settleScroll('code')
-ok('setup', 'Alpha scrolled to the target offset', Math.abs(aSet - A_OFFSET) <= 2, `at ${aSet}`)
+ok('Alpha scrolled to the target offset', Math.abs(aSet - A_OFFSET) <= 2, `at ${aSet}`, 'setup')
 
 // ── [baseline] leave to a session that never opens the file, and come back ──────
 await switchTo('Beta'); await wait(600)
 await switchTo('Alpha')
 const aBack = await settleScroll('code')
-ok('baseline', 'returning to Alpha keeps its place (passes under the OLD key too — not evidence)',
-  Math.abs(aBack - A_OFFSET) <= 3, `expected ~${A_OFFSET}, got ${aBack}`)
+ok('returning to Alpha keeps its place (passes under the OLD key too — not evidence)', Math.abs(aBack - A_OFFSET) <= 3, `expected ~${A_OFFSET}, got ${aBack}`, 'baseline')
 
 // ── [discriminating] the SAME file open in BOTH sessions at DIFFERENT offsets ───
 await switchTo('Beta')
-ok('setup', 'long.py opened in Beta as well', await openInDock('long.py', 'code'))
+ok('long.py opened in Beta as well', await openInDock('long.py', 'code'), '', 'setup')
 await setScroll('code', B_OFFSET)
 const bSet = await settleScroll('code')
-ok('setup', 'Beta scrolled to its own, different offset', Math.abs(bSet - B_OFFSET) <= 2, `at ${bSet}`)
+ok('Beta scrolled to its own, different offset', Math.abs(bSet - B_OFFSET) <= 2, `at ${bSet}`, 'setup')
 
 await switchTo('Alpha')
 const aFinal = await settleScroll('code')
-ok('discriminating', 'Alpha still at ITS offset, not Beta (the per-session key)',
-  Math.abs(aFinal - A_OFFSET) <= 3, `expected ~${A_OFFSET}, got ${aFinal}${Math.abs(aFinal - B_OFFSET) <= 3 ? '  ← this is BETA offset: the keys collided' : ''}`)
+ok('Alpha still at ITS offset, not Beta (the per-session key)', Math.abs(aFinal - A_OFFSET) <= 3, `expected ~${A_OFFSET}, got ${aFinal}${Math.abs(aFinal - B_OFFSET) <= 3 ? '  ← this is BETA offset: the keys collided' : ''}`, 'discriminating')
 
 await switchTo('Beta')
 const bFinal = await settleScroll('code')
-ok('discriminating', 'Beta still at ITS offset, not Alpha',
-  Math.abs(bFinal - B_OFFSET) <= 3, `expected ~${B_OFFSET}, got ${bFinal}${Math.abs(bFinal - A_OFFSET) <= 3 ? '  ← this is ALPHA offset: the keys collided' : ''}`)
+ok('Beta still at ITS offset, not Alpha', Math.abs(bFinal - B_OFFSET) <= 3, `expected ~${B_OFFSET}, got ${bFinal}${Math.abs(bFinal - A_OFFSET) <= 3 ? '  ← this is ALPHA offset: the keys collided' : ''}`, 'discriminating')
 
 // ═══════════════════════════════════════════════════════════════════════════════
 console.log('\n[2] the NOTEBOOK (NotebookView)')
@@ -552,24 +545,23 @@ console.log('\n[2] the NOTEBOOK (NotebookView)')
 // ═══════════════════════════════════════════════════════════════════════════════
 await switchTo('Alpha')
 const nbOpen = await openInDock('long.ipynb', 'nb')
-ok('setup', 'long.ipynb opened in Alpha', nbOpen)
+ok('long.ipynb opened in Alpha', nbOpen, '', 'setup')
 if (nbOpen) {
   const nbMax = await evaluate(`(() => { const el = window.__sm.nbScroller(); return el ? Math.round(el.scrollHeight - el.clientHeight) : -1 })()`)
-  ok('setup', 'the notebook actually scrolls', nbMax > A_OFFSET * 2, `max=${nbMax}`)
+  ok('the notebook actually scrolls', nbMax > A_OFFSET * 2, `max=${nbMax}`, 'setup')
   await setScroll('nb', A_OFFSET)
   const nbA = await settleScroll('nb')
-  ok('setup', 'Alpha notebook scrolled to the target offset', Math.abs(nbA - A_OFFSET) <= 2, `at ${nbA}`)
+  ok('Alpha notebook scrolled to the target offset', Math.abs(nbA - A_OFFSET) <= 2, `at ${nbA}`, 'setup')
 
   await switchTo('Beta')
-  ok('setup', 'long.ipynb opened in Beta as well', await openInDock('long.ipynb', 'nb'))
+  ok('long.ipynb opened in Beta as well', await openInDock('long.ipynb', 'nb'), '', 'setup')
   await setScroll('nb', B_OFFSET)
   const nbB = await settleScroll('nb')
-  ok('setup', 'Beta notebook scrolled to its own offset', Math.abs(nbB - B_OFFSET) <= 2, `at ${nbB}`)
+  ok('Beta notebook scrolled to its own offset', Math.abs(nbB - B_OFFSET) <= 2, `at ${nbB}`, 'setup')
 
   await switchTo('Alpha')
   const nbAFinal = await settleScroll('nb')
-  ok('discriminating', 'Alpha notebook still at ITS offset, not Beta',
-    Math.abs(nbAFinal - A_OFFSET) <= 3, `expected ~${A_OFFSET}, got ${nbAFinal}${Math.abs(nbAFinal - B_OFFSET) <= 3 ? '  ← BETA offset: the keys collided' : ''}`)
+  ok('Alpha notebook still at ITS offset, not Beta', Math.abs(nbAFinal - A_OFFSET) <= 3, `expected ~${A_OFFSET}, got ${nbAFinal}${Math.abs(nbAFinal - B_OFFSET) <= 3 ? '  ← BETA offset: the keys collided' : ''}`, 'discriminating')
 } else {
   console.log('  ⚠ notebook did not open — the notebook half of this probe did not run')
 }
@@ -606,10 +598,9 @@ const gitStatusShown = `document.body.textContent.includes('Changed (')`
 
 await switchTo('Alpha')
 const gitOpened = await toggleGit() && await waitFor(gitStatusShown, 25000)
-ok('setup', 'the Git dock opens on Alpha', gitOpened)
+ok('the Git dock opens on Alpha', gitOpened, '', 'setup')
 const listMax = gitOpened ? await maxScrollOf('gitList') : -1
-ok('setup', 'the changed-files list actually scrolls, and G_LIST is well short of its end',
-  listMax > G_LIST * 2, `max=${listMax} target=${G_LIST}`)
+ok('the changed-files list actually scrolls, and G_LIST is well short of its end', listMax > G_LIST * 2, `max=${listMax} target=${G_LIST}`, 'setup')
 
 // Everything below reads a container this probe has just proved it can find and measure.
 // Without this gate a missing scroller reports -1 everywhere, and `-1 !== G_LIST` renders as
@@ -617,7 +608,7 @@ ok('setup', 'the changed-files list actually scrolls, and G_LIST is well short o
 if (listMax > G_LIST * 2) {
   await setScroll('gitList', G_LIST)
   const listSet = await settleScroll('gitList')
-  ok('setup', 'the changed-files list is at the target offset', Math.abs(listSet - G_LIST) <= 2, `at ${listSet}`)
+  ok('the changed-files list is at the target offset', Math.abs(listSet - G_LIST) <= 2, `at ${listSet}`, 'setup')
 
   // [3a] The plain case: close the dock, open it again.
   await toggleGit()
@@ -625,25 +616,23 @@ if (listMax > G_LIST * 2) {
   // Assert the TEARDOWN, not just that the click landed: if the panel never unmounted, [3a]
   // would pass with no scroll memory involved at all — the DOM node would simply still be
   // there, still scrolled. This is the check that makes [3a] mean something.
-  ok('setup', 'the dock really closed, so the panel really unmounted', closed)
+  ok('the dock really closed, so the panel really unmounted', closed, '', 'setup')
   await toggleGit()
   await waitFor(`!!window.__sm.gitChangesScroller()`, 25000)
   const listBack = await settleScroll('gitList')
-  ok('core', '[3a] the changed-files list comes back where you left it',
-    Math.abs(listBack - G_LIST) <= 3, `expected ~${G_LIST}, got ${listBack}`)
+  ok('[3a] the changed-files list comes back where you left it', Math.abs(listBack - G_LIST) <= 3, `expected ~${G_LIST}, got ${listBack}`, 'core')
 
   // [3b]/[3c] The diff pane. Its subject is the specific patch, so the patch is in the key.
   const picked = await evaluate(`window.__sm.gitClickFile('big.txt')`)
-  ok('setup', 'big.txt is selectable in the changed-files list', picked)
+  ok('big.txt is selectable in the changed-files list', picked, '', 'setup')
   const diffUp = picked && await waitFor(`!!window.__sm.gitDiffScroller()`, 25000)
   const diffMax = diffUp ? await maxScrollOf('gitDiff') : -1
-  ok('setup', "big.txt's diff actually scrolls, and G_DIFF is well short of its end",
-    diffMax > G_DIFF * 2, `max=${diffMax} target=${G_DIFF}`)
+  ok("big.txt's diff actually scrolls, and G_DIFF is well short of its end", diffMax > G_DIFF * 2, `max=${diffMax} target=${G_DIFF}`, 'setup')
 
   if (diffMax > G_DIFF * 2) {
     await setScroll('gitDiff', G_DIFF)
     const diffSet = await settleScroll('gitDiff')
-    ok('setup', "big.txt's diff is at the target offset", Math.abs(diffSet - G_DIFF) <= 2, `at ${diffSet}`)
+    ok("big.txt's diff is at the target offset", Math.abs(diffSet - G_DIFF) <= 2, `at ${diffSet}`, 'setup')
 
     // [3c] Two patches, one container, NO unmount — the case that isolates the subject half
     // of the key. With `git:${cwd}:diff` alone the key never changes as you switch files, so
@@ -651,16 +640,14 @@ if (listMax > G_LIST * 2) {
     // had, and coming back to big.txt lands on big2.txt's offset.
     await evaluate(`window.__sm.gitClickFile('big2.txt')`)
     const bUp = await waitFor(`document.body.textContent.includes('big2 REWRITTEN')`, 25000)
-    ok('setup', "big2.txt's diff is showing", bUp)
+    ok("big2.txt's diff is showing", bUp, '', 'setup')
     await setScroll('gitDiff', G_DIFF_B)
     const bSet = await settleScroll('gitDiff')
-    ok('setup', "big2.txt's diff is at its own offset", Math.abs(bSet - G_DIFF_B) <= 2, `at ${bSet}`)
+    ok("big2.txt's diff is at its own offset", Math.abs(bSet - G_DIFF_B) <= 2, `at ${bSet}`, 'setup')
     await evaluate(`window.__sm.gitClickFile('big.txt')`)
     await waitFor(`!document.body.textContent.includes('big2 REWRITTEN')`, 25000)
     const aBack = await settleScroll('gitDiff')
-    ok('discriminating', "[3c] each file's diff keeps its own place in the shared pane",
-      Math.abs(aBack - G_DIFF) <= 3,
-      `expected ~${G_DIFF}, got ${aBack}${Math.abs(aBack - G_DIFF_B) <= 3 ? '  ← this is BIG2 offset: the patch is not in the key' : ''}`)
+    ok("[3c] each file's diff keeps its own place in the shared pane", Math.abs(aBack - G_DIFF) <= 3, `expected ~${G_DIFF}, got ${aBack}${Math.abs(aBack - G_DIFF_B) <= 3 ? '  ← this is BIG2 offset: the patch is not in the key' : ''}`, 'discriminating')
   } else {
     console.log('  ⚠ the diff pane never scrolled — [3c] did not run')
   }
@@ -672,19 +659,16 @@ if (listMax > G_LIST * 2) {
   await switchTo('Gamma')
   await waitFor(`!!window.__sm.gitChangesScroller()`, 25000)
   const gMax = await maxScrollOf('gitList')
-  ok('setup', "Gamma's own change list also scrolls, so 'at the top' is not trivially true",
-    gMax > G_LIST * 2, `max=${gMax}`)
+  ok("Gamma's own change list also scrolls, so 'at the top' is not trivially true", gMax > G_LIST * 2, `max=${gMax}`, 'setup')
   const gList = await settleScroll('gitList')
-  ok('discriminating', "[3d] a second repo's panel starts at the top, not at Alpha's offset",
-    gList <= 3, `expected ~0, got ${gList}${Math.abs(gList - G_LIST) <= 3 ? '  ← this is ALPHA offset: cwd is not in the key' : ''}`)
+  ok("[3d] a second repo's panel starts at the top, not at Alpha's offset", gList <= 3, `expected ~0, got ${gList}${Math.abs(gList - G_LIST) <= 3 ? '  ← this is ALPHA offset: cwd is not in the key' : ''}`, 'discriminating')
 
   // [3e] Back to Alpha (remount, must restore), then Alpha → Beta, which share a cwd and so
   // share the mounted panel. Nothing should move at all.
   await switchTo('Alpha')
   await waitFor(`!!window.__sm.gitChangesScroller()`, 25000)
   const aList = await settleScroll('gitList')
-  ok('core', '[3b] the list survives a round-trip through another repo',
-    Math.abs(aList - G_LIST) <= 3, `expected ~${G_LIST}, got ${aList}`)
+  ok('[3b] the list survives a round-trip through another repo', Math.abs(aList - G_LIST) <= 3, `expected ~${G_LIST}, got ${aList}`, 'core')
   await switchTo('Beta')
   const betaList = await settleScroll('gitList')
   // Compared against the offset OBSERVED a moment ago, not against G_LIST. This asks one
@@ -693,9 +677,7 @@ if (listMax > G_LIST * 2) {
   // before the switch, and this went red anyway saying "the key is session-scoped" — a confident
   // wrong diagnosis of a break that was not present. Triage-masking, same shape as H3/H5 in
   // refresh-survival-check. Against `aList` it can only ever red for its own reason.
-  ok('discriminating', '[3e] switching to a session that SHARES the cwd does not move the panel',
-    Math.abs(betaList - aList) <= 3,
-    `expected it to stay at ${aList}, got ${betaList}`)
+  ok('[3e] switching to a session that SHARES the cwd does not move the panel', Math.abs(betaList - aList) <= 3, `expected it to stay at ${aList}, got ${betaList}`, 'discriminating')
 
   // [3g] ★ THE CHECK THAT ACTUALLY DECIDES THE KEY. [3e] above does NOT — MEASURED: mutating the
   // key to `git:${sessionId}:…` and threading the active session in left the whole section at
@@ -710,12 +692,10 @@ if (listMax > G_LIST * 2) {
   //   wiring. Do not count it as coverage that scroll memory works; [3a]/[3b]/[3f] are that.
   await setScroll('gitList', G_LIST_B)
   const betaSet = await settleScroll('gitList')
-  ok('setup', 'Beta moves the shared panel to a different offset', Math.abs(betaSet - G_LIST_B) <= 2, `at ${betaSet}`)
+  ok('Beta moves the shared panel to a different offset', Math.abs(betaSet - G_LIST_B) <= 2, `at ${betaSet}`, 'setup')
   await switchTo('Alpha')
   const alphaAfter = await settleScroll('gitList')
-  ok('discriminating', '[3g] one panel, one position: it stays where Beta left it',
-    Math.abs(alphaAfter - G_LIST_B) <= 3,
-    `expected ~${G_LIST_B}, got ${alphaAfter}${Math.abs(alphaAfter - G_LIST) <= 3 ? '  \u2190 this is ALPHA\'s earlier offset: the key is session-scoped' : ''}`)
+  ok('[3g] one panel, one position: it stays where Beta left it', Math.abs(alphaAfter - G_LIST_B) <= 3, `expected ~${G_LIST_B}, got ${alphaAfter}${Math.abs(alphaAfter - G_LIST) <= 3 ? '  \u2190 this is ALPHA\'s earlier offset: the key is session-scoped' : ''}`, 'discriminating')
 
   // [3f] The Log tab. Its container and the Changes container are mutually exclusive, and
   // each is a NEW DOM node every time its tab is selected. This is the case that pins passing
@@ -723,20 +703,18 @@ if (listMax > G_LIST * 2) {
   // re-run on the tab switch, so it stays attached to the discarded node and the fresh one
   // opens at the top.
   const logUp = await evaluate(`window.__sm.clickExact('log')`) && await waitFor(`!!window.__sm.gitLogScroller()`, 25000)
-  ok('setup', 'the Log tab shows a commit list', logUp)
+  ok('the Log tab shows a commit list', logUp, '', 'setup')
   const logMax = logUp ? await maxScrollOf('gitLog') : -1
-  ok('setup', 'the commit list actually scrolls, and G_LOG is well short of its end',
-    logMax > G_LOG * 2, `max=${logMax} target=${G_LOG}`)
+  ok('the commit list actually scrolls, and G_LOG is well short of its end', logMax > G_LOG * 2, `max=${logMax} target=${G_LOG}`, 'setup')
   if (logMax > G_LOG * 2) {
     await setScroll('gitLog', G_LOG)
     const logSet = await settleScroll('gitLog')
-    ok('setup', 'the commit list is at the target offset', Math.abs(logSet - G_LOG) <= 2, `at ${logSet}`)
+    ok('the commit list is at the target offset', Math.abs(logSet - G_LOG) <= 2, `at ${logSet}`, 'setup')
     await evaluate(`window.__sm.clickExact('changes')`); await wait(700)
     await evaluate(`window.__sm.clickExact('log')`)
     await waitFor(`!!window.__sm.gitLogScroller()`, 25000)
     const logBack = await settleScroll('gitLog')
-    ok('core', '[3f] the commit list survives a Changes/Log tab round-trip',
-      Math.abs(logBack - G_LOG) <= 3, `expected ~${G_LOG}, got ${logBack}`)
+    ok('[3f] the commit list survives a Changes/Log tab round-trip', Math.abs(logBack - G_LOG) <= 3, `expected ~${G_LOG}, got ${logBack}`, 'core')
   } else {
     console.log('  ⚠ the commit list never scrolled — [3f] did not run')
   }
@@ -770,26 +748,24 @@ await switchTo('Alpha')
 
 await writeFile(GO.a, 'go')
 const badgeUp = await waitFor(`!!window.__sm.agentBadge('Alpha')`, 40000)
-ok('setup', "the subagent reaches Alpha's sidebar", badgeUp)
+ok("the subagent reaches Alpha's sidebar", badgeUp, '', 'setup')
 
 if (!badgeUp) {
   console.log('  ⚠ no subagent ever appeared — section [4] did not run')
 } else {
   await evaluate(`window.__sm.agentBadge('Alpha').click()`); await wait(500)
   const lineUp = await waitFor(`!!window.__sm.agentLine('Alpha')`, 15000)
-  ok('setup', "Alpha's agent is listed under its session row", lineUp)
+  ok("Alpha's agent is listed under its session row", lineUp, '', 'setup')
   if (lineUp) await evaluate(`window.__sm.agentLine('Alpha').click()`)
   const agUp = lineUp && await waitFor(`!!window.__sm.agentScroller()`, 25000)
-  ok('setup', "the agent's thought process opens as a content tab", agUp)
+  ok("the agent's thought process opens as a content tab", agUp, '', 'setup')
   // Alpha and Beta hold an agent with an IDENTICAL id. Reading the session back off the
   // view's own header is what stops the rest of this section from measuring Beta's pane and
   // reporting it as Alpha's.
   const inSession = agUp ? await evaluate(`window.__sm.agentInSession()`) : null
-  ok('setup', "…and it is ALPHA's agent, not another session's with the same id",
-    inSession === 'Alpha', `the view's header says "in ${inSession}"`)
+  ok("…and it is ALPHA's agent, not another session's with the same id", inSession === 'Alpha', `the view's header says "in ${inSession}"`, 'setup')
   const agMax = agUp ? await maxScrollOf('agent') : -1
-  ok('setup', 'the agent detail actually scrolls, and A_AGENT is well short of the end',
-    agMax > A_AGENT * 2, `max=${agMax} target=${A_AGENT}`)
+  ok('the agent detail actually scrolls, and A_AGENT is well short of the end', agMax > A_AGENT * 2, `max=${agMax} target=${A_AGENT}`, 'setup')
 
   // Everything below reads a pane this probe has just proved it can find, identify and
   // measure. Without the gate a missing pane reports -1 everywhere and renders as a row of
@@ -799,29 +775,25 @@ if (!badgeUp) {
   } else {
     await setScroll('agent', A_AGENT)
     const agSet = await settleScroll('agent')
-    ok('setup', 'the agent detail is at the target offset', Math.abs(agSet - A_AGENT) <= 2, `at ${agSet}`)
+    ok('the agent detail is at the target offset', Math.abs(agSet - A_AGENT) <= 2, `at ${agSet}`, 'setup')
     // ★ The reader must be OUT of the 80px bottom-pin zone. Parked at the bottom, the follow
     //   effect puts them back at the end by itself on every remount — [4a] would then be green
     //   with the scroll memory removed entirely, passing for a reason that has nothing to do
     //   with what it claims to test.
-    ok('setup', 'the target sits outside the 80px pin zone, so a pass cannot come from the follow effect',
-      agMax - A_AGENT > 80, `max=${agMax} target=${A_AGENT} gap=${agMax - A_AGENT}`)
+    ok('the target sits outside the 80px pin zone, so a pass cannot come from the follow effect', agMax - A_AGENT > 80, `max=${agMax} target=${A_AGENT} gap=${agMax - A_AGENT}`, 'setup')
 
     // ── [4a] select the Chat tab and come back ────────────────────────────────────────
     await evaluate(`window.__sm.clickExact('Chat')`); await wait(700)
     // Assert the TEARDOWN, not just that the click landed: if the pane never unmounted the DOM
     // node would still be there, still scrolled, and [4a] would pass with no scroll memory
     // involved at all. This is the check that makes [4a] mean something.
-    ok('setup', 'the detail view really unmounted, so the round-trip means something',
-      !await evaluate(`!!window.__sm.agentScroller()`))
-    ok('setup', "the agent's tab is re-selectable from the tab strip",
-      await evaluate(`window.__sm.agentTab(${JSON.stringify(AGENT_DESC)})`))
+    ok('the detail view really unmounted, so the round-trip means something', !await evaluate(`!!window.__sm.agentScroller()`), '', 'setup')
+    ok("the agent's tab is re-selectable from the tab strip", await evaluate(`window.__sm.agentTab(${JSON.stringify(AGENT_DESC)})`), '', 'setup')
     await waitFor(`!!window.__sm.agentScroller()`, 25000)
     const agBack = await settleScroll('agent')
     // Kept, because [4b]'s diagnosis below is only meaningful if the wiring works at all.
     const restoreWorks = Math.abs(agBack - A_AGENT) <= 3
-    ok('core', '[4a] the agent detail comes back where you left it after a tab round-trip',
-      restoreWorks, `expected ~${A_AGENT}, got ${agBack}`)
+    ok('[4a] the agent detail comes back where you left it after a tab round-trip', restoreWorks, `expected ~${A_AGENT}, got ${agBack}`, 'core')
 
     // ── [4b] the same agent id, in two sessions ───────────────────────────────────────
     // Both stubs emitted the same Task tool id, so agentKey() is identical in Alpha and Beta.
@@ -839,18 +811,18 @@ if (!badgeUp) {
     //   only when the two sessions' agents have different ids.)
     await switchTo('Beta')
     const bBadge = await waitFor(`!!window.__sm.agentBadge('Beta')`, 40000)
-    ok('setup', 'Beta holds an agent with the same id', bBadge)
+    ok('Beta holds an agent with the same id', bBadge, '', 'setup')
     if (bBadge) {
       await evaluate(`window.__sm.agentBadge('Beta').click()`); await wait(500)
       if (await waitFor(`!!window.__sm.agentLine('Beta')`, 15000)) await evaluate(`window.__sm.agentLine('Beta').click()`)
     }
     const bUp = bBadge && await waitFor(`!!window.__sm.agentScroller()`, 25000)
     const bIn = bUp ? await evaluate(`window.__sm.agentInSession()`) : null
-    ok('setup', "Beta's own view of that agent is open", bUp && bIn === 'Beta', `header says "in ${bIn}"`)
+    ok("Beta's own view of that agent is open", bUp && bIn === 'Beta', `header says "in ${bIn}"`, 'setup')
     if (bUp && bIn === 'Beta') {
       await setScroll('agent', B_AGENT)
       const bSet2 = await settleScroll('agent')
-      ok('setup', 'Beta scrolled its view to a different offset', Math.abs(bSet2 - B_AGENT) <= 2, `at ${bSet2}`)
+      ok('Beta scrolled its view to a different offset', Math.abs(bSet2 - B_AGENT) <= 2, `at ${bSet2}`, 'setup')
       await switchTo('Alpha')
       await waitFor(`!!window.__sm.agentScroller()`, 25000)
       const aFinal2 = await settleScroll('agent')
@@ -859,11 +831,9 @@ if (!badgeUp) {
       // break that was not present, the same triage-masking that [3e] was fixed for. A landed
       // Beta offset means the key collided only if the wiring is otherwise working.
       const isBeta = Math.abs(aFinal2 - B_AGENT) <= 3
-      ok('discriminating', "[4b] Alpha's view of that agent keeps ITS offset, not Beta's",
-        Math.abs(aFinal2 - A_AGENT) <= 3,
-        `expected ~${A_AGENT}, got ${aFinal2}` + (!isBeta ? '' : restoreWorks
+      ok("[4b] Alpha's view of that agent keeps ITS offset, not Beta's", Math.abs(aFinal2 - A_AGENT) <= 3, `expected ~${A_AGENT}, got ${aFinal2}` + (!isBeta ? '' : restoreWorks
           ? '  ← this is BETA offset: the key is not session-scoped'
-          : '  ← this is BETA offset, but [4a] failed too: the wiring is gone, not the key'))
+          : '  ← this is BETA offset, but [4a] failed too: the wiring is gone, not the key'), 'discriminating')
     } else {
       console.log('  ⚠ Beta never opened its own view of the agent — [4b] did not run')
     }
@@ -891,24 +861,21 @@ if (!badgeUp) {
     await waitFor(`!!window.__sm.agentScroller()`, 25000)
     await setScroll('agent', 0)
     const topSet = await settleScroll('agent')
-    ok('setup', 'the agent detail is parked at the very top', topSet <= 1, `at ${topSet}`)
+    ok('the agent detail is parked at the very top', topSet <= 1, `at ${topSet}`, 'setup')
     const stepsBefore = await evaluate(`window.__sm.agentSteps()`)
     await evaluate(`window.__sm.clickExact('Chat')`); await wait(700)
-    ok('setup', 'the detail view unmounted with the reader at the top',
-      !await evaluate(`!!window.__sm.agentScroller()`))
+    ok('the detail view unmounted with the reader at the top', !await evaluate(`!!window.__sm.agentScroller()`), '', 'setup')
     await evaluate(`window.__sm.agentTab(${JSON.stringify(AGENT_DESC)})`)
     await waitFor(`!!window.__sm.agentScroller()`, 25000)
     await writeFile(GO.b, 'go')
     const grew = await waitFor(`window.__sm.agentSteps() > ${stepsBefore}`, 40000)
     // Without this the whole case is vacuous: if no new activity arrives, "still at the top"
     // is true because nothing happened, and [4c] would be green on a broken pin.
-    ok('setup', "more of the agent's activity arrived after the remount", grew, `steps before=${stepsBefore}`)
+    ok("more of the agent's activity arrived after the remount", grew, `steps before=${stepsBefore}`, 'setup')
     if (grew) {
       const afterTop = await settleScroll('agent')
       const maxNow = await maxScrollOf('agent')
-      ok('core', '[4c] a reader parked at the top is not thrown to the end by new activity',
-        afterTop <= 3,
-        `expected ~0, got ${afterTop}${afterTop >= maxNow - 5 ? '  ← this is the END: the pin was re-asserted as true on remount' : ''}`)
+      ok('[4c] a reader parked at the top is not thrown to the end by new activity', afterTop <= 3, `expected ~0, got ${afterTop}${afterTop >= maxNow - 5 ? '  ← this is the END: the pin was re-asserted as true on remount' : ''}`, 'core')
     } else {
       console.log('  ⚠ no new agent activity arrived — [4c] did not run')
     }
@@ -940,26 +907,22 @@ if (!badgeUp) {
     await setScroll('agent', 999999)
     const botSet = await settleScroll('agent')
     const maxBefore = await maxScrollOf('agent')
-    ok('setup', 'the agent detail is parked at the bottom, so the reader is following',
-      Math.abs(botSet - maxBefore) <= 3, `at ${botSet} of ${maxBefore}`)
+    ok('the agent detail is parked at the bottom, so the reader is following', Math.abs(botSet - maxBefore) <= 3, `at ${botSet} of ${maxBefore}`, 'setup')
     const steps2 = await evaluate(`window.__sm.agentSteps()`)
     await evaluate(`window.__sm.clickExact('Chat')`); await wait(700)
-    ok('setup', 'the detail view unmounted with the reader pinned to the bottom',
-      !await evaluate(`!!window.__sm.agentScroller()`))
+    ok('the detail view unmounted with the reader pinned to the bottom', !await evaluate(`!!window.__sm.agentScroller()`), '', 'setup')
     // The growth happens HERE, with the view unmounted — that is the whole point of the case.
     await writeFile(GO.c, 'go')
     await wait(3000)
     await evaluate(`window.__sm.agentTab(${JSON.stringify(AGENT_DESC)})`)
     await waitFor(`!!window.__sm.agentScroller()`, 25000)
     const steps3 = await evaluate(`window.__sm.agentSteps()`)
-    ok('setup', 'the transcript grew while the tab was closed', steps3 > steps2, `${steps2} → ${steps3}`)
+    ok('the transcript grew while the tab was closed', steps3 > steps2, `${steps2} → ${steps3}`, 'setup')
     if (steps3 > steps2) {
       const afterBottom = await settleScroll('agent')
       const maxAfter = await maxScrollOf('agent')
-      ok('discriminating', '[4d] a pinned reader whose transcript grew while away is carried to the NEW end',
-        Math.abs(afterBottom - maxAfter) <= 6,
-        `remembered=${maxBefore} new end=${maxAfter} landed=${afterBottom}` +
-        `${Math.abs(afterBottom - maxBefore) <= 6 ? '  ← the RESTORE won: parked at the OLD end, no longer following' : ''}`)
+      ok('[4d] a pinned reader whose transcript grew while away is carried to the NEW end', Math.abs(afterBottom - maxAfter) <= 6, `remembered=${maxBefore} new end=${maxAfter} landed=${afterBottom}` +
+        `${Math.abs(afterBottom - maxBefore) <= 6 ? '  ← the RESTORE won: parked at the OLD end, no longer following' : ''}`, 'discriminating')
     } else {
       console.log('  ⚠ the transcript did not grow while unmounted — [4d] did not run')
     }

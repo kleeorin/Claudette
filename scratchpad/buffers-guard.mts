@@ -55,11 +55,8 @@
 //   behaviour, and that this file is wired to the REAL module is proven by its green run.
 import { peekBuffer, setBuffer, clearBuffers } from '../web/src/lib/buffers'
 
-let passed = 0, failed = 0
-const ok = (tag: string, name: string, cond: boolean, extra = ''): void => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 const P = '/proj/notes.md'
 const DISK_A = '# Notes\n\nfirst version on disk\n'
@@ -72,32 +69,26 @@ clearBuffers()
 // causes. If this ever goes red the feature is gone entirely, and [3]/[4] below would then
 // be passing for the wrong reason — a buffer that is never stored also never shadows.
 setBuffer(P, EDITED, DISK_A)
-ok('core', '[1] an unsaved edit is restored while disk is unchanged',
-  peekBuffer(P, DISK_A) === EDITED, `got ${JSON.stringify(String(peekBuffer(P, DISK_A)).slice(0, 30))}`)
+ok('[1] an unsaved edit is restored while disk is unchanged', peekBuffer(P, DISK_A) === EDITED, `got ${JSON.stringify(String(peekBuffer(P, DISK_A)).slice(0, 30))}`, 'core')
 
 // [2] Nothing held for a path nobody edited.
-ok('core', '[2] a path with no buffer restores nothing',
-  peekBuffer('/proj/untouched.txt', DISK_A) === undefined)
+ok('[2] a path with no buffer restores nothing', peekBuffer('/proj/untouched.txt', DISK_A) === undefined, '', 'core')
 
 // [3] ★ THE FIX. Disk moved underneath the edit; the buffer must NOT be handed back.
 const shadowed = peekBuffer(P, DISK_B)
-ok('core', '[3] a buffer does NOT shadow a file that changed on disk',
-  shadowed === undefined,
-  shadowed === EDITED ? '← the stale edit was restored on top of new disk content: this is the reported bug' : '')
+ok('[3] a buffer does NOT shadow a file that changed on disk', shadowed === undefined, shadowed === EDITED ? '← the stale edit was restored on top of new disk content: this is the reported bug' : '', 'core')
 
 // [4] ★ …and the entry is DROPPED, not merely skipped. This is the check that separates the
 // two implementations that both pass [3]: one that only COMPARES leaves the entry in place,
 // so if disk ever returns to its old bytes — a git checkout back, an undo, a revert — the
 // stale buffer springs back to life long after the user stopped thinking about it.
-ok('core', '[4] …and the stale entry is dropped, so it cannot come back if disk returns',
-  peekBuffer(P, DISK_A) === undefined,
-  peekBuffer(P, DISK_A) === EDITED ? '← still held: peekBuffer compared but did not delete' : '')
+ok('[4] …and the stale entry is dropped, so it cannot come back if disk returns', peekBuffer(P, DISK_A) === undefined, peekBuffer(P, DISK_A) === EDITED ? '← still held: peekBuffer compared but did not delete' : '', 'core')
 
 // [5] The explicit drop (save, or typing back to the saved text).
 clearBuffers()
 setBuffer(P, EDITED, DISK_A)
 setBuffer(P, null)
-ok('core', '[5] setBuffer(path, null) drops the buffer', peekBuffer(P, DISK_A) === undefined)
+ok('[5] setBuffer(path, null) drops the buffer', peekBuffer(P, DISK_A) === undefined, '', 'core')
 
 // [6] The MARKDOWN case end to end, which is how the operator actually met this. Opening the
 // file normalizes it, so a buffer is stored with NO user edit; the same file opened again
@@ -106,10 +97,8 @@ clearBuffers()
 const NORMALIZED = '# Notes\n\nfirst version on disk\n'   // Milkdown's emit differs from the bytes
 const RAW = '#   Notes\n\nfirst version on disk'          // …because the file was not in normal form
 setBuffer(P, NORMALIZED, RAW)                             // stored by merely opening it
-ok('core', '[6a] opening a .md file out of normal form does hold a buffer (the trigger)',
-  peekBuffer(P, RAW) === NORMALIZED)
-ok('core', '[6b] …and that no-op buffer still cannot shadow a file that changed since',
-  peekBuffer(P, DISK_B) === undefined)
+ok('[6a] opening a .md file out of normal form does hold a buffer (the trigger)', peekBuffer(P, RAW) === NORMALIZED, '', 'core')
+ok('[6b] …and that no-op buffer still cannot shadow a file that changed since', peekBuffer(P, DISK_B) === undefined, '', 'core')
 
 // ── [7] WAS HERE, AND WAS DELETED WHEN THE TRAP IT DOCUMENTED WAS REMOVED ───────────
 // It pinned `setBuffer(path, text, base = '')`: the default baseline could never match a
@@ -125,8 +114,7 @@ ok('core', '[6b] …and that no-op buffer still cannot shadow a file that change
 // an assertion that it works is load-bearing for the file rather than a courtesy.
 setBuffer('/a', 'x', 'ax'); setBuffer('/b', 'y', 'by')
 clearBuffers()
-ok('core', '[8] clearBuffers drops every path',
-  peekBuffer('/a', 'ax') === undefined && peekBuffer('/b', 'by') === undefined)
+ok('[8] clearBuffers drops every path', peekBuffer('/a', 'ax') === undefined && peekBuffer('/b', 'by') === undefined, '', 'core')
 
 console.log(`\n${passed} passed / ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)

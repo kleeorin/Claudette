@@ -7,8 +7,7 @@ import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts
 import { KernelManager } from '../server/src/jupyter/kernelManager.ts'
 import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 const streamText = (cell: any) =>
   (cell.outputs ?? []).filter((o: any) => o.output_type === 'stream').map((o: any) => o.text).join('')
 
@@ -39,27 +38,27 @@ console.log('starting jupyter + kernel (may take a few seconds)…')
 await kernels.runCell(nb, a)
 await kernels.runCell(nb, b)
 
-ok(doc.kernelId != null, 'kernel bound to notebook')
-ok(streamText(doc.cells.find((c) => c.id === a)).trim() === 'A', 'cell A output = "A"')
-ok(streamText(doc.cells.find((c) => c.id === b)).trim() === 'B', 'cell B output = "B"')
-ok(doc.cells.find((c) => c.id === a)!.executionCount != null, 'cell A got an execution_count')
+ok('kernel bound to notebook', doc.kernelId != null)
+ok('cell A output = "A"', streamText(doc.cells.find((c) => c.id === a)).trim() === 'A')
+ok('cell B output = "B"', streamText(doc.cells.find((c) => c.id === b)).trim() === 'B')
+ok('cell A got an execution_count', doc.cells.find((c) => c.id === a)!.executionCount != null)
 
 // THE KEY TEST: reorder (B to front), then re-run A. Outputs must track cellId,
 // not position — B keeps "B", A re-runs to "A".
 docs.applyOp({ op: 'moveCell', notebookId: nb, cellId: b, toIndex: 0 })
-ok(doc.cells[0].id === b, 'reordered: B now at index 0')
+ok('reordered: B now at index 0', doc.cells[0].id === b)
 await kernels.runCell(nb, a)
-ok(streamText(doc.cells.find((c) => c.id === b)).trim() === 'B', 'after reorder, B still has "B"')
-ok(streamText(doc.cells.find((c) => c.id === a)).trim() === 'A', 'after reorder, A still has "A" (routed by cellId)')
+ok('after reorder, B still has "B"', streamText(doc.cells.find((c) => c.id === b)).trim() === 'B')
+ok('after reorder, A still has "A" (routed by cellId)', streamText(doc.cells.find((c) => c.id === a)).trim() === 'A')
 
 // error output path
 docs.applyOp({ op: 'editCell', notebookId: nb, cellId: a, source: 'raise ValueError("boom")' })
 await kernels.runCell(nb, a)
 const errs = (doc.cells.find((c) => c.id === a)!.outputs ?? []).filter((o: any) => o.output_type === 'error')
-ok(errs.length === 1 && (errs[0] as any).ename === 'ValueError', 'error output captured (ename=ValueError)')
+ok('error output captured (ename=ValueError)', errs.length === 1 && (errs[0] as any).ename === 'ValueError')
 
 // editCell cleared the old outputs before the error run
-ok(streamText(doc.cells.find((c) => c.id === a)) === '', 'edit cleared prior stream output before error run')
+ok('edit cleared prior stream output before error run', streamText(doc.cells.find((c) => c.id === a)) === '')
 
 kernels.destroy()
 console.log(failed === 0 ? '\n🎉 all passed' : `\n💥 ${failed} failed`)

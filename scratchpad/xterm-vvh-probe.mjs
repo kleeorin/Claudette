@@ -47,19 +47,13 @@ const SAVED_TERM_H = 600
 const SAVED_STACK_H = 400
 const PORTRAIT_KB = 508   // 844 - a ~336px iOS keyboard (the ask-card-height-probe allowance)
 const wait = (ms) => new Promise(r => setTimeout(r, ms))
-let failed = 0, passed = 0, open_ = 0
+import { withMarks, passed, failed, open as open_ } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 // Three tags. [today] must pass now; [fix] is what this slice delivers. [open] is a defect
 // this probe MEASURED but deliberately did not fix — it reports with a ⚠️ and does NOT fail
 // the run, so the suite stays green while the finding stays in the output with its numbers.
 // The alternative (registering another EXPECTED-RED harness, as layout-check is) hands the
 // suite a red that everyone learns to skip past, which is how a real failure gets buried.
-const ok = (tag, name, cond, extra = '') => {
-  if (cond) passed++
-  else if (tag === 'open') open_++
-  else failed++
-  const mark = cond ? '✅' : tag === 'open' ? '⚠️ ' : '❌'
-  console.log(`  ${mark} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
 if (!process.env.CHROME_BIN) { console.error('SKIP: CHROME_BIN unset'); process.exit(0) }
 
 const DATA = await mkdtemp(join(tmpdir(), 'xvvh-data-'))
@@ -144,12 +138,11 @@ const clicked = await ev(`(() => { const b = [...document.querySelectorAll('butt
 // (all five were observed 'ok'/true on every run, and the demo.py one was caught needing
 // dblclick rather than click); these checks exist so DRIFT names itself.
 console.log('Terminal toolbar button:', clicked)
-ok('today', 'PRECONDITION: a <button> labelled "Terminal" exists, is enabled, and was clicked',
-   clicked === 'ok', `lookup returned: ${clicked}`)
+ok('PRECONDITION: a <button> labelled "Terminal" exists, is enabled, and was clicked', clicked === 'ok', `lookup returned: ${clicked}`, 'today')
 let hasXterm = false
 for (let i = 0; i < 60; i++) { hasXterm = await ev(`!!document.querySelector('.xterm-rows')`); if (hasXterm) break; await wait(400) }
 console.log('xterm painted:', hasXterm)
-ok('today', 'PRECONDITION: xterm painted a .xterm-rows element', hasXterm)
+ok('PRECONDITION: xterm painted a .xterm-rows element', hasXterm, '', 'today')
 await wait(1500)
 
 // The dock is the nearest ancestor of the xterm carrying an inline height — App.tsx renders
@@ -213,7 +206,7 @@ const TABLET_W = 900
 // checks went GREEN while measuring nothing.
 const guard = (m, tag, name) => {
   if (m && !m.err && m.dockH !== null && m.dockH !== undefined) return true
-  ok(tag, name, false, `lookup failed: ${m ? (m.err || 'dockH is ' + m.dockH) : 'no measurement'}`)
+  ok(name, false, `lookup failed: ${m ? (m.err || 'dockH is ' + m.dockH) : 'no measurement'}`, tag)
   return false
 }
 
@@ -227,26 +220,19 @@ const kb = await ev(MEASURE)
 console.log('  keyboard up  (--vvh 508):', JSON.stringify(kb))
 console.log('')
 
-ok('today', 'the terminal actually mounted and fitted', !rest.err && rest.rowCount > 0,
-   `${rest.rowCount} rows`)
+ok('the terminal actually mounted and fitted', !rest.err && rest.rowCount > 0, `${rest.rowCount} rows`, 'today')
 if (guard(rest, 'today', 'PHONE: the dock pane was located by its test hook') &&
     guard(kb, 'today', 'PHONE: the dock pane is still located with the keyboard up')) {
-  ok('today', 'PHONE: the layout really is in phone mode (data-phone)', rest.phoneLayout === true,
-     `data-phone=${rest.phoneLayout}`)
+  ok('PHONE: the layout really is in phone mode (data-phone)', rest.phoneLayout === true, `data-phone=${rest.phoneLayout}`, 'today')
   // THE PHONE INVARIANT, and it is the opposite of the desktop one. Slice 2B makes the dock the
   // single pane and sizes it with flex, so an inline pixel height here would be the DEFECT — it
   // is what would pin the dock to a dragged desktop size the pane layout cannot override.
-  ok('fix', 'PHONE: the dock is flex-sized, carrying NO inline height',
-     !rest.dockInlineH, `inline height: ${rest.dockInlineH || '(none)'}`)
+  ok('PHONE: the dock is flex-sized, carrying NO inline height', !rest.dockInlineH, `inline height: ${rest.dockInlineH || '(none)'}`, 'fix')
   // …and what replaces the --vvh arithmetic is a structural fact: flex inside #root, which IS
   // var(--vvh). So the property to assert is the OUTCOME the bound existed to produce.
-  ok('fix', 'PHONE: the dock never extends below the shell, at rest or with the keyboard up',
-     rest.clippedPx === 0 && kb.clippedPx === 0,
-     `clipped ${rest.clippedPx}px at rest, ${kb.clippedPx}px with the keyboard up (dock ends ${kb.dockBottom}, #root ends ${kb.rootH})`)
-  ok('fix', 'PHONE: the dock tracks --vvh through flex (it shrinks with the visible viewport)',
-     kb.dockH < rest.dockH && kb.dockH > 0, `dock ${rest.dockH}px → ${kb.dockH}px`)
-  ok('fix', 'PHONE: xterm RE-FITS when --vvh changes: fewer rows with the keyboard up',
-     kb.rowCount < rest.rowCount, `rows ${rest.rowCount} → ${kb.rowCount}`)
+  ok('PHONE: the dock never extends below the shell, at rest or with the keyboard up', rest.clippedPx === 0 && kb.clippedPx === 0, `clipped ${rest.clippedPx}px at rest, ${kb.clippedPx}px with the keyboard up (dock ends ${kb.dockBottom}, #root ends ${kb.rootH})`, 'fix')
+  ok('PHONE: the dock tracks --vvh through flex (it shrinks with the visible viewport)', kb.dockH < rest.dockH && kb.dockH > 0, `dock ${rest.dockH}px → ${kb.dockH}px`, 'fix')
+  ok('PHONE: xterm RE-FITS when --vvh changes: fewer rows with the keyboard up', kb.rowCount < rest.rowCount, `rows ${rest.rowCount} → ${kb.rowCount}`, 'fix')
 }
 
 // ══ >= md LAYOUT (900x844) ═════════════════════════════════════════════════════════════
@@ -264,18 +250,12 @@ console.log('')
 
 if (guard(mdRest, 'today', '>=md: the dock pane was located') &&
     guard(mdKb, 'today', '>=md: the dock pane is still located with the keyboard up')) {
-  ok('today', '>=md: the layout really is in desktop mode (data-phone)', mdRest.phoneLayout === false,
-     `data-phone=${mdRest.phoneLayout}`)
-  ok('fix', '>=md: the dock height is expressed against --vvh, not as a raw pixel value',
-     /--vvh/.test(mdRest.dockInlineH || ''), `inline height: ${mdRest.dockInlineH}`)
-  ok('fix', '>=md: the dock is bounded by the VISIBLE viewport, not just the layout one',
-     mdKb.dockH <= mdKb.vvh, `dock ${mdKb.dockH}px inside a ${mdKb.vvh}px visible viewport`)
-  ok('fix', '>=md: nothing is clipped below the shell when the keyboard is up',
-     mdKb.clippedPx === 0, `${mdKb.clippedPx}px of dock below #root (dock ends ${mdKb.dockBottom}, #root ends ${mdKb.rootH})`)
-  ok('fix', '>=md: xterm RE-FITS when --vvh changes: fewer rows with the keyboard up',
-     mdKb.rowCount < mdRest.rowCount, `rows ${mdRest.rowCount} → ${mdKb.rowCount}`)
-  ok('today', '>=md CONTROL: at rest the dock keeps the full saved height (the bound is conditional, not a blanket shrink)',
-     mdRest.dockH === SAVED_TERM_H, `dock ${mdRest.dockH}px of a saved ${SAVED_TERM_H}px`)
+  ok('>=md: the layout really is in desktop mode (data-phone)', mdRest.phoneLayout === false, `data-phone=${mdRest.phoneLayout}`, 'today')
+  ok('>=md: the dock height is expressed against --vvh, not as a raw pixel value', /--vvh/.test(mdRest.dockInlineH || ''), `inline height: ${mdRest.dockInlineH}`, 'fix')
+  ok('>=md: the dock is bounded by the VISIBLE viewport, not just the layout one', mdKb.dockH <= mdKb.vvh, `dock ${mdKb.dockH}px inside a ${mdKb.vvh}px visible viewport`, 'fix')
+  ok('>=md: nothing is clipped below the shell when the keyboard is up', mdKb.clippedPx === 0, `${mdKb.clippedPx}px of dock below #root (dock ends ${mdKb.dockBottom}, #root ends ${mdKb.rootH})`, 'fix')
+  ok('>=md: xterm RE-FITS when --vvh changes: fewer rows with the keyboard up', mdKb.rowCount < mdRest.rowCount, `rows ${mdRest.rowCount} → ${mdKb.rowCount}`, 'fix')
+  ok('>=md CONTROL: at rest the dock keeps the full saved height (the bound is conditional, not a blanket shrink)', mdRest.dockH === SAVED_TERM_H, `dock ${mdRest.dockH}px of a saved ${SAVED_TERM_H}px`, 'today')
 }
 
 
@@ -310,9 +290,8 @@ const picked = await ev(`(() => {
 })()`)
 await wait(2000)
 console.log(`\n  files dock: ${opened}, demo.py: ${picked}`)
-ok('today', 'PRECONDITION: a <button> labelled "Files" opened the dock', opened === 'ok', `lookup returned: ${opened}`)
-ok('today', 'PRECONDITION: a leaf element with the text "demo.py" was found and double-clicked',
-   picked === 'ok', `lookup returned: ${picked}`)
+ok('PRECONDITION: a <button> labelled "Files" opened the dock', opened === 'ok', `lookup returned: ${opened}`, 'today')
+ok('PRECONDITION: a leaf element with the text "demo.py" was found and double-clicked', picked === 'ok', `lookup returned: ${picked}`, 'today')
 const COLUMN = `(() => {
   const xterm = document.querySelector('.xterm')
   // The DOCK comes from the pane hook (see MEASURE); only the COLUMN above it is found by its
@@ -356,12 +335,10 @@ const colKb = await ev(COLUMN)
 console.log(`  column at rest    : ${JSON.stringify(colRest)}`)
 console.log(`  column keyboard up: ${JSON.stringify(colKb)}\n`)
 if (colRest.err || colKb.err) {
-  ok('fix', 'content-tab branch reachable (column found)', false, JSON.stringify(colRest))
+  ok('content-tab branch reachable (column found)', false, JSON.stringify(colRest), 'fix')
 } else {
-  ok('fix', 'with a content tab open the column height tracks the BOUNDED dock, not raw termH',
-     /--vvh/.test(colKb.colInlineH || ''), `column height: ${colKb.colInlineH}`)
-  ok('fix', 'no gap opens below the terminal when the dock is bounded',
-     Math.abs(colKb.gapPx) <= 2, `${colKb.gapPx}px between the dock's bottom and the column's`)
+  ok('with a content tab open the column height tracks the BOUNDED dock, not raw termH', /--vvh/.test(colKb.colInlineH || ''), `column height: ${colKb.colInlineH}`, 'fix')
+  ok('no gap opens below the terminal when the dock is bounded', Math.abs(colKb.gapPx) <= 2, `${colKb.gapPx}px between the dock's bottom and the column's`, 'fix')
   // FIXED 2026-08-26 — and the attribution this line used to carry was WRONG, which is worth
   // keeping because it is the reason the item sat open so long. It read "the residual is
   // stackH (280px), not the dock". Measured term by term, the clip is a SUM: 32 chrome + 0
@@ -370,9 +347,7 @@ if (colRest.err || colKb.err) {
   // (blind to stackH) and stackH's drag max by `splitRef - 200` (blind to the dock).
   // The content pane was never a candidate for "which gives way": it measured 0px in BOTH
   // states, so it had already given everything before the terminal was cut at all.
-  ok('fix', 'the stacked column does NOT clip the terminal, at rest or with the keyboard up',
-     colRest.clippedPx === 0 && colKb.clippedPx === 0,
-     `clipped ${colRest.clippedPx}px at rest (--vvh 844) and ${colKb.clippedPx}px with the keyboard up`)
+  ok('the stacked column does NOT clip the terminal, at rest or with the keyboard up', colRest.clippedPx === 0 && colKb.clippedPx === 0, `clipped ${colRest.clippedPx}px at rest (--vvh 844) and ${colKb.clippedPx}px with the keyboard up`, 'fix')
   // THE HALF THAT PROVES THE SQUEEZE WAS NOT JUST MOVED. Capping the column alone would also
   // read as "not clipped" while leaving the content pane at 0 and the chat at 11px — the same
   // budget failure one element over. At rest the content pane must get its full reserve back.
@@ -392,18 +367,12 @@ if (colRest.err || colKb.err) {
   // floor wins and the chat lands at ~160 rather than the saved 400. Reverting boundStackH
   // puts it back at ~400 and reds this and the clip assertion above together.
   const kbClamped = colKb.chatH < 200 && colKb.chatH > 120
-  ok('fix', 'a persisted stackH too tall for the CURRENT viewport is clamped on read',
-     kbClamped,
-     kbClamped
+  ok('a persisted stackH too tall for the CURRENT viewport is clamped on read', kbClamped, kbClamped
        ? `chat ${colKb.chatH}px with the keyboard up, from a saved ${SAVED_STACK_H}px — clamped to the floor, not trusted`
-       : `chat ${colKb.chatH}px with the keyboard up, from a saved ${SAVED_STACK_H}px — NOT clamped: the saved value is being trusted against a viewport that cannot hold it`)
-  ok('today', 'CONTROL: at rest the same saved stackH is NOT clamped (the bound is conditional)',
-     colRest.chatH > 300,
-     `chat ${colRest.chatH}px at rest (--vvh 844), from a saved ${SAVED_STACK_H}px — untouched, so the clamp is not a blanket shrink`)
+       : `chat ${colKb.chatH}px with the keyboard up, from a saved ${SAVED_STACK_H}px — NOT clamped: the saved value is being trusted against a viewport that cannot hold it`, 'fix')
+  ok('CONTROL: at rest the same saved stackH is NOT clamped (the bound is conditional)', colRest.chatH > 300, `chat ${colRest.chatH}px at rest (--vvh 844), from a saved ${SAVED_STACK_H}px — untouched, so the clamp is not a blanket shrink`, 'today')
 
-  ok('fix', 'the content pane gets its reserve back at rest, rather than the clip moving to it',
-     colRest.contentH >= 200,
-     `content pane ${colRest.contentH}px at rest (was 0px), chat ${colRest.chatH}px, dock ${colRest.dockH}px`)
+  ok('the content pane gets its reserve back at rest, rather than the clip moving to it', colRest.contentH >= 200, `content pane ${colRest.contentH}px at rest (was 0px), chat ${colRest.chatH}px, dock ${colRest.dockH}px`, 'fix')
   // With the keyboard up the floor wins and the content pane goes under its reserve — stated
   // rather than asserted away, because a 120px terminal that is fully visible is the correct
   // outcome and pretending otherwise would need a number nobody chose.
@@ -424,9 +393,7 @@ if (colRest.err || colKb.err) {
     const root = document.getElementById('root').getBoundingClientRect()
     return Math.max(0, Math.round(dock.getBoundingClientRect().bottom - root.bottom))
   })()`)
-  ok('fix', 'the --vvh bound measurably shrinks the keyboard-up clip',
-     before > colKb.clippedPx,
-     `${before}px clipped unbounded → ${colKb.clippedPx}px bounded`)
+  ok('the --vvh bound measurably shrinks the keyboard-up clip', before > colKb.clippedPx, `${before}px clipped unbounded → ${colKb.clippedPx}px bounded`, 'fix')
 }
 
 // ── DESKTOP NO-REGRESSION ──────────────────────────────────────────────────────────────
@@ -452,11 +419,9 @@ const backToChat = await ev(`(() => {
   b.click(); return true
 })()`)
 await wait(1500)
-ok('today', 'PRECONDITION: the content tab was closed, so this measures the no-tab state',
-   backToChat === true, backToChat ? '' : 'could not find the Chat tab — the 600 below would be measuring the other state')
+ok('PRECONDITION: the content tab was closed, so this measures the no-tab state', backToChat === true, backToChat ? '' : 'could not find the Chat tab — the 600 below would be measuring the other state', 'today')
 const desk = await ev(MEASURE)
-ok('today', 'DESKTOP 1440x900, NO content tab: the bound is inert, the saved dock height is untouched',
-   desk.dockH === SAVED_TERM_H, `dock ${desk.dockH}px of a saved ${SAVED_TERM_H}px`)
+ok('DESKTOP 1440x900, NO content tab: the bound is inert, the saved dock height is untouched', desk.dockH === SAVED_TERM_H, `dock ${desk.dockH}px of a saved ${SAVED_TERM_H}px`, 'today')
 
 console.log(`\n${failed ? '❌' : '✅'} ${passed} passed, ${failed} failed` + (open_ ? `, ${open_} OPEN (measured, deliberately not fixed — see ⚠️  above)` : ''))
 cdpDone = true; reapAll()

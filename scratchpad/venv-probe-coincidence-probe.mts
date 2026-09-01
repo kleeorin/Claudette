@@ -16,11 +16,8 @@ import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts
 import type { SandboxConfig } from '../shared/src/index.ts'
 
 const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'venv-coin-')))
-let bad = 0
-const check = (ok: boolean, label: string, detail = ''): void => {
-  console.log(`${ok ? '✅' : '⚠️ '} ${label}${detail ? `  — ${detail}` : ''}`)
-  if (!ok) bad++
-}
+import { withMarks, failed as bad } from './assert.mjs'
+const check = withMarks({ fail: '⚠️ ', sep: '  — ' })
 
 try {
   const real = path.join(root, 'real')
@@ -46,10 +43,8 @@ try {
 
   // The guard's whole job: a planted interpreter must be recognised as box-writable, so
   // canImportJupyter runs the probe INSIDE the box instead of on the host.
-  check(logicalGuarded, 'guard holds for a LOGICAL candidate (today\'s chain)',
-    logicalGuarded ? 'recognised as box-writable → probed inside the box' : 'FAILED OPEN')
-  check(!realGuarded, 'guard would FAIL OPEN for a REAL candidate',
-    realGuarded ? 'still recognised' : 'NOT recognised as box-writable → probe would run UNSANDBOXED on the host')
+  check('guard holds for a LOGICAL candidate (today\'s chain)', logicalGuarded, logicalGuarded ? 'recognised as box-writable → probed inside the box' : 'FAILED OPEN')
+  check('guard would FAIL OPEN for a REAL candidate', !realGuarded, realGuarded ? 'still recognised' : 'NOT recognised as box-writable → probe would run UNSANDBOXED on the host')
 
   // Does the chain actually keep the path logical today? doc.path is what
   // KernelManager.serverFor feeds to pythonFor via dirname().
@@ -59,15 +54,12 @@ try {
   const doc = await docs.openPath(nbLogical)
   const startDir = dirname(doc.path)   // exactly what serverFor computes
   console.log(`\nopenPath("${nbLogical}")\n  doc.path  = ${doc.path}\n  dirname   = ${startDir}`)
-  check(doc.path === resolve(nbLogical) && startDir === projLogical,
-    'doc.path is LOGICAL today, so the chain feeds the guard a logical target',
-    'openPath stores resolve(path), never realpath')
+  check('doc.path is LOGICAL today, so the chain feeds the guard a logical target', doc.path === resolve(nbLogical) && startDir === projLogical, 'openPath stores resolve(path), never realpath')
 
   // …and one realpathSync in openPath is all it takes to flip it.
   const hypothetical = realpathSync(nbLogical)
   console.log(`\nIF openPath stored realpathSync(path) instead:\n  doc.path  = ${hypothetical}\n  dirname   = ${dirname(hypothetical)}`)
-  check(!pathInWritableMount(cfg, projLogical, path.join(dirname(hypothetical), '.venv', 'bin', 'python3')),
-    'that one change reopens the escape', 'candidate no longer matches the logical rw root')
+  check('that one change reopens the escape', !pathInWritableMount(cfg, projLogical, path.join(dirname(hypothetical), '.venv', 'bin', 'python3')), 'candidate no longer matches the logical rw root')
   docs.close(doc.notebookId)
 } finally {
   rmSync(root, { recursive: true, force: true })

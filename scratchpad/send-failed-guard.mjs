@@ -70,11 +70,8 @@ const ECHO = 'zzstubechozz'          // the live stub echoes this back: POSITIVE
 const MARK = 'Not delivered'
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-let passed = 0, failed = 0
-const ok = (tag, name, cond, extra = '') => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 const DATA = await mkdtemp(join(tmpdir(), 'sendfail-data-'))
 const BIN = await mkdtemp(join(tmpdir(), 'sendfail-bin-'))
@@ -335,17 +332,13 @@ const sendTurn = async (text) => {
 // Everything below reads a UI this harness must first prove it reached. Without these a
 // broken selector reports a confident row of reds about the fix.
 console.log('\n[0] preconditions')
-ok('setup', '[0a] both sessions are on screen',
-  await waitFor(`document.body.innerText.includes(${JSON.stringify(DEAD)}) && document.body.innerText.includes(${JSON.stringify(LIVE)})`, 20000))
-ok('setup', `[0b] the ${DEAD} session really is dead (its stub exited before init)`,
-  await waitFor(`window.__sf.clickSession(${JSON.stringify(DEAD)}) && document.body.innerText.includes('Claude exited')`, 20000))
+ok('[0a] both sessions are on screen', await waitFor(`document.body.innerText.includes(${JSON.stringify(DEAD)}) && document.body.innerText.includes(${JSON.stringify(LIVE)})`, 20000), '', 'setup')
+ok(`[0b] the ${DEAD} session really is dead (its stub exited before init)`, await waitFor(`window.__sf.clickSession(${JSON.stringify(DEAD)}) && document.body.innerText.includes('Claude exited')`, 20000), '', 'setup')
 // The premise of the whole bug: an exited session still lets you type. If this ever stops
 // being true the fix is unreachable from the UI and this file should be re-scoped, not
 // patched — so it is a precondition, not an assertion about the fix.
-ok('setup', '[0c] …and its composer is still usable, which is what makes the bug reachable',
-  await evaluate(`!!window.__sf.composer()`))
-ok('setup', '[0d] nothing is marked undelivered before anything is sent',
-  (await evaluate(`window.__sf.markCount()`)) === 0)
+ok('[0c] …and its composer is still usable, which is what makes the bug reachable', await evaluate(`!!window.__sf.composer()`), '', 'setup')
+ok('[0d] nothing is marked undelivered before anything is sent', (await evaluate(`window.__sf.markCount()`)) === 0, '', 'setup')
 
 if (failed) {
   console.log('  ⚠ preconditions failed — the assertions below did not run')
@@ -354,10 +347,8 @@ if (failed) {
   console.log('\n[1] a turn into a dead session')
   await sendTurn(DEAD_TEXT)
   const marked = await waitFor(`window.__sf.says(${JSON.stringify(DEAD_TEXT)})`, 15000)
-  ok('core', '[1a] the bubble says the turn was NOT delivered', marked,
-    marked ? '' : '← the optimistic echo still reads as delivered: this is the reported bug')
-  ok('core', '[1b] …and is styled as undelivered (dashed), not as an ordinary turn',
-    await evaluate(`window.__sf.dashed(${JSON.stringify(DEAD_TEXT)})`))
+  ok('[1a] the bubble says the turn was NOT delivered', marked, marked ? '' : '← the optimistic echo still reads as delivered: this is the reported bug', 'core')
+  ok('[1b] …and is styled as undelivered (dashed), not as an ordinary turn', await evaluate(`window.__sf.dashed(${JSON.stringify(DEAD_TEXT)})`), '', 'core')
 
   // ═══ [2] ★ THE NEGATIVE CONTROL — the half the rest of the suite cannot see ════════
   console.log('\n[2] a turn into a LIVE session (the inversion control)')
@@ -367,25 +358,20 @@ if (failed) {
   // Delivery proved POSITIVELY, off the engine's own echo — not inferred from the absence
   // of a marker. Without this, [2b] would also be green if the turn silently went nowhere.
   const echoed = await waitFor(`document.body.innerText.includes(${JSON.stringify(ECHO)})`, 20000)
-  ok('core', '[2a] the turn actually reached the engine (it echoed the text back)', echoed)
+  ok('[2a] the turn actually reached the engine (it echoed the text back)', echoed, '', 'core')
   await wait(1200)
-  ok('core', '[2b] a DELIVERED turn is NOT marked undelivered',
-    !await evaluate(`window.__sf.says(${JSON.stringify(LIVE_TEXT)})`),
-    '← if this reds, sendFailed is firing on success: the delivered check is inverted')
+  ok('[2b] a DELIVERED turn is NOT marked undelivered', !await evaluate(`window.__sf.says(${JSON.stringify(LIVE_TEXT)})`), '← if this reds, sendFailed is firing on success: the delivered check is inverted', 'core')
   // ═══ [2c]/[2d] SESSION SWITCHING — last, because switching may re-load a transcript
   // Scoped to what is ON SCREEN, because ChatView renders only the SELECTED session's
   // transcript. The first version of this asserted "exactly one turn is marked in the whole
   // app" and went red at count=0 — measuring a transcript that was not mounted and calling
   // it a finding about the fix. The app-wide claim is not observable from the DOM at all.
-  ok('core', '[2c] with the live session selected, NOTHING on screen is marked',
-    (await evaluate(`window.__sf.markCount()`)) === 0, `count=${await evaluate(`window.__sf.markCount()`)}`)
+  ok('[2c] with the live session selected, NOTHING on screen is marked', (await evaluate(`window.__sf.markCount()`)) === 0, `count=${await evaluate(`window.__sf.markCount()`)}`, 'core')
   // The mark lives in the store, not in a DOM artefact of the moment it arrived — so it has
   // to survive unmounting and remounting the transcript.
   await evaluate(`window.__sf.clickSession(${JSON.stringify(DEAD)})`)
   await wait(900)
-  ok('core', '[2d] switching back to the dead session, its turn is STILL marked',
-    await evaluate(`window.__sf.says(${JSON.stringify(DEAD_TEXT)})`) && (await evaluate(`window.__sf.markCount()`)) === 1,
-    `count=${await evaluate(`window.__sf.markCount()`)}`)
+  ok('[2d] switching back to the dead session, its turn is STILL marked', await evaluate(`window.__sf.says(${JSON.stringify(DEAD_TEXT)})`) && (await evaluate(`window.__sf.markCount()`)) === 1, `count=${await evaluate(`window.__sf.markCount()`)}`, 'core')
   await evaluate(`window.__sf.clickSession(${JSON.stringify(LIVE)})`)
   await wait(900)
 
@@ -396,13 +382,11 @@ if (failed) {
   console.log('\n[3] a sendFailed carrying no turnId')
   const liveTurnId = await evaluate(`window.__sf.turnIdFor(${JSON.stringify(LIVE_TEXT)})`)
   console.log(`  ↳ diag: sockets=${await evaluate('window.__socks')} loads=${await evaluate("Number(sessionStorage.getItem('__loads')||0)")}`)
-  ok('setup', '[3a] the outgoing send carried a turnId at all', typeof liveTurnId === 'string' && !!liveTurnId, `turnId=${liveTurnId}`)
+  ok('[3a] the outgoing send carried a turnId at all', typeof liveTurnId === 'string' && !!liveTurnId, `turnId=${liveTurnId}`, 'setup')
   const injectedNull = await evaluate(`window.__sf.inject(${JSON.stringify(live.id)}, null)`)
-  ok('setup', '[3a2] the injection mechanism has a socket to fire at',
-    injectedNull === true, `__hub present=${await evaluate(`!!window.__hub`)}`)
+  ok('[3a2] the injection mechanism has a socket to fire at', injectedNull === true, `__hub present=${await evaluate(`!!window.__hub`)}`, 'setup')
   await wait(900)
-  ok('core', '[3b] a sendFailed with no turnId marks nothing — it does not guess',
-    !await evaluate(`window.__sf.says(${JSON.stringify(LIVE_TEXT)})`))
+  ok('[3b] a sendFailed with no turnId marks nothing — it does not guess', !await evaluate(`window.__sf.says(${JSON.stringify(LIVE_TEXT)})`), '', 'core')
   // ★ AND THE CONTROL THAT STOPS [3b] BEING VACUOUS. Injecting a frame the page ignores
   // and a frame that never arrived look identical from the DOM, so [3b] alone would be
   // green even if inject() were broken. Fire the SAME mechanism with a real turnId and
@@ -424,8 +408,7 @@ if (failed) {
     console.log('    An undelivered mark does not survive a reload, so nothing here is measurable after one.')
     console.log('  ↳ console said:\n' + consoleLines.slice(-8).map((l) => '     | ' + l).join('\n'))
   } else {
-    ok('core', '[3c] CONTROL: the same injection WITH a turnId does mark, so [3b] is not vacuous',
-      landed, landed ? '' : `← inject returned ${injectedReal}; the frame is not reaching the client, so [3b] proves nothing`)
+    ok('[3c] CONTROL: the same injection WITH a turnId does mark, so [3b] is not vacuous', landed, landed ? '' : `← inject returned ${injectedReal}; the frame is not reaching the client, so [3b] proves nothing`, 'core')
   }
 }
 
@@ -453,8 +436,7 @@ if (failed) {
   const RESTORE_TEXT = 'zzrestoremezz the words I do not want to retype'
   await sendTurn(RESTORE_TEXT)
   const restored = await waitFor(`window.__sf.value() === ${JSON.stringify(RESTORE_TEXT)}`, 15000)
-  ok('core', '[4a] a failed send puts its text BACK in the empty composer',
-    restored, restored ? '' : `composer holds ${JSON.stringify(await evaluate(`window.__sf.value()`))} — the words are lost`)
+  ok('[4a] a failed send puts its text BACK in the empty composer', restored, restored ? '' : `composer holds ${JSON.stringify(await evaluate(`window.__sf.value()`))} — the words are lost`, 'core')
 
   // ── [4b] THE GUARD. The restore must not fire while the user is BROWSING history.
   // Reaching the state needs care: at a recalled level the box normally holds the recalled
@@ -467,21 +449,17 @@ if (failed) {
   await evaluate(`window.__sf.caret(0)`)
   await pressKey('ArrowUp', 38)                       // level 0 → 1, box = the recalled turn
   const recalledText = await evaluate(`window.__sf.value()`)
-  ok('setup', '[4b0] PRECONDITION: Up actually recalled a message (history level is not 0)',
-    typeof recalledText === 'string' && recalledText.length > 0, `box=${JSON.stringify(recalledText)}`)
+  ok('[4b0] PRECONDITION: Up actually recalled a message (history level is not 0)', typeof recalledText === 'string' && recalledText.length > 0, `box=${JSON.stringify(recalledText)}`, 'setup')
   await evaluate(`window.__sf.type('')`)              // clear it, still at level 1
   await wait(300)
 
   const restoreTurnId = await evaluate(`window.__sf.turnIdFor(${JSON.stringify(RESTORE_TEXT)})`)
-  ok('setup', '[4b1] PRECONDITION: the restored turn has a turnId to inject',
-    typeof restoreTurnId === 'string' && !!restoreTurnId, `turnId=${restoreTurnId}`)
+  ok('[4b1] PRECONDITION: the restored turn has a turnId to inject', typeof restoreTurnId === 'string' && !!restoreTurnId, `turnId=${restoreTurnId}`, 'setup')
   await evaluate(`window.__sf.inject(${JSON.stringify(dead.id)}, ${JSON.stringify(restoreTurnId)})`)
   await wait(1200)
   const midBrowseBox = await evaluate(`window.__sf.value()`)
-  ok('core', '[4b2] mid-browse, the restore DECLINES: the composer is left alone',
-    midBrowseBox === '',
-    midBrowseBox === '' ? 'box still empty'
-      : `composer holds ${JSON.stringify(midBrowseBox)} — it wrote into a box the user is browsing with`)
+  ok('[4b2] mid-browse, the restore DECLINES: the composer is left alone', midBrowseBox === '', midBrowseBox === '' ? 'box still empty'
+      : `composer holds ${JSON.stringify(midBrowseBox)} — it wrote into a box the user is browsing with`, 'core')
 
   // ★ AND THE HALF THAT MATTERS MORE — assert the LEVEL, not the visible text.
   // `goTo` saves the box's live DOM value against the level it is LEAVING, so a restore that
@@ -494,10 +472,8 @@ if (failed) {
   await evaluate(`window.__sf.caret(0)`)
   await pressKey('ArrowUp', 38)                       // back to level 1
   const level1 = await evaluate(`window.__sf.value()`)
-  ok('core', '[4b3] …and the browsed LEVEL is not corrupted: it still holds what the user left',
-    level1 === '',
-    level1 === '' ? 'level 1 still holds the empty box the user left there'
-      : `level 1 holds ${JSON.stringify(level1)} — a fake edit the user never typed, persisted by goTo`)
+  ok('[4b3] …and the browsed LEVEL is not corrupted: it still holds what the user left', level1 === '', level1 === '' ? 'level 1 still holds the empty box the user left there'
+      : `level 1 holds ${JSON.stringify(level1)} — a fake edit the user never typed, persisted by goTo`, 'core')
   }
 
 console.log(`\n${passed} passed / ${failed} failed`)

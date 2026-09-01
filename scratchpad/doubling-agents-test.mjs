@@ -73,11 +73,8 @@ const DESC_TASK = 'Sweep the transcript for doubles'
 const DESC_AGENT = 'Name the tray controls'
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
-let passed = 0, failed = 0
-const ok = (tag, name, cond, extra = '') => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 
 const DATA = await mkdtemp(join(tmpdir(), 'doubling-data-'))
 // A FRESH CWD PER RUN, and this is load-bearing even now that no real CLI runs. It used to be
@@ -318,7 +315,7 @@ if (!await waitFor(`!!document.querySelector('aside') || !!document.querySelecto
   console.error('app never rendered'); console.error(weblog.slice(-1200)); reapAll(); process.exit(1)
 }
 await evaluate(HELPERS)
-ok('setup', 'the session is on screen', await waitFor(`document.body.innerText.includes(${JSON.stringify(SESSION)})`, 20000))
+ok('the session is on screen', await waitFor(`document.body.innerText.includes(${JSON.stringify(SESSION)})`, 20000), '', 'setup')
 await wait(800)
 
 // ═══ [1] DOUBLING ════════════════════════════════════════════════════════════════════
@@ -328,7 +325,7 @@ await writeFile(GO.stream, 'go')
 // reports four confident reds about doubling, which is a probe describing a subject it never
 // managed to load. The marker reaching the DOM at all is the precondition; the COUNT is the test.
 const arrived = await waitFor(`window.__db.count(${JSON.stringify(M_STREAM)}) > 0`, 30000)
-ok('setup', "the stub CLI's frames reach the transcript", arrived)
+ok("the stub CLI's frames reach the transcript", arrived, '', 'setup')
 
 if (!arrived) {
   console.log('  ⚠ nothing from the engine — section [1] and [2] did not run')
@@ -336,15 +333,13 @@ if (!arrived) {
 } else {
   await wait(600)
   const cStream = await evaluate(`window.__db.count(${JSON.stringify(M_STREAM)})`)
-  ok('core', '[1a] a streamed message restated by its completed snapshot renders ONCE',
-    cStream === 1, `count=${cStream}${cStream > 1 ? ' ← the completed message appended a second copy instead of settling the streamed item' : ''}`)
+  ok('[1a] a streamed message restated by its completed snapshot renders ONCE', cStream === 1, `count=${cStream}${cStream > 1 ? ' ← the completed message appended a second copy instead of settling the streamed item' : ''}`, 'core')
 
   await writeFile(GO.snap, 'go')
   await waitFor(`window.__db.count(${JSON.stringify(M_SNAP)}) > 0`, 20000)
   await wait(800)
   const cSnap = await evaluate(`window.__db.count(${JSON.stringify(M_SNAP)})`)
-  ok('core', '[1b] the SAME completed message sent twice, never streamed, renders ONCE',
-    cSnap === 1, `count=${cSnap}${cSnap > 1 ? ' ← the first copy did not register itself in the block-index map' : ''}`)
+  ok('[1b] the SAME completed message sent twice, never streamed, renders ONCE', cSnap === 1, `count=${cSnap}${cSnap > 1 ? ' ← the first copy did not register itself in the block-index map' : ''}`, 'core')
 
   await writeFile(GO.msgs, 'go')
   await waitFor(`window.__db.count(${JSON.stringify(M_SECOND)}) > 0`, 20000)
@@ -354,23 +349,20 @@ if (!arrived) {
   // The two halves of the message_start reset, split because they fail for different reasons:
   // losing the FIRST message means the index map was not reset, while a doubled SECOND means
   // it was reset but the new item registered wrongly.
-  ok('core', '[1c] the first of two consecutive messages SURVIVES the second',
-    cFirst === 1, `count=${cFirst}${cFirst === 0 ? " ← message 2's block 0 landed on message 1's item: the index map was not reset on message_start" : ''}`)
-  ok('core', '[1d] the second of the pair renders ONCE',
-    cSecond === 1, `count=${cSecond}${cSecond > 1 ? ' ← re-sending it appended a copy: a block materialized AFTER a reset did not register itself either' : ''}`)
+  ok('[1c] the first of two consecutive messages SURVIVES the second', cFirst === 1, `count=${cFirst}${cFirst === 0 ? " ← message 2's block 0 landed on message 1's item: the index map was not reset on message_start" : ''}`, 'core')
+  ok('[1d] the second of the pair renders ONCE', cSecond === 1, `count=${cSecond}${cSecond > 1 ? ' ← re-sending it appended a copy: a block materialized AFTER a reset did not register itself either' : ''}`, 'core')
 
   // Belt-and-braces, and deliberately weaker than [1a]-[1d]: it catches any repeated
   // paragraph, but it is BLIND to the message_start bug, which loses text rather than
   // duplicating it. Do not read a green here as covering [1c].
   const dup = await evaluate(`window.__db.dupLine()`)
-  ok('core', '[1e] no long line is rendered twice anywhere on the page',
-    dup === null, dup ? `dup: ${String(dup).slice(0, 70)}` : '')
+  ok('[1e] no long line is rendered twice anywhere on the page', dup === null, dup ? `dup: ${String(dup).slice(0, 70)}` : '', 'core')
 
   // ═══ [2] THE SUBAGENT SURFACE ══════════════════════════════════════════════════════
   console.log('\n[2] the subagent tray (sidebar ◈ badge → AgentLine)')
   await writeFile(GO.task, 'go')
   const badgeUp = await waitFor(`!!window.__db.badge()`, 30000)
-  ok('core', '[2a] a subagent reaches the sidebar as a ◈ badge', badgeUp)
+  ok('[2a] a subagent reaches the sidebar as a ◈ badge', badgeUp, '', 'core')
 
   if (!badgeUp) {
     console.log('  ⚠ no badge ever appeared — the rest of [2] did not run')
@@ -379,41 +371,35 @@ if (!arrived) {
     // did not discriminate on the tool name would say 3, and one that still only knew `Task`
     // would say 1 — which is the regression shared/tasks.ts's `Agent` clause exists to stop.
     const badgeText = await evaluate(`window.__db.badgeText()`)
-    ok('core', '[2b] the badge counts exactly the TWO subagent tools, not the Bash call beside them',
-      badgeText === '◈2', `badge reads ${JSON.stringify(badgeText)}${badgeText === '◈1' ? ' ← only one of Task/Agent was recognised as a subagent launcher' : ''}`)
+    ok('[2b] the badge counts exactly the TWO subagent tools, not the Bash call beside them', badgeText === '◈2', `badge reads ${JSON.stringify(badgeText)}${badgeText === '◈1' ? ' ← only one of Task/Agent was recognised as a subagent launcher' : ''}`, 'core')
 
     await evaluate(`window.__db.badge().click()`)
     const tLine = await waitFor(`!!window.__db.line(${JSON.stringify(DESC_TASK)})`, 15000)
-    ok('core', '[2c] expanding it lists the `Task`-named subagent', tLine)
+    ok('[2c] expanding it lists the `Task`-named subagent', tLine, '', 'core')
     const aLine = await evaluate(`!!window.__db.line(${JSON.stringify(DESC_AGENT)})`)
-    ok('core', '[2d] …and the `Agent`-named one, which older builds dropped entirely', aLine)
+    ok('[2d] …and the `Agent`-named one, which older builds dropped entirely', aLine, '', 'core')
     const tTitle = await evaluate(`window.__db.lineTitle(${JSON.stringify(DESC_TASK)})`)
-    ok('core', "[2e] a line carries the agent's own subagent_type, not a placeholder",
-      typeof tTitle === 'string' && tTitle.startsWith('explorer: '), `title=${JSON.stringify(tTitle)}`)
+    ok("[2e] a line carries the agent's own subagent_type, not a placeholder", typeof tTitle === 'string' && tTitle.startsWith('explorer: '), `title=${JSON.stringify(tTitle)}`, 'core')
 
     // A launch ack and no result: live, with no turn running. This is the whole of
     // isAgentLive's `launched` limb — remove it and this reads "stopped".
     const sTask = await evaluate(`window.__db.status(${JSON.stringify(DESC_TASK)})`)
-    ok('core', '[2f] a launched, unfinished agent reads RUNNING with no turn in flight',
-      sTask === 'running', `status=${JSON.stringify(sTask)}`)
+    ok('[2f] a launched, unfinished agent reads RUNNING with no turn in flight', sTask === 'running', `status=${JSON.stringify(sTask)}`, 'core')
 
     // The agent's own chain of thought belongs to its detail view. In the main transcript it
     // must not appear at all — this is the same parentId tag that, when it was ignored,
     // put a subagent's prose into the conversation AND then doubled it.
     const leak = await evaluate(`window.__db.count(${JSON.stringify(STEP)})`)
-    ok('core', "[2g] the subagent's own prose does not leak into the main transcript",
-      leak === 0, `count=${leak}`)
+    ok("[2g] the subagent's own prose does not leak into the main transcript", leak === 0, `count=${leak}`, 'core')
 
     // Settle ONE of the two. The other staying `running` is what makes this a check on
     // per-tool-id pairing rather than on a global "something finished" flag.
     await writeFile(GO.done, 'go')
     const settled = await waitFor(`window.__db.status(${JSON.stringify(DESC_TASK)}) === 'done'`, 20000)
     const sTask2 = await evaluate(`window.__db.status(${JSON.stringify(DESC_TASK)})`)
-    ok('core', '[2h] a terminal tool_result settles THAT agent to done',
-      settled, `status=${JSON.stringify(sTask2)}`)
+    ok('[2h] a terminal tool_result settles THAT agent to done', settled, `status=${JSON.stringify(sTask2)}`, 'core')
     const sAgent2 = await evaluate(`window.__db.status(${JSON.stringify(DESC_AGENT)})`)
-    ok('core', '[2i] …and leaves its unfinished sibling running',
-      sAgent2 === 'running', `status=${JSON.stringify(sAgent2)}`)
+    ok('[2i] …and leaves its unfinished sibling running', sAgent2 === 'running', `status=${JSON.stringify(sAgent2)}`, 'core')
   }
 }
 

@@ -34,11 +34,8 @@ process.env.CLAUDETTE_APP_ROOT = appRootReal
 
 const { wrapCommand, wrapSandbox, sandboxAvailable } = await import('../server/src/claude/sandbox.ts')
 
-let failures = 0
-const check = (ok: boolean, label: string, detail = ''): void => {
-  console.log(`${ok ? '✅' : '❌'} ${label}${detail ? `  — ${detail}` : ''}`)
-  if (!ok) failures++
-}
+import { withMarks, failed as failures } from './assert.mjs'
+const check = withMarks({ sep: '  — ' })
 
 try {
   console.log(`(sandboxAvailable=${sandboxAvailable()}; appSourceRoot=${appRootReal})\n`)
@@ -53,8 +50,7 @@ try {
   const planted = path.join(proj1, `p$(touch ${marker})x`, '.venv', 'bin', 'python3')
   const cfg1: SandboxConfig = { enabled: true, mounts: [{ path: proj1, mode: 'rw' }] }
   try { wrapCommand(cfg1, proj1, planted, ['-c', 'import jupyter_server']) } catch { /* resolution failure is fine */ }
-  check(!existsSync(marker), '1. which(): command substitution did NOT execute on the host',
-    existsSync(marker) ? 'MARKER CREATED — unsandboxed RCE' : 'no marker')
+  check('1. which(): command substitution did NOT execute on the host', !existsSync(marker), existsSync(marker) ? 'MARKER CREATED — unsandboxed RCE' : 'no marker')
 
   // ── 2. symlinked-mount escape guard ──────────────────────────────────────────
   // The operator mounts <link>/work/proj rw (a symlinked ancestor). The box plants
@@ -69,8 +65,7 @@ try {
   // resolves the source symlink, so this is `--bind <cwd>/.claude <cwd>/.claude` → / rw.
   const boundPlanted = args2.some((a, i) =>
     a === '--bind' && args2[i + 1] === path.join(proj2Logical, '.claude'))
-  check(!boundPlanted, '2. symlink guard: box-planted <cwd>/.claude was REFUSED as a mount source',
-    boundPlanted ? 'bound rw — this binds / into the box' : 'not bound')
+  check('2. symlink guard: box-planted <cwd>/.claude was REFUSED as a mount source', !boundPlanted, boundPlanted ? 'bound rw — this binds / into the box' : 'not bound')
 
   // ── 3. app-source read-only pinning ──────────────────────────────────────────
   // <link>/ is mounted rw and the Claudette checkout lives under its realpath, so the
@@ -82,8 +77,7 @@ try {
   // protects nothing.
   const serverLogical = path.join(link, 'Claudette', 'server')
   const pinnedRo = args3.some((a, i) => a === '--ro-bind' && args3[i + 2] === serverLogical)
-  check(pinnedRo, '3. app-source: server/ pinned READ-ONLY at the box-visible path',
-    pinnedRo ? serverLogical : `no --ro-bind dest ${serverLogical} — source is WRITABLE`)
+  check('3. app-source: server/ pinned READ-ONLY at the box-visible path', pinnedRo, pinnedRo ? serverLogical : `no --ro-bind dest ${serverLogical} — source is WRITABLE`)
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

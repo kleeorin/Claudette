@@ -192,11 +192,8 @@ async function waitFor(expr, ms = 25000) {
   if (consoleErrors.length) console.error('page errors:\n  ' + consoleErrors.slice(-4).join('\n  '))
   throw new Error(`timeout waiting for: ${expr}`)
 }
-let failures = 0
-const check = (ok, label, extra = '') => {
-  console.log(`  ${ok ? '✅' : '❌'} ${label}${extra ? ` — ${extra}` : ''}`)
-  if (!ok) failures++
-}
+import { withMarks, failed as failures } from './assert.mjs'
+const check = withMarks({ indent: '  ' })
 async function key(text, { ctrl = false, shift = false, code, keyCode } = {}) {
   const mods = (ctrl ? 2 : 0) | (shift ? 8 : 0)
   const base = { modifiers: mods, key: text, code: code ?? `Key${text.toUpperCase()}`, windowsVirtualKeyCode: keyCode ?? text.toUpperCase().charCodeAt(0) }
@@ -234,28 +231,26 @@ console.log('\n[DiffEditor — pending Edit review]')
 await writeFile(GO, 'go')                      // cue the shim
 await waitFor(`document.body.innerText.includes('Claude proposes changes')`)
 await wait(1200)
-check(await evaluate(`document.querySelectorAll('.cm-deletedChunk, .cm-changedLine').length > 0`),
-  'review mode is showing the inline diff')
+check('review mode is showing the inline diff', await evaluate(`document.querySelectorAll('.cm-deletedChunk, .cm-changedLine').length > 0`))
 await shot('10-diff-review')
 
 // Ctrl+F from the container, with focus wherever review mode left it.
 await key('f', { ctrl: true })
 await wait(500)
-check(await evaluate(`!!document.querySelector('input[placeholder^="Find"]')`), 'Ctrl+F opens the bar in the diff view')
+check('Ctrl+F opens the bar in the diff view', await evaluate(`!!document.querySelector('input[placeholder^="Find"]')`))
 await focusFindField()
 await send('Input.insertText', { text: 'alpha' })
 await wait(600)
 // 5, not 4: the proposed line adds "# alpha scaled" on top of the original four.
-check((await counter()) === '1/5', 'diff view finds all 5 matches in the proposed text', await counter())
-check(await evaluate(`!!document.querySelector('.cm-find-match-active')`), 'diff active match is highlighted')
+check('diff view finds all 5 matches in the proposed text', (await counter()) === '1/5', await counter())
+check('diff active match is highlighted', await evaluate(`!!document.querySelector('.cm-find-match-active')`))
 // Find only here — deciding hunks is the review's job, not the find bar's.
-check(!(await evaluate(`[...document.querySelectorAll('input')].some(x => (x.placeholder||'').startsWith('Replace'))`)),
-  'the diff view offers find WITHOUT replace')
+check('the diff view offers find WITHOUT replace', !(await evaluate(`[...document.querySelectorAll('input')].some(x => (x.placeholder||'').startsWith('Replace'))`)))
 await shot('11-diff-find')
 
 await key('Enter', { code: 'Enter', keyCode: 13 })
 await wait(400)
-check((await counter()) === '2/5', 'Enter steps through diff matches', await counter())
+check('Enter steps through diff matches', (await counter()) === '2/5', await counter())
 
 console.log(`\nshots in ${OUT}`)
 console.log(failures === 0 ? '\n✅ diff find checks passed' : `\n❌ ${failures} check(s) failed`)

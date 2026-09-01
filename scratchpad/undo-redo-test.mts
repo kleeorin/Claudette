@@ -5,8 +5,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
 
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 
 const dir = await mkdtemp(join(tmpdir(), 'undo-'))
 const docs = new NotebookDocManager()
@@ -15,49 +14,49 @@ const doc = () => docs.get(nid)!
 const cells = () => doc().cells
 const orig0 = cells()[0].source
 
-ok(doc().canUndo === false && doc().canRedo === false, 'fresh: no undo/redo')
+ok('fresh: no undo/redo', doc().canUndo === false && doc().canRedo === false)
 
 const c0 = cells()[0].id
 docs.applyOp({ op: 'editCell', notebookId: nid, cellId: c0, source: 'A' }, 'human')
-ok(cells()[0].source === 'A' && doc().canUndo === true, 'edit applied, canUndo=true')
+ok('edit applied, canUndo=true', cells()[0].source === 'A' && doc().canUndo === true)
 
 docs.applyOp({ op: 'addCell', notebookId: nid, cellType: 'code', source: 'B' }, 'human')
-ok(cells().length === 2, 'addCell → 2 cells')
+ok('addCell → 2 cells', cells().length === 2)
 
-ok(docs.undo(nid) === true && cells().length === 1, 'undo reverts the add')
-ok(doc().canRedo === true, 'canRedo=true after undo')
+ok('undo reverts the add', docs.undo(nid) === true && cells().length === 1)
+ok('canRedo=true after undo', doc().canRedo === true)
 
-ok(docs.undo(nid) === true && cells()[0].source === orig0, 'undo reverts the edit to original')
-ok(doc().canUndo === false, 'undo stack exhausted')
+ok('undo reverts the edit to original', docs.undo(nid) === true && cells()[0].source === orig0)
+ok('undo stack exhausted', doc().canUndo === false)
 
-ok(docs.redo(nid) === true && cells()[0].source === 'A', 'redo re-applies the edit')
-ok(docs.redo(nid) === true && cells().length === 2, 'redo re-applies the add')
-ok(doc().canRedo === false, 'redo stack exhausted')
+ok('redo re-applies the edit', docs.redo(nid) === true && cells()[0].source === 'A')
+ok('redo re-applies the add', docs.redo(nid) === true && cells().length === 2)
+ok('redo stack exhausted', doc().canRedo === false)
 
 // A fresh edit after an undo drops the redo branch.
 docs.undo(nid)
-ok(doc().canRedo === true, 'canRedo=true after undo')
+ok('canRedo=true after undo', doc().canRedo === true)
 docs.applyOp({ op: 'editCell', notebookId: nid, cellId: cells()[0].id, source: 'C' }, 'human')
-ok(doc().canRedo === false, 'new edit cleared the redo branch')
+ok('new edit cleared the redo branch', doc().canRedo === false)
 
 // clearAllOutputs is undoable and restores outputs.
 const cc = cells()[0].id
 docs.appendCellOutput(nid, cc, { output_type: 'stream', name: 'stdout', text: 'hi' })
 docs.setCellExecutionCount(nid, cc, 5)
-ok((cells()[0].outputs?.length ?? 0) === 1, 'output present before clear')
+ok('output present before clear', (cells()[0].outputs?.length ?? 0) === 1)
 docs.clearAllOutputs(nid)
-ok((cells()[0].outputs?.length ?? 0) === 0 && cells()[0].executionCount == null, 'clearAllOutputs cleared it')
-ok(docs.undo(nid) === true && (cells()[0].outputs?.length ?? 0) === 1, 'undo restored the outputs')
+ok('clearAllOutputs cleared it', (cells()[0].outputs?.length ?? 0) === 0 && cells()[0].executionCount == null)
+ok('undo restored the outputs', docs.undo(nid) === true && (cells()[0].outputs?.length ?? 0) === 1)
 
 // undo on an empty stack is a no-op false.
 while (docs.undo(nid)) { /* drain */ }
-ok(docs.undo(nid) === false, 'undo on empty history → false')
+ok('undo on empty history → false', docs.undo(nid) === false)
 
 // A wholesale reload from disk drops history.
 docs.applyOp({ op: 'editCell', notebookId: nid, cellId: cells()[0].id, source: 'Z' }, 'human')
-ok(doc().canUndo === true, 'canUndo=true before reload')
+ok('canUndo=true before reload', doc().canUndo === true)
 await docs.reloadFromDisk(nid)
-ok(doc().canUndo === false && doc().canRedo === false, 'reload from disk cleared history')
+ok('reload from disk cleared history', doc().canUndo === false && doc().canRedo === false)
 
 docs.close(nid)
 console.log(failed ? `\n${failed} FAILED` : '\nALL PASSED')

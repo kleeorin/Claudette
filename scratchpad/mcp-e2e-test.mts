@@ -12,8 +12,7 @@ import { ActivePaneRegistry } from '../server/src/mcp/activePaneRegistry.ts'
 import { TurnNotebookRegistry } from '../server/src/mcp/turnNotebookRegistry.ts'
 import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 
 const dir = await mkdtemp(join(tmpdir(), 'nbmcp-'))
 const path = join(dir, 'mcp.ipynb')
@@ -37,7 +36,7 @@ const port = await mcp.start()
 // configFor mints a session-attributed token URL — exactly what --mcp-config gives Claude.
 const cfg = JSON.parse(mcp.configFor('sess-1'))
 const url: string = cfg.mcpServers.app.url
-ok(url.startsWith(`http://127.0.0.1:${port}/mcp/`), 'configFor returns a token URL on the MCP port')
+ok('configFor returns a token URL on the MCP port', url.startsWith(`http://127.0.0.1:${port}/mcp/`))
 
 let rpcId = 0
 async function call(method: string, params?: unknown) {
@@ -56,41 +55,41 @@ const callTool = async (name: string, args: Record<string, unknown>) => {
 
 // initialize + tools/list
 const init = await call('initialize', { protocolVersion: '2025-06-18' })
-ok(init?.serverInfo?.name === 'claudette-app', 'initialize → claudette-app')
+ok('initialize → claudette-app', init?.serverInfo?.name === 'claudette-app')
 const list = await call('tools/list')
 const toolNames = new Set((list.tools as any[]).map((t) => t.name))
-ok(['read_notebook', 'edit_cell', 'add_cell', 'run_cell', 'run_all', 'create_notebook'].every((n) => toolNames.has(n)), 'tools/list has the notebook tools')
+ok('tools/list has the notebook tools', ['read_notebook', 'edit_cell', 'add_cell', 'run_cell', 'run_all', 'create_notebook'].every((n) => toolNames.has(n)))
 
 // create_notebook → add code cell → run it, all via MCP
 let r = await callTool('create_notebook', { path })
-ok(!r.isError, `create_notebook: ${r.text}`)
+ok(`create_notebook: ${r.text}`, !r.isError)
 r = await callTool('edit_cell', { path, index: 0, source: 'x = 6 * 7\nprint(x)' })
-ok(!r.isError, 'edit_cell cell 0')
+ok('edit_cell cell 0', !r.isError)
 r = await callTool('add_cell', { path, type: 'markdown', source: '# notes' })
-ok(!r.isError, 'add_cell markdown')
+ok('add_cell markdown', !r.isError)
 
 console.log('running cell via MCP (starts kernel)…')
 r = await callTool('run_cell', { path, index: 0 })
 console.log('   run_cell result:', JSON.stringify(r).slice(0, 400))
-ok(!r.isError && r.text.includes('42'), 'run_cell → output contains 42')
+ok('run_cell → output contains 42', !r.isError && r.text.includes('42'))
 
 // read_notebook reflects the run output + the markdown cell
 r = await callTool('read_notebook', { path })
 const view = JSON.parse(r.text)
-ok(view.cells.length === 2 && view.cells[1].type === 'markdown', 'read_notebook: 2 cells, cell 1 is markdown')
+ok('read_notebook: 2 cells, cell 1 is markdown', view.cells.length === 2 && view.cells[1].type === 'markdown')
 // KernelStatus is none|starting|idle|busy|dead — there is no 'running'. The run above
 // has finished, so a LIVE kernel reports 'idle'; the property worth pinning is that a
 // bound kernel never reads as 'none' once a cell has executed.
-ok(view.kernel === 'idle', `read_notebook: kernel is live and idle after the run (got ${view.kernel})`)
+ok(`read_notebook: kernel is live and idle after the run (got ${view.kernel})`, view.kernel === 'idle')
 
 // the direct-to-disk write-through: the .ipynb on disk has the output + stable ids
 const disk = JSON.parse(await readFile(path, 'utf8'))
-ok(disk.cells[0].outputs.some((o: any) => (o.text ?? '').includes('42')), 'disk .ipynb has the run output (write-through)')
-ok(typeof disk.cells[0].id === 'string', 'disk cell has a stable id')
+ok('disk .ipynb has the run output (write-through)', disk.cells[0].outputs.some((o: any) => (o.text ?? '').includes('42')))
+ok('disk cell has a stable id', typeof disk.cells[0].id === 'string')
 
 // error surfaced as an MCP result error (out-of-range index)
 r = await callTool('edit_cell', { path, index: 99, source: 'nope' })
-ok(r.isError && r.text.includes('out of range'), 'out-of-range index → tool error')
+ok('out-of-range index → tool error', r.isError && r.text.includes('out of range'))
 
 kernels.destroy()
 mcp.stop()

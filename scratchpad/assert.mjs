@@ -86,7 +86,7 @@ export const failures = []
  *              for a defect that is MEASURED and deliberately not fixed, so the suite stays
  *              green while the finding stays visible.
  */
-const HOUSE = { pass: '✅', fail: '❌', open: '⚠️ ', gap: ' ', indent: '' }
+const HOUSE = { pass: '✅', fail: '❌', open: '⚠️ ', gap: ' ', indent: '', sep: ' — ' }
 
 // The one place an assertion is recorded. `check` and any vocabulary from `withMarks` both
 // come through here, so the guard, the counters, the array shape and the line format cannot
@@ -116,7 +116,7 @@ function record(marks, name, cond, extra, tag) {
   // diffing per-entry output, and a changed separator would bury a real difference under
   // hundreds of cosmetic ones.
   const mark = cond ? marks.pass : isOpen ? (marks.open ?? HOUSE.open) : marks.fail
-  console.log(`${marks.indent ?? ''}${mark}${marks.gap ?? ' '}${tag ? `[${tag}] ` : ''}${name}${extra ? ' — ' + extra : ''}`)
+  console.log(`${marks.indent ?? ''}${mark}${marks.gap ?? ' '}${tag ? `[${tag}] ` : ''}${name}${extra ? (marks.sep ?? ' — ') + extra : ''}`)
 }
 
 /**
@@ -150,9 +150,10 @@ export function reset() {
 // right and no longer says the same thing. So the vocabulary is a parameter, not a default,
 // and each harness names its own at the point of use.
 //
-// `gap` exists because those two separate mark from name by TWO spaces, and `indent` because
-// several harnesses indent the whole line by two. Both are preserved rather than tidied, so
-// their output stays byte-identical and the diff that verifies this refactor stays readable.
+// `gap`, `indent` and `sep` all exist for the same reason: harnesses differ in the spacing
+// around the mark, before the line, and before the em dash — five of them write `  — ` with two
+// spaces. Preserved rather than tidied, so their output stays byte-identical and the diff that
+// verifies this refactor stays readable rather than drowning in whitespace churn.
 export function withMarks(marks) {
   return (name, cond, extra = '', tag = '') => record({ ...HOUSE, ...marks }, name, cond, extra, tag)
 }

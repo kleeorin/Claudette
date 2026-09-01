@@ -7,8 +7,7 @@ import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts
 import { SessionConfinement } from '../server/src/claude/sessionConfinement.ts'
 import { KernelManager } from '../server/src/jupyter/kernelManager.ts'
 
-let failed = 0
-const ok = (c: unknown, m: string) => { console.log(`${c ? '✅' : '❌'} ${m}`); if (!c) failed++ }
+import { check as ok, failed } from './assert.mjs'
 const streamText = (cell: any) =>
   (cell.outputs ?? []).filter((o: any) => o.output_type === 'stream').map((o: any) => o.text).join('')
 
@@ -35,8 +34,8 @@ await kernels.runCell(nb, a)
 const cwd = streamText(doc.cells.find((c: any) => c.id === a)).trim()
 console.log(`   notebook dir: ${dir}`)
 console.log(`   kernel  cwd : ${cwd}`)
-ok(cwd === dir, 'kernel cwd equals the notebook directory (not "/")')
-ok(cwd !== '/', 'kernel cwd is not Jupyter root "/"')
+ok('kernel cwd equals the notebook directory (not "/")', cwd === dir)
+ok('kernel cwd is not Jupyter root "/"', cwd !== '/')
 
 kernels.destroy()
 console.log(failed === 0 ? '\n🎉 all passed' : `\n💥 ${failed} failed`)

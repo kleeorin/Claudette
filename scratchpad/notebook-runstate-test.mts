@@ -132,7 +132,7 @@ await (async () => {
     /KeyboardInterrupt/.test(JSON.stringify(after.outputs ?? [])), JSON.stringify(after.outputs))
   const idle2 = await waitFor((s) => !s.busy, 'the kernel to settle after the interrupt')
   check('kernel is idle again after the interrupt', idle2.busy === false)
-})().catch((e) => { fail++; console.log(`❌ threw: ${e?.message ?? e}`) })
+})().catch((e) => { check(`threw: ${e?.message ?? e}`, false) })
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} passed, ${fail} failed`)
 kernels.destroy()

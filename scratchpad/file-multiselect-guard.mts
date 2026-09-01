@@ -113,11 +113,8 @@
 // failure visible.
 import { setupDom, NO_DOM_NOTE } from './dom-env.mts'
 
-let passed = 0, failed = 0
-const ok = (tag: string, name: string, cond: boolean, extra = ''): void => {
-  cond ? passed++ : failed++
-  console.log(`  ${cond ? '✅' : '❌'} [${tag}] ${name}${extra ? ` — ${extra}` : ''}`)
-}
+import { withMarks, passed, failed } from './assert.mjs'
+const ok = withMarks({ indent: '  ' })
 const done = (): never => {
   console.log(`\n${passed} passed / ${failed} failed`)
   process.exit(failed === 0 ? 0 : 1)
@@ -297,9 +294,9 @@ const deleteSelection = async (): Promise<boolean> => {
 
 // ═══ [0] PRECONDITIONS ═══════════════════════════════════════════════════════════════
 console.log('\n[0] preconditions — can this harness reach the thing it claims to test?')
-ok('setup', '[0a] the listing rendered', !!row('alpha.txt') && !!row('sub'))
-ok('setup', '[0b] a dotfile is hidden by default', !row('.hidden.txt'))
-ok('setup', '[0c] nothing is selected at rest', selCount() === 0)
+ok('[0a] the listing rendered', !!row('alpha.txt') && !!row('sub'), '', 'setup')
+ok('[0b] a dotfile is hidden by default', !row('.hidden.txt'), '', 'setup')
+ok('[0c] nothing is selected at rest', selCount() === 0, '', 'setup')
 if (!row('alpha.txt')) { console.log('  ⚠ no listing — nothing below could run.'); done() }
 
 // ═══ [4] NEGATIVE CONTROLS — ordinary single-file use, run FIRST ═════════════════════
@@ -307,24 +304,21 @@ if (!row('alpha.txt')) { console.log('  ⚠ no listing — nothing below could r
 // anything satisfies "you cannot act on what you cannot see" trivially.
 console.log('\n[4] negative controls — the ordinary single-file path still works')
 await clickRow('sub')
-ok('core', '[4a] with no selection, a plain click still navigates into a folder',
-  !!row('delta.txt'), `dir now shows ${row('delta.txt') ? '/root/sub' : 'unchanged'}`)
+ok('[4a] with no selection, a plain click still navigates into a folder', !!row('delta.txt'), `dir now shows ${row('delta.txt') ? '/root/sub' : 'unchanged'}`, 'core')
 const crumb = buttons().find((b) => b.textContent === 'root')
 if (crumb) { await fire(crumb, 'click') }
-ok('setup', '[0d] …and the breadcrumb navigates back', !!row('alpha.txt'))
+ok('[0d] …and the breadcrumb navigates back', !!row('alpha.txt'), '', 'setup')
 
 await fire(row('alpha.txt')!, 'dblclick')
-ok('core', '[4b] with no selection, a double-click still opens a file',
-  opened.includes('/root/alpha.txt'), `onOpenFile got ${JSON.stringify(opened)}`)
+ok('[4b] with no selection, a double-click still opens a file', opened.includes('/root/alpha.txt'), `onOpenFile got ${JSON.stringify(opened)}`, 'core')
 
 const selModeBtn = btn('☑')
-ok('setup', '[0e] the select-mode toggle exists', !!selModeBtn)
+ok('[0e] the select-mode toggle exists', !!selModeBtn, '', 'setup')
 if (selModeBtn) {
   await fire(selModeBtn, 'click')
   const before = opened.length
   await fire(row('gamma.txt')!, 'dblclick')
-  ok('core', '[4c] in select mode a double-click does NOT open', opened.length === before,
-    opened.length === before ? '' : `onOpenFile fired: ${JSON.stringify(opened.slice(before))}`)
+  ok('[4c] in select mode a double-click does NOT open', opened.length === before, opened.length === before ? '' : `onOpenFile fired: ${JSON.stringify(opened.slice(before))}`, 'core')
   await fire(selModeBtn, 'click')   // leave select mode (also clears)
 }
 
@@ -338,36 +332,32 @@ if (selModeBtn) {
   await fire(r, 'click', { ctrlKey: true })     // 1st of the double: toggles on
   await fire(r, 'click', { ctrlKey: true })     // 2nd: toggles back off
   await fire(r, 'dblclick', { ctrlKey: true })
-  ok('core', '[4d] a Ctrl-double-click does NOT also open the file',
-    opened.length === before,
-    opened.length === before ? '' : `onOpenFile fired: ${JSON.stringify(opened.slice(before))}`)
+  ok('[4d] a Ctrl-double-click does NOT also open the file', opened.length === before, opened.length === before ? '' : `onOpenFile fired: ${JSON.stringify(opened.slice(before))}`, 'core')
   await clickRow('alpha.txt')   // plain click: back to a clean, unselected state
 }
 
 // ═══ [3] RANGE AND TOGGLE MECHANICS ══════════════════════════════════════════════════
 console.log('\n[3] range / toggle mechanics')
 await clickRow('alpha.txt', { ctrlKey: true })
-ok('core', '[3a] Ctrl-click selects a row', selCount() === 1, `count=${selCount()}`)
+ok('[3a] Ctrl-click selects a row', selCount() === 1, `count=${selCount()}`, 'core')
 await clickRow('alpha.txt', { ctrlKey: true })
-ok('core', '[3b] …and Ctrl-clicking it again deselects it', selCount() === 0, `count=${selCount()}`)
+ok('[3b] …and Ctrl-clicking it again deselects it', selCount() === 0, `count=${selCount()}`, 'core')
 
 await clickRow('alpha.txt', { ctrlKey: true })
 await clickRow('gamma.txt', { shiftKey: true })
-ok('core', '[3c] Shift-click extends the range over the VISIBLE rows',
-  selCount() === 3, `count=${selCount()} (alpha→beta→gamma)`)
+ok('[3c] Shift-click extends the range over the VISIBLE rows', selCount() === 3, `count=${selCount()} (alpha→beta→gamma)`, 'core')
 // ★ The decisive half: reveal the dotfile that sits INSIDE that range in the underlying
 // listing. If the range had extended over `entries` instead of `visible`, it was swept in
 // and the count jumps to 4 the moment it becomes visible.
 await setHidden(true)
-ok('setup', '[0f] the Hidden toggle really reveals the dotfile (or [3d] proves nothing)', hiddenIs(true))
-ok('core', '[3d] …and did NOT sweep in the hidden dotfile inside the range',
-  selCount() === 3, `count=${selCount()} after revealing .hidden.txt`)
+ok('[0f] the Hidden toggle really reveals the dotfile (or [3d] proves nothing)', hiddenIs(true), '', 'setup')
+ok('[3d] …and did NOT sweep in the hidden dotfile inside the range', selCount() === 3, `count=${selCount()} after revealing .hidden.txt`, 'core')
 await setHidden(false)
 // The escape hatch: a stray plain click must always drop the selection, so you can never be
 // stuck in a state where clicking a folder refuses to open it. Tested here rather than
 // inside [1b], which is where it used to hide and quietly neuter that assertion.
 await clickRow('alpha.txt')
-ok('core', '[3e] a plain click drops the selection (the escape hatch)', selCount() === 0, `count=${selCount()}`)
+ok('[3e] a plain click drops the selection (the escape hatch)', selCount() === 0, `count=${selCount()}`, 'core')
 
 // ═══ [1] YOU CAN ONLY ACT ON WHAT YOU CAN SEE ════════════════════════════════════════
 console.log('\n[1] the selection can only contain rows that are on screen')
@@ -377,19 +367,15 @@ await setHidden(true)
 await clickRow('alpha.txt')                      // plain click: drops the range above
 await clickRow('alpha.txt', { ctrlKey: true })
 await clickRow('.hidden.txt', { ctrlKey: true })
-ok('setup', '[0g] with Hidden on, a dotfile can be selected alongside a normal file',
-  selCount() === 2, `count=${selCount()}`)
+ok('[0g] with Hidden on, a dotfile can be selected alongside a normal file', selCount() === 2, `count=${selCount()}`, 'setup')
 await setHidden(false)
-ok('core', '[1a] turning Hidden OFF drops the now-invisible dotfile from the count',
-  selCount() === 1, `count=${selCount()} — expected 1 (alpha.txt only)`)
+ok('[1a] turning Hidden OFF drops the now-invisible dotfile from the count', selCount() === 1, `count=${selCount()} — expected 1 (alpha.txt only)`, 'core')
 
 const before1a = deleted.length
 await deleteSelection()
 const touched1a = deleted.slice(before1a)
-ok('core', "[1a'] …and deleting does NOT touch the hidden file",
-  !touched1a.includes('/root/.hidden.txt'), `delete calls: ${JSON.stringify(touched1a)}`)
-ok('core', "[1a''] …while the visible one IS deleted (so this is not passing by doing nothing)",
-  touched1a.includes('/root/alpha.txt'))
+ok("[1a'] …and deleting does NOT touch the hidden file", !touched1a.includes('/root/.hidden.txt'), `delete calls: ${JSON.stringify(touched1a)}`, 'core')
+ok("[1a''] …while the visible one IS deleted (so this is not passing by doing nothing)", touched1a.includes('/root/alpha.txt'), '', 'core')
 
 // [1b] the cross-folder hazard — the one that deletes the wrong file with the right name.
 //
@@ -401,36 +387,30 @@ ok('core', "[1a''] …while the visible one IS deleted (so this is not passing b
 // nothing, which is the only ordinary route that actually carries a selection across a
 // folder change.
 await clickRow('sub')
-ok('setup', '[0h] in /root/sub, which has its OWN beta.txt', !!row('beta.txt') && !!row('delta.txt'))
+ok('[0h] in /root/sub, which has its OWN beta.txt', !!row('beta.txt') && !!row('delta.txt'), '', 'setup')
 await clickRow('beta.txt', { ctrlKey: true })
-ok('setup', '[0i] its beta.txt is selected', selCount() === 1, `count=${selCount()}`)
+ok('[0i] its beta.txt is selected', selCount() === 1, `count=${selCount()}`, 'setup')
 const upCrumb = buttons().find((b) => b.textContent === 'root')
 if (upCrumb) await fire(upCrumb, 'click')
-ok('setup', '[0j] the breadcrumb navigated back to /root without clearing anything itself',
-  !!row('alpha.txt') || !!row('gamma.txt'))
-ok('core', "[1b] a selection made in /root/sub does NOT re-bind to /root's same-named row",
-  selCount() === 0, `count=${selCount()} — a name-only selection would report 1 here`)
+ok('[0j] the breadcrumb navigated back to /root without clearing anything itself', !!row('alpha.txt') || !!row('gamma.txt'), '', 'setup')
+ok("[1b] a selection made in /root/sub does NOT re-bind to /root's same-named row", selCount() === 0, `count=${selCount()} — a name-only selection would report 1 here`, 'core')
 
 // ═══ [2] PARTIAL FAILURE IS REPORTED, NOT SWALLOWED ══════════════════════════════════
 console.log('\n[2] a batch with one failing item')
 // Back into the subfolder — [1b] left us in /root, and this section wants the two rows that
 // live in /root/sub. A plain click both navigates and clears, which is the state we want.
 await clickRow('sub')
-ok('setup', '[0k] in /root/sub for the batch case', !!row('beta.txt') && !!row('delta.txt'))
+ok('[0k] in /root/sub for the batch case', !!row('beta.txt') && !!row('delta.txt'), '', 'setup')
 failDelete.add('/root/sub/beta.txt')
 await clickRow('beta.txt', { ctrlKey: true })
 await clickRow('delta.txt', { ctrlKey: true })
-ok('setup', '[0l] two rows selected in /root/sub', selCount() === 2, `count=${selCount()}`)
+ok('[0l] two rows selected in /root/sub', selCount() === 2, `count=${selCount()}`, 'setup')
 const before2 = deleted.length
 await deleteSelection()
 const touched2 = deleted.slice(before2)
-ok('core', '[2a] every item is attempted — the batch does not abort on the first failure',
-  touched2.includes('/root/sub/beta.txt') && touched2.includes('/root/sub/delta.txt'),
-  `delete calls: ${JSON.stringify(touched2)}`)
-ok('core', '[2b] the failing item is named in the on-screen error',
-  /beta\.txt/.test(text()) && /permission denied/.test(text()),
-  text().includes('permission denied') ? '' : '← nothing on screen says anything failed')
-ok('core', '[2c] …and the item that succeeded is really gone from the listing', !row('delta.txt'))
+ok('[2a] every item is attempted — the batch does not abort on the first failure', touched2.includes('/root/sub/beta.txt') && touched2.includes('/root/sub/delta.txt'), `delete calls: ${JSON.stringify(touched2)}`, 'core')
+ok('[2b] the failing item is named in the on-screen error', /beta\.txt/.test(text()) && /permission denied/.test(text()), text().includes('permission denied') ? '' : '← nothing on screen says anything failed', 'core')
+ok('[2c] …and the item that succeeded is really gone from the listing', !row('delta.txt'), '', 'core')
 
 // ═══ [5] runBatch PRUNES THE SELECTION ═══════════════════════════════════════════════
 // A stale name surviving a delete is invisible until the name comes BACK — then it returns
@@ -443,15 +423,13 @@ failDelete.clear()
 const back = buttons().find((b) => b.textContent === 'root')
 if (back) await fire(back, 'click')
 await clickRow('gamma.txt', { ctrlKey: true })
-ok('setup', '[0m] gamma.txt selected in /root', selCount() === 1, `count=${selCount()}`)
+ok('[0m] gamma.txt selected in /root', selCount() === 1, `count=${selCount()}`, 'setup')
 await deleteSelection()
-ok('setup', '[0n] …and it is gone', !row('gamma.txt'))
+ok('[0n] …and it is gone', !row('gamma.txt'), '', 'setup')
 FIXTURE['/root'].push({ name: 'gamma.txt', isDir: false })   // it comes back, e.g. from git
 const refresh = buttons().find((b) => b.textContent === '⟳')
 if (refresh) await fire(refresh, 'click')
-ok('core', '[5a] a re-created file of the same name comes back UNSELECTED',
-  !!row('gamma.txt') && selCount() === 0,
-  `row back=${!!row('gamma.txt')} count=${selCount()} — a lingering name would report 1`)
+ok('[5a] a re-created file of the same name comes back UNSELECTED', !!row('gamma.txt') && selCount() === 0, `row back=${!!row('gamma.txt')} count=${selCount()} — a lingering name would report 1`, 'core')
 
 // ═══ [6] THE CONFIRM SNAPSHOT — does the delete hit the folder you confirmed IN? ═════
 // `setConfirmDel(selected)` stores the ROWS, but `doDelete` rebuilds each path with
@@ -475,30 +453,25 @@ console.log('\n[6] the folder changes between confirm and confirm-click')
     console.log('  ⚠ /root no longer has both `sub` and `beta.txt` — [6] did not run.')
   } else {
     await clickRow('sub')
-    ok('setup', '[0o] in /root/sub, which has its own beta.txt', !!row('beta.txt'))
+    ok('[0o] in /root/sub, which has its own beta.txt', !!row('beta.txt'), '', 'setup')
     await clickRow('beta.txt', { ctrlKey: true })
-    ok('setup', '[0p] its beta.txt is selected', selCount() === 1, `count=${selCount()}`)
+    ok('[0p] its beta.txt is selected', selCount() === 1, `count=${selCount()}`, 'setup')
     const del = btn('Delete…')
     if (!del) {
       console.log('  ⚠ no Delete… button — [6] did not run.')
     } else {
       await fire(del, 'click')
-      ok('setup', '[0q] the confirm dialog is open', !!btn('Delete'))
+      ok('[0q] the confirm dialog is open', !!btn('Delete'), '', 'setup')
       // Leave the folder WITHOUT dismissing the dialog.
       const crumb2 = buttons().find((b) => b.textContent === 'root')
       if (crumb2) await fire(crumb2, 'click')
-      ok('setup', '[0r] navigated to /root while the confirm is still open',
-        !!btn('Delete') && !!row('gamma.txt'), `dialog=${!!btn('Delete')}`)
+      ok('[0r] navigated to /root while the confirm is still open', !!btn('Delete') && !!row('gamma.txt'), `dialog=${!!btn('Delete')}`, 'setup')
       const before6 = deleted.length
       const confirmBtn = btn('Delete')
       if (confirmBtn) await fire(confirmBtn, 'click')
       const touched6 = deleted.slice(before6)
-      ok('core', '[6a] the delete resolves against the folder the confirm was MADE in',
-        touched6.length === 1 && touched6[0] === '/root/sub/beta.txt',
-        `delete calls: ${JSON.stringify(touched6)} — expected ["/root/sub/beta.txt"]`)
-      ok('core', "[6b] …so /root's own same-named file is NOT the one destroyed",
-        !touched6.includes('/root/beta.txt'),
-        touched6.includes('/root/beta.txt') ? '← it deleted the WRONG beta.txt: a name resolved against the wrong folder' : '')
+      ok('[6a] the delete resolves against the folder the confirm was MADE in', touched6.length === 1 && touched6[0] === '/root/sub/beta.txt', `delete calls: ${JSON.stringify(touched6)} — expected ["/root/sub/beta.txt"]`, 'core')
+      ok("[6b] …so /root's own same-named file is NOT the one destroyed", !touched6.includes('/root/beta.txt'), touched6.includes('/root/beta.txt') ? '← it deleted the WRONG beta.txt: a name resolved against the wrong folder' : '', 'core')
     }
   }
 }
@@ -524,28 +497,20 @@ console.log('\n[7] the drawn icons')
   const folder = await svgOf('folder')
   const folderClass = folder?.getAttribute('class') ?? ''
   const fPaths = folder ? [...folder.querySelectorAll('path')] : []
-  ok('core', '[7a] the folder glyph draws a non-empty shape',
-    fPaths.length > 0 && (fPaths[0].getAttribute('d') ?? '').length > 20,
-    `paths=${fPaths.length}`)
-  ok('core', '[7b] …and it is FILLED, which is the weight difference that survives losing colour',
-    fPaths.some((n) => n.getAttribute('fill') === 'currentColor'))
+  ok('[7a] the folder glyph draws a non-empty shape', fPaths.length > 0 && (fPaths[0].getAttribute('d') ?? '').length > 20, `paths=${fPaths.length}`, 'core')
+  ok('[7b] …and it is FILLED, which is the weight difference that survives losing colour', fPaths.some((n) => n.getAttribute('fill') === 'currentColor'), '', 'core')
   const file = await svgOf('file')
   const fileClass = file?.getAttribute('class') ?? ''
   const filePaths = file ? [...file.querySelectorAll('path')] : []
   const stroked = file?.querySelector('g[stroke="currentColor"]')
-  ok('core', '[7c] the file glyph draws an OUTLINE, not a fill',
-    !!stroked && filePaths.length > 0 && !filePaths.some((n) => n.getAttribute('fill') === 'currentColor'),
-    `paths=${filePaths.length} stroked=${!!stroked}`)
+  ok('[7c] the file glyph draws an OUTLINE, not a fill', !!stroked && filePaths.length > 0 && !filePaths.some((n) => n.getAttribute('fill') === 'currentColor'), `paths=${filePaths.length} stroked=${!!stroked}`, 'core')
   const nb = await svgOf('notebook')
   const nbClass = nb?.getAttribute('class') ?? ''
   const nbPaths = nb ? [...nb.querySelectorAll('path')] : []
-  ok('core', '[7d] a notebook is the file silhouette PLUS a mark, not a different shape',
-    nbPaths.length === filePaths.length + 1, `notebook=${nbPaths.length} file=${filePaths.length}`)
+  ok('[7d] a notebook is the file silhouette PLUS a mark, not a different shape', nbPaths.length === filePaths.length + 1, `notebook=${nbPaths.length} file=${filePaths.length}`, 'core')
   // Colour is set centrally so it cannot drift into four slightly different yellows.
-  ok('core', '[7e] each kind carries its own tone class from the one TONE map',
-    folderClass.includes('text-ctp-yellow') && fileClass.includes('text-ctp-overlay')
-    && nbClass.includes('text-ctp-peach'),
-    `folder=${folderClass.trim()} file=${fileClass.trim()} notebook=${nbClass.trim()}`)
+  ok('[7e] each kind carries its own tone class from the one TONE map', folderClass.includes('text-ctp-yellow') && fileClass.includes('text-ctp-overlay')
+    && nbClass.includes('text-ctp-peach'), `folder=${folderClass.trim()} file=${fileClass.trim()} notebook=${nbClass.trim()}`, 'core')
   await act(async () => { iconRoot.unmount() })
 }
 
@@ -560,10 +525,10 @@ console.log('\n[8] the user navigates while a delete batch is in flight')
   const backR = buttons().find((b) => b.textContent === 'root')
   if (backR) await fire(backR, 'click')
   await clickRow('sub')
-  ok('setup', '[0s] /root/sub re-stocked with two files', !!row('one.txt') && !!row('two.txt'))
+  ok('[0s] /root/sub re-stocked with two files', !!row('one.txt') && !!row('two.txt'), '', 'setup')
   await clickRow('one.txt', { ctrlKey: true })
   await clickRow('two.txt', { ctrlKey: true })
-  ok('setup', '[0t] both selected', selCount() === 2, `count=${selCount()}`)
+  ok('[0t] both selected', selCount() === 2, `count=${selCount()}`, 'setup')
   const del = btn('Delete…')
   if (del) await fire(del, 'click')
   const confirmBtn = btn('Delete')
@@ -586,12 +551,8 @@ console.log('\n[8] the user navigates while a delete batch is in flight')
     await new Promise((r) => setTimeout(r, 600))          // let the batch and both loads finish
     await settle()
     deleteDelayMs = 0
-    ok('core', '[8a] the batch still deleted everything it was asked to',
-      deleted.includes('/root/sub/one.txt') && deleted.includes('/root/sub/two.txt'),
-      `deleted: ${JSON.stringify(deleted.slice(-2))}`)
-    ok('core', '[8b] …and finishing did NOT yank the user back to the batch\'s folder',
-      !!row('gamma.txt') && !row('one.txt'),
-      `on screen: ${JSON.stringify(([...document.querySelectorAll('span.font-mono')] as HTMLElement[]).filter((n) => n.closest('button')).map((n) => n.textContent))}`)
+    ok('[8a] the batch still deleted everything it was asked to', deleted.includes('/root/sub/one.txt') && deleted.includes('/root/sub/two.txt'), `deleted: ${JSON.stringify(deleted.slice(-2))}`, 'core')
+    ok('[8b] …and finishing did NOT yank the user back to the batch\'s folder', !!row('gamma.txt') && !row('one.txt'), `on screen: ${JSON.stringify(([...document.querySelectorAll('span.font-mono')] as HTMLElement[]).filter((n) => n.closest('button')).map((n) => n.textContent))}`, 'core')
     console.error = realErr
   }
 }
@@ -612,16 +573,15 @@ console.log('\n[9] a cut where one item fails to move')
   const backR = buttons().find((b) => b.textContent === 'root')
   if (backR) await fire(backR, 'click')
   await clickRow('sub')
-  ok('setup', '[0u] /root/sub stocked with two files to cut', !!row('moves.txt') && !!row('sticks.txt'))
+  ok('[0u] /root/sub stocked with two files to cut', !!row('moves.txt') && !!row('sticks.txt'), '', 'setup')
   await clickRow('moves.txt', { ctrlKey: true })
   await clickRow('sticks.txt', { ctrlKey: true })
   const cut = btn('Cut')
-  ok('setup', '[0v] both selected and a Cut button is offered', selCount() === 2 && !!cut, `count=${selCount()}`)
+  ok('[0v] both selected and a Cut button is offered', selCount() === 2 && !!cut, `count=${selCount()}`, 'setup')
   if (cut) await fire(cut, 'click')
   const pasteBtn = (): HTMLElement | null =>
     buttons().find((b) => (b.textContent ?? '').startsWith('📋 Paste')) ?? null
-  ok('setup', '[0w] the clipboard now offers a paste of BOTH items',
-    (pasteBtn()?.textContent ?? '').trim() === '📋 Paste 2', `label=${JSON.stringify(pasteBtn()?.textContent)}`)
+  ok('[0w] the clipboard now offers a paste of BOTH items', (pasteBtn()?.textContent ?? '').trim() === '📋 Paste 2', `label=${JSON.stringify(pasteBtn()?.textContent)}`, 'setup')
 
   // `sticks.txt` refuses to move; `moves.txt` goes through.
   failRename.add('/root/sub/sticks.txt')
@@ -634,20 +594,12 @@ console.log('\n[9] a cut where one item fails to move')
     const beforeRen = renamed.length
     await fire(p, 'click')
     const tried = renamed.slice(beforeRen)
-    ok('core', '[9a] both items were attempted (the batch does not abort on the failure)',
-      tried.some((r) => r.from === '/root/sub/moves.txt') && tried.some((r) => r.from === '/root/sub/sticks.txt'),
-      `renames tried: ${JSON.stringify(tried.map((r) => r.from))}`)
-    ok('core', '[9b] the one that succeeded really moved', !!row('moves.txt'))
+    ok('[9a] both items were attempted (the batch does not abort on the failure)', tried.some((r) => r.from === '/root/sub/moves.txt') && tried.some((r) => r.from === '/root/sub/sticks.txt'), `renames tried: ${JSON.stringify(tried.map((r) => r.from))}`, 'core')
+    ok('[9b] the one that succeeded really moved', !!row('moves.txt'), '', 'core')
     const after = pasteBtn()
-    ok('core', '[9c] the clipboard is PRUNED, not cleared — a retry is still offered',
-      !!after,
-      after ? '' : '← the clipboard was cleared wholesale: the failed item is stranded with no way to retry it')
-    ok('core', '[9d] …and it holds ONLY the failure, not both',
-      (after?.textContent ?? '').trim() === '📋 Paste',
-      `label=${JSON.stringify(after?.textContent)} — "📋 Paste 2" means it was kept whole, so a retry would re-attempt the moved item`)
-    ok('core', '[9e] …and the item it names is the one that failed',
-      (after?.getAttribute('title') ?? '').includes('sticks.txt'),
-      `title=${JSON.stringify(after?.getAttribute('title'))}`)
+    ok('[9c] the clipboard is PRUNED, not cleared — a retry is still offered', !!after, after ? '' : '← the clipboard was cleared wholesale: the failed item is stranded with no way to retry it', 'core')
+    ok('[9d] …and it holds ONLY the failure, not both', (after?.textContent ?? '').trim() === '📋 Paste', `label=${JSON.stringify(after?.textContent)} — "📋 Paste 2" means it was kept whole, so a retry would re-attempt the moved item`, 'core')
+    ok('[9e] …and the item it names is the one that failed', (after?.getAttribute('title') ?? '').includes('sticks.txt'), `title=${JSON.stringify(after?.getAttribute('title'))}`, 'core')
   }
 
   // ── the other half of the `mode === 'cut'` guard ──────────────────────────────────
@@ -659,18 +611,15 @@ console.log('\n[9] a cut where one item fails to move')
     buttons().find((b) => (b.textContent ?? '').startsWith('📋 Paste')) ?? null
   await clickRow('gamma.txt', { ctrlKey: true })
   const copyBtn = btn('Copy')
-  ok('setup', '[0x] a file is selected in /root and Copy is offered', selCount() === 1 && !!copyBtn)
+  ok('[0x] a file is selected in /root and Copy is offered', selCount() === 1 && !!copyBtn, '', 'setup')
   if (copyBtn) await fire(copyBtn, 'click')
   const beforeCopy = copied.length
   const p2 = pasteBtn2()
   if (p2) await fire(p2, 'click')
-  ok('core', '[9f] a copy-paste really copies', copied.length > beforeCopy,
-    `copies: ${JSON.stringify(copied.slice(beforeCopy).map((c) => c.to))}`)
+  ok('[9f] a copy-paste really copies', copied.length > beforeCopy, `copies: ${JSON.stringify(copied.slice(beforeCopy).map((c) => c.to))}`, 'core')
   const afterCopy = pasteBtn2()
-  ok('core', '[9g] …and a COPY clipboard SURVIVES its paste, so it can be pasted again',
-    !!afterCopy && (afterCopy.getAttribute('title') ?? '').includes('gamma.txt'),
-    afterCopy ? `title=${JSON.stringify(afterCopy.getAttribute('title'))}`
-              : '← the copy clipboard was consumed by pasting; only a CUT should be')
+  ok('[9g] …and a COPY clipboard SURVIVES its paste, so it can be pasted again', !!afterCopy && (afterCopy.getAttribute('title') ?? '').includes('gamma.txt'), afterCopy ? `title=${JSON.stringify(afterCopy.getAttribute('title'))}`
+              : '← the copy clipboard was consumed by pasting; only a CUT should be', 'core')
 }
 
 await act(async () => { root.unmount() })
