@@ -213,7 +213,7 @@ attributed to Devil and was not Devil's; the correction came from the teammate, 
 a full suite run while anyone is writing the tree; the run's own fingerprint will flag it and the
 number is wasted.
 
-## SERVER-SIDE / HARNESS SESSION — handover, 2026-08-31 (2nd update). Session `2e41c0b7`.
+## SERVER-SIDE / HARNESS SESSION — handover, 2026-09-01. Session `2e41c0b7`.
 
 Written by the session that holds write access to `server/src`, `shared/src` and root
 `node_modules`. Thin on purpose: everything already in this file, in the code, or in git is
@@ -226,15 +226,21 @@ connector upstream timeouts (`862c0e5`), built-in connectors (`833a165` + `3c54d
 the suite's full-run lock + end-of-run bundle banner (`3f73437`, `8e80a10`), jsdom (`4d403d8`)
 and the vitest root install (`8dbed06`).
 
-The lock move landed as `a58d49c`. **Nothing of mine is uncommitted** except this block —
-and note the coordinator commits fast, so a "currently uncommitted" list written here is
-stale within minutes. Read `git status` and `git log`, not this sentence.
+The lock move landed as `a58d49c` and is **verified cross-session** (the coordinator read this
+session's id out of `.suite-run.lock` at 18:18:08 on 08-31). The coordinator commits fast, so
+a "currently uncommitted" list written here is stale within minutes — read `git status` and
+`git log`, not this sentence.
 
-**My baseline: `90 passed / 2 failed / 2 skipped` (94 entries), zero contamination flags.**
-It PREDATES QA's uncommitted 29-file `assert.mjs` refactor and should not be quoted against
-the post-refactor tree. Both remaining non-green entries are known: the documented
-`EXPECTED_RED|closed` awaiting A2, and `sandbox-fs-escape-fixes-test`, which is red only in
-this session (see deltas).
+⚠ **The last CLEAN baseline is `90 passed / 2 failed / 2 skipped` (2026-08-31, 94 entries).**
+The later `88/4/2` run is **VOID** — another session wrote 33-35 files into `scratchpad/`
+inside its window and the fingerprint correctly flagged it (`THIS TOTAL IS NOT A BASELINE`,
+all culprits named). Do not quote 88/4/2. Two of its four reds are explained above and in the
+gotchas; only `sandbox-fs-escape-fixes-test` (environment) and the documented expected red
+were real.
+
+Both remaining non-green entries in that baseline are known and neither is a regression: the
+documented `EXPECTED_RED|closed` awaiting A2, and `sandbox-fs-escape-fixes-test`, which is red
+only in this session (see the deltas table).
 
 ### ★ THE FIVE ENVIRONMENT DELTAS — the most expensive thing on this page
 Sessions do NOT share an environment, and a suite figure is a property of the session that
@@ -270,17 +276,20 @@ It paid for itself within nine minutes — and by failing usefully. **QA wrote 3
 It had not run `--lock-status` first, and said so unprompted with the timestamps. So the
 mechanism works and the discipline of consulting it does not yet. Take the lock; also CHECK it.
 
-### ⚠ KNOWN FLAW IN THE LOCK, found by using it — the session field is usually wrong
-It reads `session:` from the `CLAUDE_CONFIG_DIR` basename. That is a real id only in a session
-with a host-scrubbed config mirror (`…/host-scrubbed-config/<uuid>`); everywhere else it is
-plain `~/.claude` and the field prints **`.claude`** — identical for every such holder, and
-attribution is the whole reason the field exists. Observed live: QA's run held the lock and
-identified itself as `.claude`.
+### ⚠ THE LOCK'S SESSION FIELD WAS USELESS FOR MOST HOLDERS — FIXED 2026-09-01
+It derived `session:` from the `CLAUDE_CONFIG_DIR` basename: a real uuid only in a session
+with a host-scrubbed config mirror, and the literal **`.claude`** everywhere else — identical
+for every such holder, which is precisely the job the field exists to do. Observed live: QA
+held the lock and identified itself as `.claude`.
 
-This is the `CLAUDE_CONFIG_DIR` environment delta reappearing inside a NEW mechanism, one
-block after the lesson that should have prevented it. The identifier was verified in the one
-session where it happens to work. Fix by falling back to pid (already present and unique on
-this host) and reporting `unknown` rather than a name that looks specific and is not.
+**This was the `CLAUDE_CONFIG_DIR` delta — item 2 of the table above — reappearing inside a
+NEW mechanism, one block after the lesson that should have prevented it.** I verified the
+identifier in the single session where it happens to work.
+
+Now: the uuid when there genuinely is one, else **`unidentified`** — an honest "unidentified
+holder, started 09:51, pid 536810" beats a name that looks specific and is not. Verified in
+all three shapes (mirror / no mirror / unset). ⚠ pid disambiguates for a HUMAN only: process
+visibility differs between sessions, so it is not a key to look a process up by.
 
 ### ★ NEXT STEP 2 — the concurrency cap. Coordinator is scoping it; do not invent a bound.
 The most valuable unbuilt thing in the tree, and the one most likely to be mistaken for
@@ -295,10 +304,29 @@ picking a number and defending it afterwards.
 fingerprinted. The repo root is NOT (`FP_TREES="web server/src shared/src scratchpad"`), so
 editing `HANDOVER.md` or `.gitignore` during a run is safe.
 
+### ★ THE `srv4321` "FLAKE" IS DIAGNOSED — a test asserting on a path that no longer feeds it
+`ratelimit-test.mjs` fails ~2 runs in 4. Not a flake in the ordinary sense, and not two flaky
+tests: the failures show REAL values (`Session 52%`, `Weekly 12%`) replacing the injected
+fixtures (41%, 91%).
+
+Mechanism: the test injects `rate_limit_event` frames over the websocket, but **`useUsage()`
+(`web/src/components/ChatView.tsx:857`) polls `GET /api/usage` on mount and every 60s and
+REPLACES the whole window array**, and the chip renders from that poll — not from the injected
+event. The test passes only when it wins a race against the real data source; its green means
+the poll was slow.
+
+That also explains why two DIFFERENT `srv4321` tests each failed once: one timing-dependent
+mechanism, and whichever test is on screen when a poll resolves gets clobbered. Fix by keeping
+the live fetch away from the fixture (stub/block `/api/usage` in the harness, or have the
+throwaway server not fetch) — not by chasing either test.
+
 ### Gotchas that actually bit
 - **Mutation-test a COPY, never the live file**, for anything under `web/`: the bucket-1
   banner compares *mtime*, so even a byte-identical revert leaves it stale. The fingerprint
   compares *content*. They answer different questions and disagree on exactly this case.
+- **A harness rewritten MID-RUN executes a version nobody verified.** On 2026-08-31 a run
+  executed `notebook-ui-e2e.mjs` two minutes after another session rewrote it; its red was an
+  artefact, not a regression. Check a failing file's mtime against its log's before believing it.
 - **Never infer "a run is in flight" from a port.** `:4321` is held only during the srv4321
   block. Use log mtimes or ask.
 - A **rebuild mid-run** splits bucket 1 across two bundles. The end-of-run banner now names
