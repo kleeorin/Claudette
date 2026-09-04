@@ -421,6 +421,36 @@ function reduceStore(state: SessionStoreState, action: SessionStoreAction): Sess
         next.delete(action.id)
         attention = next
       }
+      // (a2) STARTING A NEW TURN RETIRES A `finished` ENTRY. Reported 2026-09-03: a subsession
+      //      showed the red "done" light WHILE IT WAS WORKING, so red meant both "finished,
+      //      needs you" and "busy" and told you neither.
+      //
+      //      Why it happened: `finished` was cleared in exactly ONE place — `withActive`, i.e.
+      //      by VIEWING the session. That is sufficient only if viewing is the only way a
+      //      finished session stops being finished. It is not: sending it another turn starts
+      //      it working again, and on a session you are not watching (a teammate, which is the
+      //      whole point of subsessions) nothing ever cleared the flag. The dot then reported a
+      //      turn that ended two turns ago.
+      //
+      //      Scoped to `running`, and BE HONEST ABOUT WHY: at THIS position the scope is not
+      //      load-bearing. Measured 2026-09-03 — replacing the condition with an unscoped
+      //      `attention.get(id) === 'finished'` delete leaves the suite at 98/98, because this
+      //      clear runs BEFORE (b), so a waiting→idle transition simply has its flag re-set by
+      //      (b) on the same action. An earlier draft of this comment claimed the scope was
+      //      required for the reason (a) records; the mutation refutes that, and the claim is
+      //      removed rather than left to read as a justification nothing supports.
+      //
+      //      The scope is kept anyway, as PRECISION THAT SURVIVES A MOVE: (a) is only correct
+      //      because of where it sits, and this file has already been bitten once by a condition
+      //      that was carried by position and silently dropped when the code moved (see the
+      //      composed EXIT handler in run-suite.sh, same week). Saying what we mean costs
+      //      nothing and does not depend on ordering staying as it is. `waiting` needs no case
+      //      — (c) below overwrites the reason via flagAttention.
+      if (action.state === 'running' && attention.get(action.id) === 'finished') {
+        const next = new Map(attention)
+        next.delete(action.id)
+        attention = next
+      }
       // (b) then (c). Both go through flagAttention, so a repeat of the same reason keeps
       //     the existing map identity.
       if (finishedUnwatched) attention = flagAttention(attention, action.id, 'finished')

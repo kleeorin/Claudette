@@ -14,12 +14,27 @@ import { ConnectorGrants } from './ConnectorGrants'
 //
 // `compact` (the meta-bar popover) trims the explanatory prose to just "what is
 // mounted"; the full panel keeps the detail.
+//
+// THE FOLDER LIST IS A UNION, not just this session's mounts: it shows every mount PLUS
+// every saved default (SandboxDefaultFolder) that isn't mounted here, each as one ticked
+// or unticked row. That is what makes a default "always there" — unticking a saved folder
+// leaves the row in place so it can be ticked back on, whereas unticking an unsaved one
+// removes it outright and the row goes with it. The saved list is install-wide and INERT:
+// it is a menu, and only a tick (which goes through setSandbox like any other mount) ever
+// binds anything into a box.
 export function SandboxEditor({ session, compact = false }: { session: SessionInfo; compact?: boolean }) {
-  const { sandboxAvailable, gpuDevices, setSandbox } = useSessions()
+  const { sandboxAvailable, gpuDevices, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault } = useSessions()
   const [picking, setPicking] = useState(false)   // folder-picker modal open
   // Access for the folder about to be added, chosen INSIDE the picker. Defaults to the
   // safe 'ro' each time it opens, so granting write is always a deliberate click.
   const [pickMode, setPickMode] = useState<'rw' | 'ro'>('ro')
+  // Does the folder about to be added ALSO go into the saved defaults? Reset to false each
+  // time the picker opens, for the same reason pickMode resets to 'ro': a choice that
+  // outlives the pick it was made for is a choice nobody made for the next one.
+  const [pickSave, setPickSave] = useState(false)
+  // The server's refusal (a relative path, the 50-entry cap). Rendered under the list
+  // rather than thrown away — a star that silently does nothing is the worst outcome here.
+  const [defaultsError, setDefaultsError] = useState<string | null>(null)
 
   // The requested config, defaulting to enabled + the session cwd (rw) — mirrors the
   // server's normalizeSandbox so a session with no stored config still shows sensibly.
@@ -49,6 +64,26 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
   const removeMount = (i: number) => push({ ...cfg, mounts: cfg.mounts.filter((_, j) => j !== i) })
   const addMount = (m: SandboxMount) => push({ ...cfg, mounts: [...cfg.mounts, m] })
   const applyNow = () => { void api.http.relaunchApply(session.id) }
+
+  // Save (or re-mode) a default, surfacing the server's refusal instead of swallowing it.
+  const saveDefault = async (f: SandboxMount) => { setDefaultsError(await saveSandboxDefault(f)) }
+  // Same for forgetting one. Both report through the SAME error line, because from the
+  // operator's side "the star did nothing" is one symptom regardless of which way it failed.
+  const forgetDefault = async (p: string) => { setDefaultsError(await removeSandboxDefault(p)) }
+
+  // The union the list renders: this session's mounts first, in their own order, then the
+  // saved defaults it does NOT mount. `index` is the row's position in cfg.mounts, which
+  // is what setMode/removeMount address — hence -1 for an unmounted row, where neither is
+  // reachable. Keyed by path (not index) so ticking one row can't make React reuse another
+  // row's checkbox state as the array reorders under it.
+  const mounted = new Set(cfg.mounts.map((m) => m.path))
+  const savedPaths = new Set(sandboxDefaults.map((d) => d.path))
+  const rows = [
+    ...cfg.mounts.map((m, i) => ({ path: m.path, mode: m.mode, mounted: true, saved: savedPaths.has(m.path), index: i })),
+    ...sandboxDefaults
+      .filter((d) => !mounted.has(d.path))
+      .map((d) => ({ path: d.path, mode: d.mode, mounted: false, saved: true, index: -1 })),
+  ]
 
   return (
     <div className="p-3 text-[11px] text-ctp-subtext space-y-2.5">
@@ -92,28 +127,70 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
               </div>
             </>
           )}
-          {compact && <div className="text-ctp-overlay leading-snug">Mounted (writable <span className="text-ctp-blue font-mono">rw</span> / read-only <span className="font-mono">ro</span>):</div>}
+          {compact && (
+            <div className="text-ctp-overlay leading-snug">
+              Tick to mount (writable <span className="text-ctp-blue font-mono">rw</span> / read-only{' '}
+              <span className="font-mono">ro</span>); <span className="text-ctp-yellow">★</span> keeps a folder
+              in this list for every session.
+            </div>
+          )}
+          {!compact && (
+            <div className="text-ctp-overlay leading-snug">
+              Tick a folder to mount it here. <span className="text-ctp-yellow">★</span> saves it to your
+              <b> defaults</b>: a starred folder stays listed in every session, ticked or not, so you never walk
+              the picker to it twice. Starring mounts nothing on its own — an unticked row is just a shortcut.
+            </div>
+          )}
           <div className="space-y-1">
-            {cfg.mounts.length === 0 && <div className="text-ctp-overlay italic">No mounts — nothing writable.</div>}
-            {cfg.mounts.map((m, i) => (
-              <div key={i} className="flex items-center gap-1.5">
-                <span className="font-mono text-ctp-text truncate flex-1" title={m.path}>
-                  {prettyPath(m.path)}
-                  {m.path === session.cwd && <span className="text-ctp-overlay"> (project)</span>}
-                </span>
-                <button
-                  onClick={() => setMode(i, m.mode === 'rw' ? 'ro' : 'rw')}
-                  className={`px-1.5 rounded text-[10px] font-mono ${m.mode === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface0 text-ctp-subtext'}`}
-                  title={m.mode === 'rw' ? 'Writable — click for read-only' : 'Read-only — click for writable'}
+            {cfg.mounts.length === 0 && <div className="text-ctp-overlay italic">Nothing ticked — nothing writable.</div>}
+            {rows.map((r) => (
+              <div key={r.path} className="flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={r.mounted}
+                  onChange={() => (r.mounted ? removeMount(r.index) : addMount({ path: r.path, mode: r.mode }))}
+                  className="accent-ctp-accent shrink-0"
+                  title={r.mounted
+                    ? (r.saved ? 'Mounted — untick to drop it from this session (stays in your defaults)'
+                               : 'Mounted — untick to remove it (not saved, so the row goes too)')
+                    : `Not mounted — tick to bind it ${r.mode}`}
+                />
+                <span
+                  className={`font-mono truncate flex-1 ${r.mounted ? 'text-ctp-text' : 'text-ctp-overlay'}`}
+                  title={r.path}
                 >
-                  {m.mode}
+                  {prettyPath(r.path)}
+                  {r.path === session.cwd && <span className="text-ctp-overlay"> (project)</span>}
+                </span>
+                {/* One chip, two targets, because it edits WHATEVER THE ROW IS SHOWING. A ticked
+                    row shows this session's mount, so the chip changes that and leaves the saved
+                    default alone (the point of SandboxDefaultFolder.mode being a seed). An
+                    unticked row is only ever the saved default, so the chip changes that. */}
+                <button
+                  onClick={() => (r.mounted
+                    ? setMode(r.index, r.mode === 'rw' ? 'ro' : 'rw')
+                    : void saveDefault({ path: r.path, mode: r.mode === 'rw' ? 'ro' : 'rw' }))}
+                  className={`px-1.5 rounded text-[10px] font-mono ${r.mode === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface0 text-ctp-subtext'}`}
+                  title={`${r.mode === 'rw' ? 'Writable — click for read-only' : 'Read-only — click for writable'}`
+                    + (r.mounted ? ' (this session)' : ' (the saved default)')}
+                >
+                  {r.mode}
                 </button>
-                <button onClick={() => removeMount(i)} className="text-ctp-overlay hover:text-ctp-red px-0.5" title="Remove mount">×</button>
+                <button
+                  onClick={() => (r.saved ? void forgetDefault(r.path) : void saveDefault({ path: r.path, mode: r.mode }))}
+                  className={`px-0.5 ${r.saved ? 'text-ctp-yellow hover:text-ctp-overlay' : 'text-ctp-overlay hover:text-ctp-yellow'}`}
+                  title={r.saved
+                    ? 'Saved as a default — click to forget it (any session already mounting it keeps it)'
+                    : 'Save to your defaults, so every session lists it'}
+                >
+                  {r.saved ? '★' : '☆'}
+                </button>
               </div>
             ))}
           </div>
+          {defaultsError && <div className="text-ctp-red leading-snug">{defaultsError}</div>}
           <button
-            onClick={() => { setPickMode('ro'); setPicking(true) }}
+            onClick={() => { setPickMode('ro'); setPickSave(false); setPicking(true) }}
             className="w-full rounded border border-dashed border-ctp-surface2 text-ctp-subtext hover:text-ctp-text hover:border-ctp-overlay py-1"
           >
             + Add a folder…
@@ -219,27 +296,43 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
           // Pick the access alongside the folder — mounting a drive you intend to write
           // to shouldn't mean adding it read-only and then hunting for the toggle.
           accessory={
-            <div className="flex items-center gap-1 shrink-0" title="Read-only, or writable by Claude">
-              <span className="text-[11px] text-ctp-overlay">Access</span>
-              {(['ro', 'rw'] as const).map((m) => (
-                <button
-                  key={m}
-                  onClick={() => setPickMode(m)}
-                  className={`px-2 py-1 rounded text-[11px] font-mono transition-colors ${
-                    pickMode === m
-                      ? m === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface1 text-ctp-text'
-                      : 'text-ctp-overlay hover:text-ctp-text'
-                  }`}
-                >
-                  {m}
-                </button>
-              ))}
+            <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-1" title="Read-only, or writable by Claude">
+                <span className="text-[11px] text-ctp-overlay">Access</span>
+                {(['ro', 'rw'] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setPickMode(m)}
+                    className={`px-2 py-1 rounded text-[11px] font-mono transition-colors ${
+                      pickMode === m
+                        ? m === 'rw' ? 'bg-ctp-blue/20 text-ctp-blue' : 'bg-ctp-surface1 text-ctp-text'
+                        : 'text-ctp-overlay hover:text-ctp-text'
+                    }`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+              {/* Saving rides ALONG with the pick for the same reason the access does: the
+                  moment you have walked the picker to a folder is the moment you know
+                  whether you'll want it again, and making that a second hunt for the ☆
+                  afterwards is how a defaults list stays empty. */}
+              <label
+                className="flex items-center gap-1 cursor-pointer select-none"
+                title="Keep this folder in your defaults, so every session lists it"
+              >
+                <input type="checkbox" checked={pickSave} onChange={() => setPickSave((v) => !v)} className="accent-ctp-accent" />
+                <span className="text-[11px] text-ctp-overlay">Save as default</span>
+              </label>
             </div>
           }
           onPick={(p) => {
             setPicking(false)
             // Skip exact duplicates; the per-mount toggle still changes access later.
             if (!cfg.mounts.some((m) => m.path === p)) void addMount({ path: p, mode: pickMode })
+            // Independent of the dup check above: a folder can already be mounted here and
+            // still be worth saving, and that is exactly the case the check would skip.
+            if (pickSave) void saveDefault({ path: p, mode: pickMode })
           }}
         />
       )}

@@ -86,6 +86,12 @@ vi.mock('../api/client', () => ({
       rename: async () => ({ ok: true }),
       setMode: async () => ({ applied: 'live', mode: 'default' }),
       setSandbox: async () => ({ ok: true }),
+      // The saved-folder list the provider fetches once at mount. Empty is the right
+      // stub: these tests are about session transitions, and an empty list is what the
+      // sandbox editor degrades to anyway (picker only), so nothing here depends on it.
+      sandboxDefaults: async () => ({ folders: [] }),
+      saveSandboxDefault: async () => ({ folders: [] }),
+      removeSandboxDefault: async () => ({ folders: [] }),
       setTeamEmploy: async () => ({ ok: true }),
     },
   },

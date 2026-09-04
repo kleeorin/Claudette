@@ -824,10 +824,27 @@ export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
 // security ro overlays (appSourceProtections / hookSettingsProtections) are applied
 // separately at emission and are NOT weakened by this — they still layer ro on top of
 // the broader rw bind (bwrap's deeper/later bind wins there).
-function dedupeMounts(mounts: SandboxMount[]): SandboxMount[] {
+//
+// EXPORTED because it is THE canonicaliser for a mount list. normalizeSandbox calls it too,
+// so the config the client is handed is byte-identical to the set emitted here — see the
+// comment there. Before that, this function was the only one of three normalisation sites in
+// the mount path that resolved before comparing, and the UI joined its own un-normalised list
+// against the defaults store's `path.resolve`d one by raw string equality, producing two rows
+// for one folder.
+//
+// Malformed entries are DROPPED rather than resolved. `path.resolve` accepts a non-string by
+// throwing (ERR_INVALID_ARG_TYPE, out of the launch path, where it is a 500 that names
+// "paths[0]" and nothing else), and — worse, because it is silent — `path.resolve('')`
+// returns the SERVER'S OWN CWD, so an empty mount path bind-mounted the Claudette install
+// directory into the box. Dropping is strictly narrowing, so it cannot widen a box that
+// worked before; it removes a widening nobody asked for.
+export function dedupeMounts(mounts: SandboxMount[]): SandboxMount[] {
   const byPath = new Map<string, SandboxMount>()
   for (const m of mounts) {
-    const p = path.resolve(m.path)
+    if (!m || typeof m.path !== 'string' || !m.path.trim()) continue
+    const p = path.resolve(m.path.trim())
+    // Any mode that is not exactly 'rw' is treated as 'ro' — unchanged, and the reason
+    // normalizeSandbox can coerce a junk mode to 'ro' without altering what the box contains.
     const mode: SandboxMount['mode'] = byPath.get(p)?.mode === 'rw' || m.mode === 'rw' ? 'rw' : 'ro'
     byPath.set(p, { path: p, mode })
   }

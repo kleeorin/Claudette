@@ -28,6 +28,7 @@ import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from '.
 import { registerFsRoutes } from './fs/fsApi'
 import { registerGitRoutes } from './git/gitApi'
 import { registerConnectorRoutes } from './connectors/connectorApi'
+import { registerSandboxDefaultsRoutes } from './claude/sandboxDefaultsApi'
 import { ConnectorProxy } from './connectors/connectorProxy'
 import { connectorServers, connectorDenyRules } from './connectors/connectorLaunch'
 import { strictMode, defaultGrants } from './connectors/connectorStore'
@@ -291,6 +292,7 @@ registerPaneRoutes(app, panes)
 registerFsRoutes(app)
 registerGitRoutes(app)
 registerConnectorRoutes(app, sessions)
+registerSandboxDefaultsRoutes(app)
 registerUsageRoutes(app)
 
 // Reverse-proxy the browser's Jupyter REST/asset requests through our origin, with

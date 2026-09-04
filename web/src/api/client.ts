@@ -11,7 +11,7 @@ import type {
   TaskRecord,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
-  ActivePane, KernelSpecsResponse, SandboxConfig,
+  ActivePane, KernelSpecsResponse, SandboxConfig, SandboxDefaultFolder, SandboxDefaultsResponse,
   AgentInfo, ListAgentsResponse,
   EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
   UsageResponse,
@@ -321,6 +321,17 @@ export const api = {
     // Grant/revoke a session's right to hire teammates. Only this auth-gated route can:
     // the server refuses an untrusted grant so a confined session can't hire itself a team.
     setTeamEmploy: (id: string, teamEmploy: boolean) => post<OkResponse>('/api/session/setTeamEmploy', { id, teamEmploy }),
+    // --- saved folder defaults (SandboxDefaultFolder) -------------------------
+    // The operator's standing list of favourite folders, offered as one-click mounts in
+    // every session's sandbox editor. INSTALL-WIDE like the connector catalog above, and
+    // like it the list is only ever a menu: an entry mounts nothing until it is ticked,
+    // and the tick goes through setSandbox. Every write answers with the WHOLE list, so a
+    // caller never reconciles a patch against what it thought it had.
+    sandboxDefaults: () => get<SandboxDefaultsResponse>('/api/sandbox/defaults'),
+    saveSandboxDefault: (f: SandboxDefaultFolder) =>
+      post<SandboxDefaultsResponse & { error?: string }>('/api/sandbox/defaults/save', f),
+    removeSandboxDefault: (path: string) =>
+      post<SandboxDefaultsResponse>('/api/sandbox/defaults/delete', { path }),
     // --- connectors (see CONNECTORS.md) --------------------------------------
     // The CATALOG is global (one per install); the GRANT is per session. Two scopes, two
     // surfaces: the Claudette deck edits the catalog, the sandbox panel edits a session's

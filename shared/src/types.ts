@@ -46,6 +46,32 @@ export interface SandboxConfig {
   gpu?: boolean
 }
 
+// A folder the operator keeps in a standing, INSTALL-WIDE list so every session's sandbox
+// editor can offer it as a one-click mount instead of a walk through the folder picker.
+// The list is deliberately INERT: an entry is a shortcut and nothing more, never mounted
+// into any session on its own, so saving one widens no box until the operator ticks it
+// somewhere specific.
+//
+// That inertness is also why the list needs no trust gate of its own, unlike `gpu` or
+// `enabled:false` above. Ticking an entry still goes through the auth-gated setSandbox
+// route and normalizeSandbox, so the worst an in-box caller could achieve by reaching the
+// list is to SUGGEST a path to the operator's own UI. Keep it that way: the moment an
+// entry here mounts itself into a session, it becomes a confinement-widening channel and
+// needs the same `trusted` gate normalizeSandbox applies.
+export interface SandboxDefaultFolder {
+  path: string
+  // The access a tick GRANTS. A seed, not a binding: once mounted, the per-mount rw/ro
+  // toggle edits the SESSION's copy and leaves this alone — so a folder saved as `ro` can
+  // still be made writable for one session without rewriting the default for every other.
+  mode: 'rw' | 'ro'
+}
+
+// GET /api/sandbox/defaults, and the reply to every mutation below — each write returns
+// the WHOLE list so a client never has to reconcile a patch against what it thought it had.
+export interface SandboxDefaultsResponse {
+  folders: SandboxDefaultFolder[]
+}
+
 // A selectable session role (agent): its id, display name, and a one-line summary.
 // The full charter/tool-scope lives server-side (claude/agents.ts); the client only
 // needs these three to render the role picker + a sidebar badge.

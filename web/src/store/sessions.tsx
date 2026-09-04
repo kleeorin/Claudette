@@ -44,7 +44,7 @@
 import {
   createContext, useContext, useEffect, useState, useCallback, useMemo, useReducer, type ReactNode,
 } from 'react'
-import type { SessionInfo, PermissionMode, SetModeResult, SandboxConfig, AgentInfo } from '@claudette/shared'
+import type { SessionInfo, PermissionMode, SetModeResult, SandboxConfig, SandboxDefaultFolder, AgentInfo } from '@claudette/shared'
 import { api, getHealth } from '../api/client'
 import { reduceSessionStore, initialSessionStore, type AttentionReason } from './sessionReducer'
 
@@ -76,6 +76,21 @@ interface ContextValue {
   // Update a session's bwrap sandbox config (enable/disable, mounts). Applies on the
   // next launch; the caller relaunches to bring it into force.
   setSandbox: (id: string, sandbox: SandboxConfig) => Promise<void>
+  // The operator's standing list of favourite folders (SandboxDefaultFolder). INSTALL-WIDE,
+  // not per session, and INERT: nothing here is mounted anywhere until it is ticked in a
+  // session's sandbox editor, which goes through setSandbox above like any other mount.
+  // Lives in this store rather than in the editor's own state because the sandbox chip's
+  // popover and the dock panel are two mounted copies of that editor — two copies of the
+  // list would disagree the moment one of them saved.
+  sandboxDefaults: SandboxDefaultFolder[]
+  // Add a folder to the list, or change the mode of one already in it (upsert by path).
+  // Resolves to an error string when the server refused (a relative path, list full).
+  saveSandboxDefault: (folder: SandboxDefaultFolder) => Promise<string | null>
+  // Drop a folder from the list. Does NOT unmount it anywhere: a session that already has
+  // it mounted keeps it, because forgetting a shortcut is not the same act as revoking a
+  // mount the operator granted. Resolves to an error string when the server refused or
+  // answered with something that is not a list.
+  removeSandboxDefault: (path: string) => Promise<string | null>
   // Grant/revoke this session's right to hire teammates itself (employ_teammate).
   setTeamEmploy: (id: string, teamEmploy: boolean) => Promise<void>
   // Was this session created in THIS app load (vs restored from persistence)? A
@@ -109,6 +124,7 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   const [gpuDevices, setGpuDevices] = useState<string[]>([])
   const [homeDir, setHomeDir] = useState('')
   const [agents, setAgents] = useState<AgentInfo[]>([])
+  const [sandboxDefaults, setSandboxDefaults] = useState<SandboxDefaultFolder[]>([])
 
   const patch = useCallback((id: string, fields: Partial<SessionInfo>) => {
     dispatch({ type: 'patch', id, fields })
@@ -240,6 +256,44 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     await api.http.setSandbox(id, sandbox)
   }, [patch])
 
+  // Fetch the saved folder list once. A failure leaves it empty, which degrades to exactly
+  // the pre-feature UI (picker only) rather than to a broken one — so no error surface.
+  useEffect(() => { api.http.sandboxDefaults().then((r) => setSandboxDefaults(r.folders ?? [])).catch(() => {}) }, [])
+
+  // Both mutators take the server's returned list as the new truth instead of patching
+  // locally. The server normalises paths (`/a/b/` and `/a/b` are one entry) and upserts, so
+  // a client-side splice would drift from what is actually stored the first time a path
+  // needed normalising — and the drift would only show up after a reload.
+  // BOTH mutators gate on `Array.isArray(r.folders)` rather than `r.folders ?? []`, and that
+  // is not defensive noise — it is the difference between showing an error and silently
+  // destroying the operator's menu. `post()` in client.ts does NOT check `res.ok`; it returns
+  // `res.json()` whatever the status. So a 500 (persist() hitting ENOSPC or EACCES on the data
+  // dir) arrives here as a perfectly ordinary object with no `folders` key, and `?? []` then
+  // reads that absence as the authoritative answer "there are no saved folders" and empties the
+  // list. The server still holds every row; only the UI forgets them, until a reload nobody
+  // knows to do. That is this repo's recurring "empty collection treated as authoritative"
+  // shape — the same one that has twice ended in every terminal being killed.
+  //
+  // An absent list means WE DO NOT KNOW, which is not the same as "empty", so the mutators
+  // leave the last known-good list alone and report instead.
+  const saveSandboxDefault = useCallback(async (folder: SandboxDefaultFolder): Promise<string | null> => {
+    const r = await api.http.saveSandboxDefault(folder)
+    if (r.error) return r.error
+    if (!Array.isArray(r.folders)) return 'Could not save that folder — the server did not return the list.'
+    setSandboxDefaults(r.folders)
+    return null
+  }, [])
+
+  // Returns an error string like its sibling, rather than void: forgetting a default that
+  // silently fails is exactly the "a star that does nothing" outcome the editor's error line
+  // exists to prevent, and the caller cannot surface what it is not given.
+  const removeSandboxDefault = useCallback(async (path: string): Promise<string | null> => {
+    const r = await api.http.removeSandboxDefault(path)
+    if (!Array.isArray(r.folders)) return 'Could not forget that folder — the server did not return the list.'
+    setSandboxDefaults(r.folders)
+    return null
+  }, [])
+
   // "Employ team allowed": may this session hire/dismiss teammates on its own? Off by
   // default. Messaging between existing sessions never depends on this — only roster
   // management does, because that is the part that spends money without being asked.
@@ -267,8 +321,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // permanently stable (they close over nothing but `dispatch`), so this list is shorter
   // in practice than it looks.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention, activity }),
-    [sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, setTeamEmploy, isFresh, markBusy, attention, activity],
+    () => ({ sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity }),
+    [sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity],
   )
   return (
     <SessionsContext.Provider value={value}>

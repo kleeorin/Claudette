@@ -17,7 +17,7 @@ import { getAgent, isAgent, agentKey, COORDINATOR_INSTRUCTION, MEMBER_INSTRUCTIO
 import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
 import { snapshot, saveRef } from '../git/shadowSnapshots'
-import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed } from './sandbox'
+import { wrapSandbox, sandboxAvailable, sandboxSystemPrompt, sandboxKey, unsandboxedAllowed, dedupeMounts } from './sandbox'
 import { connectorKey } from '../connectors/connectorLaunch'
 import { markConfigExposed, isConfigExposed, scrubbedHostConfigDir, releaseHostConfigDir } from './configProtection'
 
@@ -238,6 +238,42 @@ export class SessionManager extends EventEmitter {
     accountConnectors?: string[],
   ): Session {
     const id = crypto.randomUUID()
+    // CANONICALISE THE SESSION'S DIRECTORIES ONCE, HERE, before anything stores or compares
+    // them. register() is the single funnel — create() delegates to it and boot restore()
+    // reaches it directly — so this is the only place that has to be right.
+    //
+    // WHY: `cwd` arrives as free text from the new-session dialog, and shell tab-completion
+    // supplies a trailing slash. It was stored verbatim while mount paths are canonical
+    // (normalizeSandbox → dedupeMounts), and SandboxEditor renders its "(project)" marker by
+    // comparing `r.path === session.cwd`. So for the exact input the mount fix was written
+    // for — `/home/u/proj/` — the star was fixed and the label broke: two populations
+    // compared by string equality with only one of them canonicalised, which is the original
+    // defect displaced by one join. Fixing it in the browser is not available (`path.resolve`
+    // does not exist there) and would mean a second normal form, which is what sharing
+    // dedupeMounts exists to prevent.
+    //
+    // It also closes a latent mismatch nobody had hit yet: the CLI writes its transcripts
+    // under the mangle of ITS OWN process.cwd(), and spawning with `/home/u/proj/` gives the
+    // child `/home/u/proj` (measured — the kernel strips it). So a stored trailing slash made
+    // projectDir(s.cwd) point at `-home-u-proj-` while the transcripts sat in `-home-u-proj`,
+    // the failure mode conversations.ts already documents for CLAUDE_CONFIG_DIR: /resume
+    // listing nothing and rewind silently unavailable.
+    //
+    // `rootDir` gets the SAME treatment deliberately. It defaults to `cwd`, so canonicalising
+    // one and not the other would make the default case hold two spellings of one directory —
+    // a fresh instance of the very inconsistency being removed. It is the file-browser root
+    // and is displayed in the session panel; nothing server-side does a `startsWith`
+    // containment test against it, so removing a trailing slash cannot widen a prefix match.
+    //
+    // EMPTY STAYS EMPTY. `path.resolve('')` returns the SERVER'S OWN CWD, and an absent cwd is
+    // a real state with real meaning — runDirOf falls back to homedir(), and normalizeSandbox
+    // seeds no mount at all. Resolving it would silently give every cwd-less session the
+    // install directory as its working dir and as an rw mount. Whitespace-only collapses to
+    // empty for the same reason, which also spares runDirOf a spawn into a directory named
+    // "   ". Resolution is against the SERVER's process cwd, matching dedupeMounts — never a
+    // session-relative base, which would silently name a different directory.
+    cwd = canonicalDir(cwd)
+    rootDir = canonicalDir(rootDir)
     // SANDBOXED TOGETHER BY DEFAULT: a teammate created without an explicit config
     // inherits its coordinator's, so extra mounts the operator granted the coordinator
     // (a docs tree, a sibling repo) reach the team too — rather than the teammate
@@ -1252,10 +1288,55 @@ export function normalizeGrants(
   return { connectors: c.length ? c : undefined, accountConnectors: a.length ? a : undefined }
 }
 
+// One spelling for a directory the operator typed. Exported so a test can pin the empty-stays-
+// empty rule, which is the part that is easy to "simplify" away and expensive to get wrong.
+export function canonicalDir(p: string): string {
+  const t = p?.trim()
+  return t ? path.resolve(t) : ''
+}
+
 export function normalizeSandbox(sandbox: SandboxConfig | undefined, cwd: string, trusted = false): SandboxConfig {
   const cfg: SandboxConfig = !sandbox
     ? { enabled: true, mounts: cwd ? [{ path: cwd, mode: 'rw' }] : [] }
     : { enabled: sandbox.enabled, mounts: sandbox.mounts, sandboxTerminals: sandbox.sandboxTerminals, gpu: sandbox.gpu }
+  // CANONICALISE THE MOUNT PATHS, through the same dedupeMounts that emits the bwrap args.
+  // This function used to pass `sandbox.mounts` through verbatim — no resolve, no trim — while
+  // the sandbox-defaults store canonicalised every saved path with `path.resolve`. The sandbox
+  // editor then joined those two lists by raw string equality, so a mount of `/home/u/proj/`
+  // and a saved default of `/home/u/proj` were two rows for one folder: the mounted row showed
+  // a star that could never fill (each click upserted the same canonical path and got back the
+  // same non-matching string) and the phantom row below it added a SECOND mount of the same
+  // directory. No hand-editing needed — the new-session dialog takes a free-text working
+  // directory, and a trailing slash is what shell tab-completion gives you.
+  //
+  // Fixed HERE rather than at the join in the web editor because `path.resolve` does not exist
+  // in a browser bundle: fixing it there would mean a second, hand-written normal form obliged
+  // to agree with this one forever. One canonicaliser, server-side, and the client only ever
+  // receives canonical paths.
+  //
+  // Calling dedupeMounts rather than re-implementing it is the same argument one level down.
+  // It was ALREADY the only site in this feature's path that resolved before comparing, which
+  // is why the box has always been correct — the duplicate collapsed at emission, so this was
+  // a UI/state defect and never a confinement one. Sharing it means the config handed to the
+  // client is exactly the set that will be mounted, rather than two lists that merely ought to
+  // agree. It is also what `sandboxPathAccess` authorizes against, so all three stay in step.
+  //
+  // RELATIVE PATHS ARE RESOLVED, NOT REFUSED — a deliberate choice, and the alternative was
+  // real. The defaults store refuses a non-absolute path outright (`isAbsolute`), so refusing
+  // here would be the consistent-looking move. Three reasons against it. It would change what
+  // the box CONTAINS for an already-approved session: restore() replays persisted configs
+  // through here as trusted, so a refusal would silently drop a mount the operator had
+  // approved, and a narrower box than last boot is a confusing way to learn about a validation
+  // rule. It would also be a new KIND of refusal at this altitude — every existing refusal in
+  // this function is a trust-gated widening (`gpu`, `enabled:false`), whereas a path shape is
+  // not a widening at all. And resolving is strictly behaviour-preserving: dedupeMounts has
+  // always resolved relative paths against the server's process cwd on the way to bwrap, so
+  // `docs` already meant `<server cwd>/docs` in the box while the UI displayed the bare word
+  // `docs`. Resolving does not bless that spelling — it stops the display lying about which
+  // directory is mounted. Note it resolves against the SERVER's cwd, not the session's, for
+  // exactly that reason: `path.resolve(cwd, m.path)` would read better and would silently
+  // mount a DIFFERENT directory than the one bwrap has been binding all along.
+  cfg.mounts = dedupeMounts(cfg.mounts ?? [])
   // `gpu` is the MIRROR IMAGE of the enabled:false gate below: it WIDENS the box (real
   // device nodes, a direct kernel attack surface, and GPU memory that isn't scrubbed
   // between contexts), so an untrusted request may not turn it ON. Same reachability
