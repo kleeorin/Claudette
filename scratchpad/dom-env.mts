@@ -13,15 +13,31 @@
 // It is deliberately NOT a test runner — the suite is still ~50 standalone scripts sequenced
 // by run-suite.sh, and each one still owns its own asserts and exit code.
 //
-// ⚠ CORRECTED 2026-08-27: this said jsdom "is a devDependency". It is NOT — `grep -n jsdom`
-// over package.json, web/, server/ and shared/ returns nothing, and it is in neither
-// node_modules nor web/node_modules. The approval was recorded; the declaration was never
-// made. So the note below telling you `npm i` will fix a missing jsdom is wrong too: npm has
-// nothing to install. EVERY caller of setupDom therefore takes the no-DOM path on this
-// machine, which is how output-sanitizer-test.mts came to report `10 passed, 0 failed` and
-// exit 0 with the whole sanitizer-behaviour half unrun. Declaring it needs a lockfile
-// regeneration (root node_modules is read-only to most sessions), so it is owned work, not a
-// one-liner — until then CLAUDETTE_JSDOM below is the ONLY way these tests actually run.
+// ⚠ CORRECTED 2026-08-27, then CLOSED 2026-09-02. Both stages are kept, because the second is
+// only legible against the first and because the arc is the clearest vacuous-pass example in
+// this repo.
+//
+//   [stage 1] The header here originally said jsdom "is a devDependency (approved 2026-08-21)".
+//     It was not. It appeared in no package.json and in neither node_modules, so `npm i` had
+//     nothing to install and EVERY setupDom caller took the no-DOM path — on every machine,
+//     since the day this file was written. That is how output-sanitizer-test.mts came to report
+//     `10 passed, 0 failed` and exit 0 with the whole sanitizer-behaviour half UNRUN.
+//   [stage 2] The 08-27 correction made that caller exit 77 instead of 0 when no DOM is present.
+//     It fixed no bug and changed no behaviour; it only stopped the instrument lying.
+//   [stage 3] `4d403d8` (2026-08-28) DECLARED jsdom at the ROOT package.json ("jsdom":
+//     "^29.1.1"), and it resolves — require.resolve('jsdom') finds node_modules/jsdom/lib/api.js
+//     at 29.1.1. The plain `import('jsdom')` in loadJsdom() below now succeeds, that caller is
+//     back to exit 0, and it reports 32 passed / 0 failed / 0 skipped.
+//
+// ★ THE TRAP THIS LEAVES BEHIND: stage 1 and stage 3 have the SAME EXIT CODE (0) and both look
+// green. One certified a security boundary it never touched; the other verifies all of it. The
+// assertion COUNT is the only thing that distinguishes them — 10 against 32. If you are ever
+// comparing this seam across history, compare counts, because the exit code is blind to the
+// difference that matters.
+//
+// Declared at the ROOT rather than in web/ deliberately: scratchpad/ is not a workspace, these
+// harnesses run under `npx tsx` from the repo root and resolve from root node_modules, so a
+// declaration in web/ would only be found by a hoisting accident.
 //
 // IT IS ALSO THE SEAM FOR THE NEXT WEB TEST. The chat store (web/src/store/chat.tsx) is the
 // obvious next candidate: its reducer is pure and per-session, and the only reason it was
@@ -29,10 +45,31 @@
 // globals than this installs — add them HERE, to `DOM_GLOBALS`, rather than patching them
 // in at the call site.
 //
-// The `CLAUDETTE_JSDOM` escape hatch: a CONFINED session mounts `node_modules` read-only
-// (that is the sandbox working as designed), so `npm i` cannot run there and a plain
-// `import('jsdom')` fails even though the dependency is declared. Point that env var at an
-// out-of-tree install to run these tests from inside a box. Ordinary runs never need it.
+// The `CLAUDETTE_JSDOM` escape hatch, and WHEN IT IS AND IS NOT NEEDED. It is a genuine
+// fallback and it stays — but since `4d403d8` it is no longer the default path, and reaching
+// for it out of habit is unnecessary work premised on a claim that is no longer true.
+//
+// The distinction that decides it is RESOLVE versus WRITE, and conflating the two is what made
+// the hatch look mandatory for a week. A confined session mounts root `node_modules` READ-ONLY
+// — that is the sandbox working as designed — so `npm i` cannot run there. But a plain
+// `import('jsdom')` only needs to RESOLVE and READ, which a read-only mount permits perfectly
+// well. So on any box that can see root `node_modules` at all, the first branch of loadJsdom()
+// below wins and no env var is wanted. Measured 2026-09-02 from a confined session with the
+// variable unset: all four setupDom callers ran with a real DOM and none skipped —
+// output-sanitizer-test 32/0 (0 skipped), file-live-sync-client-guard 46/0,
+// file-multiselect-guard 57/0, sandbox-chip-picker-guard 13/0.
+//
+// Use CLAUDETTE_JSDOM when root `node_modules` is not reachable from your sandbox at all (not
+// merely read-only). Point it at an out-of-tree install; note /tmp is per-sandbox private, so
+// each session needs its own copy:
+//   mkdir -p /tmp/qa-deps && (cd /tmp/qa-deps && npm i jsdom)
+//   CLAUDETTE_JSDOM=/tmp/qa-deps/node_modules/jsdom/lib/api.js npx tsx scratchpad/<test>.mts
+//
+// ★ AND IT IS NOT AN OFF-SWITCH. To test the no-DOM path, HIDE `node_modules/jsdom`; do not
+// invent an env var to simulate its absence. `4d403d8` first tried exactly that (a
+// `CLAUDETTE_NO_JSDOM` variable) and it returned exit 0 while proving nothing, because this
+// variable is a fallback the loader consults AFTER the plain import, not a lever that disables
+// the plain import. Verify an absence with the absence.
 
 // Globals a jsdom window must publish for DOM-consuming library code to work. DOMPurify
 // needs the node/element constructors for its `instanceof` checks; the rest are what
@@ -106,13 +143,28 @@ export async function setupDom(html = '<!doctype html><html><body></body></html>
 }
 
 // The message to print when setupDom() returns null, so every test says the same thing.
+//
+// REWRITTEN 2026-09-02, and the change is one of expectations, not just of wording. This used
+// to open "jsdom is NOT declared in any package.json … there is nothing for npm to install",
+// which was true when written and is now false: `4d403d8` declared it at the root. Printing
+// that to someone whose DOM failed to load would send them to install a dependency they
+// already have and to set an env var they do not need, while the real cause — a sandbox that
+// cannot reach root node_modules — went unnamed. So this now states what IS expected and
+// treats its own firing as the anomaly, which is what it has become: on a normal checkout,
+// reaching this text at all means something is wrong beyond a missing package.
+//
+// (The previous version also carried a duplicated half-line, "and point CLAUDETTE_JSDOM at
+// it, e.g.:", left over from an earlier edit. Removed here rather than preserved — unlike the
+// stale claims above it records no decision and teaches nothing.)
 export const NO_DOM_NOTE = [
   'no DOM available: `jsdom` could not be imported.',
-  'jsdom is NOT declared in any package.json (approved 2026-08-21, never added), so `npm i`',
-  'will not fix this — there is nothing for npm to install. See the header.',
-  'Install it out of tree and point CLAUDETTE_JSDOM at it — note /tmp is per-sandbox private,',
-  'so each session needs its own copy:',
-  'and point CLAUDETTE_JSDOM at it, e.g.:',
+  'This is NOT the expected state. jsdom IS declared at the ROOT package.json ("jsdom":',
+  '"^29.1.1") and normally resolves from root node_modules with no configuration at all —',
+  'a read-only mount is fine, since importing only needs to resolve and read, not write.',
+  'So reaching this message means your sandbox cannot see root node_modules AT ALL, or the',
+  'install is incomplete. Check `node -e "console.log(require.resolve(\'jsdom\'))"` first.',
+  'If root node_modules is genuinely unreachable, install out of tree and point',
+  'CLAUDETTE_JSDOM at it — note /tmp is per-sandbox private, so each session needs its own:',
   '  mkdir -p /tmp/qa-deps && (cd /tmp/qa-deps && npm i jsdom)',
   '  CLAUDETTE_JSDOM=/tmp/qa-deps/node_modules/jsdom/lib/api.js npx tsx scratchpad/<test>.mts',
 ]

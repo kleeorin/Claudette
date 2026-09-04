@@ -561,7 +561,18 @@ const gaps: { file: string; missing: string[] }[] = []
 
 for (const f of files) {
   const src = readFileSync(path.join(DIR, f), 'utf8')
-  for (const p of boundPorts(src)) {
+  // STRIPPED, not raw. `boundPorts` is a grep over source text, so on raw input it reads
+  // COMMENTS AS CODE — and on 2026-09-04 that turned this lint RED for a documentation edit:
+  // `shared-server.mjs` gained a header line citing `proxy.listen(4321, '127.0.0.1', ...)` as
+  // the counterexample that retracts a false claim, and this rule reported the file as binding
+  // :4321. The comment was correct; the lint was wrong. A rule that cannot tell prose from code
+  // punishes writing accurate prose about code, which is the opposite of what it is for.
+  //
+  // Stripped HERE rather than at the shared `src`, deliberately: every other consumer in this
+  // loop (cdpHangGaps, reapGaps, unreapedChildren, groupKillGaps) either strips internally or
+  // is written against raw text, and changing what they all receive is a much larger change
+  // than the one defect being fixed. Only `boundPorts` is corrected, and only its input.
+  for (const p of boundPorts(stripComments(src))) {
     byPort.set(p, [...(byPort.get(p) ?? []), f])
   }
   // GATE. Was `spawnsDetachedChild` alone, which skipped every file whose only long-lived

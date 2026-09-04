@@ -22,12 +22,28 @@
 // added to the root devDependencies that day, closing the gap the file was written against
 // (approved 2026-08-21, declared a week later — until then EVERY setupDom caller took the
 // no-DOM path on every machine, and the two DOM harnesses that existed could not run for
-// anyone on a clean checkout). Verified here: 45/0 with no environment variable set.
+// anyone on a clean checkout). Verified here: 46/0 with no environment variable set.
+// (Restamped 2026-09-02: this said 45/0. Re-measured at 46/0 on the same seam. A recorded
+// count that no longer matches its file reads as authoritative and is not — same reason
+// send-failed-guard's mutation record had to be restamped.)
 //
-// The CLAUDETTE_JSDOM escape hatch still matters for CONFINED sessions, which mount
-// node_modules read-only and so cannot `npm i` even for a declared dependency. `/tmp` is
-// per-sandbox private, so each such session needs its own copy, and it does not survive a
-// context clear:
+// ⚠ CORRECTED 2026-09-02 — this paragraph was HALF right, which made it worse than plainly
+// wrong: it disagreed with dom-env.mts, the module this file imports, so a reader who trusted
+// the header and a reader who trusted the module reached opposite conclusions about the same
+// mechanism. It said the CLAUDETTE_JSDOM hatch "still matters for CONFINED sessions, which
+// mount node_modules read-only and so cannot `npm i` even for a declared dependency". The
+// premise is true and the conclusion does not follow.
+//
+// THE CONFLATION IS "cannot write" WITH "cannot import", and they are not the same operation.
+// `npm i` needs to WRITE node_modules, which a read-only mount forbids. `import('jsdom')` only
+// needs to RESOLVE and READ, which a read-only mount permits perfectly well. So an ordinary
+// confined session — read-only root node_modules, no environment variable — imports jsdom
+// fine. Measured from exactly such a session: this file 46/0, and the other three setupDom
+// callers 32/0/0, 57/0 and 13/0, none skipped, nothing set.
+//
+// The hatch is still real, but its condition is NARROWER than this said: use it when root
+// node_modules is unreachable ALTOGETHER, not merely read-only. `/tmp` is per-sandbox private,
+// so each such session needs its own copy, and it does not survive a context clear:
 //
 //   mkdir -p /tmp/qa-deps && (cd /tmp/qa-deps && npm i jsdom)
 //   CLAUDETTE_JSDOM=/tmp/qa-deps/node_modules/jsdom/lib/api.js \

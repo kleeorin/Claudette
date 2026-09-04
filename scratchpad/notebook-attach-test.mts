@@ -22,9 +22,12 @@
 // is the dep array's job and asserting it needs Shell mounted with a live notebooks store.
 // What it proves is that IF the effect re-runs, the retry now succeeds; under the old ordering
 // it could not, whatever the dep array said. Note also there is a `web/src/store/
-// sessions.test.tsx` in the tree that would be the natural home for a React-level version —
-// but `vitest` is neither installed nor declared in web/package.json, so that file cannot
-// currently be executed at all. Hence this, in the style of session-reducer-test.mts.
+// sessions.test.tsx` in the tree that would be the natural home for a React-level version.
+// When this was written `vitest` was neither installed nor declared in web/package.json, so
+// that file could not be executed at all — hence this, in the style of session-reducer-test.
+// THAT IS NO LONGER TRUE: vitest is declared, sessions.test.tsx runs, and the whole web suite
+// is now a suite member via scratchpad/web-vitest-shim.mjs. This file stays as it is anyway —
+// it is pure, costs ~3ms, and needs no DOM to pin what it pins.
 import { attachNewNotebooks } from '../web/src/lib/notebookAttach'
 
 import { check, passed as pass, failed as fail } from './assert.mjs'

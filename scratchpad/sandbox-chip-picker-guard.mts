@@ -1,7 +1,14 @@
 // SANDBOX-CHIP FOLDER PICKER — does clicking inside the picker kill the popover that opened it?
 //
-//   CLAUDETTE_JSDOM=/tmp/qa-deps/node_modules/jsdom/lib/api.js \
-//     npx tsx scratchpad/sandbox-chip-picker-guard.mts
+//   npx tsx scratchpad/sandbox-chip-picker-guard.mts
+//
+// CORRECTED 2026-09-02: this line used to prefix the command with
+// CLAUDETTE_JSDOM=/tmp/qa-deps/…, which was necessary when jsdom was undeclared and is now
+// unnecessary work. `4d403d8` declared jsdom at the ROOT package.json and it resolves with no
+// configuration, including from a confined session — importing needs to RESOLVE and READ,
+// which a read-only node_modules mount permits; only `npm i` needs write. See dom-env.mts for
+// the full history and for when the CLAUDETTE_JSDOM fallback is still the right answer
+// (root node_modules unreachable ALTOGETHER, not merely read-only).
 //
 // GROUP C: no browser, no server, no ports. Renders the REAL SandboxControl into jsdom via
 // react-dom and drives real `mousedown` events at it.

@@ -21,7 +21,12 @@ of this document.
 
 ## What is actually true
 
-**No harness binds :4321.** All nineteen files that mention the port only *connect* to it:
+~~**No harness binds :4321.** All nineteen files that mention the port only *connect* to it:~~
+**CORRECTED 2026-09-02 — both halves false.** `super-editor-test.mjs` BINDS it
+(`proxy.listen(4321, '127.0.0.1', ...)`), and the count is nine registered `srv4321` entries, not
+nineteen. The hazard below survives the correction but its ROUTE changes: a single-file run
+through `run-suite.sh` does NOT adopt — the `ss` probe sets `FOREIGN_4321=yes` and skips. The
+unguarded route is DIRECT invocation, where no runner exists to probe. Original text kept:
 
     attention-test.mjs        history-resume-test.mjs   notebook-session-test.mjs
     notifications-test.mjs    optimistic-busy-test.mjs  ratelimit-test.mjs

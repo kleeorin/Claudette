@@ -97,12 +97,48 @@ export function ConnectorGrants({ session, compact = false, bare = false }: { se
                 {c.needsSetup && <span className="text-ctp-yellow ml-1.5">needs setup</span>}
                 {c.health === 'needs-auth' && !c.needsSetup && <span className="text-ctp-yellow ml-1.5" title={c.lastError}>needs auth</span>}
                 {c.health === 'error' && <span className="text-ctp-red ml-1.5" title={c.lastError}>error</span>}
-                {blocked && (
+                {/* ★ GATED ON `needsSetup`, NOT ON `blocked` — and that difference is the whole
+                    point of this block. `blocked` is `needsSetup && !on`, so gating here on it
+                    told an operator what to do ONLY while the connector was ungranted. A row
+                    that is needsSetup AND ALREADY GRANTED fell through to nothing but the two
+                    words "needs setup" beside a checked, normal-looking box: no hint, no error,
+                    no next step. That is the state a real operator hit with `gcalendar`
+                    (`inUseBy=1`, `needsSetup=true`, `oauthClients: []`) — it reads as working,
+                    and the only symptom is a tool call that dies much later.
+                    Granted-despite-needsSetup is reachable by four routes that never pass the
+                    toggle: the `enabledByDefault` set applied at session creation, grant
+                    inheritance from a parent, a direct setSessionConnectors call, and — the
+                    quiet one — being granted while an OAuth client existed that was later
+                    deleted, since `needsSetup` is recomputed on every read. */}
+                {c.needsSetup && (
                   <span className="block text-ctp-yellow/90">
-                    Can’t be granted yet — it needs an OAuth client you create, added under
-                    <b> Claudette → Connectors</b>. Google requires one per product; there is no
-                    automatic registration.
+                    {/* The lead has to differ: "can't be granted yet" is simply false for a row
+                        that IS granted, and telling an operator their granted connector cannot
+                        be granted is how a correct warning gets dismissed as a bug. */}
+                    {on ? 'Granted, but it cannot work yet — ' : 'Can’t be granted yet — '}
+                    {/* The per-product text comes from the SERVER (BUILTIN_SETUP_HINT, beside
+                        the definitions it describes). shared/src/connectors.ts warns explicitly
+                        against copying it into web/src because it drifts — and the hardcoded
+                        Google paragraph that used to sit here was that warning coming true, in
+                        this exact spot. No local fallback string either, deliberately: a second
+                        copy of the generic wording would recreate the same drift one level down,
+                        so an absent hint degrades to the instruction alone rather than to a
+                        duplicate. */}
+                    {c.setupHint ? `${c.setupHint} ` : null}
+                    Add an OAuth client under <b>Claudette → Connectors</b>, then point this
+                    connector at it with <span className="text-ctp-text">edit</span>.
                   </span>
+                )}
+                {/* lastError was reachable ONLY as a tooltip, on two chips that a needsSetup row
+                    never renders: the "needs auth" chip is suppressed by `&& !c.needsSetup`, and
+                    the red one requires health === 'error' while this state reports 'needs-auth'.
+                    So "upstream returned 401" was in the API response and on no screen. It is
+                    worth its own line rather than a title: it distinguishes DIALLED-AND-REFUSED
+                    from NEVER-DIALLED, which is the difference between a credential problem and
+                    a configuration one — and a title attribute is invisible on a phone, which is
+                    where this panel is most often read. */}
+                {c.lastError && (
+                  <span className="block text-ctp-red/90 break-words">{c.lastError}</span>
                 )}
                 {/* Read-only roles get the whole server denied until it has been probed —
                     worth saying HERE, where the grant is made, not only in the catalog. */}

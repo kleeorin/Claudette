@@ -1,5 +1,5 @@
 # Claudette — Handover
-_Last updated: 2026-08-27._
+_Last updated: 2026-09-01._
 
 <!-- Deliberately no "working tree is clean" line here. The previous one was stale the
      moment it was written and stayed wrong for a month, which is the same failure this
@@ -14,17 +14,37 @@ _Last updated: 2026-08-27._
 > none true now). Everything below the CORRECTIONS heading is older still: **treat it as
 > history, not as state.** `git status` and `git log` are authoritative; this file is not.
 
-### Status — 2026-08-27, second update (evening). HEAD is still `9af9bdf`; nothing pushed.
+### Status — 2026-09-01. HEAD `b9dacf1`; nothing pushed. (The 08-27 block below is HISTORY.)
 
-**Step (ii) is DONE, not half-applied** — the line above this said otherwise and was wrong by
+**The assertion-helper programme is finished.** Four commits: `197fd77` shared helper + the
+argument-order guard (28 files) · `fa8f8f4` middle tier (21) · `2b89b80` the 473-call reorder
+(32 files, ~500 calls) · `82593bb` the `{ pass, fail }` object form. **82 files now import
+`scratchpad/assert.mjs`; four local helpers remain** (the three `eq()` files plus
+`review-fixes-test.mts`, deliberately reverted rather than half-migrated). Zero guard trips
+across all 188 baseline logs, and totals identical to the pre-refactor pair — which is the
+outcome a refactor should have.
+
+**IN FLIGHT AND UNCOMMITTED — `real-turn-browser-test` (see the dedicated section below).**
+`git status` at time of writing: `M real-turn-browser-test.mjs` · `M registration-lint.mts`
+(one NON_TESTS entry) · `M run-suite.sh` (one registration) · new `turn-indicator.mjs` +
+`turn-indicator-test.mjs`. Also `?? scratchpad/shared-server.mjs`, which is **session
+`2e41c0b7`'s** in-flight shared-server ownership guard — **not ours, do not register or edit
+it.** It is the sole `registration-lint` violation and it is theirs to close.
+
+<!-- ─────────── EVERYTHING FROM HERE TO THE BASELINE TABLE IS 2026-08-27 HISTORY ───────────
+     Kept for the reasoning, NOT as state. Its "Uncommitted" list is superseded by the
+     2026-09-01 status above and by `git status`, which is authoritative. Both items it names
+     have since landed. Do not act on it. -->
+
+**[2026-08-27] Step (ii) is DONE, not half-applied** — the line above this said otherwise and was wrong by
 the evening. `viewof-precondition-guard.mts` is **4/4, exit 0** and `tsc -p server/tsconfig.json`
 is clean against the uncommitted `server/src/claude/sandbox.ts`. It still wants Landing's own
 read before committing, and when it commits, **remove its `EXPECTED_RED` entry from
 `run-suite.sh` in the SAME commit** (the guard's header asks for that). Its closing narration
 still prints "refused, but with no reason recorded" — now false; fix it in that commit.
 
-**Uncommitted, and it is no longer one file.** `git status` is authoritative, but as of this
-writing: `server/src/claude/sandbox.ts` (above) · three `web/src` changes (sandbox-chip picker
+**[2026-08-27 — SUPERSEDED, see the status block above] Uncommitted, and it is no longer one
+file.** `git status` is authoritative, but as of this writing: `server/src/claude/sandbox.ts` (above) · three `web/src` changes (sandbox-chip picker
 fix, Files multi-select, drawn file icons) · `web/src/components/FileIcon.tsx` (new) ·
 `scratchpad/` — two new guards, `safe-mutate.sh`, `live-file-sync-design.md`, and edits to
 `dom-env.mts`, `output-sanitizer-test.mts`, `run-suite.sh`.
@@ -115,13 +135,34 @@ An environment-local truth reported as a tree fact cost three separate correctio
 
 **Older baselines: unchanged and still not re-takeable** — `web/dist` is STILL the 08-26 10:48
 bundle and three more `web/src` changes landed on top of it today. Last quotable: `79/2/6`.
-**Expect the next real baseline to move for a truthful reason:** `output-sanitizer-test.mts`
+~~**Expect the next real baseline to move for a truthful reason:** `output-sanitizer-test.mts`
 now exits **77 (runtime skip)** instead of 0 when no DOM is present. That is a correction, not
 a regression — it was reporting `10 passed, 0 failed`, exit 0, with every behavioural invariant
-of the notebook output sanitizer UNRUN. See the jsdom item below for why that is every machine.
+of the notebook output sanitizer UNRUN.~~ — **CLOSED, INVERTED, AND ALREADY SPENT. Corrected
+2026-09-02.** This expectation was written 2026-08-27 and was overtaken the next morning:
+`4d403d8` (2026-08-28 09:21) declared jsdom at the root, so the harness went **77 → 0** and now
+exits 0 at **32 passed, 0 failed, 0 sections skipped**. Three things follow, and the third is
+the one that matters when you next measure:
+- **The direction stated above is backwards now.** The harness leaves the skip bucket and enters
+  the passed bucket, not the reverse. Both moves were corrections rather than regressions, which
+  is precisely why a reader needs to be told which one they are looking at — the sentence is
+  preserved rather than deleted because a reader arriving at a fresh total would otherwise
+  conclude the wrong direction is the error.
+- **Do NOT expect the next baseline to move for this reason.** `4d403d8` is an ancestor of
+  `b9dacf1`, the commit BOTH current baselines were measured at, so `output-sanitizer-test`
+  already exited 0 during those runs and is already counted inside **87/1/6** and **90/2/2**.
+  The movement happened between the `79/2/6` era and the 08-28 pair; it is spent. The six skips
+  in those figures are the jupyter set, enumerated in the environment-deltas list above, and
+  this harness is not among them.
+- **The 08-28 09:59 baseline was itself taken 38 minutes after `4d403d8` landed**, so even the
+  first baseline quoted after this paragraph was written already contradicted it. An expectation
+  is a claim with a shelf life; this one expired before it was ever checked against a number.
 
-### ★ jsdom was never declared. The whole DOM-test seam has never run by default.
-`dom-env.mts`'s header claimed jsdom "is a devDependency (approved 2026-08-21)". It is **not in
+See the jsdom item below for the full three-stage history, and for why the exit code cannot
+distinguish the original vacuous pass from today's real one.
+
+### ~~★ jsdom was never declared. The whole DOM-test seam has never run by default.~~ — **CLOSED** by `4d403d8` (2026-08-28)
+~~`dom-env.mts`'s header claimed jsdom "is a devDependency (approved 2026-08-21)". It is **not in
 any `package.json`**, and in neither `node_modules` nor `web/node_modules`. The approval was
 recorded; the declaration was never made — so `npm i` was never going to fix it, and every
 `setupDom()` caller has taken the no-DOM path since the day it was written. Header and
@@ -129,7 +170,56 @@ recorded; the declaration was never made — so `npm i` was never going to fix i
 checkout** until it is declared (needs a lockfile regeneration → Landing). Until then:
 `mkdir -p /tmp/deps && (cd /tmp/deps && npm i jsdom)` then
 `CLAUDETTE_JSDOM=/tmp/deps/node_modules/jsdom/lib/api.js npx tsx scratchpad/<test>.mts`.
-`/tmp` is per-sandbox private, so **every session needs its own copy**.
+`/tmp` is per-sandbox private, so **every session needs its own copy**.~~
+
+**Kept verbatim rather than deleted, for two reasons.** It is the best worked example of a
+vacuous pass this repo has produced — a security-critical sanitizer certifying coverage it never
+performed — and the correction below is only legible against it. What is stale: jsdom **IS** now
+declared, at ROOT `package.json` (`"jsdom": "^29.1.1"`), and it resolves —
+`require.resolve('jsdom')` → `node_modules/jsdom/lib/api.js`, version **29.1.1**, measured
+2026-09-02. Nothing is blocked on Landing or on a lockfile regeneration, and no session needs the
+`/tmp` install. `4d403d8` sits 33 commits before HEAD, so this section was wrong the morning
+after it was written and stayed wrong for five days — the cost of recording a diagnosis and not
+revisiting it once the fix lands.
+
+**THE HISTORY IS THREE STAGES, AND THE EXIT CODE CANNOT TELL YOU WHICH ONE YOU ARE IN.**
+
+| stage | `output-sanitizer-test.mts` reports | exit | what was actually verified |
+|---|---|---|---|
+| 1 — original | `10 passed, 0 failed` | **0** | **nothing about the sanitizer.** No DOM, PART 1 skipped silently, exit 0 regardless |
+| 2 — the 08-27 correction | `10 passed, 0 failed` + a SKIP line | **77** | still nothing — but it now SAYS so |
+| 3 — `4d403d8`, current | `32 passed, 0 failed, 0 skipped` | **0** | every behavioural invariant of the sanitizer |
+
+**Stage 1 and stage 3 carry the SAME exit code and the same green.** One certified a security
+boundary it never touched; the other verifies all of it. Anyone reconstructing this history from
+exit codes — which is what a suite total is — concludes that nothing changed across the whole
+arc. **The assertion COUNT is the only thing that separates them: 10 vacuous against 32 real.**
+That is this repo's recurring defect family in its purest form, an instrument answering a
+different question than the one asked, and it is the argument for reading per-harness counts
+rather than the total alone. Stage 2 is the load-bearing middle: it changed no behaviour and
+fixed no bug, it only made the instrument stop lying, and it is what made stage 3 legible.
+
+**The seam runs for `scratchpad/` too, not only for `web/`.** `dom-env.mts`'s `loadJsdom()` tries
+a plain `import('jsdom')` FIRST and only then falls back to `CLAUDETTE_JSDOM`. That plain import
+now succeeds from ROOT `node_modules`, which a CONFINED session can **resolve** even where it
+cannot **write** — resolution is all `import` needs, and conflating the two is what kept the
+escape hatch looking mandatory. All four `setupDom()` callers were run from a confined box with
+no env var set, and none skipped:
+
+| harness | result |
+|---|---|
+| `output-sanitizer-test.mts` | 32 passed / 0 failed / 0 sections skipped, exit 0 |
+| `file-live-sync-client-guard.mts` | 46 passed / 0 failed, exit 0 |
+| `file-multiselect-guard.mts` | 57 passed / 0 failed, exit 0 |
+| `sandbox-chip-picker-guard.mts` | 13 passed / 0 failed, exit 0 |
+
+`CLAUDETTE_JSDOM` **remains the right mechanism and stays documented** — a session whose sandbox
+cannot reach root `node_modules` at all still needs it — but it is now the fallback, not the
+default path. One method note from `4d403d8` worth keeping: it verified both directions by
+**hiding `node_modules/jsdom`**, not by trusting an env var. Its first attempt invented a
+`CLAUDETTE_NO_JSDOM` variable, which is not a real lever — the hatch is a fallback path, not an
+off-switch — and that attempt returned exit 0 while proving nothing. Reach for the absence
+itself, not for a flag that simulates it.
 
 ### The critical path is still ONE permission prompt
 **`Landing` (session `2e41c0b7`) is blocked**, and is the only session that can write
@@ -140,7 +230,10 @@ UNDELIVERED to it. Clearing the prompt unblocks, in order:
    so the built app shows none of them, and one of them (the folder icon) can only be checked
    by eye. Also unblocks bucket 1 and a real baseline.
 2. **Confirm + commit step (ii)** (above).
-3. **Declare jsdom + regenerate the lockfile** (above).
+3. ~~**Declare jsdom + regenerate the lockfile** (above).~~ — **DONE** by `4d403d8` (2026-08-28);
+   it is not waiting on Landing or on a permission prompt. Struck here as well as in the section
+   above, because a queue entry outlives the section it points at: someone reading only this list
+   would hand Landing work that landed five days ago.
 4. **Live file sync — the server half.** Fully designed in
    [`scratchpad/live-file-sync-design.md`](scratchpad/live-file-sync-design.md); hand it over
    intact, it needs no re-derivation. Makes `.md`/`.ts` editors follow the file on disk the way
@@ -211,18 +304,66 @@ Related: authorship cannot be recovered from a dirty tree. `ChatView.tsx`'s unco
 attributed to Devil and was not Devil's; the correction came from the teammate, with evidence.
 **Never infer provenance from `git status`.**
 
+### ★ AN INSTRUMENT ANSWERING A DIFFERENT QUESTION THAN THE ONE ASKED — four instances
+The unifying name for a class that cost real time four separate times this week. Written into
+`scratchpad/assert.mjs`'s header too, because that is the file every harness author now opens.
+
+1. **`pgrep -f run-suite.sh` / `pkill -f …` MATCH THEIR OWN COMMAND LINE.** One session saw a
+   phantom survivor after killing a run; the coordinator **killed its own shell mid-command**
+   (exit 144) before a commit landed. Use the bracket form, which cannot match itself:
+   `ps -eo pid,args | grep -c "[r]un-suite.sh"`. **Caveat that matters more:** under
+   `--unshare-pid` a process check is only ever evidence about *this* sandbox — it can never
+   tell you whether another session is running something.
+2. **`/tmp` looks shared and is per-session.** The old lock at `/tmp/claudette-qa/.full-run.lock`
+   was a *different file* in every session, so `--lock-status` was structurally blind to other
+   sessions. Fixed by `a58d49c` (repo root). The symptom was two sessions reading "no run in
+   flight" while a third held one — and neither "it finished fast" nor "it hadn't started".
+3. **A grep confirms what it MATCHES, never what EXISTS.** A census of assertion helpers
+   anchored on two exact spellings reported 80 files / 8 signatures; the real numbers were
+   **84 / 17 / ~1,264 call sites**. A floor presented as a census.
+4. **An unchanged green set is not an unchanged ability to go red.** Verifying a refactor by
+   diffing per-entry results catches changed *results*, not changed *discriminating power*.
+   For files carrying documented mutations, re-run the mutations.
+
+### ★ ZERO LIVE INSTANCES IS NOT AN ARGUMENT AGAINST A FIX — it is an argument against a fix that COSTS something
+The blanket "make `extra` fail-only" default was designed, adopted, and **withdrawn on the
+numbers**: 490 of ~1,090 green lines carry detail; 11 match a failure-phrasing grep; **0 are
+actually lies**. So the trade was silencing ~490 informative lines — the non-vacuity evidence a
+green run provides — to close a class with no live occurrences. The rule had been inferred from
+three self-observed cases and was about to be applied to ~1,264 call sites. Contrast the
+argument-order guard: also zero live instances, but its fix was **free** (a runtime check, no
+output change, 82 files structurally safe). **Weigh the cost before the elegance.** Full
+reasoning and the numbers live in `scratchpad/assert.mjs`'s header so this is not re-proposed
+from the same three anecdotes in six months.
+
 ### Open, measured, unowned
 - **`shell-fixed-cost-probe`**: 33px composer clip, phone + keyboard up. Stable over three
   baselines. Prints as `[open]`; passes.
-- **`App.tsx` residual**: the dock clip returns above `stackH ≈ 351` at `vvh` 508, and nothing
-  clamps a persisted `stackH` against `--vvh` on restore. Named in `eda4a76`.
-- **vitest**: `web/package.json` declares `"test": "vitest run"`, `web/src/store/sessions.test.tsx`
-  is committed with **7 cases**, and vitest is not installed. PM's finding: all 7 fail at mount
-  (mock drift), and **test 6 is vacuous** — it spreads a `ReadonlyMap` into a `string[]`, so its
-  central invariant can never fail. `web/tsconfig.json` excludes test files and vitest does not
-  typecheck, so **a naive install yields a green 7/7 that verifies nothing.** Sequence must be:
-  install → drop the `exclude` → let `tsc` find the vacuity → fix → then run. Root
-  `node_modules` is read-only; `web/node_modules` is writable.
+- ~~**`App.tsx` residual**: dock clip above `stackH ≈ 351`~~ — **CLOSED** by `c0bf98f`.
+  Reproduced at `stackH` 400 / `vvh` 508 (column 521, bottom 557 against a 508 shell, 49px
+  clipped), fixed with one `boundStackH` shared by the drag path and every render, and pinned
+  in `xterm-vvh-probe` (`891996d`). **The seed had to be raised 280 → 400**: at 280 the column
+  lands at 401 and never clips, so the clip assertion passed with the clamp reverted — green
+  for the entire life of the bug it appeared to cover.
+- ~~**vitest**: not installed; all 7 cases of `sessions.test.tsx` fail at mount, test 6 vacuous,
+  `web/tsconfig.json` excludes test files~~ — **CLOSED** by the root install (`8dbed06`) plus the
+  `tsconfig` change. **PM's prescribed sequence was followed and was vindicated**: install → drop
+  the `exclude` → let `tsc` speak → fix → then run. That order was the whole value of the entry,
+  because vitest does not typecheck, so installing and running FIRST would have yielded a green
+  7/7 that verified nothing. One `tsc` run with the `exclude` removed found the vacuity
+  immediately; `web/tsconfig.json` now opens "TEST FILES ARE TYPECHECKED" and records why.
+  The vacuous probe spread a `ReadonlyMap` into a `string[]` and asked whether an array of
+  PAIRS `.includes()` a plain session id — false for every possible input. It now pushes
+  `[...ctx.attention.keys()]` and can reach its failure state.
+  **One particular of this entry was not merely stale but actively misleading, and is corrected
+  here rather than deleted**: it said root `node_modules` is read-only and `web/node_modules`
+  writable, which would point a future installer at the wrong directory. The install landed in
+  **root** `node_modules` (the workspace hoist); `web/node_modules/.bin/vitest` does not exist.
+  Measured 2026-09-02: `vitest` 2.1.9, `jsdom` 29.1.1 and `@testing-library/react` 16.3.3 all
+  resolve. There are now **two** web test files — `store/sessions.test.tsx` and
+  `components/SandboxEditor.test.tsx`, 14 cases between them — so "7 cases" is a floor, not a
+  count. The suite reaches `run-suite.sh` as `none:web-vitest-shim.mjs`, which asserts a
+  per-case `numTotalTests` floor off `--reporter=json` rather than trusting exit 0.
 
 ### Rules that generated most of today's value
 1. **A green you cannot explain is a finding.** Today: a harness that passed while its own log
@@ -239,9 +380,46 @@ attributed to Devil and was not Devil's; the correction came from the teammate, 
    control, not by self-review.
 
 ### What to do first on resume
-`list_team`, then ask the operator about Landing's prompt — it is the whole queue. Do not start
-a full suite run while anyone is writing the tree; the run's own fingerprint will flag it and the
-number is wasted.
+1. **`git status`** — the in-flight `real-turn-browser-test` work is uncommitted and is the
+   only thing mid-air. Its remaining step is **one live run**, below.
+2. **`list_team`**, then check `.suite-run.lock` (repo root — NOT `/tmp`, see the gotcha).
+3. Do not start a full run while anyone is writing the tree; the fingerprint will flag it and
+   the number is wasted. **Positive confirmation from each session is the guarantee; the lock
+   is only the net for when someone forgets.**
+
+### ★ IN FLIGHT — `real-turn-browser-test`, needs ONE live run to close
+**The question asked was "is it flaky?"; the answer is "the assertion is sound but not
+specific."** `sawRunningAfterInit` asserted *Stop still up at some sample >2500ms*. A clobbered
+indicator is down well before 2.5s, so it **could** fail for the right reason — never a
+cannot-fail assertion. But `2500` is a **wall-clock proxy for "init has fired"**, and it fails
+identically when the turn simply finishes early. Both causes produce the same observation.
+Recorded in the file's own history: 2026-08-24, samples `stop=true` at 2.4s and `stop=false` at
+3.0s. The response then was to lengthen the prompt — margin against the model's speed rather
+than removing the dependency on it.
+
+**Fix: compare two events OF THE TURN.** *The last sample showing Stop must be at or after the
+first sample showing assistant output.* Under the bug Stop dies at init, before any output; a
+fast turn moves both together, so the model's speed drops out. Extracted to
+`scratchpad/turn-indicator.mjs` (pure) so the decision is testable **without spending API
+calls** — `turn-indicator-test.mjs`, 7/7, mutation-tested three ways (always-ok → test 3 red;
+inverted comparison → 1 and 3 red; inconclusive-as-pass → 6 red).
+
+Three further things found in that loop:
+- **Sampling was three CDP round-trips per iteration**, so a nominal 200ms period was 600ms+.
+  The gap is *part of the measurement* — the assertion depends on catching a sample inside a
+  window. Now one round-trip.
+- **The loop's exit condition was half-vacuous**: it tested `innerText.includes('hello')`, and
+  **the harness's own prompt contains "hello"**. A second instance of the vacuity `c253572`
+  fixed elsewhere in the same file.
+- **Inconclusive is now distinct from failing** (`no-stop-sample` / `no-assistant-sample` skip
+  loudly rather than reporting a defect never observed).
+
+**Stated limit, asserted not hidden (test 4):** a *late* clobber — Stop dropping after output
+has begun — is NOT caught. The rule asks whether Stop survived until output began, not beyond.
+
+**REMAINING: one live run.** It is `srv4321+claude:` — needs the shared server, a live
+credential, and **real API calls on the operator's account**. Zero spent so far. Sequence the
+`:4321` port against `2e41c0b7` before running it.
 
 ## SERVER-SIDE / HARNESS SESSION — handover, 2026-09-01. Session `2e41c0b7`.
 
@@ -409,6 +587,37 @@ one level up. **A convention that is grep-counted should publish its own count w
 
 ### ★ THE `STATUS:`/mechanism TAXONOMY HAS A THIRD CATEGORY IT DOES NOT NAME — found 2026-08-24
 The convention above splits prose in two: `STATUS:` claims rot, unmarked **mechanism** cannot.
+
+> **A FOURTH CATEGORY, added 2026-09-02: claims about the RUNNING PROCESS.** (The section this
+> sits under already names a third — unmarked INVARIANTS, which the taxonomy assumed could not
+> rot and which Architect found false twice. Numbering this one "third" as well was the first
+> draft of this very note, caught before it landed: a document about contradictions is the
+> worst possible place to introduce one.) These must NOT carry
+> `STATUS:`. A `STATUS:` claim stays true until something changes it, and the reader's job is to
+> ask whether that something happened. A claim about the live `:4319` server is falsified by a
+> restart that leaves no trace in this file, by nobody, at an unknown time — so it is not
+> re-checkable, it is merely unfalsifiable from any session that can read this document (`ps` is
+> namespace-blind in a sandbox; only the unconfined teammate can answer). Use instead:
+>
+>     **OBSERVED <date>, VOID ON RESTART** — <the claim>. Evidence: <how it was established>.
+>
+> Stamping rather than deleting, because several of these carry mechanism reasoning worth keeping
+> after the observation expires — the same claim/correction split the `~~…~~ — **CLOSED**` shape
+> already uses.
+>
+> **WHY THIS EXISTS.** An audit on 2026-09-02 found NINE present-tense assertions about the one
+> live process, written on four dates, all still reading as current, and at least one pair
+> MUTUALLY CONTRADICTORY — a 07-18 entry saying the server still runs the old code against a
+> 07-22 entry saying it was restarted with the hardened sandbox. At most one was true. The file
+> already states both governing rules — "in the tree and live are different claims, and only a
+> restart connects them", and "a point-in-time observation cannot license a future action" — and
+> then broke them nine times. The convention is what makes the rules enforceable rather than
+> merely stated.
+>
+> **NOT EVERY MENTION OF `:4319` IS A MEMBER**, and a grep-driven sweep will get this wrong. The
+> `Run / verify` note that `ui-screenshot.mjs` "reads the operator's REAL persisted token and
+> drives their LIVE `:4319` server" is a durable statement about what a SCRIPT DOES; it stays
+> true across every restart and must keep reading as live. Stamp observations, not behaviours.
 Architect audited `sandboxPaths-rationale-header.txt` against the tree and found **all 11 STATUS
 claims TRUE — and two unmarked INVARIANTS FALSE.** The taxonomy has a hole:
 
@@ -1374,7 +1583,15 @@ is whatever that stranger chose — possibly the operator's real one. **That fal
 remaining route by which the suite can touch a live session store**, which is the argument that
 settled the decision below.
 
-### STATUS: the `:4321` fallback is being changed to HARD-FAIL — approved 2026-08-25
+### ~~STATUS: the `:4321` fallback is being changed to HARD-FAIL — approved 2026-08-25~~ — **CLOSED: BUILT.**
+> **Corrected 2026-09-02.** All four behaviours below shipped. Read the body as a DESCRIPTION of
+> `run-suite.sh`, not as a plan — it is accurate, it is simply written in the future tense.
+> Verified: the skip fires with `SKIP … :4321 held by another process`, the entries are counted
+> into a `foreign_skipped` tally, `ALLOW_FOREIGN_4321=1` is honoured with an explicit
+> untrustworthy-results warning, and the end-of-run banner prints `!!! N shared-server tests DID
+> NOT RUN` / `!!! This total is not a baseline` — including the summary line this section flags
+> as the easy thing to forget. Only the heading is struck: a specification that shipped is worth
+> keeping verbatim, because it records what was intended as well as what exists.
 It will SKIP the `srv4321` entries as a prerequisite failure rather than running them (consistent
 with how a missing Chrome is handled), print who to stop and why, and keep `ALLOW_FOREIGN_4321=1`
 as an override. The skip must also appear in the FINAL SUMMARY — "55 passed, 0 failed, 15 skipped"
@@ -1586,8 +1803,23 @@ principle applied to a warning channel, and it is the right call.
 > **JOIN THEM: every `[open]` gets a `STATUS:` line here.** Then a healed `[open]` is caught by the
 > single greppable sweep rather than only by whoever happens to read a run's output.
 **STATUS: the stacked column clips the terminal AT REST — 121px at 390x844 with `--vvh` 844, and
-201px with the keyboard up. Residual cause is `stackH` (280px, unbounded, from localStorage), not
-the dock. UNFIXED — the design call is which of `stackH` / the dock / the content pane gives way.**
+201px with the keyboard up. ~~Residual cause is `stackH` (280px, unbounded, from localStorage), not
+the dock.~~ UNFIXED — the design call is which of `stackH` / the dock / the content pane gives way.**
+
+> **The CAUSE clause was struck 2026-09-02; the UNFIXED verdict and the design question stand.**
+> The symptom has NOT been re-measured — that needs the Chrome layout harness — so this is not a
+> closure. What is provably wrong is the sentence telling the next person where to look, and it is
+> wrong in two independent ways. (1) `stackH` is not unbounded: `boundStackH` is applied at
+> `effStackH` on EVERY render and again as the drag divider's ceiling, landed in `c0bf98f`, which
+> another entry in this file records as landed. (2) Even so, the bound is INACTIVE at the cited
+> numbers — at `--vvh` 844 the ceiling is 607 undocked and 486 docked, both far above the cited
+> `stackH` of 280 — so bounding `stackH` could never have changed this scenario. The overflow in
+> the cited arithmetic (84 + 280 + 600 + 1) is driven by the restored 600px `termH`, which
+> `boundStackH` does not touch.
+>
+> **FALSE PASS TO AVOID when someone does re-measure:** re-testing at the DEFAULT `termH` of 240
+> rather than the restored 600 comes back clean and proves nothing. The cited scenario depends on
+> a persisted value, not a default.
 **STATUS: with a pending AskUserQuestion card and the keyboard up at 390x844, the composer's bottom
 sits 33px below the `overflow-hidden` shell. Phone+keyboard only; desktop clean. UNFIXED.**
 
@@ -1926,100 +2158,14 @@ rather than produce this).
 scan by current mtime shows only the later timestamp and silently excludes the file. **Never use
 mtime to establish that a file did NOT change during a window.**
 
-### ★ STEP (i) DESIGN — THE ORDERING FAULT. Two defects, one fix. DESIGNED, NOT YET BUILT.
-`viewOf` sorts by depth of the LOGICAL path while `boxCanReach` matches on the REAL one and takes
-the LAST match. That single mismatch produces **two distinct wrong answers**, in opposite
-directions, and both die to the same fix — resolve in BOX space instead of host space.
-- **Defect B — SHADOWING, fails OPEN.** A mount whose exposure is overmounted by a deeper dest
-  still counts. Recorded in `mount-shadowing-guard` §4.
-- **Defect A — "LAST MATCH WINS" IS THE WRONG AGGREGATION, fails CLOSED.** Two UNRELATED mounts
-  can expose the same real bytes without shadowing each other — both live in the box at once — so
-  the right rule is "ANY mount that reaches it grants". **PROVEN BY EXECUTION 2026-08-25** against
-  real `bwrap 0.9.0`: the box wrote the file (host contents `ORIGINAL` → `MUTATED`) while
-  `sandboxPathAccess` returned `write:false`. Pinned by `scratchpad/authorizer-box-divergence-guard.mts`.
-  It DENIES a legitimate write — an inexplicable permission error, **not a breach**. Do not let a
-  red there be reported as a sandbox escape.
-
-**THE FIX.** Extract `resolveReach(entriesInEmissionOrder, target): readonly ResolvedMount[]`.
-`boxCanReach` keeps only `real(p)` (returning false on null — fail closed) and the mode decision,
-which becomes `need === 'write' ? reaching.some(m => m.mode === 'rw') : reaching.length > 0`.
-> **`resolveReach` takes `entries`, NOT a `MountView`, and that is load-bearing.** Taking a view
-> would inherit the closed constructor and shut the test seam. **THE ENFORCEMENT BOUNDARY
-> (`viewOf`) AND THE TESTABILITY BOUNDARY (`resolveReach`) MUST STAY DIFFERENT FUNCTIONS.**
-
-**★ THE OWNERSHIP RULE — corrected, and the first version was wrong.** It was specified as "the
-DEEPEST logical root containing boxPath, ties broken by emission order". **bwrap's actual rule is
-not about depth at all:** a bind applies at its dest and everything beneath it, and a later bind
-covers an earlier one *including an earlier deeper one*. Mounting `/a` after `/a/b` covers `/a/b`.
-> **The owner of a box path is simply the LAST entry in emission order whose logical root contains
-> it. Depth does not enter.**
-The failing case the depth rule got backwards: `[{logical:'/a/b'}, {logical:'/a'}]` with the
-shallow one emitted last — bwrap says `/a` covers `/a/b`; the depth rule picks `/a/b`. **Every
-other test in the set still passes under the wrong rule**, which is why §4d exists.
-
-**And this restates why `viewOf`'s sort must not be deleted, more strongly than "it breaks ties":**
-> **The sort is what makes `entries` equal bwrap's ARGV ORDER.** Without it, "last containing
-> entry" is last in some arbitrary order rather than last in the order bwrap will apply. That is
-> the comment to put beside the sort — it explains why the sort stays even though `resolveReach`
-> never mentions depth.
-
-**INV-R1 — a precondition stated honestly rather than closed.** `resolveReach` REQUIRES entries in
-bwrap emission order. This one **cannot** be closed by construction, because the order is genuine
-semantic input: sorting internally would destroy information and make the function unable to model
-the very case it must model. *Falsifier:* a caller assembling entries another way, or someone
-"helpfully" sorting inside. *Escape:* none — instead name the parameter `entriesInEmissionOrder`
-so the obligation sits at every call site, and keep `viewOf` the only production producer.
-*Check:* §4d, which fails if ownership becomes depth-based or the array is pre-sorted.
-
-**Same-dest-different-source is NOT reachable through `viewOf`**, and the reason is structural:
-`logical` and `real` are both derived from the SAME input string, so two entries with one logical
-path necessarily share a real root. It arises only in hand-built fixtures (deliberately — that is
-the test seam) and in an exotic self-healing TOCTOU. Named, not guarded.
-
-**(i) IS ENTIRELY A `server/`-WRITER TASK — do not split it across two actors**, because
-regenerating `scratchpad/sandboxPaths-body-snapshot.ts` requires reading the landed file. Commit
-order: edit `sandboxPaths.ts` → regenerate the snapshot → verify the diff prints nothing → update
-the preamble's counts. **Of the three numbers only the TOTAL moves**; the body offset (224) and
-header count (223) change only when the HEADER changes. Encode that asymmetry so a future
-recompute knows which numbers it actually has to redo.
-
-### ★ A POST-MORTEM COMMENT COPIED INTO A NEW FILE BECOMES A LIVE FINDING — 2026-08-25
-A deleted probe carried a paragraph claiming that two Chrome harnesses booted against the
-operator's REAL `~/.config/claudette`, with `restore()` relaunching every persisted session before
-`app.listen()`. Alarming, and it reached me as a possible live compromise of the operator's
-session store. **It is FALSE today, established by enumeration, not argument: 12 of 12 harnesses
-that boot a server set `CLAUDETTE_DATA_DIR`, with no exceptions**, and the nine that do not boot
-one use the shared `:4321` server, which `run-suite.sh` starts with a `mktemp -d` data dir.
-The claim's origin is the lesson. `terminal-ui-e2e.mjs`'s header carries a **past-tense
-post-mortem** — "These *were* the only two … so they *booted* against the operator's REAL …" —
-narrating a bug fixed ten lines below it. A new file copied the paragraph verbatim, and detached
-from the fix it was narrating, it read as a present-tense discovery.
-> **A post-mortem is bound to the fix it sits beside. Copy the prose without the fix and it
-> becomes a bug report.** When lifting a comment into a new file, re-read it as someone who
-> cannot see the original context — which is exactly who will read it next.
-
-**ONE LIVE EXCEPTION SURVIVES, and it upgraded the port problem from tidiness to safety.** Those
-nine harnesses are isolated only if the harness actually STARTS the shared server. Under the
-`already listens on :4321 — using it` fallback they run against a stranger's server whose data dir
-is whatever that stranger chose — possibly the operator's real one. **That fallback is the last
-remaining route by which the suite can touch a live session store**, which is the argument that
-settled the decision below.
-
-### STATUS: the `:4321` fallback is being changed to HARD-FAIL — approved 2026-08-25
-It will SKIP the `srv4321` entries as a prerequisite failure rather than running them (consistent
-with how a missing Chrome is handled), print who to stop and why, and keep `ALLOW_FOREIGN_4321=1`
-as an override. The skip must also appear in the FINAL SUMMARY — "55 passed, 0 failed, 15 skipped"
-read without scrollback looks like a healthy run.
-
-### ★ A FALSE GREEN FOUND NEXT TO A RED — 2026-08-25
-`notifications-test`'s `bell shows enabled (aria-pressed)` asked whether **any** button in the
-document had `aria-pressed="true"`. `SoundToggle` is on by default and carries it, so that check
-**passed while the click beneath it was failing** — reporting the sound toggle's state under the
-bell's name. Found only because the red beside it was being repaired.
-> **A green sitting next to a red deserves the same scrutiny as the red.** Nobody audits the
-> passing lines of a failing file, which is precisely where a check that asserts nothing survives.
-Repaired to 8/8, and — the right standard — verified **under the condition that broke it** (run
-behind three other session-creating harnesses), not merely standalone.
+> **[A verbatim duplicate of the 96 lines above was removed here on 2026-09-02.]** The block
+> beginning "★ STEP (i) DESIGN — THE ORDERING FAULT" through "★ A FALSE GREEN FOUND NEXT TO A
+> RED" appeared TWICE, byte-identical, 631 lines apart. Deleted rather than struck: a duplicate
+> records no decision, so there is nothing to preserve the way a retracted claim is preserved —
+> and leaving it would have pre-loaded this file with the retraction-missed-a-copy fault, since
+> any future correction inside that block would have fixed one copy and left the other reading
+> as authoritative. The surviving copy is the earlier one. Noted rather than removed silently,
+> because a 96-line deletion someone cannot account for is its own kind of unreliable record.
 
 ### ~~STATUS: `super-editor-test.mjs` — GENUINE NEW RED, cause NOT the reducer work~~
 **RETRACTED 2026-08-25 — THIS ENTIRE BLOCK WAS FALSE AND ITS CLOSING IMPERATIVE WAS THE WORST OF
@@ -2141,7 +2287,7 @@ Three proposals were designed on 2026-08-21. (C) is largely landed, (A)'s module
 
 `RefusalReason` from (A) and `widens(): string[]` are the same shape. **One reason type should serve both** — a deduplication neither design noticed when specced separately.
 
-**Verified so nobody re-raises it:** `restore` provenance is EARNED. `sessionPersistence` writes to `dataDir()`, not `~/.claude` (`sessionPersistence.ts:14`), and `dataDir.ts:17` documents that as security-relevant for exactly this reason. **CORRECTED 2026-08-23 — this residual is CLOSED.** `stateDirsToHide()` owns the invariant for `dataDir()` AND `dirname(tokenFilePath())` independently (they diverge under `CLAUDETTE_DATA_DIR`). Box side: `hiddenStateDests`, bound from an EMPTY dir — ro would still permit the read, and here READING is the escape. Authorizer side: an explicit loop in `sandboxPathAccess`. Verified with `$HOME` mounted rw: token, `sessions.json`, ledger and team-notes all `read=false write=false`, control file still readable. Both guards 6/6. **The real residual is narrower:** `stateDirsToHide()` is a hand-maintained list and nothing asserts the WRITERS agree with it. An operator who mounts it reopens self-granted `enabled:false` on next boot.
+**Verified so nobody re-raises it:** `restore` provenance is EARNED. `sessionPersistence` writes to `dataDir()`, not `~/.claude` (`file()` in `sessionPersistence.ts`), and `dataDir.ts:17` documents that as security-relevant for exactly this reason. **CORRECTED 2026-08-23 — this residual is CLOSED.** `stateDirsToHide()` owns the invariant for `dataDir()` AND `dirname(tokenFilePath())` independently (they diverge under `CLAUDETTE_DATA_DIR`). Box side: `hiddenStateDests`, bound from an EMPTY dir — ro would still permit the read, and here READING is the escape. Authorizer side: an explicit loop in `sandboxPathAccess`. Verified with `$HOME` mounted rw: token, `sessions.json`, ledger and team-notes all `read=false write=false`, control file still readable. Both guards 6/6. **The real residual is narrower:** `stateDirsToHide()` is a hand-maintained list and nothing asserts the WRITERS agree with it. An operator who mounts it reopens self-granted `enabled:false` on next boot.
 
 **Still open, neither blocking:**
 1. Does `mounts` have a defensible widening order? Answering it needs A2's containment semantics. The cheap sound answer is exact-pair subset with rw ⊄ ro; that is over-restrictive and it is unknown whether unusably so.
@@ -2159,7 +2305,7 @@ Three proposals were designed on 2026-08-21. (C) is largely landed, (A)'s module
 
 **Landed and green:** `auth-route-coverage-test.mts` (7/7; found 450 bypasses over 120 routes before the fix), `sandbox-symlink-argv-characterization.mts` (7/7), `outputKeys` + test (8/8), `sessionReducer` + test (32/32), and the `sessions.tsx` provider rewrite on `useReducer`.
 
-**Staged, unrun:** `web/src/store/sessions.test.tsx` — 7 provider tests, blocked on `vitest` + `@testing-library/react` + `jsdom`, which could not be installed against a read-only `node_modules`. **A test nobody has executed is not evidence; do not let it read as passing.**
+~~**Staged, unrun:** `web/src/store/sessions.test.tsx` — 7 provider tests, blocked on `vitest` + `@testing-library/react` + `jsdom`, which could not be installed against a read-only `node_modules`.~~ — **CLOSED** by the root install (`8dbed06`). All three resolve from **root** `node_modules`, not `web/`. The maxim survives its entry and is why the runner is wired the way it is: **a test nobody has executed is not evidence; do not let it read as passing** — which is exactly what a bare `npx vitest run` would allow, since vitest exits 0 on an include glob that matches nothing. `scratchpad/web-vitest-shim.mjs` is the executing path, and it floors tests collected AND files found, because a floor detects deletion but never non-arrival.
 
 **Not applied:** the `run-suite.sh` C-I1 lint and the web-unit-suite block. Perform the fails-first check on the lint (add a one-line `process.exit(0)` file to SUITE, confirm it IS flagged) before trusting it.
 
@@ -2306,7 +2452,7 @@ the open code file to the user turn **sent to the CLI**, so Claude can resolve "
 - **Verified:** `scratchpad/editor-context-test.mts` (13/13 — strip round-trip; resume/title/rewind
   read-backs clean; rewind text still matches; **stubbed-engine sendUserTurn**: engine gets text+context
   for a code file, broadcast stays clean, notebook/no-pane → NO injection). Typecheck clean (all 3).
-- ⚠ **SERVER change → needs a server RESTART to go live** (the running server is `tsx src/index.ts`,
+- ⚠ **OBSERVED 2026-07-22, VOID ON RESTART** — **SERVER change → needs a server RESTART to go live** (the running server is `tsx src/index.ts`,
   no watch). Web is unaffected.
 
 ## 2026-07-22 (later) — Cursor-style inline diff review ("super editor") — BUILT + VERIFIED ✅ UNCOMMITTED
@@ -2353,7 +2499,7 @@ Only the hunks the user keeps land on disk — the flow rides the mandatory perm
   `scratchpad/super-editor-test.mjs` (19/19 — REAL headless Chrome: file auto-opens, inline diff +
   merge controls render, **the CM per-hunk ✓ auto-resolves** the chat permission + updates the editor
   live, disk is correct, chat-card **Allow** reloads the editor live, **Reject all** sends DENY).
-- ⚠ **Sandbox note (this session):** the running server was restarted with the hardened sandbox, so
+- ⚠ **OBSERVED 2026-07-22, VOID ON RESTART** — **Sandbox note (this session):** the running server was restarted with the hardened sandbox, so
   in THIS agent session `web/dist`, `node_modules`, `server/`, `shared/` are **read-only** (only
   `web/src`, `scratchpad`, `.claude` writable). I therefore **could not rebuild `web/dist`** to make
   `:4319` live, and the e2e now builds to a temp dir + serves it via a thin proxy to the backend.
@@ -2425,11 +2571,25 @@ CSV editable table view `c91af3d`, OAuth-creds reconcile fix `e6fa8cc`, workspac
 `1471258`. Untracked throwaway scratch `_sbx_{fix,probe,probe2,run,test}.mts` left in the tree
 (unrelated; safe to delete). Nothing for the editor +/- feature exists yet.
 
-## 2026-07-18 (latest) — ALL KNOWN SANDBOX ESCAPES CLOSED (code) ✅ UNCOMMITTED, needs restart
+## 2026-07-18 — ALL KNOWN SANDBOX ESCAPES CLOSED (code) ✅ ~~(latest)~~ ~~UNCOMMITTED, needs restart~~ — **COMMITTED**
+> **Corrected 2026-09-02.** Two of this heading's three claims were false, both in the dangerous
+> direction for a SECURITY entry — a reader trusting it believed the sandbox-escape fixes were
+> sitting uncommitted and unactivated. Measured: `git status` is clean for both
+> `server/src/pane/paneManager.ts` and `scratchpad/sandbox-escape-fixes-test.mts`, and
+> `paneSpawnSpec` — the function this entry names as new — is in the tree. "(latest)" was false
+> by six weeks. The third claim, "Live `:4319` still runs the OLD code", is a live-process
+> assertion, unfalsifiable from a confined session, and a member of the class noted below.
+>
+> **THIS IS A CLASS, NOT AN INSTANCE.** SEVEN `## ` headings in this file carry ✅ UNCOMMITTED,
+> and the working tree is clean apart from one in-flight feature — so none of the July/August
+> work they describe is uncommitted. They are being swept per-entry rather than blanket-struck,
+> because "the tree is clean" proves the work is not PENDING, not that each entry describes work
+> that landed as written. Do not add a new ✅ UNCOMMITTED marker: it is a point-in-time
+> observation with no expiry, which is the defect, not the wording.
 Implemented fixes for every documented escape vector. All typecheck clean; verified by
 `scratchpad/sandbox-escape-fixes-test.mts` (18/18 argv-level) + a live nested-bwrap run.
-**Live `:4319` still runs the OLD code — a server restart is required to activate all of
-this** (the running server is plain `tsx src/index.ts`, NOT `tsx watch` — corrects the old
+~~**Live `:4319` still runs the OLD code — a server restart is required to activate all of
+this**~~ — **STRUCK 2026-09-02: CONTRADICTED BY A LATER ENTRY.** The 2026-07-22 "super editor" entry says the running server *was restarted with the hardened sandbox* — which is exactly what this 07-18 entry claims is not active. At most one is true and the later one falsifies the earlier, so a date stamp cannot rescue it. (the running server is plain `tsx src/index.ts`, NOT `tsx watch` — corrects the old
 gotcha — so my edits did NOT hot-reload and did NOT disturb this session).
 
 - **Terminal-pane escape → FIXED** (`server/src/pane/paneManager.ts`, `server/src/index.ts`).
@@ -2801,7 +2961,7 @@ optional secure phone/PWA access over Tailscale. Architecture + decisions: `PLAN
 ## Status
 **Phase 1 COMPLETE** (chat, notebook, terminal, phone/PWA — see §Phase 1). **Phase 2 in
 progress.** Everything below typechecks clean (`npm run typecheck`, all 3 workspaces) and is
-screenshot/e2e-verified headless. **The live `:4319` server serves a STALE bundle** — none of
+screenshot/e2e-verified headless. ~~**The live `:4319` server serves a STALE bundle**~~ — **STRUCK 2026-09-02:** two later entries record bundle rebuilds going live on `:4319`. — none of
 the 07-11/07-12 work is visible until rebuilt + restarted (`./rc_launch.sh` or `./launch.sh`).
 
 Phase 2 done + verified this session:
@@ -2936,7 +3096,7 @@ panes, **asserts**), `git-shot.mjs`, `files-shot.mjs`. Shots land in `/tmp/claud
 **`layout-shot.mjs` / `ui-screenshot.mjs`** (renamed 2026-08-22 to the `*-shot.mjs` convention, which marks a screenshot producer with no assertions). They predate the redesign and neither can fail — both end in an unconditional `process.exit(0)`. **They were NOT deleted, and the reason is worth keeping:** the same "it's stale" claim was made about nine other browser tests, and when QA finally handed them a server five passed in 2-4 seconds — they had never been run, not rotted. "This test is stale" is a hypothesis with a two-minute test, and this repo has been wrong about it nine times out of nine. Run them before deleting them. Note separately that `ui-screenshot.mjs` reads the operator's REAL persisted token and drives their LIVE `:4319` server — that hazard is independent of staleness and must be fixed or the file removed before it is ever swept into an automated suite.
 
 ## Gotchas (durable)
-- **The running `:4319` server is plain `tsx src/index.ts` — NO watch** (verified 2026-07-18
+- **The running `:4319` server is plain `tsx src/index.ts` — NO watch** (**OBSERVED 2026-07-18, VOID ON RESTART**; verified
   via the process tree: `sh -c tsx src/index.ts` → `tsx` → `node … src/index.ts`, no `watch`
   anywhere). So server *source* edits do NOT hot-reload and do NOT disturb running sessions;
   changes go live only on a **manual restart** (which drops WS clients + relaunches sessions,
@@ -2966,7 +3126,7 @@ panes, **asserts**), `git-shot.mjs`, `files-shot.mjs`. Shots land in `/tmp/claud
 ## Next steps
 **Immediate (2026-07-18 session — all uncommitted):**
 0a. ~~Browser-verify the doubling fix + Agents tray~~ ✅ DONE (see 07-18 later entry;
-    `scratchpad/doubling-agents-test.mjs` 7/7). Live `:4319` still needs a restart to pick it up.
+    `scratchpad/doubling-agents-test.mjs` 7/7). ~~Live `:4319` still needs a restart to pick it up.~~ — **STRUCK 2026-09-02: a live-process claim with no expiry; see the convention note.**
 0b. **Security — DONE.** token-on-loopback + terminal-pane + self-modification + Fix C all
     implemented + tested (see the top "ALL KNOWN SANDBOX ESCAPES CLOSED" entry). Remaining is
     only Fix D (network isolation, now defense-in-depth) + minor hardening (owner-scope panes,

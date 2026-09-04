@@ -117,6 +117,20 @@ cd "$(dirname "$0")/.."
 # Do NOT infer a run from a port: :4321 is held only during the srv4321 block, a small window
 # in a long run, so an empty listener list means nothing either way.
 LOCKFILE=".suite-run.lock"      # repo root — cd'd to above. Gitignored.
+# Did THIS invocation actually take the lock? `on_exit` runs on EVERY invocation, so it must
+# remove only what it wrote. Without this a single-file run — which deliberately never takes
+# the lock, because it produces no baseline and has no claim on anybody's writes — would delete
+# a FULL run's lock file in another session on its way out. That run then continues unlocked
+# while `--lock-status` everywhere reports "no run in flight", which is verbatim the false
+# statement this file's header records as having caused a prior incident.
+#
+# THIS IS A REGRESSION THAT WAS INTRODUCED AND CAUGHT ON 2026-09-02. The pre-composition code
+# was correct by ACCIDENT OF PLACEMENT: the lock-removal trap was registered inside the
+# full-run branch, so only a lock-taker could reach it. Composing the two EXIT traps into one
+# handler (to stop an interrupted run orphaning the :4321 server) moved the removal to
+# unconditional scope and silently dropped that condition with it. A condition carried by
+# WHERE code sits does not survive the code being moved; make it explicit before you move it.
+LOCK_TAKEN=no
 LOCK_STALE_S=3600     # a run that has not finished in an hour is assumed dead, not sacred
 # Who we are. The CLAUDE_CONFIG_DIR basename is a REAL, stable per-session id; a generated
 # one would be fresh every invocation and could not answer "whose run is this" after the
@@ -351,7 +365,36 @@ stop_shared_server() {
   [ -n "$SRV_DATA" ] && rm -rf "$SRV_DATA"
   SRV_PID=""
 }
-trap stop_shared_server EXIT
+# THE ONLY EXIT TRAP IN THIS FILE. Everything that must happen on the way out is composed
+# into on_exit and registered exactly once, because in bash a second `trap ... EXIT` REPLACES
+# the first rather than adding to it. That is not a hypothetical: the lock handler below used
+# to register its own EXIT trap, silently unhooking this one for the whole of a full run.
+# Normal completion hid it — the server is stopped explicitly further down — so it only bit on
+# Ctrl-C or a crash, and it bit in the worst possible way. The lock was released correctly
+# while the :4321 server SURVIVED, holding the port. The next run's `start_shared_server` then
+# sees it, sets FOREIGN_4321=yes, SKIPS every shared-server entry and stamps the total NOT A
+# BASELINE — so a third of the suite silently stops running until someone kills the orphan.
+# (An earlier draft of this comment said the next run "silently ADOPTED the orphan and measured
+# against it". That is FALSE for the runner path — the ss probe above refuses — and it was a
+# retracted claim repeated from a stale note. Adoption is the hazard on the DIRECT-invocation
+# path, `node scratchpad/<harness>.mjs`, where no runner exists to probe anything.)
+#
+# So: add to on_exit, never add a second `trap ... EXIT`.
+on_exit() {
+  stop_shared_server
+  # ${LOCKFILE:-} rather than "$LOCKFILE", and the reason is NOT that LOCKFILE can be unset —
+  # it is assigned unconditionally near the top of this file, so today it always has a value.
+  # (That was checked rather than assumed: an earlier draft of this comment claimed the
+  # opposite and was wrong.) The guard is here because this file runs under `set -u` and this
+  # is an EXIT handler, where the cost of being wrong is asymmetric: an exit handler that
+  # throws REPLACES the exit code it was preserving, so a correct `exit 1` surfaces as
+  # something else and the run reports the wrong outcome rather than failing loudly. That has
+  # happened here before and is recorded in the team handover. A trap must survive a future
+  # edit that moves the assignment, not merely the arrangement it was written against.
+  [ "${LOCK_TAKEN:-no}" = yes ] && [ -n "${LOCKFILE:-}" ] && rm -f "$LOCKFILE"
+  return 0
+}
+trap on_exit EXIT
 echo
 
 # ---- the set ----------------------------------------------------------------
@@ -399,6 +442,43 @@ SUITE=(
   "none:sandbox-unowned-kernel-test.mts"
   "none:sandbox-paths-test.mts"
   "none:data-dir-test.mts"
+  # PURE, no server, no browser (~40ms). The saved-folder defaults store
+  # (server/src/claude/sandboxDefaults.ts) — the operator's standing list of one-click sandbox
+  # mounts — driven against a throwaway CLAUDETTE_DATA_DIR, so it asserts what lands on disk
+  # rather than a re-implementation. Sits beside data-dir-test because it depends on the same
+  # property: the list is written under dataDir() (~/.config/claudette), which no box binds,
+  # so a confined session cannot plant a path in the operator's own menu.
+  # The two assertions worth knowing about: NORMALISATION is load-bearing (`/a/b` and `/a/b/`
+  # must be one row, or the UI shows a folder twice with contradicting mode chips), and the
+  # malformed-row pair, which pins a fault this test FOUND — load() checked that `folders` was
+  # an array but never the rows in it, so a file that PARSES with a bad row bypassed the
+  # corrupt-file catch entirely: save threw ERR_INVALID_ARG_TYPE out of path.resolve, and list
+  # handed a non-string path to prettyPath's .replace, white-screening the editor inside
+  # React's render. Its fixture puts good rows either side of the bad ones on purpose — a
+  # lone bad row returns [] under both "drop bad rows" and "empty the list", so it could not
+  # tell the fix from the bug.
+  "none:sandbox-defaults-test.mts"
+  # Is the quota meter TEST-ISOLATED? Its creds path was `join(homedir(), '.claude',
+  # '.credentials.json')` — a module-load constant honouring no override — so a harness that
+  # set CLAUDETTE_DATA_DIR believing it was isolated still read the operator's REAL OAuth
+  # token, and any Chrome harness rendering ChatView polls /api/usage via useUsage(). Reading
+  # the real token is the FEATURE; only an isolated run doing it is the defect.
+  # Browser-free and network-free: globalThis.fetch is replaced for the whole run, so the
+  # "does it reach the network" question is MEASURED on a call counter rather than inferred,
+  # and nothing can leave the process even when an assertion fails. The captured Authorization
+  # header is fingerprinted, never printed — the headline assertion fails exactly when the code
+  # read the real token, so a naive message would print a live credential into suite output.
+  "none:usage-isolation-test.mts"
+  # Is a dismissed teammate's exit interview still ON DISK? `MAX_ENTRY_CHARS` was applied
+  # inside appendRoleNote BEFORE writeFileSync, so the surplus was never written. Found
+  # 2026-09-02 with five exit interviews already destroyed at rest — each cut mid-sentence
+  # inside its defect-pattern section, losing the repo traps, the items verified closed, and
+  # the findings never dispositioned. Unrecoverable; the fix prevents the sixth.
+  # Asserts the SPLIT, because either half alone passes against the old code: what reaches
+  # DISK is complete, what reaches a FIRST TURN is bounded. Its "whole note is on disk"
+  # assertion compares against the note's LENGTH, not the cap — phrased against the cap it
+  # stayed green under the very mutation it was cited for (a 4181-char stub clears a 4000 bar).
+  "none:team-notes-truncation-test.mts"
   "none:host-config-mirror-test.mts"
   "none:creds-live-resync-test.mts"
   "none:connectors-test.mts"
@@ -721,9 +801,39 @@ SUITE=(
   # seen BEFORE testing whether it could act on it, which permanently defeated the retry its
   # own [openIds, activeId] dep array existed to provide. Test 2 is the regression; it fails
   # against the old ordering and passes against the new one. Registered here rather than as a
-  # vitest file because vitest is neither installed nor declared in web/package.json, so
-  # web/src/store/sessions.test.tsx cannot currently be executed at all.
+  # vitest file because, WHEN IT WAS WRITTEN, vitest was neither installed nor declared in
+  # web/package.json. THAT IS NO LONGER TRUE — vitest 2.1.9 is a real devDependency and the
+  # web tests run (see web-vitest-shim.mjs below). This stays as-is regardless: it is pure and
+  # costs ~3ms, and rewriting a green pinning test to use a runner it does not need would risk
+  # the pin to gain nothing.
   "none:notebook-attach-test.mts"
+  # The WEB vitest suite (web/src/**/*.test.{ts,tsx}) as a single member — the runner itself,
+  # not one file. Registered because a whole test RUNNER was sitting outside the suite:
+  # registration-lint scans scratchpad/ for unregistered files and structurally cannot see
+  # that, so web/'s tests ran only when somebody typed the command by hand. Same principle the
+  # lint enforces ("a test absent from the suite is indistinguishable from a test that
+  # passes"), one level up. It asserts a test-count FLOOR rather than just exit 0, because
+  # vitest exits 0 on a glob that matches nothing; and it fails CLOSED on a missing binary
+  # rather than skipping, because web/ declares vitest, so an absent one is a broken checkout
+  # and not an optional prerequisite like chrome or jupyter.
+  "none:web-vitest-shim.mjs"
+  # PURE, no browser, no server, no API calls (~5ms). The init-clobber DECISION from
+  # real-turn-browser-test, extracted so it can be exercised without spending real API calls
+  # in the one session whose CLI is logged in. That harness asserted "Stop still up at some
+  # sample >2500ms" — sound, but not specific: 2500 is a wall-clock proxy for "init has
+  # fired" and it fails identically when the turn simply finishes early, which is the recorded
+  # 2026-08-24 false red. The replacement compares two events OF THE TURN, so the model's
+  # speed drops out. Test 2 replays that false red; test 3 is the clobber itself.
+  "none:turn-indicator-test.mjs"
+  # STATIC, reads source text only — no browser, no server, no API calls. Guards the premise
+  # that turn-indicator-test.mjs cannot reach from its own file: that real-turn-browser-test
+  # captures a baseline BEFORE it sends and requires an INCREASE, rather than asking whether
+  # any assistant text is on screen. That question answers YES before the prompt is sent,
+  # because the harness's fixed cwd means the CLI replays its own previous runs — which made
+  # two assertions in that file vacuous, one of them created by REPAIRING the other. Proving
+  # this by hand costs a live API turn on the operator's account, which is exactly why the
+  # defect survived; this check is free and runs every suite.
+  "none:assistant-signal-guard.mts"
   # --- these eight need the shared :4321 server (see start_shared_server) ---
   "srv4321:attention-test.mjs"
   "srv4321:history-resume-test.mjs"
@@ -839,13 +949,18 @@ if [ $# -eq 0 ]; then
     echo "  covers:  web/ server/src shared/src scratchpad/ — do not write to these"
     echo "  stale after ${LOCK_STALE_S}s; a dead holder in another session cannot be probed"
   } > "$LOCKFILE"
+  LOCK_TAKEN=yes          # only now may on_exit remove it — see the declaration above
   # Released on EVERY exit path, or the next run refuses for an hour over a lock nobody holds.
   # ★ INT/TERM must EXIT, not merely unlock. Measured 2026-08-29: with a handler that only
   # removed the file, `kill -TERM` ran it and the run CARRIED ON — still going, now with no
   # lock, which is worse than either state on its own. bash runs a trap and resumes unless
   # the handler itself exits.
-  trap 'rm -f "$LOCKFILE"' EXIT
-  trap 'rm -f "$LOCKFILE"; exit 130' INT TERM
+  # NO SECOND `trap ... EXIT` HERE — see on_exit above, which already removes $LOCKFILE. A
+  # trap registered here would replace on_exit outright and re-orphan the shared server.
+  # INT/TERM still needs its own handler and still must EXIT rather than merely unlock (the
+  # 2026-08-29 measurement above), but it now delegates: `exit 130` fires the EXIT trap, so
+  # on_exit does the unlocking AND stops the server, which the old handler never did.
+  trap 'exit 130' INT TERM
 fi
 
 pass=0; fail=0; skip=0; failed=(); ran_logs=(); rtskipped=(); b1_ran=()

@@ -666,5 +666,42 @@ const TWO = run(initialSessionStore, { type: 'list', sessions: [sess('a'), sess(
     bothAcked.sessions.map((x) => x.id).join() === 'a,c,d', bothAcked.sessions.map((x) => x.id).join())
 }
 
+// ── F7 — A `finished` FLAG MUST NOT SURVIVE THE SESSION GOING BACK TO WORK ──────────────
+// Reported by the operator 2026-09-03: a subsession's light was RED while it was WORKING, so
+// red meant "finished, needs you" and "busy" at once and distinguished neither.
+//
+// `finished` was cleared in exactly ONE place — `withActive`, i.e. by VIEWING the session. That
+// is sufficient only if viewing is the only way a finished session stops being finished, and it
+// is not: sending it another turn starts it working again. On a session you are not watching —
+// a teammate, which is the entire point of subsessions — nothing ever cleared it, so the dot
+// reported a turn that had ended two turns earlier.
+{
+  // `b` finishes unwatched (active is `a`), then is sent more work.
+  const finished = run(TWO,
+    { type: 'setActive', id: 'a' },
+    { type: 'state', id: 'b', state: 'running' },
+    { type: 'state', id: 'b', state: 'idle' },
+  )
+  check('F7.0 fixture: an unwatched finish really does flag `b`',
+    finished.attention.get('b') === 'finished', String(finished.attention.get('b')))
+
+  const working = run(finished, { type: 'state', id: 'b', state: 'running' })
+  check('F7.1 starting a new turn RETIRES the stale `finished` flag — red must not mean "busy"',
+    !working.attention.has('b'),
+    { pass: 'cleared', fail: `still ${working.attention.get('b')} while running — the sidebar renders this as the red "done" light` })
+
+  // The scoping matters as much as the clear: (a2) must not fire on the idle transition, or it
+  // would wipe the flag that the SAME action is setting for a finished turn.
+  const refinished = run(working, { type: 'state', id: 'b', state: 'idle' })
+  check('F7.2 …and finishing AGAIN re-flags it — the clear is scoped to `running`, not unscoped',
+    refinished.attention.get('b') === 'finished', String(refinished.attention.get('b')))
+
+  // A blocked session must not be reported as "done": `running` clears `finished` first, then
+  // `waiting` sets `blocked`, so the reason the sidebar reads is the current one.
+  const blocked = run(finished, { type: 'state', id: 'b', state: 'running' }, { type: 'state', id: 'b', state: 'waiting' })
+  check('F7.3 finished → working → blocked ends as `blocked`, not a stale `finished`',
+    blocked.attention.get('b') === 'blocked', String(blocked.attention.get('b')))
+}
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail === 0 ? 0 : 1)
