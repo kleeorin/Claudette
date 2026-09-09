@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Overlay } from './components/Overlay'
 import { createPortal } from 'react-dom'
 import { SessionsProvider, useSessions } from './store/sessions'
+import type { AttentionReason } from './store/sessionReducer'
 import { ChatProvider, useChat, collectAgents, agentKey, isAgentLive, type AgentView } from './store/chat'
 import { useDismissedAgents, dismissAgents, pruneDismissed } from './store/agentDismiss'
 import { NotebooksProvider, useNotebooks } from './store/notebooks'
@@ -28,6 +29,8 @@ import { basename, prettyPath } from './lib/paths'
 import { MD_PX, usePhone } from './lib/breakpoint'
 import { useVisibleHeight } from './lib/visualViewport'
 import { attachNewNotebooks } from './lib/notebookAttach'
+import { dotStateFor, pruneMutes, busyKernelCount } from './lib/sessionLights'
+import { StateDot } from './components/StateDot'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
@@ -238,7 +241,7 @@ const boundedDockH = (px: number, reservePx: number = DOCK_RESERVE_PX) =>
   `min(${px}px, max(${DOCK_MIN_PX}px, calc(var(--vvh, 100vh) - ${reservePx}px)))`
 
 function Shell() {
-  const { sessions, activeId, setActive, homeDir } = useSessions()
+  const { sessions, activeId, setActive, listLoaded, homeDir } = useSessions()
   const notebooks = useNotebooks()
   const [drawer, setDrawer] = useState(false)
 
@@ -273,6 +276,17 @@ function Shell() {
     }
     return out
   })
+
+  // This session's notebook tab ids, for the sidebar's kernel-activity light. Derived from
+  // the pane map rather than from the notebooks store, because the store keeps no session
+  // association: NotebookDoc has no owner field, and the server's per-notebook owner
+  // (`kernels.setOwner(..., { session })`) is never sent to the browser. The pane map is the
+  // same structure that decides which notebooks a session SHOWS, so the light matches what
+  // the user sees under that session — which is what they asked about.
+  const notebookIdsFor = useCallback((sid: string) => {
+    const pane = bySession[sid]
+    return pane ? pane.tabs.filter((t) => t.kind === 'notebook').map((t) => t.id) : []
+  }, [bySession])
 
   // Pending "save before closing?" prompt for a dirty / still-running notebook tab.
   const [closeNb, setCloseNb] = useState<{ id: string; name: string; dirty: boolean; running: boolean } | null>(null)
@@ -616,11 +630,22 @@ function Shell() {
 
   // When a session goes away, drop its terminal dock. The server already reaped the
   // ptys it owned (sessions.on('destroyed') → panes.destroyForSession), so this is
-  // pure client-state cleanup. GUARD: the session list loads async, so skip while it's
-  // empty — otherwise a refresh with restored terminals would drop them all before the
-  // list arrives.
+  // pure client-state cleanup. GUARD: the session list loads async, so skip until it has
+  // ARRIVED — otherwise a refresh with restored terminals would drop them all first.
+  //
+  // ★ THE GUARD USED TO BE `sessions.length === 0`, WHICH IS NOT THE SAME QUESTION and is
+  // the shape lib/sessionLights.test.ts documents as the tempting wrong fix. An empty list is
+  // ambiguous: not-loaded-yet AND a server whose last session was just closed both look like
+  // it. Reading it as not-loaded meant that for the whole zero-session window the dead
+  // session's panes stayed in termsBySession/bySession, publishedRef was never dropped, and
+  // pruneDismissed/pruneDrafts never ran — so dismissed-agent keys and unsent drafts sat in
+  // localStorage and the closed session's tabs kept being re-persisted on every layout
+  // change, which is verbatim the leak the setBySession half below was added to stop.
+  // Self-healing (the next list with ≥1 session prunes everything) so the window was bounded,
+  // unlike the two unbounded instances the planner handover records — but `listLoaded` asks
+  // the question this comment was already describing, so the guard now means what it says.
   useEffect(() => {
-    if (sessions.length === 0) return
+    if (!listLoaded) return
     const ids = new Set(sessions.map((s) => s.id))
     setTermsBySession((prev) => {
       let changed = false
@@ -650,7 +675,10 @@ function Shell() {
     // Keyed on the id SET, not the session array: `sessions` gets a new identity on every
     // state event (running→idle, a rename, an optimistic patch), and this body walks the
     // whole localStorage keyspace via pruneDrafts. Only membership can make it do work.
-  }, [sessionIdKey]) // eslint-disable-line react-hooks/exhaustive-deps
+    // `listLoaded` joins it because the effect now returns early on it: without the dep, the
+    // pass that flips the flag on a server reporting ZERO sessions would not re-run this —
+    // the id set is unchanged (still empty) — and the prune would never happen at all.
+  }, [sessionIdKey, listLoaded]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // --- refresh survival: reconcile, persist, restore notebooks ----------------
   // ONCE on load: reconcile the restored terminal layout against the ptys the server
@@ -829,7 +857,7 @@ function Shell() {
   // (`#root { height: var(--vvh) }`) and this is the shell wrapper it sizes.
   return (
     <div data-phone={isPhone ? 'true' : 'false'} className="flex h-full bg-ctp-base overflow-hidden">
-      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} onOpenAgent={openAgent} />
+      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} onOpenAgent={openAgent} notebookIdsFor={notebookIdsFor} />
       <div
         {...dividerProps({ axis: 'x', get: () => sidebarW, set: setSidebarW, sign: 1, min: 200, max: () => 560 })}
         title="Drag to resize"
@@ -1321,8 +1349,89 @@ function Empty() {
   )
 }
 
-function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits, onOpenAgent }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void; onOpenAgent: (sid: string, id: string, label: string) => void }) {
-  const { sessions, activeId, setActive, destroy, connected, attention, homeDir } = useSessions()
+function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits, onOpenAgent, notebookIdsFor }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void; onOpenAgent: (sid: string, id: string, label: string) => void; notebookIdsFor: (sid: string) => string[] }) {
+  const { sessions, activeId, setActive, destroy, connected, listLoaded, attention, homeDir } = useSessions()
+
+  // ── MUTED_NOTE — the click-to-mute session light ──────────────────────────────────────
+  // "I want to be able to press a gray indicator light to make it black (so i know im not
+  // using it). when it get a new interaction it lights back up to whatever it needs to be."
+  //
+  // A mute is a statement about the USER's attention, not about the session, so it is
+  // client-only and never reaches the server. It is persisted, and that is a deliberate
+  // choice rather than an oversight: "I am not using this one" is an intent that outlives a
+  // page reload, and the cost of being wrong is bounded to nothing, because a mute is only
+  // ever RENDERED for an idle, non-attention session (see StateDot). A stale mute therefore
+  // cannot hide activity — the worst it can do is show an unlit ring on a session that is
+  // genuinely idle, which is exactly what was asked for.
+  //
+  // ★ TWO MECHANISMS, AND THEY ARE NOT REDUNDANT.
+  //   1. StateDot refuses to render a mute for anything but an idle, unflagged session. That
+  //      is the SAFETY, and it holds even if this effect never runs.
+  //   2. The effect below DROPS the flag on the first activity. That is the SEMANTICS: the
+  //      light must relight and STAY lit afterwards, so the user never has to remember to
+  //      un-mute. The guard alone would re-black the dot the moment the turn ended.
+  // Only (1) is what makes the feature safe, and only (2) is what makes it what was asked
+  // for. Deleting either leaves something that still looks like it works.
+  const [muted, setMuted] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem('claudette.mutedSessions')
+      return new Set<string>(raw ? JSON.parse(raw) as string[] : [])
+    } catch { return new Set<string>() }
+  })
+  const saveMutes = (ids: string[]) => {
+    try { localStorage.setItem('claudette.mutedSessions', JSON.stringify(ids)) } catch { /* private mode */ }
+  }
+  // Same rule as the effect above: compute, write, THEN set. `muted` is current here because
+  // this only ever runs from a click handler, never from inside another updater.
+  const toggleMute = (id: string) => {
+    const next = new Set(muted)
+    if (!next.delete(id)) next.add(id)
+    saveMutes([...next])
+    setMuted(next)
+  }
+
+  // WHAT COUNTS AS "A NEW INTERACTION": any departure from a quiet idle. That is every
+  // transition into running (new output), into waiting (a permission prompt), into exited,
+  // and any attention flag — plus the session ceasing to exist. The widest reading was
+  // chosen on purpose: a narrower one (say, only new assistant output) would leave a session
+  // muted while it sat on a permission prompt, and a mute that swallows "needs you" is worse
+  // than no mute at all. Erring wide costs at most an un-mute the user did not ask for.
+  //
+  // ★★ GATED ON `listLoaded`, AND THIS GUARD IS THE WHOLE REASON PERSISTENCE WORKS AT ALL. ★★
+  // Without it this effect ran once at mount, when `sessions` is still `[]` because the list
+  // arrives asynchronously — and `clearMutes` cannot tell "that session is gone" from "the
+  // list has not loaded", because that information does not exist inside it. Every entry was
+  // therefore pruned as a vanished session and the empty result written straight back to
+  // localStorage, so EVERY PAGE LOAD ERASED THE STORE before the list landed. With two tabs
+  // open, a reload in one silently cleared the other's saved mutes. The comment above claimed
+  // the mute "outlives a page reload" while the code guaranteed it could not.
+  //
+  // It failed SAFE — a lost mute is a lit dot, never a hidden one — so this was the stated
+  // feature not working, rather than a safety defect. That distinction is why the fix belongs
+  // here and not in `clearMutes`: the pruning rule is correct, its precondition was not.
+  //
+  // This is the repo's own named pattern, third occurrence: AN EMPTY COLLECTION TREATED AS
+  // AUTHORITATIVE. The planner handover records H3 and H5 as one failure mode reached by two
+  // routes, both of which ended in every terminal being killed. The general rule it earns:
+  // a prune keyed on a collection must distinguish "nothing to keep" from "not loaded yet",
+  // and the collection itself can never answer that — the signal has to come from the loader.
+  // `muted` is a dep and that is safe BECAUSE pruneMutes returns the same reference when it
+  // changes nothing: setMuted with an identical reference does not re-render, so this settles
+  // in one pass instead of looping.
+  //
+  // ★ THE WRITE IS HOISTED OUT OF THE UPDATER, and the previous version's comment claimed
+  // this while the code did the opposite — `save` was passed INTO pruneMutes, which runs
+  // inside the setState updater. React invokes updaters twice under StrictMode (on in
+  // main.tsx), so that updater was impure. The behaviour was benign, because both writes
+  // derive purely from `prev` and produce identical content — the defect was the CLAIM. It
+  // mattered because this same file states the rule correctly for `toggleDock` a few hundred
+  // lines up; one place stating a rule and following it while another states it and breaks it
+  // is how the next person adds a non-idempotent effect here (a POST, an analytics ping) on a
+  // written guarantee that does not hold, and it fires twice in dev.
+  useEffect(() => {
+    const next = pruneMutes({ muted, sessions, attention, listLoaded, save: saveMutes })
+    if (next !== muted) setMuted(next as Set<string>)
+  }, [listLoaded, sessions, attention, muted])
   const [showNew, setShowNew] = useState(false)
   const [confirmClose, setConfirmClose] = useState<SessionInfo | null>(null)
   // The global Claudette deck (app-wide config; currently connectors). State lives here
@@ -1421,13 +1530,21 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
           {sessions.length === 0 && <div className="px-2 py-2 text-xs text-ctp-overlay">No sessions yet.</div>}
           {ordered.map(({ session: s, depth }) => (
             <SessionRow
-              // `finished` ONLY, deliberately. SessionRow renders the literal "done" and a dot
-              // titled "Finished — needs your attention", both of which are FALSE for a
-              // session that is merely blocked on a permission prompt. The store now carries
-              // the reason; until the rendering slice lands, this narrows it back to a
-              // boolean so the sidebar stays exactly as it is today. THIS is the line the
-              // next slice changes.
-              key={s.id} session={s} depth={depth} active={s.id === activeId} attention={attention.get(s.id) === 'finished'}
+              // TWO PROPS, TWO DIFFERENT QUESTIONS, and the history of this line is worth the
+              // space because it has now been wrong in both directions.
+              //   · `finished` — narrow, deliberately. It drives the literal "done" label and
+              //     the bold name, both of which are FALSE for a session merely blocked on a
+              //     permission prompt. This narrowing was here first and it was right.
+              //   · `attention` — the REASON, not a boolean, and it is what the status dot
+              //     obeys. A boolean cannot work here: collapsed to "finished" it left a muted
+              //     dot DARK on a blocked session, and widened to "any reason" it rendered a
+              //     blocked session as red-pulsing "Finished — needs your attention", which
+              //     is simply untrue. Only the reason itself lets each case say what is true,
+              //     and `dotStateFor` in lib/sessionLights.ts is where that is decided — and,
+              //     unlike this file, where it is TESTED.
+              key={s.id} session={s} depth={depth} active={s.id === activeId}
+              finished={attention.get(s.id) === 'finished'} attention={attention}
+              muted={muted.has(s.id)} onToggleMute={() => toggleMute(s.id)} notebookIds={notebookIdsFor(s.id)}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
               onOpenAgent={(id, label) => { onOpenAgent(s.id, id, label); onClose() }}
             />
@@ -1739,7 +1856,7 @@ function orderSessions(
   return out
 }
 
-function SessionRow({ session, depth, active, attention, onSelect, onClose, onOpenAgent }: { session: SessionInfo; depth: number; active: boolean; attention: boolean; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void }) {
+function SessionRow({ session, depth, active, finished, attention, muted, onToggleMute, notebookIds, onSelect, onClose, onOpenAgent }: { session: SessionInfo; depth: number; active: boolean; finished: boolean; attention: ReadonlyMap<string, AttentionReason>; muted: boolean; onToggleMute: () => void; notebookIds: string[]; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void }) {
   const { sessions, agents, setAgent, rename } = useSessions()
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const [subOpen, setSubOpen] = useState(false)
@@ -1764,6 +1881,30 @@ function SessionRow({ session, depth, active, attention, onSelect, onClose, onOp
   const turnActive = session.state === 'running' || session.state === 'waiting'
   const liveAgents = myAgents.filter((a) => isAgentLive(a, turnActive)).length
   const finishedAgents = myAgents.length - liveAgents
+
+  // ── KERNEL ACTIVITY FOR THIS SESSION'S NOTEBOOKS ──────────────────────────────────────
+  // `notebookIds` is this session's notebook TAB SET, threaded down from the shell's
+  // per-session pane map. That is the client's answer to "this session's notebooks", and it
+  // is not quite the server's: kernelManager records an owner per notebook
+  // (`{ session: <id> }`) which never reaches the browser — NotebookDoc carries no owner
+  // field. The two agree in practice because the same map is what puts a notebook on screen
+  // under a session, including one Claude opened (focusPane attaches it to the named
+  // session, not to whatever is in front of the user). Stated here so nobody later reads
+  // this as the server's ownership and is surprised.
+  //
+  // ★ AND DO NOT "FIX" THIS BY PLUMBING THE SERVER'S OWNER THROUGH. It was considered and
+  // rejected: server ownership answers "which session owns this kernel", while the user asked
+  // about the notebooks in their own visible list. The approximation is the better fit for the
+  // question, and its error is one-directional — it cannot invent a light for a kernel outside
+  // this session's tabs, so there is no false-positive direction at all. If one notebook is
+  // open under two sessions both light up, which is correct against the literal ask. The only
+  // miss is a kernel still running after its tab was closed, which goes dark.
+  //
+  // BUSY *AND* STARTING both count as working. A kernel that is starting is occupied — the
+  // user cannot run a cell — so treating it as idle would blink the light off in the middle
+  // of the one stretch where "is it doing something?" is the actual question being asked.
+  const { kernelFor } = useNotebooks()
+  const busyKernels = busyKernelCount(notebookIds, kernelFor)
 
   // Nested-looking iff it is actually nested IN THIS LIST. Deriving this from
   // `session.parentId` instead disagreed with `depth` for an orphan — close a parent while
@@ -1799,10 +1940,14 @@ function SessionRow({ session, depth, active, attention, onSelect, onClose, onOp
       <div onClick={onSelect} style={indent} className={`group relative rounded-md pr-1 py-2 cursor-pointer flex items-center gap-2.5 transition-colors ${isSub ? '' : 'pl-2.5'} ${active ? 'bg-ctp-surface0' : 'hover:bg-ctp-surface0/50'}`}>
         {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-ctp-accent" />}
         {isSub && <span style={{ left: (indent?.paddingLeft ?? 20) - 12 }} className="absolute text-ctp-overlay text-[11px] leading-none" title="Subsession">↳</span>}
-        {/* A finished/errored background session gets a red attention light until viewed. */}
-        {attention
-          ? <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0 bg-ctp-red shadow-[0_0_8px_2px] shadow-ctp-red/60 animate-pulse" title="Finished — needs your attention" />
-          : <StateDot state={session.state} />}
+        {/* One dot, one decision, made in lib/sessionLights.ts where it is under test.
+            `dotStateFor` does the map lookup itself, deliberately: this line used to read
+            `dotState(session.state, muted, attention.get(id) === 'finished')`, and NOTHING IN
+            THE REPO IMPORTS App.tsx — so getting it wrong was invisible to the reducer
+            harness, the web suite and typecheck all at once, while putting a dark dot on a
+            blocked session. The wiring is the safety-critical part of this feature, so it
+            lives where it can be asserted rather than described. */}
+        <StateDot dot={dotStateFor(session, muted, attention)} onToggleMute={onToggleMute} />
         <div className="min-w-0 flex-1">
           {renaming ? (
             <input
@@ -1816,7 +1961,7 @@ function SessionRow({ session, depth, active, attention, onSelect, onClose, onOp
             />
           ) : (
             <div className="flex items-center gap-1.5 min-w-0">
-              <span className={`truncate text-sm ${attention ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
+              <span className={`truncate text-sm ${finished ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
               {roleBadge && <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide px-1 py-0.5 rounded bg-ctp-accent/15 text-ctp-accent" title={`Role: ${roleBadge}`}>{roleBadge}</span>}
               {/* The agents bullet: count of this session's subagents, and the toggle for
                   the list below. Only here while at least one card is uncleared. */}
@@ -1831,11 +1976,27 @@ function SessionRow({ session, depth, active, attention, onSelect, onClose, onOp
                   ◈{myAgents.length}
                 </button>
               )}
+              {/* Kernel activity — deliberately the SAME grammar as the agents badge beside
+                  it (pulsing dot + glyph + count), because the ask was for something
+                  "similar to what we have with agents". Peach rather than mauve so the two
+                  are still tellable apart at a glance: mauve means subagents, peach means
+                  notebook kernels. Purely derived from live kernel status, so it needs no
+                  clearing and cannot go stale. */}
+              {busyKernels > 0 && (
+                <span
+                  data-kernel-activity={busyKernels}
+                  title={`${busyKernels} notebook kernel${busyKernels > 1 ? 's' : ''} in this session ${busyKernels > 1 ? 'are' : 'is'} running`}
+                  className="shrink-0 flex items-center gap-1 text-[9px] rounded px-1 py-0.5 text-ctp-peach"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-ctp-peach animate-pulse" />
+                  ⬢{busyKernels}
+                </span>
+              )}
             </div>
           )}
         </div>
         {/* Live status word — hidden while hovering so it doesn't fight the actions. */}
-        <span className="md:group-hover:hidden">{attention ? <span className="text-[10px] text-ctp-red">done</span> : <StateLabel state={session.state} />}</span>
+        <span className="md:group-hover:hidden">{finished ? <span className="text-[10px] text-ctp-red">done</span> : <StateLabel state={session.state} />}</span>
         <button onClick={openMenu} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text text-sm leading-none transition-opacity px-1 py-1" title="Session actions" aria-label="Session actions">⋯</button>
         <button onClick={(e) => { e.stopPropagation(); onClose() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-red text-xs transition-opacity px-1 py-1" title="Close session">✕</button>
 
@@ -2092,16 +2253,6 @@ function SessionInfoDialog({ session, roleName, parentName, onClose }: {
       </div>
     </Overlay>
   )
-}
-
-function StateDot({ state }: { state: string }) {
-  const map: Record<string, string> = {
-    running: 'bg-ctp-green shadow-[0_0_8px_2px] shadow-ctp-green/60 animate-pulse',
-    waiting: 'bg-ctp-yellow shadow-[0_0_8px_2px] shadow-ctp-yellow/60 animate-pulse',
-    exited: 'bg-ctp-red',
-    idle: 'bg-ctp-surface2',
-  }
-  return <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${map[state] ?? map.idle}`} title={state} />
 }
 
 // Tiny live status word beside a session in the sidebar — only for the states that

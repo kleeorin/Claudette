@@ -45,7 +45,38 @@ const bin = path.join(repo, 'node_modules', '.bin', 'vitest')
 // Raised 14 → 18 on 2026-09-04 with ConnectorGrants.test.tsx (4 cases): a granted connector
 // that cannot work yet must still say what to do about it. Raised in the SAME change as the
 // tests, per the note above — a floor left behind is exactly the case that note warns about.
-const MIN_TESTS = 18
+// Raised 18 → 42 the same day with the sidebar status lights: sessionLights.test.ts (17) and
+// StateDot.test.tsx (7). The mute feature's whole safety argument is an ORDERING inside
+// dotState, so those cases are the guarantee that a mute cannot hide a session asking for the
+// user — losing them silently is precisely what this floor exists to prevent.
+// Raised 42 → 46 the same day: pruneMutes' four call-site cases, added after review found the
+// mute store was erased on every page load. The boot case is the only test in the file that
+// can see that class of defect — every clearMutes test stays green under the mutation that
+// reintroduces it — so losing it silently is exactly what this floor is for.
+// Raised 46 → 51 the same day: the dot now carries the attention REASON rather than a
+// boolean, plus dotStateFor — the map lookup extracted out of App.tsx. Nothing in the repo
+// imports App.tsx, so while that lookup lived inline it was the one safety-critical line in
+// the feature with no test at any layer; these five are what make reverting it a red.
+// Raised 51 → 67 on 2026-09-08 with the connector OAuth UI: connectorAuth.test.ts (9) and
+// ConnectorOAuth.test.tsx (7). The multi-account cases are the ones worth not losing — the
+// server REFUSES to dial when two accounts are authorized, and a UI that says nothing turns
+// that deliberate refusal into an invisible failure.
+// Raised 67 → 85 on 2026-09-08 with the app-settings panel: settingsLogic.test.ts (11) and
+// SettingsPanel.test.tsx (7). The override-disables-the-control cases are the ones worth not
+// losing — an editable control the environment is already dictating is a silent no-op, and
+// this repo has corrected that exact class three times.
+// 85 → 86 the same day: `save` became SET-ONLY and clears route to /reset, so one more case
+// pins that EVERY clearable control agrees on the verb. The risk is not all four reverting
+// together — it is one reverting and failing only for the field nobody clears often.
+// 86 → 88 on 2026-09-08: authState now consumes the server's `oauthClientReady` instead of
+// inferring from the ref's presence, so two cases pin it — a SET ref with ready=false must
+// report needs-client, and the ref fallback survives only where the field is absent.
+// 88 → 96 on 2026-09-09: the OAuth gate missed DYNAMIC-CLIENT-REGISTRATION connectors
+// entirely. Confluence carries no requiresOAuthClient, so the server emits no needsSetup, no
+// oauthClientRef and no oauthClientReady — the three fields the gate read. It rendered no
+// Connect button for the one connector that needs no operator setup, and reported it 'ready'
+// while holding no token. These cases pin both halves.
+const MIN_TESTS = 96
 
 // THE DETECTOR IS DELIBERATELY WIDER THAN THE RUNNER, and that relationship is the whole
 // point of it. `web/vitest.config.ts` collects exactly `src/**/*.test.{ts,tsx}`. A detector
@@ -91,7 +122,7 @@ function testShapedUnder(dir, rel = '') {
 // MIN_TESTS even though it is a different quantity: left at 2, a whole test FILE could stop
 // arriving while this walk still reported an all-clear — the exact blindness the paragraph
 // above exists to close.
-const MIN_TEST_FILES = 3
+const MIN_TEST_FILES = 9
 
 const shaped = testShapedUnder(web)
 check(`the walk found at least ${MIN_TEST_FILES} test file(s) — it is not silently looking at nothing`,

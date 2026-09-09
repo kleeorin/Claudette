@@ -17,6 +17,7 @@ import type {
   UsageResponse,
   ConnectorsResponse, ConnectorDef, ConnectorView, AccountConnector, StrictPreflight,
 } from '@claudette/shared'
+import type { AppSettings, AppSettingsResponse } from '../lib/settingsContract'
 
 // The single place the SPA talks to the server — replaces ClaudeMaster's Electron
 // `window.api`. HTTP for request/response lifecycle; one shared WebSocket for
@@ -340,6 +341,45 @@ export const api = {
     saveConnector: (def: ConnectorDef) =>
       post<{ connector?: ConnectorView; error?: string }>('/api/connectors/save', def),
     deleteConnector: (id: string) => post<OkResponse>('/api/connectors/delete', { id }),
+    // --- app-wide settings -------------------------------------------------------------
+    // ⚠ THESE ROUTES ARE NOT KNOWN TO EXIST. The UI is built to the agreed contract ahead of
+    // the server half. Typed against the local mirror in lib/settingsContract.ts, which
+    // becomes a re-export from @claudette/shared at that point.
+    //
+    // ★ AND A MISSING ROUTE HERE ANSWERS 401, NOT 404 — corrected 2026-09-08, because the
+    // first version of this comment said 404 and would have sent someone down the wrong path.
+    // The global auth preHandler fires BEFORE route matching, so an unbuilt route and an
+    // unauthenticated request are indistinguishable by status code. Do not use a 401 from
+    // these endpoints to conclude the token is wrong, and do not use one to conclude the route
+    // is missing either: the status cannot tell you which, and that is the whole point of
+    // writing it down here.
+    appSettings: () => get<AppSettingsResponse>('/api/settings'),
+    // SET-ONLY. An omitted key is unchanged; this never clears one — see the two-verbs note
+    // in lib/settingsContract.ts. The signature is a plain `Partial<AppSettings>` precisely
+    // because of that: allowing null here would make the type say two states while carrying
+    // three, on both sides of the wire.
+    saveAppSettings: (patch: Partial<AppSettings>) =>
+      post<AppSettingsResponse & { error?: string }>('/api/settings/save', patch),
+    // CLEARS one key back to its built-in fallback. The only way to unset a setting.
+    resetAppSetting: (key: keyof AppSettings) =>
+      post<AppSettingsResponse & { error?: string }>('/api/settings/reset', { key }),
+    // --- connector OAuth ---------------------------------------------------------------
+    // The redirect URI is FETCHED, never constructed here. It is computed server-side from
+    // the live PORT/HOST, and a provider matches it exactly — `localhost` does not match
+    // `127.0.0.1`, `:4319` does not match `:4320`. Building this string in the client would
+    // be wrong for every operator who changed either, and wrong silently: the failure is
+    // `redirect_uri_mismatch` at the provider, which names nothing useful.
+    oauthRedirectUri: () => get<{ redirectUri: string }>('/api/connectors/oauth/redirect-uri'),
+    oauthAccounts: (connector: string) =>
+      get<{ accounts?: string[]; error?: string }>(`/api/connectors/oauth/accounts?connector=${encodeURIComponent(connector)}`),
+    // Returns a URL for the operator's own browser to open — deliberately not a 302, because
+    // a redirect followed inside an XHR lands the consent page in a response body nobody
+    // renders. The caller opens it.
+    oauthStart: (connector: string) =>
+      post<{ url?: string; redirectUri?: string; error?: string }>('/api/connectors/oauth/start', { connector }),
+    // Removes OUR copy of the token and nothing else — see the wording note in the UI.
+    oauthDisconnect: (connector: string, account?: string) =>
+      post<{ removed?: boolean; accounts?: string[]; error?: string }>('/api/connectors/oauth/disconnect', { connector, account }),
     setAccountConnectors: (accountConnectors: AccountConnector[]) =>
       post<{ accountConnectors: AccountConnector[] }>('/api/connectors/account', { accountConnectors }),
     connectorPreflight: (cwd: string) =>

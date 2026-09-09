@@ -53,6 +53,10 @@ interface ContextValue {
   activeId: string | null
   setActive: (id: string | null) => void
   connected: boolean
+  // Has the server's session list arrived at least once? Distinct from `sessions.length
+  // === 0`, which is also true at mount. Anything pruning per-session state must gate on
+  // this — see the note on SessionStoreState.listLoaded.
+  listLoaded: boolean
   create: (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig }) => Promise<string>
   // Spawn a child session under `parentId` (shares the parent's cwd/rootDir, carries
   // parentId so the server appends the report-to-parent instruction). Own role + sandbox.
@@ -321,8 +325,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // permanently stable (they close over nothing but `dispatch`), so this list is shorter
   // in practice than it looks.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity }),
-    [sessions, activeId, setActive, connected, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity],
+    () => ({ sessions, activeId, setActive, connected, listLoaded: store.listLoaded, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity }),
+    [sessions, activeId, setActive, connected, store.listLoaded, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity],
   )
   return (
     <SessionsContext.Provider value={value}>

@@ -117,6 +117,17 @@ export type AttentionReason = 'finished' | 'blocked'
 
 export interface SessionStoreState {
   sessions: SessionInfo[]
+  // ★ HAS THE SERVER'S SESSION LIST ARRIVED YET? Not decorative, and not the same question as
+  // `sessions.length === 0`. The list is fetched and pushed asynchronously, so at mount
+  // `sessions` is `[]` — indistinguishable, from the outside, from a server that genuinely
+  // has no sessions. Anything that PRUNES state keyed on session ids must be able to tell
+  // those apart, or it treats an empty list as authoritative and deletes everything on every
+  // page load. That is a named failure mode in this repo (the planner handover records it as
+  // one shape reached by two routes, H3 and H5, both of which ended in every terminal being
+  // killed); the sidebar's mute store was the third occurrence and is what added this flag.
+  // Set once, by the first `list` action, and never cleared: a reconnect re-sends the list,
+  // and going back to "not loaded" would re-open the same window.
+  listLoaded: boolean
   activeId: string | null
   // WHY a reason and not a boolean. The light used to mean exactly one thing — "a turn
   // finished while you were not watching" — so a session BLOCKED on a permission prompt was
@@ -150,7 +161,7 @@ export interface SessionStoreState {
 }
 
 export const initialSessionStore: SessionStoreState = {
-  sessions: [], activeId: null, attention: new Map(), prevState: new Map(), fresh: new Set(), unacked: new Set(),
+  sessions: [], listLoaded: false, activeId: null, attention: new Map(), prevState: new Map(), fresh: new Set(), unacked: new Set(),
   activity: new Map(), activitySeq: 0,
 }
 
@@ -323,9 +334,14 @@ function reduceStore(state: SessionStoreState, action: SessionStoreAction): Sess
       )
       const incoming = orphans.length === 0 ? action.sessions : [...action.sessions, ...orphans]
       const sessions = sameSessions(state.sessions, incoming) ? state.sessions : incoming
-      const withRows = sessions === state.sessions && unacked === state.unacked
+      // ★ `listLoaded` FLIPS HERE AND ONLY HERE, and it must be part of the identity check
+      // below or the very first list — the one that carries the flag — would be discarded as
+      // "nothing changed" whenever the server reports zero sessions. That is precisely the
+      // boot case the flag exists for, so getting this wrong would leave it false forever on
+      // an empty server.
+      const withRows = sessions === state.sessions && unacked === state.unacked && state.listLoaded
         ? state
-        : { ...state, sessions, unacked }
+        : { ...state, sessions, unacked, listLoaded: true }
       // A `list` OMISSION CLEARS NOTHING. This loop once called the full `forget()`, then a
       // narrowed `forgetPresenceState()` that spared `fresh` — and both were wrong for the SAME
       // reason, which is worth stating because the second version looked like the fix.

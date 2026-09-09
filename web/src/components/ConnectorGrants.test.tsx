@@ -33,6 +33,29 @@
 //       → test 2 reds on the granted-lead assertion, while the hint assertion stays green —
 //         which is why the lead is asserted separately from the hint.
 //   XX  a patch matching no text must REFUSE, not silently run the unmutated file.
+//
+// ⚠ METHOD NOTE, ADDED 2026-09-08 AND IT APPLIES TO EVERY MUTATION RECORD ABOVE.
+// The records above name which assertions turned red. They do NOT record how many assertions
+// EXECUTED, and that number is the one that tells you the run was real. A mutant that fails to
+// PARSE — a stray bracket, a shell-escaping accident — produces zero failures, exactly like a
+// clean pass. Counting only failures cannot tell them apart.
+//
+// Both directions are wrong and one is worse. On a mutation you expect to red, a crash reads
+// as "this assertion is vacuous": you chase a phantom, which wastes time but corrects itself.
+// On a CONTROL you expect to stay green, a crash reads as A PASSING CONTROL — silently, with
+// nothing to chase — and a control's entire job is to prove the harness still works.
+//
+// Measured here rather than argued, by injecting a syntax error into a mutant:
+//     clean control  → exit 0, failures counted 0, totals line "12/12 passed"
+//     crashed mutant → exit 1, failures counted 0, totals line "?"
+// The failure count is IDENTICAL. Only the executed count separates them.
+//
+// The runs behind the records above did print a totals line and it was read at the time, so
+// they are not suspect — but the DURABLE record omits it, which leaves a future reader one
+// assumption short of a proof. Stated rather than quietly relied on. New records in this
+// repo should carry `ran=N` alongside the red set; `MIN_ASSERTIONS` in
+// scratchpad/session-reducer-test.mts is the same instrument pointed at the suite instead of
+// at a mutation run.
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import type { SessionInfo, ConnectorView } from '@claudette/shared'

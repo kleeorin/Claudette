@@ -37,6 +37,163 @@
 // mis-shaped call is not a result at all, and printing ❌ for it would report a defect in
 // the code under test that does not exist.
 //
+// ── ★★ DO NOT ENUMERATE A POPULATION THAT WILL GROW — COUNT IT, OR QUERY IT ★★ ────────────
+// The organising idea for the two blocks below, which are its consequences. It is stated
+// first because it arrived LAST: three separate problems in this repo were each solved, and
+// only afterwards did anyone notice they were one solution. Reading it in that order costs a
+// week.
+//
+// The three arrivals, deliberately from unrelated parts of the codebase:
+//   · "does the environment panel expose an editable control?" — the assertion COUNTS
+//     `input, select, textarea` inside it and requires zero. Naming the three inputs it
+//     happens to contain today would pass the moment someone adds a fourth kind.
+//   · "is this settings control locked by an env var?" — driven off the `overrides` array the
+//     SERVER sends, never a list of keys in the client. A client-side list is correct the day
+//     it is written and silently wrong the first time a variable is added server-side, and
+//     the symptom is an ENABLED CONTROL THAT DOES NOTHING.
+//   · "did my assertions actually run?" — a floor on the COUNT executed, not a list of the
+//     ones you remember writing. See the block below.
+//
+//   · "can a confined session drive a browser?" — asked of an enumeration of paths that
+//     APPEAR to exist (/usr/bin/google-chrome and friends, unreachable from a box) rather
+//     than of run-suite.sh, which knows where the bundled Chrome is because it uses it. The
+//     answer was yes all along; the enumeration said no for a week.
+//
+//   · "did the screenshot capture anything?" — a headless probe exited 0 and wrote a PNG.
+//     The PNG was a 417-byte BLANK: the fixture put `#4a3` in a `data:` URL, where `#` starts
+//     the fragment, so the stylesheet never reached the page. Clean exit, file present,
+//     content empty; the real render was 3443 bytes. THE COMMAND SUCCEEDING IS A PROXY, THE
+//     ARTEFACT HAVING CONTENT IS THE PROPERTY — and a blank screenshot is exactly as green as
+//     a correct one. Assert a positive property of the OUTPUT: a byte floor, a pixel sample, a
+//     text probe through CDP. Never the exit code, never the file existing.
+//   · "is the bundle stale?" — `run-suite.sh` answers by MTIME, so a COMMENT-ONLY edit to a
+//     source file flips its banner to NO SIGNAL while the bundle's behaviour is unchanged
+//     (measured 2026-09-09: banner NO SIGNAL, yet every behavioural token from that file was
+//     present in the built asset). Mtime is the proxy; CONTENT is the property. The right
+//     check is the one that rebuild used — grep the bundle for a string unique to the change —
+//     and the banner is a cheap prompt to run it, not a verdict. Do not read NO SIGNAL as
+//     "stale", nor a fresh timestamp as "contains your change".
+//
+// ★ THAT LAST ONE IS A STALE BELIEF RATHER THAN A STALE LIST, AND IT IS THE WORST KIND.
+// A list in code can be grepped. A relayed constraint cannot: it arrives as background rather
+// than as a claim, so it is never the thing under examination. Both halves are worth naming
+// because neither was carelessness — one person asserted a limit they had not queried, and
+// the other adopted it without checking it against work they had ALREADY DONE (they had
+// driven that very binary hours earlier, and went on repeating the limit because it had been
+// handed to them). A RELAYED CONSTRAINT IS AN ENUMERATION TOO, WITH THE SAME SILENT EXPIRY.
+//
+// ★ AND A RELAYED CONSTRAINT MAKES YOU STOP READING THE EVIDENCE AGAINST IT. `run-suite.sh`
+// printed `prereqs: chrome=yes` on every run for the whole week the team believed no browser
+// existed. The refutation was in the output of a command everyone ran, and nobody read it,
+// because nobody was looking for a fact they already believed they had. That is the second,
+// nastier half of the failure: the belief does not merely go unchecked, it makes contrary
+// evidence unreadable.
+//
+// The countermeasure is the same as for the others: when someone hands you a limit, ask what
+// would have to be true for it to be false, and whether you can QUERY that rather than accept
+// the list. "No browser exists here" is falsified by one `readlink -f` and one `--version`.
+//
+// ★ THE SHAPE: every one of these is a question about a set whose membership changes without
+// the asking code being touched. Name the members and you have written down a fact with an
+// expiry date, and — the part that matters — its expiry is SILENT. A stale enumeration does
+// not throw; it agrees with you about the members it knows and says nothing about the rest.
+// Counting or querying the population instead makes the check correct for members that do not
+// exist yet, which is the only kind of correctness worth having in a growing file.
+//
+// The inverse is the tell: if you are about to write a list of things to check FOR, ask what
+// happens when someone adds the fourth. If the answer is "the check passes and nobody finds
+// out", you want a count or a query.
+//
+// Its two consequences follow — the first is this rule applied to whether a check RAN, the
+// second to whether it is looking in the right PLACE.
+//
+// ★ WHY THESE ARE IN A FILE RATHER THAN IN ANYONE'S HEAD.
+// Every rule above was written by someone who then walked past an instance of it. The author
+// of the population rule left an importer count in this very header and did not notice — it
+// went only because an unrelated restructure happened to remove the sentence, and somebody
+// else spotted it. The author of the executed-count rule had recorded seven mutation results
+// without executed counts. Neither lapse was carelessness; both were the ordinary condition of
+// holding a rule in mind while working on something else.
+//
+// So this file is the ENFORCEMENT MECHANISM, not a summary of everyone's good habits. Read it
+// when you are about to write a check, not when you already suspect one is wrong — by then the
+// green run has already told you what you wanted to hear.
+//
+// Corollary, from the count above: WHEN THE THING COUNTED KEEPS RISING, REMOVE THE COUNT
+// RATHER THAN CORRECTING IT. A number in prose is an enumeration of size one, with the same
+// silent expiry as any other.
+//
+// ── ★★ CONSEQUENCE 1: AN UNEXECUTED CHECK REPORTS SUCCESS ★★ ─────────────────────────────
+// The population rule applied to the assertions themselves. This repo hit it at two different
+// scopes inside a single week and wrote it down twice as separate habits before noticing.
+//
+// `check` counts failures. Nothing that counts failures can tell "this passed" from "this
+// never ran": both produce zero. `fail === 0` is satisfied most easily by never checking
+// anything at all. So every layer that reports a verdict needs a POSITIVE floor on what was
+// EXECUTED, not merely an absence of red:
+//
+//   · THE SUITE SCOPE — assertions that quietly stop running between commits. A harness whose
+//     body no longer executes prints `0/0 passed` and exits 0, which reads GREEN in the
+//     table. Countered by a floor: MIN_ASSERTIONS in session-reducer-test.mts, MIN_TESTS and
+//     MIN_TEST_FILES in web-vitest-shim.mjs. Raise them when you add coverage; a quietly
+//     lowered floor and a deleted assertion are indistinguishable from downstream.
+//   · THE MUTATION SCOPE — a mutant that never ran. A mutated copy with a syntax error (a
+//     stray bracket, a shell-escaping accident) crashes before the first assertion, so the
+//     run yields zero failures exactly as a clean pass does. Measured 2026-09-08:
+//         clean control  → exit 0, failures 0, totals "12/12 passed"
+//         crashed mutant → exit 1, failures 0, totals "?"
+//     Identical failure counts; only the executed count separates them. Print `ran=N` beside
+//     every mutation result. The dangerous direction is not the mutation you expect to red —
+//     a crash there reads as "vacuous assertion" and you go chasing it, which self-corrects.
+//     It is the CONTROL you expect to stay green, where a crash reads as a passing control,
+//     silently, with nothing to chase — and a control's entire job is to prove the harness
+//     still works.
+//
+// COROLLARY, and it is the more general lesson: prefer a check that cannot be fooled BY ITS
+// SHAPE over one that is correct by diligence. The XX controls in this repo's mutation
+// runners are immune to the crash above not because anyone was careful, but because they
+// `return` on a pattern miss before any process starts — there is nothing to crash and no
+// green to fake. When unfalsifiable-by-construction is available, take it over
+// correct-by-attention every time.
+//
+// ── ★★ CONSEQUENCE 2: A CHECK THAT RUNS CAN STILL CHECK THE WRONG THING ★★ ───────────────
+// Consequence 1 answers "how do I know my assertion ran?". This answers the next question,
+// "how do I know it is looking at the right place?" — and that one has now bitten seven times
+// in this repo, in three shapes that look like three different bugs and are one.
+//
+// ★ THE GENERAL FORM, and it is worth preferring to "test behaviour, not implementation"
+// because it names WHERE TO PUT THE PROBE rather than only what to avoid:
+//
+//     AN ASSERTION MUST SIT ON WHAT THE CALLER RECEIVES, NOT ON AN INPUT THE
+//     IMPLEMENTATION HAPPENS TO READ.
+//
+// Every instance below is a probe placed somewhere the defect does not have to pass through.
+//
+//   1. THE OMITTED KEY — a fixture that cannot exercise the rule it names.
+//      An omit-means-keep merge was pinned by a fixture that left the key OUT. Spreading an
+//      object without a key preserves the old value by accident, so the assertion stayed
+//      green with the guard deleted: the input could not reach the state under test. The
+//      fixture has to be PRESENT-AND-UNDEFINED, which is the case the rule is actually about.
+//      Same family as a seeded value too small to clip and a prompt containing its own
+//      expected answer — see turn-indicator.mjs and real-turn-browser-test.mjs.
+//
+//   2. THE WRONG BRANCH — the mutation targets a path the test never takes.
+//      This one is dangerous because it MIMICS a vacuous assertion perfectly: no failures,
+//      nothing to read. It is usually the mutation that is broken, not the test. Only the
+//      executed count tells you which — see the section above, and note that two instances
+//      were diagnosed correctly ONLY because `ran=N` was printed.
+//
+//   3. THE WRONG SIDE OF THE FUNCTION — asserting on the input rather than the output.
+//      An assertion inspected a constant (`BUILTIN_SCOPES.gcalendar`) while the mutation it
+//      was cited for changed the function that reads it (`scopesFor()`). The constant is
+//      untouched by that edit, so the assertion was green and the mutation undetected — and
+//      it read as a perfectly good test, because it asserted something true.
+//
+// ★ HOW ALL SEVEN WERE FOUND: by RUNNING mutations, never by reading assertions. Every one of
+// these is invisible to review — each asserts something true, about a real value, in a test
+// that passes. What exposes them is an edit that SHOULD have turned the assertion red and did
+// not. If you have not watched a check fail, you do not know what it checks.
+//
 // ── WHAT THIS DELIBERATELY DOES NOT DO ───────────────────────────────────────────────────
 // IT DOES NOT OWN THE EXIT CODE, and the 84 `process.exit(...)` lines are not an oversight.
 // run-suite.sh gates suite members on containing a `process.exit(<expr>)` whose argument is

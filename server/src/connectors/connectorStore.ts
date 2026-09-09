@@ -3,6 +3,7 @@ import path from 'path'
 import { dataDir } from '../util/dataDir'
 import { errMessage } from '../util/errMessage'
 import { BUILTIN_CONNECTORS, BUILTIN_SETUP_HINT } from './builtins'
+import { hasToken } from './connectorCreds'
 import {
   type ConnectorDef, type ConnectorView, type ConnectorTool, type ConnectorHealth,
   type OAuthClient, type AccountConnector, connectorIdError, accountConnectorNameError, MAX_TOOL_NAME_LEN,
@@ -264,7 +265,27 @@ function urlDisplay(url?: string): string | undefined {
 function oauthClientUsable(ref?: string): boolean {
   if (!ref) return false
   const c = getOAuthClient(ref)
-  return !!c?.clientId?.trim() && !!c?.clientSecret?.trim()
+  if (!c?.clientId?.trim()) return false
+  // A PUBLIC client legitimately has no secret. Google's DESKTOP APP client type is exactly
+  // that — loopback redirect, PKCE, no secret — and the ASSUMPTION above anticipated this as
+  // "the line to change" if one were ever supported. It is supported now, so this is that
+  // change: a secret is required only for a confidential (Web application) client.
+  if (c.provider === 'custom' || c.provider === undefined) return !!c.clientSecret?.trim()
+  return true
+}
+
+// Is this connector ACTUALLY USABLE — client configured AND an authorization completed?
+//
+// ★ THIS IS THE ORDERING TRAP, AND IT IS THE SAME ARGUMENT AS THE ONE ABOVE, ONE STEP FURTHER.
+// oauthClientUsable's own comment says a clientId without a secret would "clear needsSetup,
+// unblock the toggle, and land the operator in the fail-at-connect state that was explicitly
+// rejected in favour of blocking". A client WITHOUT AN AUTHORIZED TOKEN is in precisely that
+// state: the operator pastes a client id, the row goes green, the toggle unblocks, and every
+// tool call 401s — the plan's own identified trap, delivered by the plan.
+// So "setup" means the whole chain is complete, not that its first step is.
+function oauthReady(d: ConnectorDef): boolean {
+  if (!d.requiresOAuthClient) return true
+  return oauthClientUsable(d.oauthClientRef) && hasToken(d.id)
 }
 
 export function toView(d: ConnectorDef, inUseBy?: number): ConnectorView {
@@ -286,10 +307,20 @@ export function toView(d: ConnectorDef, inUseBy?: number): ConnectorView {
     // client and there is no usable one yet. Checking that the ref RESOLVES (not merely
     // that it is set) is the point — deleting the OAuth client must put the row straight
     // back into needs-setup, and a stored flag would have said "configured" forever.
-    ...(d.requiresOAuthClient && !oauthClientUsable(d.oauthClientRef)
+    // Reported only for connectors that actually need OAuth; on any other row it would be a
+    // field with no meaning, which is worse than an absent one.
+    ...(d.requiresOAuthClient ? { oauthClientReady: oauthClientUsable(d.oauthClientRef) } : {}),
+    ...(!oauthReady(d)
       // The hint rides along with the state it explains, and ONLY with it: a setup hint on a
       // row that needs no setup is a instruction to do nothing, which reads as a fault.
-      ? { needsSetup: true, ...(BUILTIN_SETUP_HINT[d.id] ? { setupHint: BUILTIN_SETUP_HINT[d.id] } : {}) }
+      // TWO DIFFERENT STATES, TWO DIFFERENT INSTRUCTIONS. Telling an operator who has already
+      // created a client to go and create one is how a correct blocker reads as a broken app.
+      ? {
+          needsSetup: true,
+          ...(oauthClientUsable(d.oauthClientRef)
+            ? { setupHint: 'Client configured — now connect the account to authorize access.' }
+            : (BUILTIN_SETUP_HINT[d.id] ? { setupHint: BUILTIN_SETUP_HINT[d.id] } : {})),
+        }
       : {}),
     importedFrom: d.importedFrom,
     health: h?.health ?? 'disconnected',

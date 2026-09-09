@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ConnectorCatalog } from './ConnectorCatalog'
+import { SettingsPanel } from './SettingsPanel'
 
 // The Claudette deck — the app's first GLOBAL settings surface, opened from the mark in
 // the sidebar header.
@@ -19,10 +20,14 @@ import { ConnectorCatalog } from './ConnectorCatalog'
 // general config too" — the next section drops in as another DECK_TABS entry with no
 // restructuring.
 
-type DeckTab = 'connectors'
+type DeckTab = 'connectors' | 'settings'
 
 const DECK_TABS: { id: DeckTab; label: string; hint: string }[] = [
   { id: 'connectors', label: 'Connectors', hint: 'External MCP servers this install can grant to sessions' },
+  // The second entry, dropped in exactly as the note above anticipated. Settings are
+  // install-wide defaults for NEW sessions plus a read-only view of the environment — which
+  // is why they belong in the deck and not in the per-session dock.
+  { id: 'settings', label: 'Settings', hint: 'Install-wide defaults applied to new sessions' },
 ]
 
 export function ClaudetteDeck({ onClose, cwd }: { onClose: () => void; cwd: string }) {
@@ -72,6 +77,7 @@ export function ClaudetteDeck({ onClose, cwd }: { onClose: () => void; cwd: stri
 
         <div className="flex-1 min-h-0 overflow-y-auto">
           {tab === 'connectors' && <ConnectorCatalog cwd={cwd} />}
+          {tab === 'settings' && <SettingsPanel />}
         </div>
       </div>
     </div>,

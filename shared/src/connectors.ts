@@ -40,12 +40,33 @@ export type ConnectorKind = 'catalog' | 'account'
 // hand-registered client is the normal path there rather than a fallback — and one
 // Google client serves Gmail, Drive and Calendar, so the indirection stops the same
 // secret being pasted once per connector.
+// Which provider's endpoints an OAuth client speaks to. A PRESET rather than two typed URLs:
+// Google's authorize/token endpoints are fixed and identical for all five Google built-ins, so
+// asking the operator to retype them is an error surface with no upside — and a mistyped token
+// endpoint is a client secret and an authorization code POSTed to a host of someone else's
+// choosing. `custom` keeps the escape hatch for a provider we do not preset, and is the only
+// value that requires the URLs to be supplied by hand.
+export type OAuthProvider = 'google' | 'atlassian' | 'custom'
+
 export interface OAuthClient {
   id: string             // local reference id (not the provider's client_id)
   name: string           // display name, e.g. "Google Workspace"
   clientId: string
   clientSecret?: string  // SECRET — never leaves the server (see ConnectorView)
+  // Which endpoint set to use. Absent is treated as 'custom' so an client stored before this
+  // field existed keeps whatever explicit URLs it had rather than silently acquiring Google's.
+  provider?: OAuthProvider
+  // Only consulted when the provider is 'custom' (or absent). For a preset provider these are
+  // ignored, so a stale value cannot quietly redirect a token exchange.
+  authorizeUrl?: string
+  tokenUrl?: string
 }
+
+// ★ NOTE FOR ANYONE ADDING A FIELD ABOVE: connectorStore.oauthClientView redacts by
+// `Omit<OAuthClient, 'clientSecret'>` and then spreads the rest, so ANY new field is exposed to
+// the client by default. That is correct for the endpoint fields — they are not secrets — but a
+// second secret added here would leak on the next read with nothing to catch it. Add it to the
+// Omit, and to the omit-means-keep merge in saveOAuthClient, in the same change.
 
 // A catalog connector's definition. `headers` / `env` / `args` / the URL's userinfo and
 // query are all SECRET-BEARING and are redacted on the way out (toView).
@@ -57,6 +78,20 @@ export interface ConnectorDef {
   url?: string
   headers?: Record<string, string>   // SECRET (e.g. Authorization: Basic …)
   oauthClientRef?: string            // OAuthClient.id, when this connector uses OAuth
+  // The OAuth scopes THIS connector needs, and deliberately not a property of the client.
+  //
+  // ★ THIS IS A DEPARTURE FROM THE BRIEF, AND THE REASON IS THE GOOGLE BUILT-INS THEMSELVES.
+  // One Google OAuth client serves all five (Drive, Docs, Sheets, Calendar, Gmail), and
+  // BUILTIN_SETUP_HINT already tells the operator each one needs its OWN scopes — "Drive
+  // scopes", "Calendar scopes", and so on. Hang scopes off the shared CLIENT and the client
+  // must carry the UNION of all five, so consenting to Calendar also hands over Gmail: the
+  // consent screen asks for mail access the operator never requested and cannot decline
+  // without losing the calendar too. Over-granting by construction, and invisible.
+  // Keyed to the connector, each authorization asks for exactly what that connector dials,
+  // which is also what makes the per-(connector, account) token keying meaningful — one token
+  // per consent, rather than one god-token behind five toggles.
+  // Absent means "the provider preset's default for this connector", never "all scopes".
+  scopes?: string[]
   // --- stdio (carried, engine-spawned) ---
   command?: string
   args?: string[]                    // SECRET-BEARING (connection strings are common)
@@ -149,6 +184,25 @@ export interface ConnectorView {
   // and copying it into the client would recreate exactly the drift that placement avoids.
   // Absent for anything that does not need setup.
   setupHint?: string
+  // Is the OAuth CLIENT half of setup done — a ref that resolves to a usable client?
+  //
+  // STRUCTURAL, because `needsSetup` conflates two states the UI must tell apart: "no client
+  // exists yet" (create one) and "a client exists but nobody has authorized" (press Connect).
+  // Neither the ref's resolvability nor a secret's presence reaches the browser — oauthClientUsable
+  // also requires a secret for custom clients — so the client could only guess, and guessing from
+  // `oauthClientRef` presence mis-reads a DANGLING ref as "ready to authorize", offering a Connect
+  // button that then fails with a 400.
+  //
+  // ★ AND IT MUST NOT BE INFERRED FROM `setupHint`. That is prose, and prose gets reworded and
+  // DECORATED: ConnectorCatalog was appending "Add it under OAuth clients below…" unconditionally
+  // after the hint, so the moment the server started saying "Client configured — now connect the
+  // account", the next sentence told the operator to add the client they had just added. A
+  // correct server fix, undone by a client-side decoration neither side could see alone. A
+  // structural boolean is what stops the next one, because prose is what invites decoration.
+  //
+  // Derived in toView from the SAME predicate oauthReady uses, so there is one source of truth
+  // rather than two that ought to agree.
+  oauthClientReady?: boolean
   health: ConnectorHealth
   lastError?: string
   tools?: ConnectorTool[]

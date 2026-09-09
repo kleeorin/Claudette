@@ -282,11 +282,54 @@ code only — no `/dev/nvidia*` was visible to the reviewing session.
 
 ## Deferred
 
-- **OAuth.** `OAuthClient` and `ConnectorDef.oauthClientRef` are modelled and validated,
-  but nothing dials an authorize/callback/refresh flow yet. Until then an HTTP connector
-  authenticates with a static header, and an imported one arrives `needs-auth`.
+- **Dynamic Client Registration.** Atlassian advertises `registration_endpoint`, so it could
+  register a client with no operator console step at all. Google cannot: it has no DCR, which is
+  why the built-in Google connectors still require an operator-created client. Only the
+  operator-created path is implemented.
 - **A standalone probe.** Classification is learned opportunistically from proxied
   `tools/list` traffic — there is no "test connection" that dials on demand.
+
+## OAuth: what authorizing does and does not do
+
+The interactive flow is implemented — authorize with PKCE (S256) and a validated `state`,
+callback, refresh, and the bearer attached **inside the proxy** so it never enters a box.
+Tokens live in `dataDir()/connector-creds.json`, 0600, keyed by **(connector, account)**.
+
+**Revocation is asymmetric, and the asymmetry is the important part.**
+
+- *Ungranting a connector from a session* bites on the **next call**. That property is
+  unchanged: the proxy checks the live session record, not what the engine launched with.
+- *Disconnecting an account* now **revokes at the provider** where the provider publishes a
+  revocation endpoint — Google (`oauth2.googleapis.com/revoke`) and Atlassian both do. The
+  refresh token is revoked in preference to the access token, because revoking the refresh token
+  invalidates the whole grant while revoking the access token leaves it able to mint more.
+  Where a provider publishes none, disconnect still only removes **our copy**, and the response
+  says which happened (`revoked` / `removed` / `revokeFailed`) so the UI need not guess.
+  The order is revoke first, forget second, and forget even if the revoke fails: forgetting first
+  would discard the only credential we could have revoked with, turning a network blip into a
+  grant that stays live forever with nothing left to revoke it.
+
+So "Disconnect" means *Claudette will not present this credential again*. It does not mean the
+grant is gone. Any wording that implies otherwise is wrong, and the difference matters precisely
+when someone disconnects **because** they think a credential is compromised — the honest
+instruction in that case is to revoke at the provider as well.
+
+**`needsSetup` means the whole chain is complete**, not that its first step is: a connector
+that requires OAuth reports `needsSetup` until there is a usable client *and* an authorized
+token. A saved client alone used to clear it, which unblocked the grant toggle for a connector
+where every tool call still 401s.
+
+**Health is decided from what we know, not only from status codes.** Google answers
+`initialize` and `tools/list` with HTTP 200 while unauthenticated — returning the real tool
+list — and challenges only at `tools/call`. Reading health from status alone therefore reported
+`connected` for a connector where nothing worked. An OAuth connector with no usable token is
+reported `needs-auth` regardless of what the current method happens to return.
+
+**The invariant the whole design rests on:** the proxy dials the path from the *connector
+definition* and discards the client's. A granted session controls the request body — that is the
+grant — but never the endpoint. Without that, a session granted one connector could aim the
+operator's token at any path on the provider's host. Pinned by
+`scratchpad/connector-proxy-path-invariant-test.mts`.
 
 ## Verification
 

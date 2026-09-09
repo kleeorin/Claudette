@@ -703,5 +703,135 @@ const TWO = run(initialSessionStore, { type: 'list', sessions: [sess('a'), sess(
     blocked.attention.get('b') === 'blocked', String(blocked.attention.get('b')))
 }
 
+// ── L1/L2 — `listLoaded`, the flag a per-session PRUNE gates on ──────────────────────────
+// These live HERE, in the reducer harness, and putting them anywhere else would be a false
+// pass. web/src/lib/sessionLights.test.ts already pins the flag's CONSUMER (pruneMutes skips
+// while it is false), but every `listLoaded` in that file is a plain boolean literal handed
+// in by the test — nothing there can reach the reducer, so the flag's PRODUCER is unguarded
+// by it. Measured: deleting `&& state.listLoaded` from the `list` case leaves the web suite
+// at 46/46 AND this harness at 98/98. Two green suites, one deleted term, and a user whose
+// server currently reports ZERO sessions loses their whole persisted mute store on every page
+// load — the exact bug the flag was added to fix.
+//
+// WHY THE TERM LOOKS DELETABLE, which is the whole hazard: `listLoaded` is only ever set
+// true and never cleared, so `&& state.listLoaded` reads as redundant. It is not. The `list`
+// case returns `state` UNCHANGED when the incoming list matches what is already held, and on
+// an empty server the very first list matches the initial empty array — so without that term
+// the identity short-circuit fires on the one list that was supposed to flip the flag, and it
+// stays false forever.
+//
+// MUTATIONS (measured 2026-09-04):
+//   L-M1  delete `&& state.listLoaded` from the identity check in the `list` case
+//         → L1 reds ALONE. Every other assertion in this file stays green, and so does the
+//           whole web suite. That asymmetry is the finding, not a footnote.
+//         Re-measured 2026-09-04 at 101/102 — this record said 99/100, which was correct when
+//         written and went stale the moment the assertion floor added a case. A count in a
+//         mutation record is a measurement with a date, and this file now has two of them
+//           (L1/L2 landing, then the floor); restamped rather than left to look authoritative.
+//   L-M2  set `listLoaded: true` unconditionally in the initial store
+//         → L1 reds. I PREDICTED THIS ONE WRONG: I expected nothing to red, on the reasoning
+//           that the flag would be vacuously true. L1 is stronger than I gave it credit for,
+//           because it asserts the TRANSITION — `initial === false` AND `after === true` — so
+//           a pre-set flag fails its first conjunct. Corrected to what was measured. Writing
+//           the prediction down and then not running it is how a mutation record becomes
+//           fiction; this is the second time today the measurement disagreed with me.
+{
+  // (a) An EMPTY first list must still flip the flag. This is the boot case on a server with
+  // no sessions — the one the identity short-circuit would otherwise swallow.
+  check('L1 initialSessionStore has listLoaded false, and an EMPTY first list flips it true',
+    initialSessionStore.listLoaded === false
+      && run(initialSessionStore, { type: 'list', sessions: [] }).listLoaded === true,
+    `initial=${initialSessionStore.listLoaded} afterEmptyList=${run(initialSessionStore, { type: 'list', sessions: [] }).listLoaded}`)
+
+  // (b) …and once flipped, a repeat empty list must change nothing at all. The flag must not
+  // buy its correctness with identity churn: this state object is a dependency of effects in
+  // the shell, and a new reference on every redundant broadcast would re-run them forever.
+  const once = run(initialSessionStore, { type: 'list', sessions: [] })
+  const twice = run(once, { type: 'list', sessions: [] })
+  check('L2 a repeat empty list returns the SAME object (no identity churn)',
+    twice === once, twice === once ? 'same reference' : 'NEW reference — effects keyed on this state will re-run')
+}
+
+// ── L3 — 'blocked' CAN co-occur with state 'idle', and the sidebar dot depends on it ──────
+// This pins a reachable state rather than a desirable one, deliberately. The sidebar's status
+// dot takes `flagged = attention.has(id)` — ANY reason — instead of the narrower
+// `=== 'finished'` that drives the "done" label. That widening exists precisely because of
+// the sequence below: a `list` action writes neither `attention` nor `prevState` (see its own
+// comment), so a session flagged 'blocked' while waiting keeps that flag when a later plain
+// list reports it idle. Under the old narrow wiring, dotState('idle', muted, false) returned
+// 'muted' — a DARK dot on a session the store says is blocked, with no session:state event
+// needed to reach it.
+//
+// If someone later makes `list` clear attention, this test reds. That is the intended signal:
+// it means the widening is no longer load-bearing and the dot's wiring can be revisited. It
+// is not an assertion that this behaviour is good.
+//
+// MUTATIONS — "make the `list` case clear attention" NAMES TWO DIFFERENT EDITS, and they do
+// not produce the same result. This is the same lesson as M2 in turn-indicator-test.mjs: a
+// mutation described loosely enough to have variants has no reproducible result, so both are
+// recorded with the site each one touches. Measured 2026-09-04:
+//
+//   L3-A  clear the entry for each session the list REPORTS
+//         → 94/102, EIGHT reds: F2.7a/b/d/e, F5.3a/b, L2, L3.
+//   L3-B  rebuild `attention` from the list, so entries for OMITTED sessions go too
+//         → 93/102, NINE reds: all of the above plus F5.1a.
+//
+// ★ F5.1a IS THE ONE THAT MATTERS, and it only appears under B. "An out-of-band list removal
+// KEEPS the attention entry — an omission is not a departure" is a SEMANTIC red: it objects
+// to the attention clearing itself, not to object churn. The other seven are collateral —
+// identity assertions correctly complaining that either patch rebuilds the state object every
+// pass. I first recorded only variant A and glossed all seven of its collateral reds as
+// "identity assertions", which was true of A and would have been FALSE as a description of B.
+// Corrected after review re-ran B and got a red my record did not predict. The useful fact is
+// the one I undersold: this harness holds a real guard on attention-vs-list, not merely a
+// tripwire for churn.
+//
+// There is no mutation of the DOT's wiring this file can see — App.tsx is not importable here
+// — stated plainly rather than left implied: L3 guards the PRECONDITION. The consequent now
+// lives in `dotStateFor` in web/src/lib/sessionLights.ts, where it IS tested, rather than in
+// a comment beside the <StateDot> call as it did when this note was first written.
+{
+  const flagged = run(initialSessionStore,
+    { type: 'list', sessions: [sess('a'), sess('b')] },
+    { type: 'state', id: 'b', state: 'waiting' },
+    { type: 'list', sessions: [sess('a'), sess('b', { state: 'idle' })] })
+  check("L3 a 'blocked' flag SURVIVES a plain list that reports the session idle",
+    flagged.attention.get('b') === 'blocked' && stateOf(flagged, 'b') === 'idle',
+    `attention=${flagged.attention.get('b')} state=${stateOf(flagged, 'b')}`)
+}
+
+// ── A POSITIVE FLOOR ON ASSERTIONS EXECUTED ───────────────────────────────────────────────
+// Same shape, and the same reason, as MIN_TESTS in scratchpad/web-vitest-shim.mjs: without
+// it, a harness whose assertions stopped running would print `0/0 passed`, exit 0, and read
+// GREEN in the suite table. `fail === 0` is satisfied most easily by never checking anything.
+//
+// ★ IT MATTERS MORE HERE THAN IT DOES FOR THE WEB SUITE, and the reason is this file's own
+// recent history. L1/L2/L3 exist because a real mutation — deleting `&& state.listLoaded`
+// from the `list` case — stayed green across all 98 assertions that existed at the time. A
+// harness that could silently collect zero would reopen exactly the hole those assertions
+// were added to close, one level up: the guard would be present, unexecuted, and reporting
+// success. A count that cannot go down is the only thing standing between those two states.
+//
+// RAISE THIS when you add assertions — that is the point of it. If it ever has to go DOWN,
+// say why in the commit, because a quietly lowered floor and a deleted assertion are
+// indistinguishable from here.
+//
+// MUTATIONS (measured 2026-09-04):
+//   F-M1  neuter three assertions so they silently stop executing (`if (false) check(...)`)
+//         → 98/99, exit 1, and THE FLOOR IS THE ONLY RED. Every remaining assertion still
+//           passes, which is the whole point: nothing else in this file can notice that a
+//           check stopped running, because a check that does not run cannot fail.
+//   F-M2  control, unmutated → 102/102, exit 0. Included because a floor that fires on a
+//         healthy run is worse than none — it trains you to ignore the red.
+//
+// Captured BEFORE the check below, which would otherwise count itself and make the floor
+// self-satisfying by exactly one.
+const MIN_ASSERTIONS = 101
+const executed = pass + fail
+check(`the harness executed at least ${MIN_ASSERTIONS} assertions (0/0 also exits 0)`,
+  executed >= MIN_ASSERTIONS,
+  { pass: `${executed} executed`,
+    fail: `only ${executed} executed — assertions stopped running, and an unexecuted check reports success` })
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail === 0 ? 0 : 1)

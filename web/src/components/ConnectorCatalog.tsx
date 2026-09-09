@@ -5,6 +5,8 @@ import type {
 } from '@claudette/shared'
 import { connectorIdError, accountConnectorNameError } from '@claudette/shared'
 import { api } from '../api/client'
+import { ConnectorOAuth } from './ConnectorOAuth'
+import { isOAuthConnector } from '../lib/connectorAuth'
 
 // The connector CATALOG — install-wide, so it lives in the Claudette deck rather than any
 // per-session panel (see CONNECTORS.md). This is where connectors are defined; granting
@@ -146,11 +148,28 @@ export function ConnectorCatalog({ cwd }: { cwd: string }) {
                         a built-in that declares requiresOAuthClient without a hint, which
                         should not happen but should not render blank if it does. */}
                     {c.setupHint ?? 'Needs an OAuth client you create, with this product’s scopes on the consent screen.'}
-                    {' '}Add it under OAuth clients below, then point this connector at it with{' '}
-                    <span className="text-ctp-text">edit</span>. Until then it cannot be granted
-                    to a session.
+                    {/* ★ THE "ADD IT UNDER OAuth clients" SENTENCE IS NOW CONDITIONAL, and it
+                        had to become so. `needsSetup` covers TWO situations and the server now
+                        distinguishes them in `setupHint`: no usable client, versus a client
+                        that is configured with nobody authorized. This sentence was appended
+                        UNCONDITIONALLY, so as soon as the hint said "Client configured — now
+                        connect the account", the line after it still told the operator to go
+                        and add the client they had just added. That is the exact defect the
+                        server-side hint split was made to remove, reintroduced one layer up by
+                        a client that appended its own instruction on top of it. Gated on the
+                        absence of a client ref so each state carries one instruction. */}
+                    {!c.oauthClientRef && (
+                      <>
+                        {' '}Add it under OAuth clients below, then point this connector at it with{' '}
+                        <span className="text-ctp-text">edit</span>.
+                      </>
+                    )}
+                    {' '}Until then it cannot be granted to a session.
                   </div>
                 )}
+                {/* Authorization is a different question from client configuration, and it gets
+                    its own block rather than more sentences in the one above. */}
+                {isOAuthConnector(c) && <ConnectorOAuth connector={c} onChanged={refresh} />}
                 {c.importedFrom && <div className="pl-3.5 text-ctp-overlay truncate" title={c.importedFrom}>imported from {c.importedFrom}</div>}
                 {c.lastError && <div className="pl-3.5 text-ctp-red/90">{c.lastError}</div>}
                 {!!c.inUseBy && (

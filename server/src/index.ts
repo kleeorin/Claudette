@@ -28,6 +28,7 @@ import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from '.
 import { registerFsRoutes } from './fs/fsApi'
 import { registerGitRoutes } from './git/gitApi'
 import { registerConnectorRoutes } from './connectors/connectorApi'
+import { registerConnectorOAuthRoutes } from './connectors/connectorOAuthApi'
 import { registerSandboxDefaultsRoutes } from './claude/sandboxDefaultsApi'
 import { ConnectorProxy } from './connectors/connectorProxy'
 import { connectorServers, connectorDenyRules } from './connectors/connectorLaunch'
@@ -292,6 +293,7 @@ registerPaneRoutes(app, panes)
 registerFsRoutes(app)
 registerGitRoutes(app)
 registerConnectorRoutes(app, sessions)
+registerConnectorOAuthRoutes(app)
 registerSandboxDefaultsRoutes(app)
 registerUsageRoutes(app)
 

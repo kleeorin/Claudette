@@ -481,6 +481,58 @@ SUITE=(
   "none:team-notes-truncation-test.mts"
   "none:host-config-mirror-test.mts"
   "none:creds-live-resync-test.mts"
+  # The OAuth token store for connectors — the file that will hold REFRESH TOKENS, which are
+  # long-lived bearers for the operator's Google account and do not expire on their own. Pins the
+  # two properties that matter most: the file (and its .corrupt sidecar) is 0600, and no failure
+  # path silently destroys a token — recovery is a human re-authorizing in a browser, and the
+  # loss is noticed days later when one connector quietly stops working.
+  # Keyed by (connector, account) because one Google client serves five connectors but a token
+  # belongs to a per-user consent; connector-only keying lets a second person's authorization
+  # silently overwrite the first. No real credential appears anywhere and no token value is ever
+  # printed — messages fingerprint, the same pattern as usage-isolation-test.mts.
+  # THE invariant the connector credential design rests on: the proxy dials the path from the
+  # CONNECTOR DEFINITION and DISCARDS the client's. Once an OAuth bearer is attached, the proxy
+  # holds a live credential for the operator's Google account; a granted session controls the
+  # request BODY (that is the grant) but must never control the ENDPOINT, or the proxy becomes a
+  # general credential-lending API gateway aimed wherever the box points it.
+  # Drives the real ConnectorProxy against a real local upstream that records what it received,
+  # with the catalog supplied through the real store via a throwaway CLAUDETTE_DATA_DIR.
+  # Mutation-verified: making the proxy forward the client sub-path turns 4 assertions red,
+  # showing /v1/users/me/messages and a traversal to /oauth2/v4/token reaching the upstream.
+  "none:connector-proxy-path-invariant-test.mts"
+  # `needsSetup` must mean "cannot work yet", not "no client saved". ConnectorGrants blocks the
+  # grant toggle on it, so if it cleared as soon as an OAuth CLIENT was saved the operator would
+  # get a green toggle and a connector that 401s on every tool call — the fail-at-connect state
+  # connectorStore's own comment says was "explicitly rejected in favour of blocking", delivered
+  # one step earlier in the chain. Also pins that the no-secret relaxation is scoped to PRESET
+  # (public/PKCE, e.g. Google Desktop app) clients and does not leak to custom ones.
+  "none:connector-needs-setup-test.mts"
+  # The interactive connector OAuth flow end to end: authorize (PKCE S256 + validated state),
+  # callback, refresh, and the bearer attach in the proxy. Drives the REAL modules against a real
+  # local provider and a real local upstream that records the Authorization it received; nothing
+  # reaches the internet and every token is an obvious fake, fingerprinted rather than echoed.
+  # Pins, among others: a forged `state` exchanges NOTHING with the provider; a state is
+  # single-use; five concurrent callers trigger exactly ONE refresh (Google rotates refresh
+  # tokens, so a second concurrent exchange invalidates what the first stored); a refused refresh
+  # dials UNAUTHENTICATED rather than sending a known-dead bearer, so the provider's own challenge
+  # reaches the client; and with two authorized accounts and no explicit choice, NO token is
+  # attached — guessing would act as one person while looking like another, which is the exact
+  # failure the (connector, account) keying exists to prevent.
+  "none:connector-oauth-flow-test.mts"
+  # Dynamic Client Registration (RFC 7591) — the path that lets Confluence authorize with NO
+  # operator console step, no pasted secret and no pre-registered redirect URI. Its own harness
+  # because DCR is a SECOND way to acquire a credential with a different trust model: a third-party
+  # JSON document tells us where to register, and we then present the result as our own identity.
+  # The endpoint is DISCOVERED by walking resource -> authorization-server metadata, never
+  # hardcoded: Atlassian's real one is auth.atlassian.com/<opaque-id>/dcr/register, which
+  # contradicts the mcp.atlassian.com/v1/register this codebase previously believed, and the
+  # opaque id will rotate.
+  # The assertion that matters most: metadata naming a token endpoint on ANOTHER ORIGIN is refused
+  # outright — without that check a discovery document could redirect authorization codes to a
+  # host of its choosing. Mutation-verified along with public-client registration, persistence
+  # across restart, re-registration on a changed redirect URI, and 0600 on the stored file.
+  "none:connector-dcr-test.mts"
+  "none:connector-creds-test.mts"
   "none:connectors-test.mts"
   "none:session-reducer-test.mts"
   # F4: does a RUNNING session notice its role definition changed underneath it? launch()

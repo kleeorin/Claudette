@@ -5,6 +5,7 @@ import type { AddressInfo } from 'net'
 import { URL } from 'url'
 import { errMessage } from '../util/errMessage'
 import { getConnector, setHealth, setTools } from './connectorStore'
+import { accessTokenFor } from './connectorOAuth'
 import type { ConnectorTool } from '@claudette/shared'
 
 // The loopback MCP proxy that stands between a granted session and an HTTP connector.
@@ -35,9 +36,24 @@ export type GrantCheck = (sessionId: string, connectorId: string) => boolean
 
 interface Route { sessionId: string; connectorId: string }
 
-// Hop-by-hop and identity-bearing headers we must not forward upstream. Host is
-// recomputed by the agent; the client's own auth is meaningless to the target and
-// forwarding it would leak Claudette's loopback token to a third party.
+// Hop-by-hop and identity-bearing headers we must not forward upstream. Host is recomputed
+// by the agent.
+//
+// WHY `authorization` IS STRIPPED — and the reason matters, because the old one was WRONG.
+// This used to say forwarding it "would leak Claudette's loopback token to a third party".
+// It would not: urlFor() puts the route token in the URL PATH (/c/<uuid>), never in a header,
+// so there is no Claudette token in the client's headers to leak. The strip is still right,
+// for a different and more important reason.
+//
+// THE CREDENTIAL IS OPERATOR-SUPPLIED AND SERVER-SIDE, AND THE TOKEN IS THE ATTRIBUTION. What
+// goes upstream is the identity the OPERATOR configured for this connector — a static header,
+// or (see the OAuth attach below) a bearer minted from the operator's own consent. Forwarding
+// a client-supplied Authorization would let the SESSION choose the identity presented upstream,
+// which dissolves that attribution: the provider's audit log would show whoever the box felt
+// like being, and a session could present a credential Claudette never issued. It also implies
+// a credential INSIDE the box, which is the thing the whole proxy exists to prevent.
+// A control whose stated justification is false is how confinement gets relaxed later by
+// someone who reads the comment, finds it does not hold, and concludes the control is unneeded.
 const STRIP_REQUEST = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-authorization', 'authorization', 'cookie', 'content-length',
@@ -76,7 +92,14 @@ export class ConnectorProxy {
 
   start(): Promise<number> {
     return new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => this.onRequest(req, res))
+      const server = http.createServer((req, res) => {
+        // onRequest is async now (the OAuth attach may await a token refresh). An unhandled
+        // rejection here would take down the whole Claudette process, so it is contained to
+        // this one request — the same reasoning as the ERR_INVALID_CHAR guard below.
+        void this.onRequest(req, res).catch((e: unknown) => {
+          try { this.deny(res, 502, `proxy error: ${errMessage(e)}`) } catch { /* already responded */ }
+        })
+      })
       server.on('error', reject)
       server.listen(0, '127.0.0.1', () => {
         this.port = (server.address() as AddressInfo).port
@@ -103,7 +126,7 @@ export class ConnectorProxy {
     for (const [tok, r] of this.routes) if (r.sessionId === sessionId) this.routes.delete(tok)
   }
 
-  private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private async onRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const m = /^\/c\/([^/?]+)/.exec(req.url || '')
     const route = m ? this.routes.get(m[1]) : undefined
     // An unknown token is indistinguishable from a revoked one on purpose: both mean
@@ -120,6 +143,29 @@ export class ConnectorProxy {
     let target: URL
     try { target = new URL(def.url) } catch { return this.deny(res, 502, 'connector URL is unparseable') }
 
+    // ★★ THE INVARIANT THE WHOLE CREDENTIAL DESIGN RESTS ON ★★
+    // THE UPSTREAM PATH COMES FROM THE CONNECTOR DEFINITION, NEVER FROM THE CLIENT.
+    // Below, the request is dialled with `path: target.pathname + target.search` — the URL the
+    // OPERATOR configured. The client's own URL is used for exactly one thing: extracting the
+    // /c/<token> route id at the top of this function. Everything after that token — extra path
+    // segments, query string, fragment — is DISCARDED and never reaches the upstream.
+    //
+    // WHY THAT IS THE LOAD-BEARING LINE. Once an OAuth bearer is attached below, this proxy
+    // holds a live credential for the operator's Google account. A granted session can put any
+    // body it likes on the wire, so it can call any TOOL the connector exposes — that is the
+    // grant, and it is bounded by the connector's own MCP endpoint. What it cannot do is choose
+    // a different ENDPOINT. Without this property, a session granted the calendar connector
+    // could dial https://calendarmcp.googleapis.com/<anything>, or any other path on that host,
+    // WITH THE OPERATOR'S TOKEN ATTACHED — and the proxy would become a general
+    // credential-lending API gateway pointed at whatever the box names.
+    //
+    // THE CHANGE THAT BREAKS THIS LOOKS HELPFUL: "forward the client's sub-path so a connector
+    // can expose sub-resources", or "pass the query string through so tools can paginate". Both
+    // read as small compatibility fixes and both hand path selection to the box. If you need a
+    // connector to reach more than one endpoint, add a second CONNECTOR — that keeps the
+    // operator choosing the destinations, which is the property being protected here.
+    // Pinned by scratchpad/connector-proxy-path-invariant-test.mts.
+
     // Forward the client's own MCP headers (content-type, accept, mcp-session-id,
     // mcp-protocol-version …) minus the hop-by-hop set, then layer the connector's
     // configured headers on top — those carry the credential and must win.
@@ -129,6 +175,39 @@ export class ConnectorProxy {
       headers[k] = Array.isArray(v) ? v.join(', ') : v
     }
     for (const [k, v] of Object.entries(def.headers ?? {})) headers[k] = v
+
+    // THE OAUTH BEARER, attached HERE and nowhere else.
+    //
+    // Inside the proxy is the whole point: the token is minted from the operator's own consent,
+    // stored 0600 outside every sandbox, and presented to the upstream by this process. It never
+    // enters a box, never appears in a --mcp-config, and never reaches the session that triggered
+    // the call. What the session gets is the RESULT.
+    //
+    // Layered after def.headers so a live OAuth token WINS over a static Authorization left on
+    // the definition. That combination should not occur, but if it does the token the operator
+    // most recently consented to is the right one — a stale static header silently shadowing a
+    // fresh grant is the harder failure to see.
+    //
+    // A null token means "expired with no way to renew", or "never authorized". We then dial
+    // WITHOUT a bearer rather than with a broken one, so the provider's own 401 challenge reaches
+    // the client intact (WWW-Authenticate is deliberately absent from STRIP_RESPONSE) instead of
+    // being masked by a credential we already knew was dead.
+    if (def.oauthClientRef) {
+      const bearer = await accessTokenFor(def.id)
+      if (bearer) headers.authorization = `Bearer ${bearer}`
+    }
+
+    // HEALTH MUST NOT READ "connected" FOR A CONNECTOR THAT CANNOT WORK.
+    // Measured: Google answers `initialize` AND `tools/list` with HTTP 200 while unauthenticated,
+    // returning the real tool set, and challenges only at `tools/call`. The status-code logic
+    // below therefore recorded `connected` and learnTools populated a full Calendar tool list for
+    // a connector where every actual call 401s — health that flaps by METHOD, and the most
+    // misleading of the three states because it asserts the opposite of the truth.
+    // Decided here, from what we KNOW rather than from what this particular method happens to
+    // return: an OAuth connector with no usable token needs auth, whatever the upstream says.
+    if (def.oauthClientRef && !headers.authorization) {
+      setHealth(def.id, 'needs-auth', 'not authorized yet — connect the account in Connectors')
+    }
 
     // Building the upstream request can THROW — most sharply on a header value carrying a
     // CRLF or other illegal character, which Node rejects with ERR_INVALID_CHAR. Uncaught
