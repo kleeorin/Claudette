@@ -4,11 +4,27 @@ import type { AppControlMcpServer, McpToolResult } from './appControlServer'
 import type { TeamMailbox } from './teamMailbox'
 import { getAgent, isAgent, listAgents } from '../claude/agents'
 import { readRoleNotes, appendRoleNote } from './teamNotes'
+import { resolveMaxTeamSize } from '@claudette/shared'
+import { getSettings } from '../settings/settingsStore'
 
 // The most teammates one coordinator may hire. A ceiling, not a recommendation — the
 // useful number is far smaller. It exists because hiring is the only team action that
 // costs a process and an API bill with nothing else bounding it.
-const MAX_TEAM_SIZE = 6
+//
+// ★ NOW THE OPERATOR'S SETTING, NOT A CONSTANT. This used to be a local `const … = 6` while
+// the settings UI offered a range up to 12, so an operator could type 10, watch it save, and
+// still be refused at 6 — an enabled control that silently did nothing. The fix is one number,
+// not a third copy: the bounds live in shared/src/settings.ts and both sides import them.
+//
+// ⚠ UNSET STILL MEANS 6, NOT 12 — see DEFAULT_MAX_TEAM_SIZE. Nobody has a stored value today,
+// so the unset branch is the one every existing install takes; resolving it to the ceiling
+// would silently double every team cap on upgrade.
+//
+// Read per hire rather than cached at module load, so a change in the settings panel applies to
+// the very next hire instead of waiting for a server restart.
+function maxTeamSize(): number {
+  return resolveMaxTeamSize(getSettings().maxTeamSize)
+}
 
 // App-control TEAM tools: how one session talks to another.
 //
@@ -275,9 +291,23 @@ export function registerTeamTools(
       // headcount, and a hire with no first task doesn't even send a message. Without this
       // a single prompt-injected coordinator could loop until the machine ran out of PIDs,
       // and worse, every hire is persisted, so a restart would relaunch the whole swarm.
+      //
+      // The cap governs NEW HIRES ONLY and never dismisses anyone: it is tested at hire time
+      // against the CURRENT roster, so lowering the setting below the number of teammates
+      // already employed leaves every one of them in place (and still in place after a
+      // restart, since the roster is persisted and this is not consulted on restore). The
+      // settings panel promises exactly that.
       const roster = sessions.childrenOf(sid)
-      if (roster.length >= MAX_TEAM_SIZE) {
-        return { error: `your team is already at its limit of ${MAX_TEAM_SIZE} (${roster.map((s) => s.name).join(', ')}). Dismiss someone before hiring, or give the work to an existing teammate.` }
+      const cap = maxTeamSize()
+      if (roster.length >= cap) {
+        // The over-cap case reads as a contradiction without this clause — "its limit of 2"
+        // followed by eight names — and it surfaces at exactly the moment the operator is
+        // already confused. Lowering the setting never dismisses anyone (see the note above),
+        // so say that here rather than leaving the reader to infer it from a mismatch.
+        const over = roster.length > cap
+          ? ` The limit was lowered after these were hired, so it only blocks new ones.`
+          : ''
+        return { error: `your team is already at its limit of ${cap} (${roster.map((s) => s.name).join(', ')}).${over} Dismiss someone before hiring, or give the work to an existing teammate.` }
       }
 
       // cwd/rootDir come from the coordinator: a team shares one workspace. Sandbox is

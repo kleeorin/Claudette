@@ -34,6 +34,7 @@ import { ConnectorProxy } from './connectors/connectorProxy'
 import { connectorServers, connectorDenyRules } from './connectors/connectorLaunch'
 import { strictMode, defaultGrants } from './connectors/connectorStore'
 import { registerUsageRoutes } from './usage/usageApi'
+import { registerSettingsRoutes } from './settings/settingsApi'
 import { resolveAuth, makeAuthHook, isAuthed, safeEqual, authCookie, tokenFilePath } from './auth'
 
 // Claudette app server. Single-user by design (PLAN §1). Binds loopback by
@@ -296,6 +297,10 @@ registerConnectorRoutes(app, sessions)
 registerConnectorOAuthRoutes(app)
 registerSandboxDefaultsRoutes(app)
 registerUsageRoutes(app)
+// Stores the operator's app-wide defaults. NOTE only `maxTeamSize` is actually obeyed today
+// (teamTools.ts reads it per hire); the other three are stored and consumed by nothing yet.
+// See the per-key list at the top of settings/settingsStore.ts.
+registerSettingsRoutes(app)
 
 // Reverse-proxy the browser's Jupyter REST/asset requests through our origin, with
 // the token injected server-side (auth-gated in makeAuthHook). hijack() hands the

@@ -18,13 +18,18 @@ import type {
   EffectivePermissions, PermissionRule, PermissionMode, PermissionScope, PermissionFile,
   PermissionAction, WriteResult,
 } from '@claudette/shared'
+import { PERMISSION_MODES } from '@claudette/shared'
 import { getAgent } from './agents'
 import { settingsJsonPaths } from './configProtection'
 import { NOTEBOOK_DENY } from './claudeEngine'
 
 // The modes we recognise for display; an unknown `defaultMode` string is ignored
 // (treated as if unset) rather than shown as a bogus mode.
-const KNOWN_MODES: readonly string[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions']
+// The shared runtime population, not a local copy. This was a fifth hand-written list of the
+// PermissionMode members; as `readonly string[]` it would not even have failed to compile when
+// the union grew — a legitimately-added mode would simply have stopped being parseable out of
+// a settings file, silently, while every type check passed.
+const KNOWN_MODES: readonly string[] = PERMISSION_MODES
 
 type Loaded = { exists: boolean; unreadable: boolean; data: Record<string, unknown> | null }
 
