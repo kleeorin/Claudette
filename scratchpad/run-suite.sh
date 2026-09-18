@@ -425,6 +425,17 @@ EXPECTED_RED=(
   # list, a genuine future failure gets waved through as "expected". Removed rather than
   # re-kinded, because it is no longer red of either kind.
   "authorizer-box-divergence-guard.mts|closed|an ordering fault, caught by failing CLOSED — this is the guard WORKING, not a sandbox escape"
+  # (restore-elevation-guard.mts was listed here as `unbuilt` a SECOND time — the first for the
+  # missing downgrade, this one for the opposite reason: the operator corrected the rule, so a
+  # session's OWN elevated mode must now SURVIVE a restart while a child still cannot acquire
+  # its parent's. Removed 2026-09-18 when fix-permission-mode-persists.server.patch landed and
+  # the guard went 4 passed/3 failed → 7 passed/0 failed. register-mode-gate-guard stayed 7/7
+  # across the same change, which is the evidence that what was relaxed is own-mode persistence
+  # and NOT the gate that stops a parent handing elevation to a child.)
+  # (restore-elevation-guard.mts was previously listed here as `unbuilt` and removed once the
+  # downgrade landed on 2026-09-14 and the guard went 3/7 → 7/7. Entry taken off in the same
+  # change as the fix — a healed red left in this list is a guard nobody is watching any more,
+  # which is the failure this list exists to prevent, one level up.)
 )
 expected_red_kind() { local f="$1" e; for e in "${EXPECTED_RED[@]}"; do [ "${e%%|*}" = "$f" ] && { e="${e#*|}"; echo "${e%%|*}"; return 0; }; done; return 1; }
 expected_red_why()  { local f="$1" e; for e in "${EXPECTED_RED[@]}"; do [ "${e%%|*}" = "$f" ] && { echo "${e##*|}"; return 0; }; done; return 1; }
@@ -458,6 +469,28 @@ SUITE=(
   # lone bad row returns [] under both "drop bad rows" and "empty the list", so it could not
   # tell the fix from the bug.
   "none:sandbox-defaults-test.mts"
+  # The app-settings STORE. Two questions, neither of which is "does it round-trip". First,
+  # do the two verbs stay separate — save SETS and must never clear, so a `save({k:null})`
+  # that silently deleted would rebuild the merged verb the contract was split to avoid, and
+  # nothing else in the tree would notice. Second, does the LOAD path enforce what the SAVE
+  # path promises: settings.json is hand-editable, so `maxTeamSize:-3` has to be dropped on
+  # read, not merely refused on write. Its bad-value fixture puts good keys on BOTH SIDES of
+  # the bad ones for the same reason the sandbox-defaults one does — with a lone bad key,
+  # "drop the bad keys" and "empty the file" give identical results and the assertion cannot
+  # tell the fix from the bug.
+  # HISTORY, worth keeping: when first written this file was BOTH unregistered AND throwing at
+  # import (PERMISSION_MODES was imported from settings.js, which does not export it), so it had
+  # never executed a single assertion. A crash-on-import and a clean pass are indistinguishable
+  # from outside the suite — which is exactly the claim registration-lint's header makes.
+  "none:settings-store-test.mts"
+  # The settings ROUTES, via app.inject(). Pins the shape (all three top-level keys) and one
+  # rule worth a dedicated assertion: environment.oauthRedirectUri must BE redirectUri(), not
+  # a second construction of the same string — `localhost` and `127.0.0.1` are different
+  # strings to an exact-matching OAuth provider, and the drift surfaces as
+  # redirect_uri_mismatch, which names neither file. Also asserts the overrides contract by
+  # property ("every key is a real AppSettings key") rather than by emptiness, so it keeps
+  # holding on the day a real override var is finally added.
+  "none:settings-api-test.mts"
   # Is the quota meter TEST-ISOLATED? Its creds path was `join(homedir(), '.claude',
   # '.credentials.json')` — a module-load constant honouring no override — so a harness that
   # set CLAUDETTE_DATA_DIR believing it was isolated still read the operator's REAL OAuth
@@ -539,6 +572,39 @@ SUITE=(
   # copies the role's scope into the spawn once, so narrowing a role leaves live sessions on
   # the old, wider one. Browser-free, result-dependent exit at :118.
   "none:agent-pending-test.mts"
+  # ★ SECURITY GUARD: a server restart must not hand a session back an elevated permission
+  # mode. Asserts on the RESTORED SESSION'S STATE, not on spawn argv — sessionManager
+  # auto-approves from the mode independently of the CLI, so an argv-only check would pass
+  # while the auto-approve path stayed live. Was an EXPECTED RED until the downgrade landed on
+  # 2026-09-14; it is a normal passing guard now, and a future regression reds it here.
+  # Uses the fake-claude shim (restore() launches what it restores).
+  "none:restore-elevation-guard.mts"
+  # register()'s OWN trust gate on permissionMode — the sibling of the guard above, and a
+  # different door: that one covers boot restore, this one covers session CREATION. Asserts on
+  # the stored permissionMode, never on spawn argv (sessionManager auto-approves from the mode
+  # independently of the CLI, so argv-only would pass while the auto-approve path stayed live).
+  # Carries the TRUSTED controls too: a gate that also refused the operator would be a
+  # regression, and without them a blanket refusal would look like a fix.
+  "none:register-mode-gate-guard.mts"
+  # ★ THE GATE THE OTHER TWO REASON FROM. `setPermissionMode`'s trust check is what stops an
+  # untrusted caller elevating an ALREADY-RUNNING session, and both guards above cite it in
+  # their headers as the reason their own door was the one that needed shutting — while
+  # testing it nowhere. Measured: neutering that one clause left restore-elevation (7/7),
+  # register-mode-gate (7/7), restore-privilege (8/8) and the server typecheck ALL GREEN.
+  # This guard reds 5 of 7 on that same mutant. Asserts on the stored mode, never the return
+  # value: a gate that reported an error and wrote the field anyway would pass a
+  # return-value-only check while the session ran elevated.
+  "none:setmode-trust-gate-guard.mts"
+  # CHARACTERIZATION of what restore() still replays besides the permission mode: a persisted
+  # sandbox (including enabled:false), teamEmploy, and both connector grants. Measured 4/4 —
+  # all four come back verbatim. GREEN and NOT an expected red: whether those deserve the same
+  # downgrade as elevation is an OPEN QUESTION for the user (bypassPermissions removes the
+  # human; sandbox:{enabled:false} removes the walls while the human still approves each call),
+  # so this file records the behaviour rather than condemning it. If it reds, read its header —
+  # a deliberate widening and an accidental drift look identical from here and it says how to
+  # tell them apart. Carries controls that a blanket wipe fails; see the note on the 'confined'
+  # fixture for the mutation proving the weaker version of that control could not fail.
+  "none:restore-privilege-guard.mts"
   # A failed turn must not render as a successful one. Pins the classifier against the real
   # auth-failure `result` frame, which carries `is_error: true` AND `subtype: 'success'` —
   # the old `is_error === true || /error/i.test(subtype)` was false for it, so the turn
@@ -559,6 +625,27 @@ SUITE=(
   # the day it happens. [4d] is the sharp one: deleting the OAuth client must put the row
   # back to needs-setup, which only holds while that state is DERIVED rather than stored.
   "none:builtin-connectors-test.mts"
+  # session:killBash — WHICH REGISTRY the kill resolves against. stopTask(id,toolId) and
+  # stopBashProc(id,toolId) take identically-shaped arguments and read DIFFERENT maps: a
+  # background shell lives in `bashProcs` and is never in the subagent `tasks` map, so wiring
+  # the kill button to stopTask — the obvious reuse, one line away — declines EVERY kill
+  # before the CLI is ever asked, with an error that reads like a dead session. The fixture
+  # puts the same tool id in both registries under different ids so a wrong lookup fails
+  # holding the other id, and includes the production shape (shell in one map only) to show
+  # the actual consequence. ⚠ Asserts at the WIRE BOUNDARY (what engine.stopTask was handed),
+  # NOT process death — whether the CLI honours the id is the CLI's behaviour and needs a
+  # live turn, so green here does not prove anything was ever killed.
+  "none:killbash-routing-test.mts"
+  # maxTeamSize ACTUALLY ENFORCED. teamTools.ts hardcoded 6 while the settings UI offered up to
+  # 12, so an operator could type 10, watch it save, and still be refused at 6 — an enabled
+  # control that silently did nothing. Its headline assertion is the REGRESSION one: unset must
+  # still resolve to 6, never to the ceiling. Nobody has a stored value, so unset is the branch
+  # every existing install takes, and resolving it to the ceiling would silently double every
+  # team cap on upgrade — invisible except as a bill. It also pins default != ceiling, or that
+  # assertion goes vacuous the day someone "simplifies" the default to the maximum. Drives the
+  # REAL employ_teammate handler (a correct resolver nothing calls is still a lying control) and
+  # measures the cap by hiring until refused rather than asserting a literal.
+  "none:team-size-setting-test.mts"
   # GROUP C. The unsaved-editor-buffer store: does a held buffer ever shadow a file that
   # changed on disk? The operator met this as "files open stale and don't record changes" —
   # nothing was failing to record; the new text was on disk and simply never displayed.
@@ -876,6 +963,13 @@ SUITE=(
   # fired" and it fails identically when the turn simply finishes early, which is the recorded
   # 2026-08-24 false red. The replacement compares two events OF THE TURN, so the model's
   # speed drops out. Test 2 replays that false red; test 3 is the clobber itself.
+  # PURE, no browser/server/ports. The background-bash wire parsers, tested against VERBATIM
+  # transcript strings rather than the plan's paraphrase — which mattered: the paraphrase was
+  # wrong twice (it recorded the status vocabulary as completed/failed only, and documented a
+  # single-<task-id> envelope). Real corpus has `stopped` as the SECOND most common shell
+  # outcome, and multi-id orphan round-ups carrying a __orphan_summary__ sentinel. A parser
+  # built to the paraphrase reads the first id and strands the rest as running forever.
+  "none:bash-procs-parse-test.mts"
   "none:turn-indicator-test.mjs"
   # STATIC, reads source text only — no browser, no server, no API calls. Guards the premise
   # that turn-indicator-test.mjs cannot reach from its own file: that real-turn-browser-test

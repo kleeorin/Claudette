@@ -28,6 +28,11 @@ process.env.CLAUDETTE_DATA_DIR = DATA
 
 const store = await import('../server/src/connectors/connectorStore')
 const { BUILTIN_CONNECTORS } = await import('../server/src/connectors/builtins')
+// needsSetup is derived from BOTH the OAuth client and an authorized token (see oauthReady in
+// connectorStore.ts), so reaching the fully-configured state at all requires writing a token.
+// connector-creds.json lives under dataDir() too, so the CLAUDETTE_DATA_DIR above isolates it
+// along with everything else — this never touches the operator's real credentials.
+const creds = await import('../server/src/connectors/connectorCreds')
 
 import { withMarks, passed as pass, failed as fail } from './assert.mjs'
 // Indented two spaces, as this file has always printed. See withMarks in assert.mjs.
@@ -75,24 +80,69 @@ store.setBuiltinOverride('gmail', { oauthClientRef: 'half' })
 ok('[4b2] an OAuth client with NO SECRET does not count as configured',
   view('gmail')?.needsSetup === true,
   view('gmail')?.needsSetup === true ? '' : '← the toggle would unblock into a connect that cannot succeed')
+// ★★ SETUP IS A THREE-STATE CHAIN, NOT A SWITCH — CORRECTED 2026-09-17 AGAINST MEASUREMENT.
+// [4c] used to assert that pointing a row at a saved OAuth client CLEARS needs-setup, and it
+// had been failing for days. The test was wrong, not the code. `oauthReady()` deliberately
+// requires the WHOLE chain — `oauthClientUsable(ref) && hasToken(id)` — and its comment gives
+// the reason: a client with no authorized token is exactly the fail-at-connect state that
+// blocking exists to prevent. The operator pastes a client id, the row goes green, the toggle
+// unblocks, and every tool call 401s. Clearing needs-setup at step one would deliver the very
+// trap the feature was designed around.
+//
+// The three states, as measured:
+//   no client          → needsSetup, hint "Needs a Google OAuth client (…)"
+//   client, no token   → needsSetup, hint "Client configured — now connect the account …"
+//   client AND token   → needsSetup absent
 store.saveOAuthClient({ id: 'goog', name: 'G', clientId: 'cid', clientSecret: 'sec' })
 store.setBuiltinOverride('gmail', { oauthClientRef: 'goog' })
-ok('[4c] pointing it at a saved OAuth client clears needs-setup',
-  view('gmail')?.needsSetup !== true && view('gmail')?.oauthClientRef === 'goog')
-// ★ THE ASSERTION THAT PROVES IT IS DERIVED RATHER THAN STORED. A stored flag would have
-// been written "configured" in [4c] and would still say so here — the row would offer a
-// toggle that cannot work, which is the exact failure the derivation exists to prevent.
+ok('[4c] a configured client alone does NOT clear needs-setup — a token is still required',
+  view('gmail')?.needsSetup === true && view('gmail')?.oauthClientRef === 'goog',
+  `needsSetup=${String(view('gmail')?.needsSetup)} ref=${String(view('gmail')?.oauthClientRef)}`)
+// The row must say which step is outstanding. Telling an operator who has already created a
+// client to go and create one is how a correct blocker reads as a broken app — and it is the
+// only thing distinguishing this state from the previous one on screen.
+ok('[4c2] …and the hint ADVANCES to name the outstanding step, rather than repeating step one',
+  view('gmail')?.oauthClientReady === true
+    && !!view('gmail')?.setupHint && /connect the account/i.test(view('gmail')!.setupHint!),
+  JSON.stringify(view('gmail')?.setupHint))
+// Completing the chain is what actually clears it. This is the assertion [4c] was reaching for
+// before the OAuth work moved the goalposts, and without it nothing here proves needsSetup can
+// EVER go false — the whole block would pass against a row permanently stuck at "needs setup".
+creds.saveToken({ connectorId: 'gmail', account: 'default', accessToken: 'at', scopes: ['s'] })
+ok('[4c3] ★ completing the chain (client AND token) DOES clear needs-setup',
+  view('gmail')?.needsSetup === undefined,
+  `needsSetup=${String(view('gmail')?.needsSetup)} — if this never clears, every assertion above passes vacuously`)
+// ★ THE ASSERTION THAT PROVES IT IS DERIVED RATHER THAN STORED — and it now runs from the
+// CLEARED state, which is the only place it can prove anything.
+// ⚠ IT USED TO RUN FROM THE "client, no token" STATE, WHERE needsSetup WAS ALREADY true. It
+// therefore passed no matter what the code did: a stored flag, a derived one, or a constant
+// `true` are indistinguishable from there. It was GREEN THROUGHOUT the period [4c] was red —
+// a check reporting success in exactly the state it was meant to catch.
 store.removeOAuthClient('goog')
 ok('[4d] DELETING that client puts it straight back to needs-setup (derived, not stored)',
   view('gmail')?.needsSetup === true,
   view('gmail')?.needsSetup === true ? '' : '← a stale stored flag would report configured forever')
+// Revoking only the TOKEN must also reopen setup, at the correct step. The two inputs to
+// oauthReady are independent and either one going away must reopen it; testing only the client
+// leg would leave `hasToken` free to be dropped from the conjunction unnoticed.
+store.saveOAuthClient({ id: 'goog', name: 'G', clientId: 'cid', clientSecret: 'sec' })
+store.setBuiltinOverride('gmail', { oauthClientRef: 'goog' })
+creds.saveToken({ connectorId: 'gmail', account: 'default', accessToken: 'at', scopes: ['s'] })
+ok('[4d2] …and so does revoking only the TOKEN, back to the connect-the-account step',
+  (creds.removeToken('gmail'), view('gmail')?.needsSetup === true
+    && /connect the account/i.test(view('gmail')?.setupHint ?? '')),
+  `needsSetup=${String(view('gmail')?.needsSetup)} hint=${JSON.stringify(view('gmail')?.setupHint)}`)
 
 // ── [4e] the hint travels WITH the state it explains ───────────────────────────────
 // Carried on the view rather than duplicated in web/src: the text lives beside the
 // definitions (BUILTIN_SETUP_HINT) so it cannot drift from them, and a copy in the client
 // would recreate exactly the drift that placement avoids.
+// Back to the virgin state for the hint check: clear the ref, the client AND the token, so
+// this reads the STEP-ONE hint rather than the "now connect the account" one left behind by
+// [4d2]. Without the token removal it would assert against whichever state happened to survive.
 store.setBuiltinOverride('gmail', { oauthClientRef: undefined })
 store.removeOAuthClient('goog')
+creds.removeToken('gmail')
 ok('[4e] a needs-setup row carries its per-product setupHint',
   !!view('gmail')?.setupHint && view('gmail')!.setupHint!.includes('Gmail'),
   JSON.stringify(view('gmail')?.setupHint))

@@ -53,6 +53,7 @@ import { registerFsRoutes } from '../server/src/fs/fsApi'
 import { registerGitRoutes } from '../server/src/git/gitApi'
 import { registerConnectorRoutes } from '../server/src/connectors/connectorApi'
 import { registerUsageRoutes } from '../server/src/usage/usageApi'
+import { registerSettingsRoutes } from '../server/src/settings/settingsApi'
 
 import { check, passed as pass, failed as fail } from './assert.mjs'
 
@@ -93,6 +94,12 @@ function buildApp(hook: (req: FastifyRequest, reply: FastifyReply) => Promise<vo
   registerGitRoutes(app)
   registerConnectorRoutes(app, stub())
   registerUsageRoutes(app)
+  // The settings routes store the operator's app-wide defaults — including
+  // defaultPermissionMode, which names the very prompt standing between a confined session and
+  // an unreviewed tool call. That makes them worth having in this sweep specifically: a box
+  // shares the network namespace and can reach this port, so "are they behind the gate?" is a
+  // real question rather than a formality.
+  registerSettingsRoutes(app)
   // index.ts:259 registers this directly rather than via a register*Routes function, so
   // it is re-declared here. See the LIMITATION note at the bottom of this file.
   app.all('/jupyter/*', async () => ({ proxied: true }))
