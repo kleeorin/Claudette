@@ -162,6 +162,10 @@ export interface SavedSession {
   accountConnectors?: string[] // allowed account connectors (ditto)
   claudeSessionId?: string // claude's own --session-id, for --resume on restore
   tasks?: TaskRecord[]     // subagent lifecycle registry, so a restart doesn't strand tray cards
+  // Background-bash registry, beside `tasks` and for the same reason: without it a restart
+  // strands every panel row as "running" forever, and a row nothing can retract is
+  // indistinguishable from a live process.
+  bashProcs?: BashProcRecord[]
 }
 
 // The authoritative record of a subagent's lifecycle, kept server-side per session
@@ -170,6 +174,52 @@ export interface SavedSession {
 // (a resumed/off-stream agent), or is lost to a server restart. Keyed by the Task/Agent
 // tool_use id. This is the durable fallback a tray card settles from when no terminal
 // tool_result ever reached the client — the fix for sticky "running" cards.
+// ── BACKGROUND BASH PROCESSES ────────────────────────────────────────────────────────────
+// A VALUE, with the union derived from it — not a bare type union. Anything reasoning over
+// "all the states" must be able to ITERATE them: the client's tests do
+// `BASH_PROC_STATES.filter(isLiveBashProc)` rather than listing states by hand, so a fifth
+// state fails loudly instead of being silently uncovered. That is the population rule in
+// scratchpad/assert.mjs ("do not enumerate a population that will grow — count it, or query
+// it"), and a type-only export would make the rule unenforceable at exactly the layer that
+// needs it.
+// ⚠ FIVE, NOT FOUR — and `stopped` was added on evidence, against the original spec.
+// The plan recorded the CLI's status vocabulary as "completed and failed only". Measured
+// per-envelope across the whole transcript corpus, restricted to shell-shaped ids, it is
+// completed 15 / STOPPED 12 / failed 2 — `stopped` is the SECOND most common shell outcome,
+// not an edge case. It is what the CLI reports for shells with no completion record (the
+// multi-id `__orphan_summary__:shell` envelope). Folding it into `unknown` would throw away
+// something the CLI actually knows, and the web half already depends on it existing.
+export const BASH_PROC_STATES = ['running', 'done', 'failed', 'stopped', 'unknown'] as const
+export type BashProcStatus = typeof BASH_PROC_STATES[number]
+
+// One backgrounded shell. Mirrors TaskRecord's shape deliberately — same key (`toolId`),
+// same lifecycle discipline — so the panel and the agent tray stay one idea in two places.
+//
+// ⚠ `unknown` IS NOT `failed`, AND THE DIFFERENCE IS THE POINT. A subagent that dies with its
+// engine genuinely failed. A shell killed by a server restart has no knowable outcome, and
+// reporting `failed` asserts something we did not observe. `unknown` is also where the CLI's
+// own `stopped` lands (see parseBashNotification in ./bashProcs) — the process ended without
+// a completion record, which is precisely "we do not know", not "it went wrong".
+export interface BashProcRecord {
+  toolId: string        // Bash tool_use id — the key, exactly as TaskRecord uses toolId
+  shellId?: string      // from the ack / <task-id>; absent until the ack arrives
+  command: string
+  description?: string
+  // Provenance only. Whether it can be READ depends on the session's tier and on the engine
+  // still being alive — see the output endpoint in server/src. Never treat this as a promise
+  // that the file is reachable.
+  outputFile?: string
+  // SERVER clock at first sight. Elapsed time must not trust the CLI: the transcript carries
+  // no reliable start instant, and a clock we do not own is a clock that can disagree.
+  startedAt: number
+  endedAt?: number
+  status: BashProcStatus
+  // Best-effort, parsed out of summary PROSE, which is why it is optional and why nothing may
+  // key state on it. `status` is the structured field; this is a courtesy for the detail view.
+  exitCode?: number
+  summary?: string
+}
+
 export interface TaskRecord {
   toolId: string            // Task/Agent tool_use id (pairs with <tool-use-id>)
   // The CLI's OWN id for the task, off `system/task_started` — the only handle its
@@ -215,7 +265,44 @@ export type PermissionDecision =
 // --- Permission Control Center (see HANDOVER-permissions.md) ------------------
 // A session's permission mode — Claude's `--permission-mode` launch flag and the
 // `defaultMode` key in its settings files.
-export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
+// The runtime list, so callers can ITERATE the population instead of hand-writing it. Same
+// shape and same reasoning as BASH_PROC_STATES: a type-only union cannot be queried at
+// runtime, which forces every consumer to keep a private copy that drifts silently.
+export const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const
+export type PermissionMode = (typeof PERMISSION_MODES)[number]
+
+// ★★ THE ONE DEFINITION OF "ELEVATED". EVERY CALLER MUST USE THIS. ★★
+//
+// This predicate was written out as `m === 'bypassPermissions' || m === 'acceptEdits'` in FOUR
+// independent places: the restore downgrade and the setPermissionMode trust gate (both in
+// server/src/claude/sessionManager.ts), the restore-elevation guard's population filter, and
+// the sidebar's "allow all" warning badge in web/src.
+//
+// ADDING A FIFTH ELEVATED MODE TO THE UNION WOULD HAVE DEFEATED ALL FOUR IN SILENCE, because
+// widening a union keeps every existing `===` comparison perfectly valid — TypeScript flags
+// nothing. The new mode would not be downgraded on restore, would not be refused from an
+// untrusted caller, would not be warned about in the sidebar, AND THE GUARD WOULD STAY GREEN,
+// because its filter tests the same two literals: it generalises over the SESSIONS in its
+// fixture, not over the MODES in this union. Every check would report that all was well.
+//
+// ★ IMPLEMENTED AS AN EXHAUSTIVE Record, DELIBERATELY — not a switch, not an array
+// `.includes`. A Record keyed by PermissionMode fails to COMPILE when the union grows, at this
+// exact line, forcing a human to decide whether the new mode removes protection. A switch with
+// a default, or an `.includes` over a literal array, would both keep compiling and answer
+// `false` — quietly classifying an unknown new privilege as safe, which is the wrong direction
+// for the one decision where being wrong means running every tool unasked.
+const ELEVATED: Record<PermissionMode, boolean> = {
+  // Only these two REMOVE protection.
+  bypassPermissions: true,   // runs every tool with no prompt at all
+  acceptEdits: true,         // auto-accepts file edits
+  // These two only ever RAISE prompting, so neither is a privilege.
+  default: false,
+  plan: false,
+}
+
+export function isElevatedMode(m: PermissionMode | undefined): boolean {
+  return m !== undefined && ELEVATED[m] === true
+}
 
 // Which of Claude's settings files a rule/mode comes from. Precedence low→high:
 // user < project < local. (Enterprise policy is out of scope for v1.)

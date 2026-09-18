@@ -1,6 +1,6 @@
 import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
-  SessionInfo, SessionState, SetModeResult, ConversationMeta, RewindPoint, RewindMode, RewindPreview, ActivePane, SandboxConfig,
+  SessionInfo, SessionState, BashProcRecord, SetModeResult, ConversationMeta, RewindPoint, RewindMode, RewindPreview, ActivePane, SandboxConfig,
   AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult, TaskRecord,
 } from './types'
 import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
@@ -34,6 +34,14 @@ export type WsClientMessage =
   // session:interrupt does). `toolId` is the Task tool-use id the tray already holds; the
   // server maps it to the CLI's own task id, the only thing `stop_task` accepts.
   | { type: 'session:stopTask'; id: string; toolId: string }
+  // Kill a backgrounded shell. DELIBERATELY NOT session:stopTask, and this is not tidiness.
+  // sessionManager.stopTask resolves toolId through the SUBAGENT registry, which by
+  // construction never holds a Bash tool_use id — so a bash kill routed through it returns
+  // ok:false WITHOUT EVER REACHING THE CLI, and reads as "the CLI refuses shell ids". It does
+  // not: measured 2026-09-10, `stop_task` with a shell id kills the shell (verified by process
+  // death, not by the response — the CLI answers unknown-task stops as success). This message
+  // exists so the server can hand the SHELL id straight to engine.stopTask().
+  | { type: 'session:killBash'; id: string; toolId: string }
   | { type: 'session:permission'; id: string; requestId: string; decision: PermissionDecision }
   // What a session is currently viewing (its active content tab), published on tab/
   // session switch. `pane` is null when the Claude tab is focused. Backs the
@@ -78,11 +86,19 @@ export type WsServerMessage =
   // device joining an in-progress session (e.g. the phone) sees the conversation
   // AND can answer a pending "allow" prompt, instead of a blank stream. Events are
   // replayed like a resumed conversation; `pending` is set only if one awaits.
-  | { type: 'session:snapshot'; id: string; events: ClaudeEvent[]; pending?: PermissionRequest[]; tasks?: TaskRecord[] }
+  // ★ `bashProcs` MUST BE PRESENT WHENEVER THE REGISTRY IS NON-EMPTY. The client dispatches
+  // `procs ?? []` unconditionally, so an OMITTED field EMPTIES the panel rather than leaving
+  // stale rows standing. The two halves are one decision, not two: emptying is the better
+  // failure, because a "still running" row that nothing can ever retract is indistinguishable
+  // from a real live process and never self-corrects. Omit only when there is nothing to report.
+  | { type: 'session:snapshot'; id: string; events: ClaudeEvent[]; pending?: PermissionRequest[]; tasks?: TaskRecord[]; bashProcs?: BashProcRecord[] }
   // Live updates to a session's subagent registry — broadcast whenever a task is first
   // seen, launched, or settled — so every tab's tray reflects the authoritative outcome
   // even if the driving <task-notification> was evicted / never buffered.
   | { type: 'session:tasks'; id: string; tasks: TaskRecord[] }
+  // Same contract as session:tasks, for backgrounded shells: broadcast on first sight, on ack
+  // and on settle, so a tab that missed the driving notification still converges.
+  | { type: 'session:bashProcs'; id: string; procs: BashProcRecord[] }
   // Per-session streaming events (namespaced by session id).
   | { type: 'session:event'; id: string; event: ClaudeEvent }
   | { type: 'session:permission'; id: string; request: PermissionRequest }
