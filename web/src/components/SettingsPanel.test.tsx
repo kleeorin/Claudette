@@ -36,17 +36,24 @@ const H = {
   reset: [] as string[],
   overrides: [] as Array<{ key: string; env: string; value: string }>,
   settings: {} as Record<string, unknown>,
+  // What `appSettings()` should do THIS test. null = the normal, well-formed response. The
+  // two failure cases below need a rejection and a malformed body respectively, and a fixed
+  // mock cannot express either — which is exactly why neither was covered.
+  appSettingsImpl: null as null | (() => Promise<unknown>),
 }
 const RESP = () => ({ settings: H.settings, overrides: H.overrides, environment: { host: '127.0.0.1', port: 4319, dataDir: '/d', oauthRedirectUri: 'u' } })
 
 vi.mock('../api/client', () => ({
   api: {
     http: {
-      appSettings: async () => ({
-        settings: H.settings,
-        overrides: H.overrides,
-        environment: { host: '127.0.0.1', port: 4319, dataDir: '/home/u/.config/claudette', oauthRedirectUri: 'http://127.0.0.1:4319/api/connectors/oauth/callback' },
-      }),
+      appSettings: async () => {
+        if (H.appSettingsImpl) return H.appSettingsImpl()
+        return {
+          settings: H.settings,
+          overrides: H.overrides,
+          environment: { host: '127.0.0.1', port: 4319, dataDir: '/home/u/.config/claudette', oauthRedirectUri: 'http://127.0.0.1:4319/api/connectors/oauth/callback' },
+        }
+      },
       saveAppSettings: async (patch: Record<string, unknown>) => {
         H.saved.push(patch)
         H.settings = { ...H.settings, ...patch }
@@ -64,7 +71,7 @@ vi.mock('../store/sessions', () => ({ useSessions: () => ({ agents: [{ id: 'gene
 
 const { SettingsPanel } = await import('./SettingsPanel')
 
-beforeEach(() => { H.saved = []; H.reset = []; H.overrides = []; H.settings = {} })
+beforeEach(() => { H.saved = []; H.reset = []; H.overrides = []; H.settings = {}; H.appSettingsImpl = null })
 afterEach(cleanup)
 
 const row = (name: string) => document.querySelector(`[data-setting="${name}"]`) as HTMLElement
@@ -152,5 +159,40 @@ describe('SettingsPanel', () => {
     fireEvent.blur(input)
     await waitFor(() => expect(screen.queryByTestId('team-size-error')).toBeTruthy())
     expect(H.saved).toEqual([])
+  })
+
+  // ★★ THE TWO CASES BELOW ARE THE USER-REPORTED BUG AND ITS SHADOW. ★★
+  // Reported: opening Settings showed "Cannot read properties of undefined (reading 'host')"
+  // and took out the whole app — the only ErrorBoundary is at the ROOT, wrapping <App/>, so a
+  // throw in this panel is not a degraded panel, it is a blank application.
+  //
+  // The chain had TWO silent links, and fixing only the first just moves the silence:
+  //   1. `get()` returned a 404 body as if it were the success type, so the failure never
+  //      presented as a failure to the COMPONENT. (Fixed in client.ts; covered by client.test.ts.)
+  //   2. Even once it did, the component could not present it to the USER: `load` leaves
+  //      `data` null on failure, and the early `if (!data)` returned only "Loading settings…",
+  //      so the "Could not load settings." branch — which sits inside the main return — was
+  //      unreachable. Correct, written, and dead.
+
+  it('shows the error instead of loading FOREVER when the fetch fails', async () => {
+    // Nothing retries, so "loading" here is not a transient state that resolves — it is the
+    // permanent end state of a failed load, and it tells the user the opposite of the truth.
+    H.appSettingsImpl = () => Promise.reject(new Error('GET /api/settings failed: 404'))
+    render(<SettingsPanel />)
+    await waitFor(() => expect(screen.getByTestId('settings-error')).toBeTruthy())
+    // And the loading text must be GONE, not merely accompanied — the assertion that fails if
+    // someone renders both.
+    expect(screen.queryByTestId('settings-loading')).toBeNull()
+  })
+
+  it('renders the rest of the panel when the server omits `environment` entirely', async () => {
+    // `environment` is typed as required, but the object came off the wire through JSON.parse:
+    // the type is an assertion about a SERVER, not a fact about a value, and typecheck can
+    // never catch this. A read-only facts block is never worth the whole application.
+    H.appSettingsImpl = async () => ({ settings: H.settings, overrides: H.overrides })
+    render(<SettingsPanel />)
+    // The settings themselves still render — the panel degrades rather than dying.
+    await waitFor(() => expect(row('defaultModel')).toBeTruthy())
+    expect(screen.queryByTestId('environment-panel')).toBeNull()
   })
 })

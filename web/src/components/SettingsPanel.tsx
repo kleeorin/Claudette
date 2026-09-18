@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { PermissionMode } from '@claudette/shared'
+// ★ FROM shared, NOT from settingsLogic, and that asymmetry is deliberate. settingsLogic
+// still holds its own 12/1 from the weeks when `shared/` was not writable here; this default
+// arrived with the server half, so there is no local copy of it to prefer and making one
+// would be the third figure the note below exists to avoid. The two mirrored bounds are a
+// known debt — see the DELETE-THIS-FILE banner in lib/settingsContract.ts, now due.
+import { DEFAULT_MAX_TEAM_SIZE } from '@claudette/shared'
 import { api } from '../api/client'
 import { useSessions } from '../store/sessions'
 import type { AppSettings, AppSettingsResponse, SettingsOverride } from '../lib/settingsContract'
@@ -93,7 +99,22 @@ export function SettingsPanel() {
   const setOrClear = <K extends keyof AppSettings>(key: K, value: AppSettings[K] | undefined) =>
     value === undefined ? void clearValue(key) : void setValue(key, value)
 
-  if (!data) return <div data-testid="settings-loading" className="text-ctp-overlay">Loading settings…</div>
+  // ★ THE ERROR STATE OUTRANKS THE LOADING STATE, and getting that order wrong is what made a
+  // failed load indistinguishable from a slow one — FOREVER, since nothing retries.
+  // `load` sets `error` and leaves `data` null, so an early `if (!data)` that returned only
+  // "Loading settings…" meant the "Could not load settings." branch further down could never
+  // render: it sits inside the main return, which a null `data` never reaches. The message was
+  // written, correct, and dead.
+  //
+  // This is the same shape as the bug it follows, one layer up. There, a failed request did not
+  // present as a failure to the component (`get` returned the 404 body as if it were the
+  // success type); here, a failure that DID reach the component still did not present as a
+  // failure to the user. Fixing the first only moved the silence.
+  if (!data) {
+    return error
+      ? <div data-testid="settings-error" className="text-ctp-red/90">{error}</div>
+      : <div data-testid="settings-loading" className="text-ctp-overlay">Loading settings…</div>
+  }
   const { settings, overrides, environment } = data
 
   const commitTeamSize = () => {
@@ -174,8 +195,21 @@ export function SettingsPanel() {
           keeps every existing teammate, across restarts. An operator reads "team size" as a
           bound on what their machine will run, and if we do not say otherwise the setting
           quietly under-delivers exactly the reassurance it exists to provide. */}
+      {/* ★ THE "NOT YET ENFORCED" CAVEAT IS GONE BECAUSE IT CAME TRUE. Hiring now resolves
+          this stored setting per hire — server/src/mcp/teamTools.ts calls resolveMaxTeamSize()
+          inside the handler rather than caching a constant at module load — so a saved value
+          binds the very next hire with no restart. The caveat asserting the opposite is now
+          the false statement, which is the failure this note was rewritten to end.
+          What REPLACES it is the one thing an operator still cannot see: UNSET IS 6, not the
+          12 the range implies. Every install is unset today, so "blank" is the branch they are
+          all on, and a panel that shows a 1–12 range while silently behaving as 6 recreates
+          exactly the mismatch we just closed. Say the number, and take it from the shared
+          constant the server resolves against rather than typing 6 in here.
+          The new-hires-only sentence stays: the cap is tested at hire time against the current
+          roster and boot restore never consults it, so lowering this keeps every teammate
+          already employed, across restarts. That is unchanged by the wiring. */}
       <Row name="maxTeamSize" label="Maximum team size" overrides={overrides}
-        note={`Limits NEW HIRES only — it never dismisses anyone. Lowering it below your current team keeps everybody, including after a restart. ${MIN_TEAM_SIZE}–${MAX_TEAM_SIZE_LIMIT}; ${MAX_TEAM_SIZE_LIMIT} is a hard maximum and cannot be raised.`}>
+        note={`Obeyed from the next hire onwards — no restart needed. Left unset it is ${DEFAULT_MAX_TEAM_SIZE}, not ${MAX_TEAM_SIZE_LIMIT}. Limits NEW HIRES only — it never dismisses anyone, including after a restart. Accepts ${MIN_TEAM_SIZE}–${MAX_TEAM_SIZE_LIMIT}.`}>
         {(locked) => (
           <div className="flex items-center gap-2">
             <input
@@ -195,6 +229,17 @@ export function SettingsPanel() {
           no-op as an enabled control under an env override. HOST is also security-relevant: a
           non-loopback bind without a token fail-closes at startup, which is not a thing to
           offer casually in a settings box. */}
+      {/* ★ RENDERED ONLY IF THE SERVER SENT IT, and the guard is not defensive padding.
+          `environment` is typed as required, but this object came off the wire through
+          JSON.parse — the type is an assertion about a server, not a fact about a value, and
+          the server half of these routes did not exist when this was written. Reading
+          `environment.host` on an undefined threw exactly that: "Cannot read properties of
+          undefined (reading 'host')".
+          What makes it worth a guard rather than a shrug is WHERE the boundary is: the only
+          ErrorBoundary is at the ROOT, wrapping <App/> in main.tsx. So a throw here does not
+          degrade the settings panel — it blanks the whole application and the user has to
+          reload. A read-only facts block is never worth the entire app. */}
+      {environment && (
       <div data-testid="environment-panel" className="pt-2 border-t border-ctp-surface0 space-y-1">
         <div className="text-ctp-text font-medium">Environment</div>
         <div className="text-ctp-overlay leading-snug">
@@ -217,6 +262,7 @@ export function SettingsPanel() {
           >{copied ? 'copied' : 'copy'}</button>
         </div>
       </div>
+      )}
     </div>
   )
 }
