@@ -410,6 +410,23 @@ export class ClaudeEngine extends EventEmitter {
     // still wins — .ipynb edits stay funnelled through the app tools. ALWAYS_PROMPT
     // tools (AskUserQuestion) are the exception: auto-allowing them returns no answer,
     // so they must reach the user even here.
+    //
+    // ★★ THE LITERAL `=== 'bypassPermissions'` IS DELIBERATE. DO NOT REPLACE IT WITH
+    // `isElevatedMode`. ★★
+    // Five other sites were consolidated onto that shared predicate; this is the sixth and it
+    // is deliberately NOT one of them, because it is not asking the same question. The shared
+    // predicate means "does this mode remove protection", which is ALSO true of `acceptEdits`
+    // — and acceptEdits must auto-accept EDITS, not every tool. Widening this line to it would
+    // silently turn acceptEdits into allow-all: the single worst regression available in this
+    // file, invisible to typecheck, and indistinguishable from correct behaviour until someone
+    // notices a Bash call that was never prompted for.
+    //
+    // The narrowness also fails in the SAFE direction. If a future bypass-like mode is added
+    // to PermissionMode, it will NOT auto-approve here until a human adds it explicitly —
+    // erring toward prompting, which is the right way to be wrong about permissions. That is
+    // the opposite of what the shared Record enforces at the type level, and both are correct
+    // for their own site: the Record forces a decision about elevation, this line forces a
+    // decision about auto-approval, and they are not the same decision.
     if (this.mode === 'bypassPermissions' && !ALWAYS_PROMPT.has(req.toolName)) {
       this.write({
         type: 'control_response',

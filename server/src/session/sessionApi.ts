@@ -7,7 +7,7 @@ import type {
   SetAgentRequest, RenameSessionRequest, ListAgentsResponse,
   PermissionsResponse, EditRuleRequest, WriteResult,
   RewindPointsResponse, RewindPreviewResponse, RewindRequest, RewindResponse,
-  TaskRecord, TrustQueryResponse, TrustFolderRequest,
+  TaskRecord, BashProcRecord, TrustQueryResponse, TrustFolderRequest,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { isTrusted, setTrusted } from '../claude/trust'
@@ -44,6 +44,13 @@ export function bridgeSessionEvents(sessions: SessionManager, hub: WsHub): void 
   // authoritative record even when a <task-notification> was evicted / never buffered.
   sessions.on('task', (id: string, tasks: TaskRecord[]) =>
     hub.broadcast({ type: 'session:tasks', id, tasks }))
+  // Live background-shell registry → every tab, mirroring the subagent line above.
+  // This is the ONLY way the panel ever learns anything: unlike agent cards, which the client
+  // can rebuild from transcript items, a backgrounded shell's completion arrives solely as a
+  // <task-notification> that the capped transcript ring may evict and that a device joining
+  // mid-run never saw. No broadcast, no panel — the registry just fills up server-side.
+  sessions.on('bashProcs', (id: string, procs: BashProcRecord[]) =>
+    hub.broadcast({ type: 'session:bashProcs', id, procs }))
 }
 
 // Send a freshly-connected socket the per-session catch-up it needs to render an
@@ -55,10 +62,19 @@ export function sendSessionSnapshots(sessions: SessionManager, hub: WsHub, ws: i
     const events = sessions.transcriptOf(s.id)
     const pending = sessions.pendingPermissionsOf(s.id)
     const tasks = sessions.tasksOf(s.id)
-    // Include a tasks-only session too: its transcript may have been evicted while a
-    // settled subagent record still needs to reach a freshly-connected tab.
-    if (events.length === 0 && pending.length === 0 && tasks.length === 0) continue
-    hub.send(ws, { type: 'session:snapshot', id: s.id, events, pending, tasks })
+    const bashProcs = sessions.bashProcsOf(s.id)
+    // Include a registry-only session too: its transcript may have been evicted while a
+    // settled subagent record — or a still-running background shell — needs to reach a
+    // freshly-connected tab.
+    if (events.length === 0 && pending.length === 0 && tasks.length === 0 && bashProcs.length === 0) continue
+    // ★ bashProcs IS ALWAYS SENT WHEN THE REGISTRY IS NON-EMPTY, AND THAT IS LOAD-BEARING.
+    // The client dispatches `procs ?? []` unconditionally on a snapshot, so a snapshot that
+    // omitted this field would EMPTY the panel rather than leave it alone. That direction was
+    // chosen deliberately on the client — a stale "still running" row that nothing can ever
+    // retract is worse than a blank one, because it is indistinguishable from a real live
+    // process and never self-corrects — but the two decisions only work together. Do not make
+    // this conditional without changing the client in the same commit.
+    hub.send(ws, { type: 'session:snapshot', id: s.id, events, pending, tasks, bashProcs })
   }
 }
 
@@ -254,6 +270,21 @@ export function handleSessionClientMessage(sessions: SessionManager, msg: WsClie
       // session) is logged, not surfaced — there's nothing for them to act on.
       void sessions.stopTask(msg.id, msg.toolId).then((r) => {
         if (!r.ok) console.warn(`[session] stop_task for ${msg.toolId} declined: ${r.error}`)
+      })
+      return true
+    case 'session:killBash':
+      // Fire-and-forget for the same reason session:stopTask is: the outcome the user cares
+      // about is the row settling, and that arrives on the normal <task-notification> path —
+      // the same one a shell that finishes by itself takes. Nothing is painted from this
+      // return value, deliberately: the engine answers a stop for an already-finished or
+      // unknown task with SUCCESS, so acting on ok:true would report a kill we never made.
+      //
+      // ★ stopBashProc, NOT stopTask. They take the same-shaped arguments and consult
+      // DIFFERENT registries — stopTask resolves toolId against the subagent map, which never
+      // holds a shell, so routing kills through it declines every one of them before the CLI
+      // is ever asked. See the note on stopBashProc in sessionManager.ts.
+      void sessions.stopBashProc(msg.id, msg.toolId).then((r) => {
+        if (!r.ok) console.warn(`[session] kill_bash for ${msg.toolId} declined: ${r.error}`)
       })
       return true
     case 'session:permission':

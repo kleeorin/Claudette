@@ -5,12 +5,14 @@ import path from 'path'
 import crypto from 'crypto'
 import type {
   SessionInfo, SessionState, ClaudeEvent, PermissionRequest, PermissionDecision,
-  PermissionMode, SetModeResult, SavedSession, SandboxConfig, TaskRecord,
+  PermissionMode, SetModeResult, SavedSession, SandboxConfig, TaskRecord, BashProcRecord,
 } from '@claudette/shared'
 import {
   isSubagentTool, isAsyncLaunchAck, parseTaskNotification, parseSystemTaskNotification,
   parseTaskStarted, taskIdOfNotification,
   assistantToolUses, userToolResults, userEventText,
+  parseBackgroundAck, parseBashNotification, shellIdsOf, bashStatusFrom,
+  isElevatedMode,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
 import { getAgent, isAgent, agentKey, COORDINATOR_INSTRUCTION, MEMBER_INSTRUCTION } from './agents'
@@ -123,6 +125,76 @@ export interface SessionManagerOpts {
   activePane?: (sessionId: string) => { path: string; isNotebook: boolean } | null | undefined
 }
 
+// ★★ A SESSION'S OWN PERMISSION MODE PERSISTS. AN INHERITED ONE NEVER EXISTS. ★★
+//
+// HISTORY, because this reversed once and the reason matters. The reported incident was a
+// SUBSESSION that "woke up from a restart with allow all which I did not give him". The first
+// fix read that as "elevation must never survive a restart" and dropped `bypassPermissions`
+// and `acceptEdits` on restore. The operator then corrected the diagnosis: the objection was
+// never to a session keeping ITS OWN mode — it was to a CHILD acquiring its PARENT's. Those
+// are different faults with different remedies, and the first fix addressed the wrong one. It
+// made every operator re-grant every elevation after every restart, while doing nothing about
+// inheritance — which, as it turned out, was never implemented in the first place.
+//
+// THE RULE: replay what the session itself was last set to, and make it impossible for a child
+// to pick up a parent's elevation. Both halves are enforced somewhere real, not asserted here:
+//
+//   1. OWN MODE PERSISTS — restore() passes `s.permissionMode` through unchanged.
+//   2. NO PARENT→CHILD INHERITANCE — register() reads `parent.sandbox`, `parent.connectors`
+//      and `parent.accountConnectors`, and deliberately reads NOTHING from the parent for
+//      permissionMode. A child starts from its own record, or from nothing. `employ_teammate`
+//      passes no mode at all, so a hired teammate starts unelevated.
+//   3. A PARENT CANNOT HAND ONE OVER — downgradeUntrustedMode below refuses an elevated mode
+//      from any untrusted caller, which is exactly what an in-process parent hiring a child
+//      is. That gate is what makes (2) a guarantee rather than an absence of code.
+//
+// scratchpad/restore-elevation-guard.mts asserts all three — including the case the FIRST fix
+// would have passed and this one must not: a child with no mode of its own, restored under an
+// elevated parent, must come back unelevated.
+
+// ★ THE SECOND LINE OF DEFENCE FOR ELEVATION, at the point of session CREATION.
+//
+// `register()` is the single funnel every session passes through, and `permissionMode` used to
+// flow through it into the session object with NO trust check — unlike its two siblings:
+// `sandbox` is gated by normalizeSandbox(…, trusted || !!inherited), and `teamEmploy` was
+// deliberately REMOVED from create()'s parameters after exactly this shape bit us there, with
+// a comment recording that it "flowed into register() with NO trust check". permissionMode was
+// the last of the three still relying on caller discipline rather than a gate.
+//
+// ★★ STATED HONESTLY: THIS CLOSES NO OPEN HOLE TODAY. Every live door was traced and each one
+// is already safe — `/api/session/create` is auth-gated and passes `trusted: true`;
+// `employ_teammate` (the in-process, possibly-sandboxed caller) passes only seven arguments so
+// the mode arrives `undefined` with `trusted` defaulting to false; `setPermissionMode`'s only
+// caller is the auth-gated setMode route. `restore()` is the one door this gate does NOT
+// screen: it passes `trusted: true`, deliberately, so an operator's own saved elevation
+// survives a restart (see the block above restore()'s register() call). What this changes is
+// the KIND of protection: it
+// was caller discipline, and it is now a gate. That matters because caller discipline is
+// invisible when it lapses, and this codebase has already had one such lapse in this exact
+// function.
+//
+// ★ DOWNGRADE-AND-WARN, NOT REFUSE — a deliberate choice, for three reasons:
+//   1. A downgrade is the least surprising outcome for a caller that had no business asking:
+//      it still gets a working session, just one that prompts. NOTE this deliberately does
+//      NOT match restore(), which replays an elevated mode untouched — the two differ because
+//      restore replays the OPERATOR's own saved choice, while this path is an untrusted
+//      caller asking for something it was never granted.
+//   2. A refusal is a PROBE. A caller that can tell "elevated request rejected" from "request
+//      accepted" learns whether it is trusted, which is a fact an untrusted caller should not
+//      be able to read out of the API. A silent downgrade returns the same shape either way.
+//   3. register() has no error channel — it returns a Session and create() returns an id.
+//      Throwing would change the contract for every caller including boot restore, so the
+//      refusal would have to be invented as well as decided.
+// The session is still created and still works; it simply prompts, which is the safe
+// direction and the one the operator can undo with a single deliberate act.
+function downgradeUntrustedMode(name: string, mode: PermissionMode | undefined, trusted: boolean): PermissionMode | undefined {
+  if (trusted || !isElevatedMode(mode)) return mode
+  // JSON.stringify for the same reason as the restore warning: `name` is user-controlled and
+  // reaches an operator's log, so an embedded newline must not be able to forge a line.
+  console.warn(`[register] ${JSON.stringify(name)}: refusing untrusted permissionMode=${mode} → default. Only the operator may lower a session's prompting.`)
+  return 'default'
+}
+
 export class SessionManager extends EventEmitter {
   private sessions = new Map<string, Session>()
   // Per-session transcript (raw stream-json events) + the current unanswered
@@ -143,10 +215,19 @@ export class SessionManager extends EventEmitter {
   // (recordTask) and force-settled when the engine dies (settleOpenTasks).
   private tasks = new Map<string, Map<string, TaskRecord>>()
 
+  // Backgrounded shells, same shape and same discipline as `tasks` above: keyed by the Bash
+  // tool_use id, fed from the same engine tap, persisted, and force-settled on engine death.
+  // Capped (see BASH_PROC_KEEP) because unlike subagents these accrue for the whole life of a
+  // long session and nothing on the client prunes them.
+  private bashProcs = new Map<string, Map<string, BashProcRecord>>()
+
   constructor(private readonly opts: SessionManagerOpts = {}) { super() }
 
   // The subagent records for a session (for the connect snapshot + persistence).
   tasksOf(id: string): TaskRecord[] { return [...(this.tasks.get(id)?.values() ?? [])] }
+
+  // The background-shell records for a session (connect snapshot + persistence).
+  bashProcsOf(id: string): BashProcRecord[] { return [...(this.bashProcs.get(id)?.values() ?? [])] }
 
   // Append an event to a session's transcript buffer, capped at TRANSCRIPT_CAP
   // (oldest dropped). The live UI shows user PROMPTS via the userTurn mirror, not the
@@ -337,7 +418,10 @@ export class SessionManager extends EventEmitter {
     const wanted = connectors ?? effectiveInherited ?? this.opts.defaultGrants?.() ?? []
     const wantedAccount = accountConnectors ?? effectiveAccount ?? []
     const session: Session = {
-      id, name, cwd, rootDir, parentId, agentId, model, permissionMode, teamEmploy,
+      id, name, cwd, rootDir, parentId, agentId, model, teamEmploy,
+      // Gated, not passed through — see downgradeUntrustedMode. Written as an explicit key
+      // rather than shorthand precisely so the gate is visible at the construction site.
+      permissionMode: downgradeUntrustedMode(name, permissionMode, trusted),
       ...normalizeGrants(wanted, wantedAccount, grantsTrusted),
       sandbox: normalizeSandbox(requested, cwd, trusted || !!inherited),
       state: 'idle', engine: null, startedAt: 0, resume,
@@ -505,6 +589,7 @@ export class SessionManager extends EventEmitter {
       this.emit('event', id, e)
       this.buffer(id, e)   // keep for the connect-time snapshot (late-joining devices)
       this.recordTask(id, e)   // authoritative subagent registry (durable tray-card state)
+      this.recordBashProc(id, e)   // same tap, for backgrounded shells (durable panel state)
       // Key this turn's pre-turn working-tree snapshot to its message uuid so /rewind
       // can restore code to this point. Fired on the FIRST assistant event (the user
       // line, with its uuid, is on disk by the time the model replies) so the snapshot
@@ -864,6 +949,138 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  // Cap: how many FINISHED shells to keep per session. Running ones are never counted
+  // against it and never evicted — a capped-out registry that dropped a live 20-minute build
+  // would hide precisely the process the panel exists to show, which is worse than a long
+  // list. The client ships no cap of its own and depends on this one.
+  private static readonly BASH_PROC_KEEP = 50
+
+  // Fold one raw stream-json event into the background-shell registry. Same tap as
+  // recordTask, three occasions, matching the contract in ws.ts:
+  //   FIRST SIGHT — an assistant Bash tool_use with run_in_background
+  //   ACK         — the tool_result carrying "running in background with ID: <shellId>"
+  //   SETTLE      — a <task-notification>, in either of the two shapes the CLI emits
+  private recordBashProc(id: string, e: ClaudeEvent): void {
+    const m = this.bashProcs.get(id) ?? new Map<string, BashProcRecord>()
+    let changed = false
+
+    if (e.type === 'assistant') {
+      for (const b of assistantToolUses(e)) {
+        const input = b.input as { command?: string; description?: string; run_in_background?: unknown }
+        // Structural, not prose: only a Bash tool_use carrying run_in_background is ours.
+        // Keying off the summary wording would collide with subagents, which share the
+        // <task-notification> envelope.
+        if (b.name !== 'Bash' || input.run_in_background !== true || m.has(b.id)) continue
+        m.set(b.id, {
+          toolId: b.id,
+          command: typeof input.command === 'string' ? input.command : '(unknown command)',
+          ...(typeof input.description === 'string' ? { description: input.description } : {}),
+          // OUR clock, deliberately — see BashProcRecord. The transcript carries no reliable
+          // start instant and a clock we do not own is one that can disagree with elapsed.
+          startedAt: Date.now(),
+          status: 'running',
+        })
+        changed = true
+      }
+    } else if (e.type === 'user') {
+      for (const tr of userToolResults(e)) {
+        const rec = m.get(tr.toolUseId)
+        if (!rec || rec.shellId) continue
+        const ack = parseBackgroundAck(tr.content)
+        if (!ack) continue
+        rec.shellId = ack.shellId
+        if (ack.outputFile) rec.outputFile = ack.outputFile
+        changed = true
+      }
+      if (this.settleFromNotification(m, userEventText(e))) changed = true
+    } else if (e.type === 'system') {
+      // The structured variant: { subtype:'task_notification', tool_use_id, status, summary }.
+      const o = e as unknown as { subtype?: string; tool_use_id?: unknown; status?: unknown; summary?: unknown }
+      if (o.subtype === 'task_notification' && typeof o.tool_use_id === 'string') {
+        const rec = m.get(o.tool_use_id)
+        if (rec && rec.status === 'running') {
+          rec.status = bashStatusFrom(String(o.status ?? ''))
+          rec.endedAt = Date.now()
+          if (typeof o.summary === 'string' && o.summary.trim()) rec.summary = o.summary.trim()
+          changed = true
+        }
+      }
+    }
+
+    if (changed) {
+      this.pruneBashProcs(m)
+      this.bashProcs.set(id, m)
+      this.emit('bashProcs', id, this.bashProcsOf(id))
+      this.emit('changed')
+    }
+  }
+
+  // Settle from a <task-notification> envelope. Returns whether anything changed.
+  //
+  // ★ RESOLVES BY tool-use-id WHEN PRESENT, OTHERWISE BY SHELL ID — and that fallback is not
+  // defensive padding. The CLI's orphan round-up carries SEVERAL <task-id> elements, no
+  // <tool-use-id> and no <output-file>; measured at 9 such envelopes in the corpus. A settler
+  // that keyed only on tool-use-id would ignore every one of them and leave those shells
+  // "running" forever, which is exactly the failure this panel exists to make visible.
+  private settleFromNotification(m: Map<string, BashProcRecord>, text: string): boolean {
+    const n = parseBashNotification(text)
+    if (!n) return false
+    const status = bashStatusFrom(n.status)
+    let changed = false
+    const settle = (rec: BashProcRecord | undefined): void => {
+      // Never overwrite a status already set: whichever authoritative signal arrives first
+      // wins, so the CLI's own report and settleOpenBashProcs stay idempotent rather than
+      // contradicting each other.
+      if (!rec || rec.status !== 'running') return
+      rec.status = status
+      rec.endedAt = Date.now()
+      if (n.summary) rec.summary = n.summary
+      if (n.exitCode !== undefined) rec.exitCode = n.exitCode
+      changed = true
+    }
+    if (n.toolUseId) settle(m.get(n.toolUseId))
+    // shellIdsOf drops the __orphan_summary__ sentinel, which is not a shell and would
+    // otherwise match nothing while looking like it should.
+    for (const sid of shellIdsOf(n)) {
+      for (const rec of m.values()) if (rec.shellId === sid) settle(rec)
+    }
+    return changed
+  }
+
+  // Drop the oldest FINISHED records once a session holds more than the cap. Running records
+  // are skipped entirely — they are never counted and never evicted.
+  private pruneBashProcs(m: Map<string, BashProcRecord>): void {
+    const finished = [...m.values()].filter((r) => r.status !== 'running')
+    const excess = finished.length - SessionManager.BASH_PROC_KEEP
+    if (excess <= 0) return
+    finished
+      .sort((a, b) => (a.endedAt ?? a.startedAt) - (b.endedAt ?? b.startedAt))
+      .slice(0, excess)
+      .forEach((r) => m.delete(r.toolId))
+  }
+
+  // Engine death: every still-running shell is a child of the CLI, which is a child of this
+  // server, so it died too. Settle them — but to 'unknown', NOT 'failed'.
+  //
+  // ⚠ THE DISTINCTION IS THE POINT, and it differs from settleOpenTasks deliberately. A
+  // subagent that dies with its engine genuinely failed. A shell killed by a restart has no
+  // knowable outcome: it may have completed successfully a millisecond earlier. Reporting
+  // 'failed' would assert something we did not observe. Only records still 'running' are
+  // touched, so a status already set from a notification always wins.
+  private settleOpenBashProcs(id: string, reason = 'Session stopped — outcome unknown'): void {
+    const m = this.bashProcs.get(id)
+    if (!m) return
+    let changed = false
+    for (const rec of m.values()) {
+      if (rec.status !== 'running') continue
+      rec.status = 'unknown'
+      rec.endedAt = Date.now()
+      if (!rec.summary) rec.summary = reason
+      changed = true
+    }
+    if (changed) { this.emit('bashProcs', id, this.bashProcsOf(id)); this.emit('changed') }
+  }
+
   // The liveness fallback the client lacks: when a session's engine dies (crash, close,
   // relaunch, resume-fallback), its in-process subagents die with it — so mark every
   // still-'running' task terminal. A card for a dead agent can then never stay "running",
@@ -899,6 +1116,35 @@ export class SessionManager extends EventEmitter {
     return session.engine.stopTask(taskId)
   }
 
+  // Stop one BACKGROUND SHELL of a session, addressed by the Bash tool-use id the panel holds.
+  //
+  // ★ DELIBERATELY NOT stopTask(), AND THIS IS THE WHOLE POINT OF A SEPARATE METHOD. The two
+  // take the same-looking arguments and mean different things: stopTask resolves `toolId`
+  // against the SUBAGENT registry (this.tasks), which never holds a shell. Routing kills
+  // through it would decline every one of them with "this agent has no stoppable task id"
+  // before anything reached the CLI — a failure that reads like a dead session rather than a
+  // lookup in the wrong map. The shell's own id lives in the bash registry and is what the CLI
+  // accepts; engine.stopTask is id-agnostic and takes either.
+  //
+  // MUTATES NOTHING. The record settles from the CLI's own <task-notification>, the same path a
+  // shell that finishes by itself takes. That is not tidiness: the engine answers a stop for an
+  // ALREADY-FINISHED or unknown task with SUCCESS, so optimistically marking the row dead on
+  // ok:true would report a kill that never happened. There is also deliberately no "is it still
+  // running?" precondition — a stop for a settled shell is harmless, and a liveness test here
+  // would be a second opinion that can disagree with the registry.
+  //
+  // The !shellId guard is a real case, not padding: the ack carrying it arrives a moment after
+  // launch, and a conversation resumed from disk never replays it. The UI already hides the
+  // kill control then (bashProcKillable = running && !!shellId), so this is defence in depth
+  // against a stale click from another device.
+  async stopBashProc(id: string, toolId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const session = this.sessions.get(id)
+    if (!session?.engine) return { ok: false, error: 'session not running' }
+    const shellId = this.bashProcs.get(id)?.get(toolId)?.shellId
+    if (!shellId) return { ok: false, error: 'this shell has no stoppable id (its background ack never arrived, or it was replayed from a resumed conversation)' }
+    return session.engine.stopTask(shellId)
+  }
+
   respondPermission(id: string, requestId: string, decision: PermissionDecision): void {
     this.sessions.get(id)?.engine?.respondPermission(requestId, decision)
   }
@@ -921,7 +1167,7 @@ export class SessionManager extends EventEmitter {
   async setPermissionMode(id: string, mode: PermissionMode, trusted = false): Promise<SetModeResult> {
     // Refuse BEFORE the session lookup: the gate is then unreachable-past regardless of what
     // the lookup does, and an untrusted caller learns nothing about which ids exist.
-    if (!trusted && (mode === 'bypassPermissions' || mode === 'acceptEdits')) {
+    if (!trusted && isElevatedMode(mode)) {
       console.warn(`[permissions] ignoring untrusted request to set ${mode} — only the operator may lower a session's permission prompting`)
       return { applied: 'error', error: `${mode} may only be set by the operator` }
     }
@@ -1187,8 +1433,21 @@ export class SessionManager extends EventEmitter {
       const session = this.register(
         s.name, s.cwd, s.rootDir, parentId,
         /* resume */ !!s.claudeSessionId, s.claudeSessionId,
+        // The session's OWN persisted mode, replayed verbatim — see the note above. `trusted`
+        // below is what lets an elevated own-mode past register()'s gate; correct here and
+        // only here, because boot restore replays the operator's own saved configuration.
         s.agentId, s.model, s.permissionMode, s.sandbox,
-        /* trusted */ true,   // a persisted config was already operator-approved
+        // `trusted` covers the whole persisted config — a sandbox with enabled:false, the
+        // employment grant, the connector grants, AND the permission mode replayed above.
+        // ★ THE ACCEPTED RESIDUAL, STATED WHERE IT IS CREATED: because this is trusted,
+        // register()'s gate does not screen the restored mode, so anything able to WRITE
+        // sessions.json can hand itself an elevated mode on the next boot. Child-inherits-
+        // parent is closed (register() reads no mode from the parent); file-level tampering
+        // is not. This is the same class sessionPersistence.ts already documents for
+        // teamEmploy and sandbox, and the operator accepted it knowingly rather than force a
+        // re-grant after every restart. Do not describe elevation as unable to survive a
+        // restart anywhere in this file — it can, by design.
+        /* trusted */ true,
         s.teamEmploy,         // …including the employment grant
         s.connectors,         // …and the connector grants (same reasoning)
         s.accountConnectors,
