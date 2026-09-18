@@ -1,0 +1,35 @@
+--- a/shared/src/bashProcs.ts
++++ b/shared/src/bashProcs.ts
+@@ -73,10 +73,30 @@
+     //   completed (exit code 0)      failed with exit code 1
+     // Absence is normal (the orphan round-up carries none), so this stays undefined rather
+     // than defaulting to 0, which would claim a clean exit nobody observed.
+-    const code = summary[1].match(/exit code (\d+)/)
+-    if (code) out.exitCode = Number(code[1])
++    const code = exitCodeFrom(summary[1])
++    if (code !== undefined) out.exitCode = code
+   }
+   return out
++}
++
++// THE EXIT CODE, extracted from summary PROSE — the only place the CLI reports it.
++//
++// ★ EXPORTED so BOTH ingestion paths can share it. It used to live inline inside
++// parseBashNotification, which meant the STRUCTURED `system/task_notification` path in
++// sessionManager had nothing to reuse and simply never set `exitCode`: the same command
++// reported its code through one CLI notification shape and omitted it through the other.
++// BashProcDetail renders `· exit N` only when defined, so the user saw an exit code appear or
++// vanish depending on which shape arrived — indistinguishable from a real absence.
++// Re-inlining the regex at the second site would reintroduce exactly the duplicated-population
++// shape the isElevatedMode consolidation was written to remove.
++//
++// TOLERANT ON PURPOSE — two prose forms exist and neither is structured data:
++//   completed (exit code 0)      failed with exit code 1
++// Absence is normal (the orphan round-up carries none), so this returns undefined rather than
++// defaulting to 0, which would claim a clean exit nobody observed.
++export function exitCodeFrom(summary: string): number | undefined {
++  const m = summary.match(/exit code (\d+)/)
++  return m ? Number(m[1]) : undefined
+ }
+ 
+ // The shell ids in an envelope, with the sentinel removed.

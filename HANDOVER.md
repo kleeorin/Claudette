@@ -1,10 +1,109 @@
 # Claudette — Handover
-_Last updated: 2026-09-01._
+_Last updated: 2026-09-17._
 
 <!-- Deliberately no "working tree is clean" line here. The previous one was stale the
      moment it was written and stayed wrong for a month, which is the same failure this
      document's rewrite exists to fix: run `git status` — it is authoritative and this
      file cannot be. -->
+
+
+## ⛔ COORDINATOR HANDOVER — 2026-09-17. READ FIRST. Supersedes the 08-27 block for current state.
+
+Coordinator session of a 6-member team (Landing, Backend, Builder, Planner, Critic, QC).
+Everything below is **UNCOMMITTED** — 48 files modified. Run `git status`; this file cannot be
+authoritative about the tree.
+
+### ★ THE ONE THING THAT MATTERS MOST: THE SERVER HAS NOT BEEN RESTARTED
+`fastifyStatic` serves `web/dist` **from disk per request**, so every CLIENT fix is already live.
+**No server-side change is.** Landing measured the running process as started **2026-09-10**
+(I could not confirm the pid — `ps` is namespace-blind from a confined session; `/api/health`
+reports no uptime). Consequences a fresh session will otherwise misdiagnose as bugs:
+- the background-processes panel renders but is **always empty** — its server half is not running
+- Settings still says "Could not load settings." — `/api/settings` exists in source, not in the process
+
+**The restart is the USER'S CALL**: it kills live sessions, and it is itself the event
+`downgradeRestoredMode` guards — so every session persisted as elevated comes back at `default`
+and needs re-granting. That is the fix working, not a fault.
+
+### What shipped this session
+| | |
+|---|---|
+| **Security: elevated modes no longer survive a restart** | `downgradeRestoredMode` in `sessionManager.ts`. A user found a teammate in "allow all" they never granted. |
+| **Security: `register()` trust gate** | `downgradeUntrustedMode`. Defence-in-depth — no open hole existed; it converts caller discipline into a gate. |
+| **`isElevatedMode` consolidation** | `shared/src/types.ts`. Was enumerated at 4 sites; a 5th mode would have been misclassified everywhere **including leaving the guard green**. |
+| **Background-processes panel** | End-to-end: registry, `session:bashProcs`, `session:killBash`, full web half. |
+| **Settings backend** | `/api/settings` + store/env/api, both rulings below applied. |
+| **File-panel Sort control** | `web/src/lib/fileSort.ts` — **NOT in the served bundle yet**. |
+| **Settings crash fix** | `get()` now throws on non-2xx; panel error state made reachable. |
+| **Subsession context fix** | Auto-resume resumed the wrong conversation for any session sharing a cwd. |
+
+### Key decisions (the non-obvious ones — do not "tidy" these away)
+- **Elevation is a LIVE decision, not a persisted attribute.** Applies at three doors: restore,
+  `register()`, and the stored `defaultPermissionMode`. A file on disk is not an operator.
+- **Downgrade, never refuse**, for untrusted elevation: a refusal is a *probe* (a caller can read
+  its own trust state out of the API), and `register()` has **no error channel** — it returns a
+  `Session`, so throwing would change the contract for boot restore too.
+- **`isElevatedMode` is backed by an exhaustive `Record<PermissionMode, boolean>`** so a new mode
+  is a BUILD FAILURE. Proven on a copy of the real file (`TS2741`). Do **not** replace with a
+  switch/`includes` — both keep compiling and answer `false`.
+- **`claudeEngine.ts:413` must NOT use `isElevatedMode`** — it tests `bypassPermissions` alone.
+  Converting it would make `acceptEdits` auto-approve *every* tool. It looks like a missed site.
+- **`get()` throws; `post()` does not.** The rule is an OBLIGATION — *every `get` caller must
+  catch* — not "no caller reads an error body" (that claim was false and regressed 4 call sites).
+- **CLEAR must not clear `bashProcs`.** The server may say the list is empty; the client may not
+  decide that on a conversation event. CLEAR fires from 5 places incl. auto-resume (no user action).
+- **Auto-resume sources the conversation id from `system/init`, not `session:ready`** — `ready` is
+  broadcast live and never replayed, so it reaches nobody in the restart case.
+- **File sort: folders always first**, in every key and direction; ties break by name and the
+  fallback is NOT reversed with direction.
+- **`maxTeamSize` unset ⇒ 6, not 12** (`resolveMaxTeamSize`). Otherwise every install silently
+  doubles its cap on upgrade.
+
+### Gotchas that cost real time
+- **★ Bundle probes must be RENDERED TEXT.** `"Background processes"` is a JSX *comment* — reads 0
+  in every build forever. Identifiers (`BashProcDetail`) are minified away. And
+  `web/dist/assets/` holds 8+ stale `index-*.js`: grep the file `index.html` **references**, never
+  a glob. Both mistakes produced confident wrong conclusions here.
+- **Mount writability FLIPS** — by session and over time. `server/src`, `shared/src`, `web/dist`
+  have each been both. **Probe, in either direction**; never trust a standing claim.
+- **Team `<team-message>` "BLOCKED" notices are unreliable** — repeatedly contradicted by
+  `list_team`, which is authoritative. Check the roster before telling the user someone is stuck.
+- **Verify a build by ARTEFACT** — a failed `vite build` here reported **exit 0**; the unchanged
+  hash caught it.
+- A test that is **unregistered in `run-suite.sh` may also be broken**: `settings-store-test.mts`
+  was throwing at import and had never run an assertion.
+- Mutating a file mid-suite-run makes that member **not interpretable** — the runner banners it.
+
+### Next steps (ordered)
+1. **Decide on the server restart** (see top). Nothing server-side is live until then.
+2. **Rebuild `web/dist`** — the Sort control is not in it. Verify `"Date modified"` appears and
+   the referenced hash changes. Backend owns this; `web/dist` is read-only to the coordinator.
+3. **Update `SettingsPanel.tsx`'s "NOT YET ENFORCED" note** — Ruling 1 landed, so it is now false.
+   That note IS in the served bundle. Sequence: fix note → one rebuild carrying both.
+4. Open QC item: `auth-route-coverage-test.mts` does not register `registerSandboxDefaultsRoutes`
+   or `registerConnectorOAuthRoutes`, so `/api/sandbox/defaults/*` is unswept. Pre-existing.
+5. Open decision: `restore()` still replays `sandbox`/`teamEmploy`/`connectors` under
+   `trusted:true`. Measured 4/4 by `scratchpad/restore-privilege-guard.mts`, written as neutral
+   evidence. User has NOT ruled on widening.
+
+### Verify state
+```
+cd web && npx tsc --noEmit && npx vitest run          # 196 passing / 16 files
+node scratchpad/web-vitest-shim.mjs                   # all 7 checks
+npx tsx scratchpad/restore-elevation-guard.mts        # 7/0 — elevated modes downgraded
+npx tsx scratchpad/restore-privilege-guard.mts        # 8/0 — characterises the 4 that still replay
+npx tsx scratchpad/register-mode-gate-guard.mts       # 7/0 — untrusted elevation gated
+npx tsx scratchpad/registration-lint.mts              # clean (first time since 2026-09-02)
+node /home/kleeorin/Work/Projects/.qa-bashproc/mutate.mjs   # 46 mutants; 1 known equivalent survivor (M30)
+```
+`MIN_TESTS`/`MIN_TEST_FILES` in `scratchpad/web-vitest-shim.mjs` are **196/16**, set from a
+counted run — raise them by counting, never by arithmetic; several sessions add tests at once.
+**Do not run a full `run-suite.sh` without checking the lock** — it blocks every implementer.
+
+### References
+- `.claude/plans/background-processes-panel.md` — spec + 3 settled experiments
+- `.claude/plans/settings-backend.md` — settings spec; §0b (routes change no behaviour) still true
+- `.claude/team-handovers/` — per-role handovers; injection truncates at ~4000 chars, the files are authority
 
 
 ## ⛔ COORDINATOR HANDOVER — rewritten 2026-08-27. READ FIRST. Supersedes the 08-25 block.
