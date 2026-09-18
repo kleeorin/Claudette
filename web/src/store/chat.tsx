@@ -1,7 +1,7 @@
 import {
   createContext, useContext, useReducer, useEffect, useCallback, useMemo, useRef, type ReactNode,
 } from 'react'
-import type { ClaudeEvent, PermissionRequest, PermissionDecision, TaskRecord, TeamMessageKind } from '@claudette/shared'
+import type { ClaudeEvent, PermissionRequest, PermissionDecision, TaskRecord, BashProcRecord, TeamMessageKind } from '@claudette/shared'
 import { isSubagentTool, isAsyncLaunchAck, userContentText, parseTaskNotification, parseSystemTaskNotification } from '@claudette/shared'
 import { hasTeamMessage, parseTeamMessages, stripTeamMessages } from '@claudette/shared'
 import { api } from '../api/client'
@@ -54,6 +54,21 @@ export interface RateLimitInfo {
 }
 export interface SessionMeta {
   model?: string
+  // ★ THIS SESSION'S OWN claude conversation id, off `system/init`'s `session_id`.
+  // It is what lets auto-resume name the right conversation instead of guessing "the newest
+  // file in this cwd" — a guess that is wrong for EVERY subsession, since a subsession shares
+  // its parent's cwd. See lib/autoResume.
+  //
+  // ★★ SOURCED FROM `init`, NOT FROM `session:ready`, AND THAT IS THE LOAD-BEARING CHOICE.
+  // The two carry the same value — the server emits `ready` from inside its init handler — but
+  // they do NOT have the same availability. `session:ready` is broadcast once, when the engine
+  // starts, and is NEVER replayed at connect time (sessionApi sends only session:list and
+  // session:snapshot to a new socket). The case this feature exists for is "the server
+  // restarted, THEN I opened the browser", where every `ready` has already been and gone. The
+  // `init` EVENT, by contrast, is buffered into the transcript ring and replayed in the
+  // snapshot, so it reaches a client that connects at any later time. Wiring `ready` alone
+  // would have looked correct and fixed nothing for the reported scenario.
+  claudeSessionId?: string
   contextTokens?: number
   contextWindow?: number
   costUsd?: number
@@ -72,6 +87,16 @@ interface State {
   // live session:tasks). The durable fallback that settles an agent card when its
   // terminal signal never reached the transcript.
   tasks: Record<string, TaskRecord[]>
+  // The server's authoritative background-bash registry per session (connect snapshot +
+  // live session:bashProcs).
+  //
+  // ★ THIS ONE IS NOT A FALLBACK, IT IS THE ONLY SOURCE, and the difference from `tasks`
+  // above matters. An agent card can be rebuilt from the transcript when the registry is
+  // silent, because the Task tool_use and its result are both transcript items. A
+  // background shell's completion arrives ONLY as a <task-notification>, which the capped
+  // transcript ring is free to evict and which a device joining mid-run never saw at all —
+  // so there is nothing to derive. If this map is empty the panel is empty, full stop.
+  bashProcs: Record<string, BashProcRecord[]>
 }
 
 type Action =
@@ -96,6 +121,7 @@ type Action =
   | { type: 'CLEAR_PENDING'; sessionId: string }                              // drop the whole queue
   | { type: 'SET_SLASH'; sessionId: string; commands: string[] }
   | { type: 'SET_TASKS'; sessionId: string; tasks: TaskRecord[] }   // replace the subagent registry (snapshot / live)
+  | { type: 'SET_BASH_PROCS'; sessionId: string; procs: BashProcRecord[] }   // replace the background-bash registry (snapshot / live)
   | { type: 'SET_META'; sessionId: string; meta: Partial<SessionMeta> }
   | { type: 'SET_LIMIT'; sessionId: string; limitType: string; info: RateLimitInfo }
   | { type: 'CLEAR_LIMITS'; sessionId: string }
@@ -112,6 +138,7 @@ const nextId = () => `i${++seq}`
 // fresh []/{} on every call — that defeats the `useMemo`s keyed on these (the sidebar
 // agent lists, the MetaBar) and makes them recompute each render for no reason.
 const EMPTY_TASKS: TaskRecord[] = []
+const EMPTY_BASH_PROCS: BashProcRecord[] = []
 const EMPTY_ITEMS: TranscriptItem[] = []
 const EMPTY_SLASH: string[] = []
 const EMPTY_META: SessionMeta = {}
@@ -253,6 +280,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, slash: { ...state.slash, [action.sessionId]: action.commands } }
     case 'SET_TASKS':
       return { ...state, tasks: { ...state.tasks, [action.sessionId]: action.tasks } }
+    case 'SET_BASH_PROCS':
+      return { ...state, bashProcs: { ...state.bashProcs, [action.sessionId]: action.procs } }
     case 'CLEAR': {
       const transcripts = { ...state.transcripts }; delete transcripts[action.sessionId]
       const pending = { ...state.pending }; delete pending[action.sessionId]
@@ -260,7 +289,26 @@ function reducer(state: State, action: Action): State {
       const open = { ...state.open }; delete open[action.sessionId]
       const meta = { ...state.meta }; delete meta[action.sessionId]
       const tasks = { ...state.tasks }; delete tasks[action.sessionId]
-      return { transcripts, pending, slash, open, meta, tasks }
+      // ★ bashProcs IS DELIBERATELY NOT CLEARED HERE, and this arm used to clear it.
+      //
+      // CLEAR is conversation lifecycle: it fires from FIVE places in ChatView — /clear,
+      // /resume, both /rewind arms, and the AUTO-RESUME effect, which is not a user action at
+      // all but merely opening a session whose transcript replays. `tasks` belongs here
+      // because agent cards ARE rebuilt from the transcript. `bashProcs` is the opposite by
+      // construction — see the note on the state field above — so applying conversation
+      // lifecycle to a server-owned registry is a category error.
+      //
+      // The cost was not cosmetic, because of WHEN the panel can refill: session:bashProcs is
+      // broadcast on CHANGE, and session:snapshot is sent once per CONNECT. So after a wipe
+      // nothing repopulates until the process finishes or the user reloads the page. Background
+      // a 20-minute build, then type /rewind — or just open the session — and a live process
+      // is invisible for the rest of its run, which the plan calls the worst outcome this
+      // panel can produce.
+      //
+      // Nothing is stranded by keeping it: the registry is the server's, the next broadcast
+      // overwrites this wholesale, and the snapshot handler empties it when the server says
+      // the list is empty.
+      return { transcripts, pending, slash, open, meta, tasks, bashProcs: state.bashProcs }
     }
     default:
       return state
@@ -526,6 +574,11 @@ function metaFromReplay(events: ClaudeEvent[]): Partial<SessionMeta> {
     if (e.type === 'system' && (e as { subtype?: string }).subtype === 'init') {
       const m = (e as { model?: unknown }).model
       if (typeof m === 'string') meta.model = m
+      // The LAST init wins, deliberately: a session relaunched mid-life (a sandbox change, a
+      // role change) emits a fresh init, and the newest one names the conversation the engine
+      // is actually on now.
+      const sid = (e as { session_id?: unknown }).session_id
+      if (typeof sid === 'string' && sid) meta.claudeSessionId = sid
     } else if (e.type === 'assistant' && !isSubagentEvent(e)) {
       const am = (e as { message?: { model?: unknown } }).message?.model
       if (typeof am === 'string') meta.model = am
@@ -649,9 +702,13 @@ interface ContextValue {
   slashCommandsFor: (sessionId: string) => string[]
   metaFor: (sessionId: string) => SessionMeta
   tasksFor: (sessionId: string) => TaskRecord[]
+  bashProcsFor: (sessionId: string) => BashProcRecord[]
   sendTurn: (sessionId: string, text: string) => void
   interrupt: (sessionId: string) => void
   stopTask: (sessionId: string, toolId: string) => void
+  // Keyed by the BASH tool_use id, not the shell id — the server owns that translation.
+  // See api.session.killBash for why this is not stopTask with a different argument.
+  killBash: (sessionId: string, toolId: string) => void
   respond: (sessionId: string, requestId: string, decision: PermissionDecision) => void
   loadTranscript: (sessionId: string, events: ClaudeEvent[]) => void
   clearTranscript: (sessionId: string) => void
@@ -660,7 +717,7 @@ interface ContextValue {
 const ChatContext = createContext<ContextValue | null>(null)
 
 export function ChatProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, { transcripts: {}, pending: {}, slash: {}, open: {}, meta: {}, tasks: {} })
+  const [state, dispatch] = useReducer(reducer, { transcripts: {}, pending: {}, slash: {}, open: {}, meta: {}, tasks: {}, bashProcs: {} })
   const stateRef = useRef(state); stateRef.current = state
 
   useEffect(() => {
@@ -670,7 +727,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const cmds = (e as { slash_commands?: unknown }).slash_commands
         if (Array.isArray(cmds)) dispatch({ type: 'SET_SLASH', sessionId: id, commands: cmds.map(String) })
         const model = (e as { model?: unknown }).model
-        if (typeof model === 'string') dispatch({ type: 'SET_META', sessionId: id, meta: { model } })
+        const sid = (e as { session_id?: unknown }).session_id
+        const initMeta: Partial<SessionMeta> = {}
+        if (typeof model === 'string') initMeta.model = model
+        if (typeof sid === 'string' && sid) initMeta.claudeSessionId = sid
+        if (Object.keys(initMeta).length) dispatch({ type: 'SET_META', sessionId: id, meta: initMeta })
         return
       }
       // Token-level streaming of text/thinking blocks — MAIN AGENT ONLY.
@@ -730,11 +791,18 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     // slash catalog + MetaBar + rate-limit chips, and surface any still-pending
     // permission so THIS device (e.g. the phone) can answer it. LOAD replaces rather
     // than appends, so a reconnect is idempotent.
-    const offSnapshot = api.on.snapshot((id, evs, pending, tasks) => {
+    const offSnapshot = api.on.snapshot((id, evs, pending, tasks, procs) => {
       dispatch({ type: 'LOAD', sessionId: id, items: evs.flatMap((e) => itemsFromEvent(e, true)) })
       // The authoritative registry from the snapshot: settles cards whose completion
       // is no longer in the (possibly-evicted) replayed transcript.
       dispatch({ type: 'SET_TASKS', sessionId: id, tasks: tasks ?? [] })
+      // ★ UNCONDITIONAL, INCLUDING THE `?? []` — a snapshot that omits the field must EMPTY
+      // the panel, not leave the previous contents standing. On a reconnect this is the only
+      // message that can retract a process the server has since dropped, and the failure it
+      // prevents is the one the transcript ring already taught us: a device joining mid-run
+      // renders a long-finished command as still running, forever, because nothing ever
+      // arrives to say otherwise.
+      dispatch({ type: 'SET_BASH_PROCS', sessionId: id, procs: procs ?? [] })
       const meta = metaFromReplay(evs)
       if (Object.keys(meta).length) dispatch({ type: 'SET_META', sessionId: id, meta })
       for (const e of evs) {
@@ -751,6 +819,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     // even when its terminal <task-notification> was evicted / never buffered / lost.
     const offTasks = api.on.tasks((id, tks) => {
       dispatch({ type: 'SET_TASKS', sessionId: id, tasks: tks })
+    })
+    // Live background-bash registry. Whole-list replacement, like tasks: the server sends
+    // the current truth rather than a delta, so there is no ordering hazard between a
+    // launch and a settle that arrive close together.
+    const offBashProcs = api.on.bashProcs((id, procs) => {
+      dispatch({ type: 'SET_BASH_PROCS', sessionId: id, procs })
     })
     const offPerm = api.on.permission((id, req) => {
       dispatch({ type: 'ADD_PENDING', sessionId: id, req })
@@ -782,7 +856,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       // user item" would mislabel a turn that DID land. Drop it rather than lie.
       if (turnId) dispatch({ type: 'MARK_UNDELIVERED', sessionId: id, turnId })
     })
-    return () => { offEvent(); offSnapshot(); offTasks(); offPerm(); offUserTurn(); offPermResolved(); offState(); offSendFailed() }
+    return () => { offEvent(); offSnapshot(); offTasks(); offBashProcs(); offPerm(); offUserTurn(); offPermResolved(); offState(); offSendFailed() }
   }, [])
 
   const sendTurn = useCallback((sessionId: string, text: string) => {
@@ -806,6 +880,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   // that doesn't take can't leave a card stuck showing "stopped" while it keeps working.
   const stopTask = useCallback((sessionId: string, toolId: string) => {
     api.session.stopTask(sessionId, toolId)
+  }, [])
+
+  // Kill one background shell. Same no-optimistic-state discipline as stopTask, and here the
+  // reason is sharper: the CLI answers a stop for an already-finished job with SUCCESS, so a
+  // client that painted the row dead on `ok` would report a kill it had not performed. The
+  // row settles only when the server's next registry broadcast says so.
+  const killBash = useCallback((sessionId: string, toolId: string) => {
+    api.session.killBash(sessionId, toolId)
   }, [])
 
   const respond = useCallback((sessionId: string, requestId: string, decision: PermissionDecision) => {
@@ -834,12 +916,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const slashCommandsFor = useCallback((sessionId: string) => state.slash[sessionId] ?? EMPTY_SLASH, [state.slash])
   const metaFor = useCallback((sessionId: string) => state.meta[sessionId] ?? EMPTY_META, [state.meta])
   const tasksFor = useCallback((sessionId: string) => state.tasks[sessionId] ?? EMPTY_TASKS, [state.tasks])
+  const bashProcsFor = useCallback((sessionId: string) => state.bashProcs[sessionId] ?? EMPTY_BASH_PROCS, [state.bashProcs])
 
   // Memoize the context value so a streamed token (which re-renders ChatProvider)
   // doesn't hand every consumer a fresh object identity and re-render them all.
   const value = useMemo(
-    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, stopTask, respond, loadTranscript, clearTranscript }),
-    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, sendTurn, interrupt, stopTask, respond, loadTranscript, clearTranscript],
+    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, bashProcsFor, sendTurn, interrupt, stopTask, killBash, respond, loadTranscript, clearTranscript }),
+    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, bashProcsFor, sendTurn, interrupt, stopTask, killBash, respond, loadTranscript, clearTranscript],
   )
   return (
     <ChatContext.Provider value={value}>

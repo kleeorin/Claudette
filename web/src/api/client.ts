@@ -8,7 +8,7 @@ import type {
   CreatePaneRequest, CreatePaneResponse, ListPanesResponse, AttachPaneResponse,
   ConversationMeta, ConversationsResponse, ConversationResponse,
   RewindPoint, RewindMode, RewindPreview, RewindPointsResponse, RewindPreviewResponse, RewindResponse,
-  TaskRecord,
+  TaskRecord, BashProcRecord,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
   ActivePane, KernelSpecsResponse, SandboxConfig, SandboxDefaultFolder, SandboxDefaultsResponse,
@@ -33,8 +33,49 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+// ★ THE STATUS IS CHECKED, AND THAT LINE IS THE WHOLE FUNCTION'S REASON FOR EXISTING.
+// This used to be `return (await fetch(path)).json()`, which quietly hands a FAILED response
+// to the caller as if it were the success type. Every error this server returns is valid JSON
+// — the auth preHandler answers `{ ok: false, error: 'invalid token' }` and the /api 404 arm
+// answers `{ error: 'not found' }` — so `.json()` resolves happily, the `as T` in the
+// signature is a lie nobody checks, and the caller's try/catch never fires because nothing
+// ever threw.
+//
+// MEASURED CONSEQUENCE, and it was a white screen rather than a bad value: `/api/settings` has
+// no route on the server, so opening Settings got `{ error: 'not found' }` typed as an
+// AppSettingsResponse. SettingsPanel's `if (!data)` guard passed (the object is truthy), the
+// destructure produced `environment === undefined`, and rendering `environment.host` threw
+// "Cannot read properties of undefined (reading 'host')" — taking out the whole panel. The
+// panel already had the right behaviour written for this case, a "Could not load settings."
+// message; it was simply unreachable, because the failure never presented as a failure.
+//
+// POST IS DELIBERATELY NOT CHANGED TO MATCH. Several of its callers type the body as
+// `T & { error?: string }` and READ that field to show the server's own message — settings
+// save/reset do exactly this. Throwing there would discard the message the UI is built to
+// display.
+//
+// ★ THE RULE FOR `get` IS "EVERY CALLER MUST CATCH", NOT "NO CALLER WANTS THE BODY".
+// An earlier version of this comment claimed the latter, and it was FALSE WHEN WRITTEN:
+// `oauthAccounts` below types `{ accounts?; error? }` and ConnectorOAuth reads `.error`.
+// Worse, the claim invited the reader to assume callers were audited when they were not —
+// four of them had no `catch`, so the throw introduced here landed mid-function and skipped
+// the lines after it. `ConnectorCatalog.refresh` was the sharp one: its `setLoading(false)`
+// stopped running, leaving "Loading catalog…" on screen forever with no error and no retry —
+// byte-for-byte the SettingsPanel defect this change was made to remove.
+//
+// So state it as an OBLIGATION on the call site rather than a property of the population:
+// a GET rejects on any non-2xx, therefore every `get` caller needs a catch that puts
+// something on screen. A caller that also reads `error` off a 2xx body is fine; what is not
+// fine is a caller with no failure path at all.
 async function get<T>(path: string): Promise<T> {
-  return (await fetch(path)).json()
+  const res = await fetch(path)
+  if (!res.ok) {
+    // Carry the server's own words when there are any, but never let an unreadable body
+    // swallow the status — the status is the part that is always true.
+    const detail = await res.text().catch(() => '')
+    throw new Error(`GET ${path} failed: ${res.status}${detail ? ` ${detail.slice(0, 200)}` : ''}`)
+  }
+  return res.json()
 }
 
 // A stable id for THIS TAB, used to claim terminal panes (see pane.prune). sessionStorage
@@ -76,8 +117,13 @@ const events = channel<[string, ClaudeEvent]>()
 // [id, buffered events, pending permission, subagent registry] — the connect-time
 // per-session catch-up. `tasks` lets a reconnecting tab settle cards even when the
 // transcript no longer carries the completion.
-const snapshots = channel<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined]>()
+const snapshots = channel<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined, BashProcRecord[] | undefined]>()
 const tasks = channel<[string, TaskRecord[]]>()   // [id, subagent registry] — live updates
+// [id, background-bash registry] — live updates. A SEPARATE channel from `tasks` rather than
+// a widened one, because the two registries are keyed by different tool_use ids and a
+// subscriber wants one or the other; merging them would make every agent list re-render on
+// every background `sleep` that ticked over.
+const bashProcs = channel<[string, BashProcRecord[]]>()
 const permissions = channel<[string, PermissionRequest]>()
 const userTurns = channel<[string, string, string | undefined]>()   // [id, text, turnId]
 const sendFailed = channel<[string, string | undefined]>()          // [id, turnId] — turn never reached a live engine
@@ -129,8 +175,9 @@ function sendLive(msg: WsClientMessage): void {
 function dispatch(msg: WsServerMessage): void {
   switch (msg.type) {
     case 'session:list': lists.emit(msg.sessions); break
-    case 'session:snapshot': snapshots.emit(msg.id, msg.events, msg.pending, msg.tasks); break
+    case 'session:snapshot': snapshots.emit(msg.id, msg.events, msg.pending, msg.tasks, msg.bashProcs); break
     case 'session:tasks': tasks.emit(msg.id, msg.tasks); break
+    case 'session:bashProcs': bashProcs.emit(msg.id, msg.procs); break
     case 'session:event': events.emit(msg.id, msg.event); break
     case 'session:permission': permissions.emit(msg.id, msg.request); break
     case 'session:userTurn': userTurns.emit(msg.id, msg.text, msg.turnId); break
@@ -254,9 +301,16 @@ export const api = {
   // Streaming subscriptions (namespaced by session id, except list/connected).
   on: {
     event: (fn: Fn<[string, ClaudeEvent]>) => events.on(fn),
-    snapshot: (fn: Fn<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined]>) => snapshots.on(fn),
+    snapshot: (fn: Fn<[string, ClaudeEvent[], PermissionRequest[] | undefined, TaskRecord[] | undefined, BashProcRecord[] | undefined]>) => snapshots.on(fn),
     // Live subagent-registry updates (session:tasks) — the durable agent-card fallback.
     tasks: (fn: Fn<[string, TaskRecord[]]>) => tasks.on(fn),
+    // Live background-bash registry (session:bashProcs). Unlike agents, which the client
+    // reassembles from the transcript, this list is ONLY ever the server's — a background
+    // shell's completion arrives as a <task-notification> that the capped transcript ring can
+    // evict, so there is nothing to derive it from. Hence the snapshot field beside it: a
+    // device joining mid-run has no other way to learn a process has already finished, and
+    // without it would replay a settled process as forever running.
+    bashProcs: (fn: Fn<[string, BashProcRecord[]]>) => bashProcs.on(fn),
     permission: (fn: Fn<[string, PermissionRequest]>) => permissions.on(fn),
     // A user turn mirrored from the server (any device); turnId de-dupes the sender's echo.
     userTurn: (fn: Fn<[string, string, string | undefined]>) => userTurns.on(fn),
@@ -295,6 +349,13 @@ export const api = {
     interrupt: (id: string) => send({ type: 'session:interrupt', id }),
     // Stop one subagent, leaving the parent turn running.
     stopTask: (id: string, toolId: string) => send({ type: 'session:stopTask', id, toolId }),
+    // Kill one background shell, leaving the turn running.
+    // ★ toolId IS THE BASH tool_use ID AND IT DOES NOT GO THROUGH stopTask. That method
+    // resolves its id against the SUBAGENT registry, which by construction never holds a
+    // Bash tool_use — routed through it every kill would return "this agent has no stoppable
+    // task id" without the request ever reaching the CLI. The server side of this message
+    // looks the toolId up in the bash registry and hands the CLI the shell id instead.
+    killBash: (id: string, toolId: string) => send({ type: 'session:killBash', id, toolId }),
     respondPermission: (id: string, requestId: string, decision: PermissionDecision) =>
       send({ type: 'session:permission', id, requestId, decision }),
     // Publish what a session is currently viewing (its active content tab, or null

@@ -17,6 +17,9 @@ import { SandboxPanel } from './components/SandboxPanel'
 import { ClaudetteDeck } from './components/ClaudetteDeck'
 import { FileEditorView } from './components/FileEditorView'
 import { AgentDetail, agentTabLabel, AgentStatusDot } from './components/AgentDetail'
+import { BashProcDetail, bashProcTabLabel, BashProcStatusDot } from './components/BashProcDetail'
+import { bashProcBadge, bashProcLabel, bashProcKillable } from './lib/bashProcLights'
+import { elevationLabel } from './lib/permissionBadge'
 import { FileBrowser } from './components/FileBrowser'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { AuthGate } from './components/AuthGate'
@@ -31,7 +34,7 @@ import { useVisibleHeight } from './lib/visualViewport'
 import { attachNewNotebooks } from './lib/notebookAttach'
 import { dotStateFor, pruneMutes, busyKernelCount } from './lib/sessionLights'
 import { StateDot } from './components/StateDot'
-import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount } from '@claudette/shared'
+import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
 // file editors open as CONTENT tabs beside it (a companion split); Files and Git
@@ -51,13 +54,16 @@ export function App() {
   )
 }
 
-// A content tab opened beside Claude: an open notebook, a file editor, or one
-// subagent's full thought process. An agent tab carries the label it was opened with
-// so the tab strip never has to re-derive it from the streaming transcript.
+// A content tab opened beside Claude: an open notebook, a file editor, one subagent's full
+// thought process, or one background process. Agent and bashProc tabs carry the label they
+// were opened with so the tab strip never has to re-derive it from live, changing state.
 type Content =
   | { kind: 'notebook'; id: string }
   | { kind: 'file'; path: string }
   | { kind: 'agent'; id: string; label: string }
+  // `id` here is the Bash tool_use id — the registry's key, and a different namespace from
+  // the agent tab's id, which is why this is its own arm rather than a flag on that one.
+  | { kind: 'bashProc'; id: string; label: string }
 // The set of content tabs + the focused one, tracked PER SESSION so panes travel
 // with the session you switch to.
 type Pane = { tabs: Content[]; active: Content | null }
@@ -437,6 +443,18 @@ function Shell() {
       active: { kind: 'agent', id, label },
     }))
   }
+  // Open (or focus) a background process's detail tab. Same session-switching behaviour as
+  // openAgent, and for the same reason: panes are per session, so clicking a process
+  // belonging to a background session has to bring that session forward or the tab would be
+  // filed somewhere the user cannot see.
+  const openBashProc = (sid: string, id: string, label: string) => {
+    setActive(sid)
+    setPhonePane('content')
+    setPane(sid, (p) => ({
+      tabs: p.tabs.some((t) => t.kind === 'bashProc' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'bashProc', id, label }],
+      active: { kind: 'bashProc', id, label },
+    }))
+  }
   const selectChat = () => { setPhonePane('chat'); if (activeId) setPane(activeId, (p) => ({ ...p, active: null })) }
   const selectTab = (t: Content) => {
     if (!activeId) return
@@ -459,6 +477,17 @@ function Shell() {
       setPane(activeId, (p) => {
         const tabs = p.tabs.filter((x) => !(x.kind === 'agent' && x.id === t.id))
         const nextActive = p.active?.kind === 'agent' && p.active.id === t.id ? (tabs[tabs.length - 1] ?? null) : p.active
+        return { tabs, active: nextActive }
+      })
+      return
+    }
+    if (t.kind === 'bashProc') {
+      // Closing the TAB does not touch the process — the registry is the server's and the
+      // sidebar row stays. This is a view being dismissed, not a command being killed; the
+      // Kill button in the detail header is the only thing that stops anything.
+      setPane(activeId, (p) => {
+        const tabs = p.tabs.filter((x) => !(x.kind === 'bashProc' && x.id === t.id))
+        const nextActive = p.active?.kind === 'bashProc' && p.active.id === t.id ? (tabs[tabs.length - 1] ?? null) : p.active
         return { tabs, active: nextActive }
       })
       return
@@ -785,6 +814,10 @@ function Shell() {
         // Agent tabs are NOT persisted: they point into a live transcript, which a
         // reload may not have (a session only replays once its conversation resumes).
         if (t.kind === 'agent') continue
+        // Nor are background-process tabs, for a sharper version of the same reason: the
+        // registry they point into does not survive the engine, so a restored tab would
+        // reliably open on "no longer in the registry" rather than occasionally.
+        if (t.kind === 'bashProc') continue
         if (t.kind === 'file') { out.push({ kind: 'file', path: t.path }); continue }
         const path = nbPathById.get(t.id)
         if (!path) { pending = true; break }
@@ -813,6 +846,7 @@ function Shell() {
       return { key: `nb:${t.id}`, kind: 'notebook', id: t.id, label: d ? basename(d.path) : 'notebook', path: d?.path ?? '', dirty: d?.dirty ?? false }
     }
     if (t.kind === 'agent') return { key: `a:${t.id}`, kind: 'agent', id: t.id, label: t.label, path: t.label, dirty: false }
+    if (t.kind === 'bashProc') return { key: `bp:${t.id}`, kind: 'bashProc', id: t.id, label: t.label, path: t.label, dirty: false }
     return { key: `f:${t.path}`, kind: 'file', id: '', label: basename(t.path), path: t.path, dirty: false }
   })
 
@@ -848,7 +882,9 @@ function Shell() {
         ? <FileEditorView key={active.path} path={active.path} sessionId={activeId ?? undefined} />
         : active?.kind === 'agent' && activeId
           ? <AgentDetail key={active.id} sessionId={activeId} agentId={active.id} />
-          : null}
+          : active?.kind === 'bashProc' && activeId
+            ? <BashProcDetail key={active.id} sessionId={activeId} toolId={active.id} />
+            : null}
     </>
   )
 
@@ -857,7 +893,7 @@ function Shell() {
   // (`#root { height: var(--vvh) }`) and this is the shell wrapper it sizes.
   return (
     <div data-phone={isPhone ? 'true' : 'false'} className="flex h-full bg-ctp-base overflow-hidden">
-      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} onOpenAgent={openAgent} notebookIdsFor={notebookIdsFor} />
+      <Sidebar open={drawer} onClose={() => setDrawer(false)} width={sidebarW} notif={notif} autoOpenEdits={autoOpenEdits} onToggleAutoOpenEdits={toggleAutoOpenEdits} onOpenAgent={openAgent} onOpenBashProc={openBashProc} notebookIdsFor={notebookIdsFor} />
       <div
         {...dividerProps({ axis: 'x', get: () => sidebarW, set: setSidebarW, sign: 1, min: 200, max: () => 560 })}
         title="Drag to resize"
@@ -1155,12 +1191,13 @@ function CloseNotebookDialog({ target, onChoose }: {
   )
 }
 
-type Tab = { key: string; kind: 'notebook' | 'file' | 'agent'; id: string; label: string; path: string; dirty: boolean }
+type Tab = { key: string; kind: 'notebook' | 'file' | 'agent' | 'bashProc'; id: string; label: string; path: string; dirty: boolean }
 
 // A strip tab back to the pane entry it stands for.
 function tabToContent(t: Tab): Content {
   if (t.kind === 'notebook') return { kind: 'notebook', id: t.id }
   if (t.kind === 'agent') return { kind: 'agent', id: t.id, label: t.label }
+  if (t.kind === 'bashProc') return { kind: 'bashProc', id: t.id, label: t.label }
   return { kind: 'file', path: t.path }
 }
 
@@ -1195,6 +1232,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
     if (!active) return false
     if (t.kind === 'notebook') return active.kind === 'notebook' && active.id === t.id
     if (t.kind === 'agent') return active.kind === 'agent' && active.id === t.id
+    if (t.kind === 'bashProc') return active.kind === 'bashProc' && active.id === t.id
     return active.kind === 'file' && active.path === t.path
   }
   const toggle = (on: boolean) =>
@@ -1223,7 +1261,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         )}
         {tabs.map((t) => (
           <span key={t.key} className={tab(isOn(t))}>
-            <span className={`shrink-0 ${t.kind === 'agent' ? 'text-ctp-mauve' : ''}`}>{t.kind === 'notebook' ? '📓' : t.kind === 'agent' ? '◈' : '📄'}</span>
+            <span className={`shrink-0 ${t.kind === 'agent' ? 'text-ctp-mauve' : t.kind === 'bashProc' ? 'text-ctp-green' : ''}`}>{t.kind === 'notebook' ? '📓' : t.kind === 'agent' ? '◈' : t.kind === 'bashProc' ? '▶' : '📄'}</span>
             <button onClick={() => onSelectTab(t)} className="truncate max-w-[150px]" title={t.path}>
               {t.label}{t.dirty && <span className="text-ctp-yellow"> ●</span>}
             </button>
@@ -1349,7 +1387,7 @@ function Empty() {
   )
 }
 
-function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits, onOpenAgent, notebookIdsFor }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void; onOpenAgent: (sid: string, id: string, label: string) => void; notebookIdsFor: (sid: string) => string[] }) {
+function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenEdits, onOpenAgent, onOpenBashProc, notebookIdsFor }: { open: boolean; onClose: () => void; width: number; notif: NotificationsApi; autoOpenEdits: boolean; onToggleAutoOpenEdits: () => void; onOpenAgent: (sid: string, id: string, label: string) => void; onOpenBashProc: (sid: string, id: string, label: string) => void; notebookIdsFor: (sid: string) => string[] }) {
   const { sessions, activeId, setActive, destroy, connected, listLoaded, attention, homeDir } = useSessions()
 
   // ── MUTED_NOTE — the click-to-mute session light ──────────────────────────────────────
@@ -1547,6 +1585,7 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
               muted={muted.has(s.id)} onToggleMute={() => toggleMute(s.id)} notebookIds={notebookIdsFor(s.id)}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
               onOpenAgent={(id, label) => { onOpenAgent(s.id, id, label); onClose() }}
+              onOpenBashProc={(id, label) => { onOpenBashProc(s.id, id, label); onClose() }}
             />
           ))}
         </div>
@@ -1856,7 +1895,7 @@ function orderSessions(
   return out
 }
 
-function SessionRow({ session, depth, active, finished, attention, muted, onToggleMute, notebookIds, onSelect, onClose, onOpenAgent }: { session: SessionInfo; depth: number; active: boolean; finished: boolean; attention: ReadonlyMap<string, AttentionReason>; muted: boolean; onToggleMute: () => void; notebookIds: string[]; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void }) {
+function SessionRow({ session, depth, active, finished, attention, muted, onToggleMute, notebookIds, onSelect, onClose, onOpenAgent, onOpenBashProc }: { session: SessionInfo; depth: number; active: boolean; finished: boolean; attention: ReadonlyMap<string, AttentionReason>; muted: boolean; onToggleMute: () => void; notebookIds: string[]; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void; onOpenBashProc: (id: string, label: string) => void }) {
   const { sessions, agents, setAgent, rename } = useSessions()
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const [subOpen, setSubOpen] = useState(false)
@@ -1864,13 +1903,14 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
   const [renameVal, setRenameVal] = useState(session.name)
   const [info, setInfo] = useState(false)
   const [agentsOpen, setAgentsOpen] = useState(false)
+  const [procsOpen, setProcsOpen] = useState(false)
   // Guards the Enter→blur double-fire and a cancel-on-Escape from saving twice/at all.
   const renameDone = useRef(false)
 
   // This session's subagents, nested under its name. Collapsed by default — the ◈
   // badge is the toggle. Cleared cards are filtered out (see store/agentDismiss), so
   // the badge only appears while there's something left to look at.
-  const { transcriptFor, tasksFor, stopTask } = useChat()
+  const { transcriptFor, tasksFor, stopTask, bashProcsFor, killBash } = useChat()
   const items = transcriptFor(session.id)
   const tasks = tasksFor(session.id)
   const dismissed = useDismissedAgents(session.id)
@@ -1881,6 +1921,24 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
   const turnActive = session.state === 'running' || session.state === 'waiting'
   const liveAgents = myAgents.filter((a) => isAgentLive(a, turnActive)).length
   const finishedAgents = myAgents.length - liveAgents
+
+  // ── BACKGROUND PROCESSES FOR THIS SESSION ─────────────────────────────────────────────
+  // `Bash` calls the model made with run_in_background: true. The ▶ badge is the toggle for
+  // the list below, mirroring the ◈ agents badge beside it.
+  //
+  // ★ THE LIST IS THE SERVER'S, NOT DERIVED, and that is the one structural difference from
+  // the agents list directly above. An agent is reassembled here from transcript items, so
+  // this component filters it and a dismissed card is a client-side fact. A background
+  // process is only ever what the server's registry says: its completion arrives as a
+  // <task-notification> the capped transcript ring may evict, and a device joining mid-run
+  // never saw it at all, so there is nothing to reassemble from. Which is also why there is
+  // no dismiss store here to match agentDismiss — the server prunes its own registry, and
+  // two mechanisms deciding what is visible would disagree the first time either changed.
+  const myProcs = bashProcsFor(session.id)
+  // Whether to draw the badge at all, and what the number is. Decided in lib/bashProcLights
+  // rather than inline, because NOTHING IN THIS REPO IMPORTS App.tsx — the same reason the
+  // dot lookup above was moved out, and the same class of bug it was moved out to prevent.
+  const procBadge = bashProcBadge(myProcs)
 
   // ── KERNEL ACTIVITY FOR THIS SESSION'S NOTEBOOKS ──────────────────────────────────────
   // `notebookIds` is this session's notebook TAB SET, threaded down from the shell's
@@ -1963,6 +2021,31 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
             <div className="flex items-center gap-1.5 min-w-0">
               <span className={`truncate text-sm ${finished ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
               {roleBadge && <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide px-1 py-0.5 rounded bg-ctp-accent/15 text-ctp-accent" title={`Role: ${roleBadge}`}>{roleBadge}</span>}
+              {/* ★ ELEVATED PERMISSIONS — FIRST IN THE ROW, AND RED, BECAUSE IT IS THE ONE
+                  BADGE THAT REPORTS A PRIVILEGE RATHER THAN ACTIVITY.
+                  A user found a teammate session running in "allow all" they had never
+                  granted, and the reason it went unnoticed is that this list said NOTHING:
+                  the mode was visible only after opening the session (the composer control,
+                  the permissions panel, the info dialog). A privilege that is invisible until
+                  you go looking is one nobody audits.
+                  This is a MITIGATION, not the fix — the defect is that the server's restore()
+                  replays a persisted elevated mode with trusted:true, so it survives a restart
+                  nobody re-approved. Making it visible cannot make it legitimate.
+                  Red, and deliberately NOT sharing the pulsing-dot grammar of the three badges
+                  beside it: those count things that are happening, this one warns about a
+                  standing state, and borrowing their shape would file it as activity. */}
+              {(() => {
+                const el = elevationLabel(session.permissionMode)
+                return el && (
+                  <span
+                    data-elevated={session.permissionMode}
+                    title={el.title}
+                    className="shrink-0 flex items-center justify-center w-3.5 h-3.5 rounded text-[9px] font-bold bg-ctp-red/20 text-ctp-red ring-1 ring-ctp-red/40"
+                  >
+                    {el.glyph}
+                  </span>
+                )
+              })()}
               {/* The agents bullet: count of this session's subagents, and the toggle for
                   the list below. Only here while at least one card is uncleared. */}
               {myAgents.length > 0 && (
@@ -1991,6 +2074,34 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
                   <span className="w-1.5 h-1.5 rounded-full bg-ctp-peach animate-pulse" />
                   ⬢{busyKernels}
                 </span>
+              )}
+              {/* Background processes — the third badge, same grammar as the two above
+                  (pulsing dot + glyph + count) because the ask was for "a panel of
+                  background processes similar to our panel of agents".
+
+                  GREEN, and the palette left exactly one workable choice: mauve is
+                  subagents, peach is notebook kernels and is already close to the coral
+                  accent, yellow is too close to that peach, and red is reserved for
+                  attention. Green is the only remaining hue tellable apart from both of its
+                  neighbours. The one collision, stated rather than discovered later: green
+                  also means "working" in the state label at the right of this row — judged
+                  helpful (both do mean "something is happening") rather than confusing.
+
+                  The count is the TOTAL, and the dot pulses only while something is still
+                  running. A finished process's exit code is the whole reason it was
+                  backgrounded, so a count that emptied itself when the build finished would
+                  hide the answer at the moment it arrived. */}
+              {procBadge && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setProcsOpen((v) => !v) }}
+                  data-bash-procs={procBadge.total}
+                  title={`${procBadge.total} background process${procBadge.total > 1 ? 'es' : ''}${procBadge.live > 0 ? ` · ${procBadge.live} running` : ''} — click to ${procsOpen ? 'collapse' : 'expand'}`}
+                  aria-expanded={procsOpen}
+                  className={`shrink-0 flex items-center gap-1 text-[9px] rounded px-1 py-0.5 transition-colors ${procsOpen ? 'bg-ctp-green/15 text-ctp-green' : 'text-ctp-green hover:bg-ctp-green/10'}`}
+                >
+                  {procBadge.live > 0 && <span className="w-1.5 h-1.5 rounded-full bg-ctp-green animate-pulse" />}
+                  ▶{procBadge.total}
+                </button>
               )}
             </div>
           )}
@@ -2043,6 +2154,62 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
             </button>
           )}
         </div>
+      )}
+
+      {/* Expanded: this session's background processes, one line each. Click opens the
+          command's detail tab; ■ kills a running one.
+
+          NO "CLEAR FINISHED" HERE, unlike the agents list above, and its absence is
+          deliberate rather than unfinished. Clearing an agent card is a client-side filter
+          over a transcript the client cannot change. This list is a server-owned registry
+          that the server prunes itself, so a client-side clear would be a second mechanism
+          deciding what is visible — and the two would disagree the first time either one
+          changed. A real clear needs a message to the server, and that is worth designing
+          after somebody has actually used this panel, not before. */}
+      {procsOpen && myProcs.length > 0 && (
+        <div style={{ marginLeft: (indent?.paddingLeft ?? 10) + 8 }} className="mt-0.5 mb-1 pl-2 border-l border-ctp-surface1 space-y-px animate-fade-in">
+          {myProcs.map((p) => (
+            <BashProcLine
+              key={p.toolId} proc={p}
+              onOpen={() => onOpenBashProc(p.toolId, bashProcTabLabel(p))}
+              onKill={() => killBash(session.id, p.toolId)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// One background process in the sidebar list: status dot, what the command was, and — while
+// it is running — a ■ to kill it.
+//
+// NO × TO CLEAR, mirroring the absence of "Clear finished" above: this list is the server's
+// registry, and the row goes away when the server drops the record.
+function BashProcLine({ proc, onOpen, onKill }: { proc: BashProcRecord; onOpen: () => void; onKill: () => void }) {
+  // The rule lives in lib/bashProcLights, not here — this is the one DESTRUCTIVE control in
+  // the feature, and App.tsx is precisely where a rule goes untested (nothing in this repo
+  // imports it). See bashProcKillable for why it does not reuse isLiveBashProc.
+  const killable = bashProcKillable(proc)
+  return (
+    <div className="group/proc flex items-center gap-1.5 rounded pr-0.5 hover:bg-ctp-surface0/60">
+      <button
+        onClick={(e) => { e.stopPropagation(); onOpen() }}
+        className="min-w-0 flex-1 flex items-center gap-1.5 py-0.5 text-left"
+        title={`${proc.command} — open its details`}
+      >
+        <BashProcStatusDot status={proc.status} />
+        <span className="min-w-0 truncate text-[11px] text-ctp-subtext">{bashProcLabel(proc)}</span>
+      </button>
+      {killable && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onKill() }}
+          title="Kill this background process (the turn keeps running)"
+          aria-label={`Kill background process: ${bashProcLabel(proc)}`}
+          className="shrink-0 opacity-100 md:opacity-0 md:group-hover/proc:opacity-100 text-ctp-overlay hover:text-ctp-red text-[9px] leading-none px-0.5 transition-opacity"
+        >
+          ■
+        </button>
       )}
     </div>
   )
