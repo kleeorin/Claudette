@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConversationMeta, PermissionMode, RewindPoint, RewindMode, SessionInfo } from '@claudette/shared'
 import { useChat, isSubagentTool, type TranscriptItem, type SessionMeta, type RateLimitInfo } from '../store/chat'
 import { useSessions } from '../store/sessions'
+import { autoResumePlan } from '../lib/autoResume'
 import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
 import { prettyPath, isNotebookPath } from '../lib/paths'
 import { Markdown } from './Markdown'
@@ -307,27 +308,89 @@ export function ChatView({ sessionId, visible = true }: {
   // transcript pulls in its latest conversation — the equivalent of /resume picking
   // the top entry — so a page reload lands you back where you were. Once per session
   // per app load; never disturbs a running turn.
+  //
+  // ★ IT MAY ONLY GUESS WHEN THE GUESS IS UNAMBIGUOUS, AND THAT GUARD IS THE WHOLE POINT.
+  // The lookup below is `listConversations(cwd)` → `list[0]` — "the most recently touched
+  // conversation in this directory". That identifies a session's own conversation only while
+  // the directory holds ONE session. It is not a niche case that it might not:
+  // `SessionInfo.cwd`'s own comment says "a subsession shares its parent's cwd", so EVERY
+  // subsession is in a directory with at least two sessions, by construction.
+  //
+  // What went wrong without this guard, reported by the user: restart the server, and a
+  // subsession showed its PARENT's conversation. Both resolved `list[0]` to the same file —
+  // normally the parent's, since the parent is usually the more recently active — so the
+  // subsession rendered a history that was never its own. Two ROOT sessions opened on the same
+  // directory collide identically; the parent/child case is just the one guaranteed to happen.
+  //
+  // ★★ AND IT WAS NOT ONLY A DISPLAY FAULT. `resumeInto` below REPOINTS the engine at the
+  // conversation it picked, so the wrong guess did not merely show the wrong transcript — it
+  // moved the session's actual context onto another session's conversation, overriding a
+  // restore the server had already performed correctly. Persistence relaunches every restored
+  // session with `--resume` into its OWN saved claudeSessionId (see sessionPersistence.ts), so
+  // for a subsession this effect could only ever make a correct state worse.
+  //
+  // Why the guard is "alone in the cwd" rather than "not a subsession": both are the same
+  // defect, and keying on `parentId` would fix the guaranteed instance while leaving the
+  // two-roots-one-directory instance live and much harder to recognise.
+  //
+  // ★★★ THE GUESS IS NOW THE FALLBACK, NOT THE MECHANISM. The client learns each session's own
+  // claudeSessionId from `system/init` (store/chat.tsx folds it into SessionMeta), so a session
+  // that has seen an init resumes its OWN conversation by id — subsessions included — and the
+  // cwd heuristic is only reached when that id is not known.
+  //
+  // Note where the id comes from, because the obvious route does not work: `session:ready`
+  // carries the same value but is broadcast ONCE when the engine starts and is never replayed
+  // to a socket that connects later, and "the server restarted, then I opened the browser" is
+  // exactly this feature's case. The `init` EVENT is buffered and replayed in the connect
+  // snapshot, so it survives that gap.
+  //
+  // The residual cost, stated honestly: a session whose init has been evicted from the capped
+  // transcript ring, or whose engine never started, still falls back to the cwd guess and so
+  // still restores empty when it shares a directory. That is now a narrow case rather than
+  // every subsession.
   useEffect(() => {
-    if (!session || autoResumed.has(sessionId)) return
-    if (isFresh(sessionId) || items.length > 0 || running) return
+    // Narrowing only — the real "is the list loaded?" decision is autoResumePlan's, which makes
+    // the same check and explains it. TypeScript cannot narrow through a boolean return, and a
+    // type predicate here would be worse: it would assert a fact about `session` when what the
+    // function actually answers is a question about the whole fleet.
+    if (!session) return
+    // The decision itself lives in lib/autoResume, where it is under test — nothing in this
+    // repo imports ChatView, so this rule had no coverage at any layer while it was inline,
+    // and it is a rule that already shipped wrong once.
+    const plan = autoResumePlan({
+      session, sessions,
+      alreadyTried: autoResumed.has(sessionId),
+      isFresh: isFresh(sessionId), hasItems: items.length > 0, running,
+      claudeSessionId: metaFor(sessionId).claudeSessionId,
+    })
+    // A skip is NOT recorded as tried — see autoResumePlan's note. The id usually arrives a
+    // moment later in the connect snapshot, and this effect re-runs on that change.
+    if (plan.kind === 'skip') return
     autoResumed.add(sessionId)
     const cwd = session.cwd
     void (async () => {
       try {
-        const list = await api.http.listConversations(cwd)
-        const latest = list[0]
-        if (!latest || resumeAborted.has(sessionId)) return
+        // Resolve which conversation to read. byId already knows; byCwd has to ask.
+        const conversationId = plan.kind === 'byId'
+          ? plan.conversationId
+          : (await api.http.listConversations(cwd))[0]?.id
+        if (!conversationId || resumeAborted.has(sessionId)) return
         // Fetch BEFORE mutating, and re-check the abort flag after each await: a
         // /clear|/resume|/rewind may fire while we're fetching, and this in-flight
         // pull must not clobber it (the "/clear did nothing" race).
-        const events = await api.http.readConversation(cwd, latest.id)
+        const events = await api.http.readConversation(cwd, conversationId)
         if (resumeAborted.has(sessionId)) return
         clearTranscript(sessionId)
         loadTranscript(sessionId, events)
-        await api.http.resumeInto(sessionId, latest.id)
+        // ★ ONLY THE GUESS REPOINTS THE ENGINE. In the byId path the engine is already on this
+        // conversation — the id came from its own init — so resumeInto would be a no-op at
+        // best, and it is the exact call that previously moved a correctly-restored subsession
+        // onto its parent's conversation. Reading a transcript and moving a session are
+        // different acts; only the first is wanted when we already know where we are.
+        if (plan.kind === 'byCwd') await api.http.resumeInto(sessionId, conversationId)
       } catch { /* best-effort; the user can still /resume manually */ }
     })()
-  }, [session, sessionId, items.length, running, isFresh, clearTranscript, loadTranscript])
+  }, [session, sessionId, items.length, running, isFresh, clearTranscript, loadTranscript, sessions, metaFor])
 
   // Slash-command menu: the two natively-handled commands (/clear, /resume) plus
   // the session's own init `slash_commands` (which pass through as a turn).

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { errText } from '../lib/errText'
 import type { SessionInfo, ConnectorView, AccountConnector } from '@claudette/shared'
 import { api } from '../api/client'
 
@@ -28,11 +29,18 @@ export function ConnectorGrants({ session, compact = false, bare = false }: { se
   const granted = session.connectors ?? []
   const accountAllow = session.accountConnectors ?? []
 
+  // Catches for the same reason as ConnectorCatalog: a GET throws on non-2xx, and without
+  // this an expired token left the grants list silently EMPTY — which reads as "this session
+  // has no connectors", a statement we have no basis for making.
   const refresh = useCallback(async () => {
-    const r = await api.http.listConnectors()
-    setCatalog(r.connectors)
-    setAccounts(r.accountConnectors)
-    setStrict(r.strict)
+    try {
+      const r = await api.http.listConnectors()
+      setCatalog(r.connectors)
+      setAccounts(r.accountConnectors)
+      setStrict(r.strict)
+    } catch (e) {
+      setError(errText(e))
+    }
   }, [])
   useEffect(() => { void refresh() }, [refresh])
 

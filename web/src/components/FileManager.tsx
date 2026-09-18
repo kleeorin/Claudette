@@ -3,6 +3,10 @@ import { Overlay } from './Overlay'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
 import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
+import {
+  SORT_KEYS, SORT_LABEL, SORT_DIR_LABEL, DEFAULT_DIR,
+  sortEntries, loadSort, saveSort, type SortKey,
+} from '../lib/fileSort'
 import { errText } from '../lib/errText'
 import type { DirEntry } from '@claudette/shared'
 import { useDismissOnOutside, useEscape } from '../lib/useDismiss'
@@ -60,6 +64,11 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   // map on every render for a value used once.
   const [dir, setDir] = useState(() => lastDirByCwd.get(initialPath) ?? initialPath)
   const [entries, setEntries] = useState<DirEntry[]>([])
+  // Restored from localStorage on first render (lazy initialiser, so the read happens once
+  // rather than on every render). A panel that forgets your ordering is one you re-sort every
+  // time you open it.
+  const [sort, setSort] = useState(loadSort)
+  const [sortOpen, setSortOpen] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [showHidden, setShowHidden] = useState(false)
@@ -178,6 +187,11 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
   // Same outside-click / Escape close for the "+ New" dropdown. The trigger stops
   // propagation so opening it isn't immediately undone by this same listener.
   useDismissOnOutside(addOpen, () => setAddOpen(false))
+  // The sort menu needs the same outside-click and Escape handling as "+ New" beside it, or it
+  // stays open over the listing with no way to dismiss it except re-clicking the button.
+  // Registered separately rather than folded into one handler so each popover owns its own
+  // lifetime — one shared flag would close both when either is dismissed.
+  useDismissOnOutside(sortOpen, () => setSortOpen(false))
 
   // --- file operations -------------------------------------------------------
   const run = async (p: Promise<{ ok: true } | { ok: false; error: string }>) => {
@@ -320,7 +334,11 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
 
   // Declared here rather than beside the other derived values further down: everything in
   // the selection block below reads it, and it is the definition of "on screen".
-  const visible = entries.filter((e) => showHidden || !e.name.startsWith('.'))
+  // ORDERED HERE, AFTER the hidden filter and BEFORE anything reads it. Everything below
+  // treats `visible` as "what is on screen" — the select-all box, the range-select shift-click,
+  // the selection count — so sorting anywhere else would let those disagree with the rows the
+  // user can actually see. The comparator itself lives in lib/fileSort, under test.
+  const visible = sortEntries(entries.filter((e) => showHidden || !e.name.startsWith('.')), sort)
 
   // --- selection ------------------------------------------------------------
   // What is ACTUALLY selected: the on-screen rows whose names are in `sel`, and only
@@ -472,6 +490,47 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
                 <button className={addItem} onClick={() => { setAddOpen(false); beginCreate('folder') }}><FileIcon kind="folder" /> Folder</button>
                 <div className="my-1 border-t border-ctp-surface0" />
                 <button className={addItem} onClick={() => { setAddOpen(false); uploadInput.current?.click() }}>↑ Upload files…</button>
+              </div>
+            )}
+          </div>
+          {/* SORT — beside "+ New" because both act on the folder you are looking at.
+              Picking a KEY applies that key's natural direction (newest-first for dates, not
+              oldest-first); picking the key you already have TOGGLES direction, which is the
+              behaviour every file manager has trained people to expect. */}
+          <div className="relative flex-1">
+            <button
+              className={`${actBtn} w-full`}
+              onClick={(e) => { e.stopPropagation(); setSortOpen((o) => !o) }}
+              aria-expanded={sortOpen}
+              title={`Sorted by ${SORT_LABEL[sort.key].toLowerCase()}, ${SORT_DIR_LABEL[sort.key][sort.dir].toLowerCase()}`}
+            >⇅ {SORT_LABEL[sort.key]} {sort.dir === 'asc' ? '↑' : '↓'}</button>
+            {sortOpen && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="absolute left-0 top-full mt-1 z-50 w-44 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1"
+              >
+                {/* Rendered FROM the exported key list, not from a hand-written menu: a new
+                    sort key cannot be added without showing up here. */}
+                {SORT_KEYS.map((k) => {
+                  const active = sort.key === k
+                  return (
+                    <button
+                      key={k}
+                      data-sort-key={k}
+                      data-sort-active={active ? 'true' : undefined}
+                      className={`${addItem} justify-between ${active ? 'text-ctp-accent' : ''}`}
+                      onClick={() => {
+                        const next = { key: k as SortKey, dir: active ? (sort.dir === 'asc' ? 'desc' as const : 'asc' as const) : DEFAULT_DIR[k] }
+                        setSort(next); saveSort(next); setSortOpen(false)
+                      }}
+                    >
+                      <span>{SORT_LABEL[k]}</span>
+                      {/* The direction word shows only on the ACTIVE key. Showing it on every
+                          row would read as four independent toggles rather than one choice. */}
+                      {active && <span className="text-[10px] text-ctp-overlay">{SORT_DIR_LABEL[k][sort.dir]}</span>}
+                    </button>
+                  )
+                })}
               </div>
             )}
           </div>

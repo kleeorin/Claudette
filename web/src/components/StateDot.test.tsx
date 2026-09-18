@@ -61,6 +61,28 @@ describe('StateDot', () => {
     }
   })
 
+  // ★ STYLING NOW CARRIES MEANING, so one assertion holds it — but NOT by naming Tailwind
+  // tokens, which are presentation and will churn. What must stay true is the RELATION: a
+  // muted dot and an idle dot must not render the same treatment, or the feature is invisible
+  // no matter which palette is in fashion. Pinning `bg-black` here would go red on a rename
+  // that changed nothing a user can see, and would go GREEN on a change that made the two
+  // identical — the wrong way round on both counts.
+  //
+  // The colours behind this are measured, not chosen by eye: black fill reads 1.26 against
+  // the sidebar where the previous crust fill read 1.11, and the rim was dropped to surface1
+  // so it stops out-contrasting its own fill (2.11 → 1.68) and reading as a hollow ring.
+  it('a muted dot is visually distinguishable from an idle one', () => {
+    render(<StateDot dot="idle" onToggleMute={() => {}} />)
+    const idle = (document.querySelector('[data-dot="idle"]') as HTMLElement).className
+    cleanup()
+    render(<StateDot dot="muted" onToggleMute={() => {}} />)
+    const muted = (document.querySelector('[data-dot="muted"]') as HTMLElement).className
+    expect(muted).not.toBe(idle)
+    // …and the press cue that survives touch is on both, since either can be pressed.
+    expect(idle).toContain('active:scale-90')
+    expect(muted).toContain('active:scale-90')
+  })
+
   it('a quiet dot is a real button — focusable and keyboard-operable', () => {
     render(<StateDot dot="idle" onToggleMute={() => {}} />)
     const b = screen.getByRole('button')

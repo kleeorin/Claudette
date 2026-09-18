@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { errText } from '../lib/errText'
 import type { ConnectorView } from '@claudette/shared'
 import { api } from '../api/client'
 import { authState, canConnect, type ConnectorAuthState } from '../lib/connectorAuth'
@@ -20,10 +21,19 @@ export function ConnectorOAuth({ connector, onChanged }: { connector: ConnectorV
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
 
+  // ★ `r.error` IS NO LONGER THE FAILURE PATH — the throw is. GETs reject on any non-2xx,
+  // so the server's 400 body never arrives here as a value; its message comes through the
+  // rejection instead. The `error` field is kept in the type only because a 2xx body may
+  // still carry one, and reading it costs nothing. Without the catch this was an unhandled
+  // rejection that discarded the server's message entirely.
   const refresh = useCallback(async () => {
-    const r = await api.http.oauthAccounts(connector.id)
-    if (r.error) { setError(r.error); return }
-    setAccounts(r.accounts ?? [])
+    try {
+      const r = await api.http.oauthAccounts(connector.id)
+      if (r.error) { setError(r.error); return }
+      setAccounts(r.accounts ?? [])
+    } catch (e) {
+      setError(errText(e))
+    }
   }, [connector.id])
 
   useEffect(() => { void refresh() }, [refresh])

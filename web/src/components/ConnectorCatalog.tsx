@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { errText } from '../lib/errText'
 import { createPortal } from 'react-dom'
 import type {
   ConnectorDef, ConnectorView, ConnectorTransport, AccountConnector, StrictPreflight,
@@ -34,16 +35,30 @@ export function ConnectorCatalog({ cwd }: { cwd: string }) {
   const [accounts, setAccounts] = useState<AccountConnector[]>([])
   const [strict, setStrict] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [editing, setEditing] = useState<ConnectorView | 'new' | null>(null)
   const [preflight, setPreflight] = useState<StrictPreflight | null>(null)
   const [busy, setBusy] = useState(false)
 
+  // ★ THE catch AND THE finally ARE BOTH LOAD-BEARING, and their absence was a real bug.
+  // `api.http` GETs THROW on any non-2xx (see the note on `get` in api/client.ts). Without
+  // the finally, an expired token meant `setLoading(false)` never ran and this panel showed
+  // "Loading catalog…" FOREVER — no error, no retry, because `loading` starts true and the
+  // early return below fires before anything else can render. That is the identical shape
+  // SettingsPanel was fixed for: a failure that reaches the component but never reaches the
+  // user. Fixing one instance of that class while leaving this one is how it came back.
   const refresh = useCallback(async () => {
-    const r = await api.http.listConnectors()
-    setConnectors(r.connectors)
-    setAccounts(r.accountConnectors)
-    setStrict(r.strict)
-    setLoading(false)
+    try {
+      const r = await api.http.listConnectors()
+      setConnectors(r.connectors)
+      setAccounts(r.accountConnectors)
+      setStrict(r.strict)
+      setLoadError(null)
+    } catch (e) {
+      setLoadError(errText(e))
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
   useEffect(() => { void refresh() }, [refresh])
@@ -60,10 +75,21 @@ export function ConnectorCatalog({ cwd }: { cwd: string }) {
   // it is paid.
   const openPreflight = async () => {
     setBusy(true)
-    setPreflight(await api.http.connectorPreflight(cwd))
-    setBusy(false)
+    // finally, for the same reason as refresh: a throw here used to leave the strict-mode
+    // button disabled permanently, with nothing on screen saying why.
+    try {
+      setPreflight(await api.http.connectorPreflight(cwd))
+    } catch (e) {
+      setLoadError(errText(e))
+    } finally {
+      setBusy(false)
+    }
   }
 
+  // ERROR OUTRANKS LOADING. `loading` is false once the attempt settles either way, so a
+  // failed load must say so here — otherwise the error state is written but unreachable,
+  // which is the precise defect this panel had.
+  if (loadError) return <div className="p-4 text-[11px] text-ctp-red/90">Could not load the connector catalog. {loadError}</div>
   if (loading) return <div className="p-4 text-[11px] text-ctp-overlay">Loading catalog…</div>
 
   return (
