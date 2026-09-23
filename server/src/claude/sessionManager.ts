@@ -11,7 +11,7 @@ import {
   isSubagentTool, isAsyncLaunchAck, parseTaskNotification, parseSystemTaskNotification,
   parseTaskStarted, taskIdOfNotification,
   assistantToolUses, userToolResults, userEventText,
-  parseBackgroundAck, parseBashNotification, shellIdsOf, bashStatusFrom,
+  parseBackgroundAck, parseBashNotification, shellIdsOf, bashStatusFrom, exitCodeFrom,
   isElevatedMode,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
@@ -1001,7 +1001,15 @@ export class SessionManager extends EventEmitter {
         if (rec && rec.status === 'running') {
           rec.status = bashStatusFrom(String(o.status ?? ''))
           rec.endedAt = Date.now()
-          if (typeof o.summary === 'string' && o.summary.trim()) rec.summary = o.summary.trim()
+          if (typeof o.summary === 'string' && o.summary.trim()) {
+            rec.summary = o.summary.trim()
+            // ★ THE PROSE PATH SETS THIS AND THIS ONE DID NOT — so the exit code appeared for
+            // one CLI notification shape and vanished for the other, which the detail pane
+            // renders as "no exit code", indistinguishable from a real absence. Same extractor
+            // as settleFromNotification, imported rather than re-inlined.
+            const code = exitCodeFrom(rec.summary)
+            if (code !== undefined) rec.exitCode = code
+          }
           changed = true
         }
       }
@@ -1078,7 +1086,15 @@ export class SessionManager extends EventEmitter {
       if (!rec.summary) rec.summary = reason
       changed = true
     }
-    if (changed) { this.emit('bashProcs', id, this.bashProcsOf(id)); this.emit('changed') }
+    if (changed) {
+      // ★ PRUNE HERE TOO. This is the single largest running→finished conversion in the system
+      // — every open record flips to 'unknown' at once — and the cap was applied only inside
+      // recordBashProc. With the engine dead there may be no further record event to trigger
+      // it, so the registry could sit above the cap indefinitely. The client ships NO cap and
+      // depends entirely on this one.
+      this.pruneBashProcs(m)
+      this.emit('bashProcs', id, this.bashProcsOf(id)); this.emit('changed')
+    }
   }
 
   // The liveness fallback the client lacks: when a session's engine dies (crash, close,
