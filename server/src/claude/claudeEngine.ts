@@ -141,6 +141,16 @@ export class ClaudeEngine extends EventEmitter {
 
   get state(): 'idle' | 'running' | 'waiting' { return this._state }
   get alive(): boolean { return this.child != null }
+  // The spawned process's pid, or undefined once it has exited.
+  //
+  // ★ THIS IS THE OUTER PID WHEN THE SESSION IS SANDBOXED, and that distinction has already
+  // cost one wrong conclusion. `launch()` wraps the command with `wrapSandbox`, so what is
+  // spawned here is `bwrap`, not `claude`. `/proc/<this pid>/root` therefore does NOT show the
+  // box's private tmpfs — a caller reading a confined session's files must first walk to the
+  // INNER child (see innerPidOf in bashProcOutput.ts). Anyone implementing from this value
+  // directly gets "path does not resolve" and concludes, wrongly, that the approach cannot
+  // work. It does; it was measured, including that the file tracks appends live.
+  get pid(): number | undefined { return this.child?.pid }
 
   start(): void {
     const { command, args, cwd, env } = this.spawnCfg

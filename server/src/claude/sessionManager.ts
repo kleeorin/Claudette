@@ -15,6 +15,7 @@ import {
   isElevatedMode,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
+import { readBashProcOutput, type BashOutputRead } from './bashProcOutput'
 import { getAgent, isAgent, agentKey, COORDINATOR_INSTRUCTION, MEMBER_INSTRUCTION } from './agents'
 import { listRewindPoints, projectDir } from './conversations'
 import { buildEditorContext } from './editorContext'
@@ -228,6 +229,35 @@ export class SessionManager extends EventEmitter {
 
   // The background-shell records for a session (connect snapshot + persistence).
   bashProcsOf(id: string): BashProcRecord[] { return [...(this.bashProcs.get(id)?.values() ?? [])] }
+
+  // One background shell's output, for GET /api/session/:id/bashProc/:toolId/output.
+  //
+  // An unknown session or toolId is an ERROR, not an empty result: the UI only ever asks about
+  // a row it is already rendering, so a miss means the client and the registry disagree about
+  // what exists, and answering `retrievable: false` would present that as an ordinary "no
+  // output yet" and hide it. Everything else — engine gone, nothing written, unreadable — is a
+  // legitimate `retrievable: false` WITH A REASON, because those are states a user can be in
+  // through no fault of anyone's.
+  bashProcOutput(id: string, toolId: string): { ok: true; read: BashOutputRead } | { ok: false; error: string } {
+    const session = this.sessions.get(id)
+    if (!session) return { ok: false, error: 'no such session' }
+    const rec = this.bashProcs.get(id)?.get(toolId)
+    if (!rec) return { ok: false, error: 'no such background process' }
+    return {
+      ok: true,
+      read: readBashProcOutput({
+        outputFile: rec.outputFile,
+        // `engine` is nulled when the process exits, so this is the authoritative "is it still
+        // alive" — not the record's status, which can say 'running' for a shell whose engine
+        // died before any notification arrived.
+        engineAlive: session.engine != null,
+        enginePid: session.engine?.pid,
+        // EFFECTIVE confinement, not the requested config: a session that asked for a sandbox
+        // it could not get is not confined, and its file is on the real filesystem.
+        sandboxed: session.sandboxed === true,
+      }),
+    }
+  }
 
   // Append an event to a session's transcript buffer, capped at TRANSCRIPT_CAP
   // (oldest dropped). The live UI shows user PROMPTS via the userTurn mirror, not the

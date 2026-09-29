@@ -126,3 +126,21 @@ export function isLiveBashStatus(s: BashProcStatus): boolean {
 export function bashProcStates(): readonly BashProcStatus[] {
   return BASH_PROC_STATES
 }
+
+
+// The response shape of GET /api/session/:id/bashProc/:toolId/output.
+//
+// ★ `retrievable: false` CARRIES A REASON RATHER THAN AN EMPTY `output`, and that is the whole
+// point of the discriminant. "Nothing has been written yet" and "we can no longer reach it"
+// both render as a blank pane, and only the words separate them — a user staring at an empty
+// box cannot tell whether to wait or to give up. The client renders `reason` VERBATIM, so it
+// is written for a person, not for a log.
+//
+// `ok: false` is reserved for a request that should not have been made — an unknown session or
+// toolId. The UI only asks about a row it is already showing, so that means the client and the
+// server's registry disagree about what exists, which is a bug to surface rather than an
+// ordinary empty state to absorb.
+export type BashProcOutputResponse =
+  | { ok: true; retrievable: true; output: string; truncated: boolean }
+  | { ok: true; retrievable: false; reason: string }
+  | { ok: false; error: string }

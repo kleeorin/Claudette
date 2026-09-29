@@ -8,9 +8,12 @@
 //
 // ⚠ AND THE THING THIS CANNOT TEST: that any of it DOES anything. These assertions are about
 // the ROUTES. Whether a stored key is obeyed is a separate question with a separate test —
-// `maxTeamSize` is obeyed (see team-size-setting-test.mts) while defaultModel, defaultAgentId
-// and defaultPermissionMode are read by nothing. Every assertion below would stay green if all
-// four were inert. Read this as "the routes are correct", not as "settings work".
+// `maxTeamSize` is obeyed (see team-size-setting-test.mts) and defaultModel, defaultAgentId
+// and defaultPermissionMode are obeyed at session creation (see session-defaults-setting-test.mts).
+// Every assertion below would stay green if all four were inert. Read this as "the routes are
+// correct", not as "settings work" — that separation is why the consumption tests are separate
+// files, and why this sentence must be updated whenever a key is wired rather than left saying
+// the opposite of the truth.
 
 import Fastify from 'fastify'
 import { mkdtempSync, rmSync } from 'fs'

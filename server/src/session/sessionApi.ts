@@ -7,7 +7,7 @@ import type {
   SetAgentRequest, RenameSessionRequest, ListAgentsResponse,
   PermissionsResponse, EditRuleRequest, WriteResult,
   RewindPointsResponse, RewindPreviewResponse, RewindRequest, RewindResponse,
-  TaskRecord, BashProcRecord, TrustQueryResponse, TrustFolderRequest,
+  TaskRecord, BashProcRecord, BashProcOutputResponse, TrustQueryResponse, TrustFolderRequest,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { isTrusted, setTrusted } from '../claude/trust'
@@ -16,6 +16,7 @@ import { getEffective, addRule, removeRule } from '../claude/permissions'
 import { listConversations, readConversation, listRewindPoints, forkConversationBefore } from '../claude/conversations'
 import { previewRestore, restore } from '../git/shadowSnapshots'
 import { WsHub } from '../ws/hub'
+import { getSettings } from '../settings/settingsStore'
 
 // The session API layer: HTTP lifecycle routes + a bridge from SessionManager's
 // events to the WS hub (broadcast to every tab). Replaces ClaudeMaster's Electron
@@ -80,11 +81,51 @@ export function sendSessionSnapshots(sessions: SessionManager, hub: WsHub, ws: i
 
 // Register the HTTP lifecycle routes on the Fastify app.
 export function registerSessionRoutes(app: FastifyInstance, sessions: SessionManager): void {
+  // One background shell's output. GET because it is a read; the id and toolId are path
+  // params so the route is cacheable-shaped and shows up in Fastify's route table, which is
+  // what auth-route-coverage-test.mts enumerates — a route added another way could ship
+  // unprotected without that sweep noticing.
+  app.get<{ Params: { id: string; toolId: string } }>('/api/session/:id/bashProc/:toolId/output',
+    async (req, reply): Promise<BashProcOutputResponse> => {
+      const r = sessions.bashProcOutput(req.params.id, req.params.toolId)
+      if (!r.ok) {
+        // 404: the client asked about something the registry does not have. Deliberately an
+        // HTTP error as well as `ok:false`, so it cannot be mistaken for an empty result by a
+        // caller that only looks at the status.
+        reply.code(404)
+        return { ok: false, error: r.error }
+      }
+      return r.read.retrievable
+        ? { ok: true, retrievable: true, output: r.read.output, truncated: r.read.truncated }
+        : { ok: true, retrievable: false, reason: r.read.reason }
+    })
+
   app.post<{ Body: CreateSessionRequest }>('/api/session/create', async (req): Promise<CreateSessionResponse> => {
     const b = req.body
+    // ★ THE APP-SETTINGS FALLBACK, AND `??` IS THE WHOLE OF IT — OMITTED, NOT FALSY.
+    // `??` falls back only for null/undefined, which is exactly the rule these three need: a
+    // request that OMITS the field gets the operator's stored default, and a request that
+    // SENDS one keeps it. `||` would be a bug with teeth here — `permissionMode: 'default'`
+    // is a real, explicit "ask me each time", and under `||` it is falsy-adjacent thinking
+    // away from being silently replaced by a stored 'bypassPermissions'. Turning a user's
+    // explicit request for prompting into allow-all is the worst outcome this route has.
+    //
+    // ★ SCOPE — THIS ROUTE ONLY, DELIBERATELY. `defaultPermissionMode` may legitimately hold
+    // `bypassPermissions`, and this route passes `trusted: true`, so a stored elevated default
+    // IS honoured for every session created through it. That is defensible because it is
+    // operator configuration set through an auth-gated UI — but it is also why the fallback
+    // must not be pushed down into `sessions.create`. `employ_teammate` calls that method
+    // DIRECTLY with seven positional arguments (no mode, untrusted), so a hired teammate
+    // cannot pick up a stored elevated default; moving this lookup inside create() would
+    // silently hand every teammate the operator's allow-all.
+    const settings = getSettings()
     const id = sessions.create(
       b.name, b.cwd, b.rootDir, b.parentId, b.resume,
-      b.claudeSessionId, b.agentId, b.model, b.permissionMode, b.sandbox,
+      b.claudeSessionId,
+      b.agentId ?? settings.defaultAgentId,
+      b.model ?? settings.defaultModel,
+      b.permissionMode ?? settings.defaultPermissionMode,
+      b.sandbox,
       /* trusted */ true,   // this route is auth-gated → the operator, may disable the sandbox
     )
     return { id }

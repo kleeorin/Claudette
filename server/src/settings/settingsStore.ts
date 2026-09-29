@@ -18,17 +18,29 @@ import {
 //   maxTeamSize           — ★ CONSUMED. `mcp/teamTools.ts` resolves it per hire via
 //                           resolveMaxTeamSize(). Unset still means 6, deliberately; see the
 //                           note on DEFAULT_MAX_TEAM_SIZE in shared/src/settings.ts.
-//   defaultModel          — NOT consumed.
-//   defaultAgentId        — NOT consumed.
-//   defaultPermissionMode — NOT consumed. `/api/session/create` takes model/agentId/
-//                           permissionMode straight off the request body and never asks this
-//                           module.
+//   defaultModel          — ★ CONSUMED. `/api/session/create` falls back to it when the
+//                           request OMITS `model`.
+//   defaultAgentId        — ★ CONSUMED. Same route, same rule, for an omitted `agentId`.
+//   defaultPermissionMode — ★ CONSUMED. Same route, for an omitted `permissionMode`.
+//                           ★ The fallback is `??`, not `||`: only an ABSENT field falls back.
+//                           `permissionMode: 'default'` is an explicit "ask me each time" and
+//                           must win over a stored `bypassPermissions` — silently turning a
+//                           user's request for prompting into allow-all is the worst outcome
+//                           that route has.
+//                           ★ AND IT IS SCOPED TO THAT ROUTE ON PURPOSE. This key may hold
+//                           `bypassPermissions`, and /api/session/create passes `trusted:true`,
+//                           so a stored elevated default IS honoured there — defensible, since
+//                           it is operator config set through an auth-gated UI. It must NOT be
+//                           pushed down into sessions.create(): `employ_teammate` calls that
+//                           directly, with no mode and untrusted, so a hired teammate cannot
+//                           inherit the operator's allow-all. Moving the lookup would hand it
+//                           to every teammate silently.
 //
-// So three of the four still round-trip faithfully and change nothing. That is deliberate
-// sequencing rather than an oversight, but it is exactly the "enabled control that silently
-// does nothing" shape the settings contract was written to prevent, so it is written down here
-// rather than left for someone to discover. Anyone wiring up another key should start by
-// grepping for importers of this file, and should move it up this list when they do.
+// All four are now wired. Anyone wiring up another key should start by grepping for importers
+// of this file, and should update this list in the same change — a stale entry here is the
+// "enabled control that silently does nothing" shape the settings contract exists to prevent,
+// and it fails in both directions: claiming CONSUMED when it is not sends someone looking for
+// a bug that is really a missing feature.
 //
 // WHY settings.json AND NOT sessions.json: that file is a bare `SavedSession[]` with no object
 // envelope, so there is nowhere to put a settings key without changing its top-level shape and

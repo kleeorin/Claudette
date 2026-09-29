@@ -646,6 +646,19 @@ SUITE=(
   # REAL employ_teammate handler (a correct resolver nothing calls is still a lying control) and
   # measures the cap by hiring until refused rather than asserting a literal.
   "none:team-size-setting-test.mts"
+  # The other three app settings — defaultModel / defaultAgentId / defaultPermissionMode —
+  # actually OBEYED at POST /api/session/create. Consumption, not routes: settings-api-test
+  # covers the HTTP surface and says so in its own header. Asserts on the CREATED SESSION'S
+  # stored fields rather than the response body, which carries only an id. Also pins the scope
+  # boundary — a teammate hired in-process takes none of them — which is the only case that
+  # reds if the lookup is ever pushed down into sessions.create().
+  "none:session-defaults-setting-test.mts"
+  # The filesystem half of the background-process output endpoint. REAL files and a REAL
+  # process tree, not a mock — the difficulty here is paths and process lifetimes, so a mock
+  # would assert nothing. Its key case is the levelling-down one: a file that EXISTS and is
+  # READABLE must still be refused once the engine is gone, because a panel that remembers for
+  # unconfined sessions and forgets for confined ones is the two-tier outcome this rejected.
+  "none:bashproc-output-test.mts"
   # GROUP C. The unsaved-editor-buffer store: does a held buffer ever shadow a file that
   # changed on disk? The operator met this as "files open stale and don't record changes" —
   # nothing was failing to record; the new text was on disk and simply never displayed.
