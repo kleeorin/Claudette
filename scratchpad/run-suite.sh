@@ -424,6 +424,11 @@ EXPECTED_RED=(
   # would be the exact confusion the block above warns about: once a green file is on this
   # list, a genuine future failure gets waved through as "expected". Removed rather than
   # re-kinded, because it is no longer red of either kind.
+  # (model-next-turn-test.mts was listed here as `unbuilt` while the per-session model API
+  # shipped as a pair of patches — server/src and shared/src being read-only to the session
+  # that wrote the test. Removed 2026-09-29 when both patches landed and it went
+  # 0 passed/1 failed → 11 passed/0 failed. Registration below is untouched: the guard keeps
+  # running, and a future regression reds it there rather than being excused here.)
   "authorizer-box-divergence-guard.mts|closed|an ordering fault, caught by failing CLOSED — this is the guard WORKING, not a sandbox escape"
   # (restore-elevation-guard.mts was listed here as `unbuilt` a SECOND time — the first for the
   # missing downgrade, this one for the opposite reason: the operator corrected the rule, so a
@@ -653,12 +658,29 @@ SUITE=(
   # boundary — a teammate hired in-process takes none of them — which is the only case that
   # reds if the lookup is ever pushed down into sessions.create().
   "none:session-defaults-setting-test.mts"
+  # Per-session model: stored on request, applied on the NEXT TURN, forceable now. Counts
+  # LAUNCHES off the 'ready' event rather than comparing engine identity — get() returns
+  # SessionInfo, which has no `engine`, so an earlier draft's identity comparison was
+  # undefined === undefined and its headline negative passed vacuously.
+  "none:model-next-turn-test.mts"
   # The filesystem half of the background-process output endpoint. REAL files and a REAL
   # process tree, not a mock — the difficulty here is paths and process lifetimes, so a mock
   # would assert nothing. Its key case is the levelling-down one: a file that EXISTS and is
   # READABLE must still be refused once the engine is gone, because a panel that remembers for
   # unconfined sessions and forgets for confined ones is the two-tier outcome this rejected.
   "none:bashproc-output-test.mts"
+  # The background-process registry surviving a server restart: saved() → restore(). Pins the
+  # restart discipline that differs DELIBERATELY from the `tasks` block beside it — a running
+  # shell settles to 'unknown', never 'failed', because its outcome is unknowable rather than
+  # known-bad. Asserts on bashProcsOf() after restore, never on restore()'s return value.
+  "none:bashprocs-persist-test.mts"
+  # session:clearBashProcs — clearing settled background-process rows from the SERVER registry,
+  # which is what makes a clear cross-device (it replaced a browser-localStorage store that
+  # left the phone showing rows the desktop had cleared). Asserts on the registry via the
+  # public bashProcsOf(), not on a return value. Its load-bearing case is that a RUNNING record
+  # is REFUSED: hiding a live process is the worst outcome this panel has, and a fix that just
+  # deleted every requested id would pass every other case in the file.
+  "none:clear-bashprocs-test.mts"
   # GROUP C. The unsaved-editor-buffer store: does a held buffer ever shadow a file that
   # changed on disk? The operator met this as "files open stale and don't record changes" —
   # nothing was failing to record; the new text was on disk and simply never displayed.
@@ -801,8 +823,9 @@ SUITE=(
   # properties and pass, so they belong in the suite rather than in the non-test list.
   "none:sandbox-three-escapes-probe.mts"
   "none:venv-probe-coincidence-probe.mts"
-  # EXPECTED RED until reviewer-role-scope.patch + connector-readonly-deny.patch land.
-  # Asserts the FIXED behaviour, so today it demonstrates that the `reviewer` role still
+  # Was EXPECTED RED until reviewer-role-scope + connector-readonly-deny landed; both have, it
+  # passes, and the spent patches were deleted 2026-09-29. It asserts the FIXED behaviour —
+  # before those landed it demonstrated that the `reviewer` role still
   # auto-approves bare Bash and that a read-only role still trusts a connector's own
   # readOnlyHint. It turning green is the signal those two patches are in.
   "none:reviewer-scope-test.mts"

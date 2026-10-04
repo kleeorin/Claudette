@@ -1,6 +1,6 @@
 // Patch 5 (reviewer narrowing + honest semantics) and Patch 6 (D1: connector tools must
-// not defeat a read-only role). Fails against current source, passes once
-// scratchpad/reviewer-role-scope.patch and scratchpad/connector-readonly-deny.patch land.
+// not defeat a read-only role). Both fixes have LANDED and this passes; it was written to fail
+// against the source before them (their patches were deleted as spent on 2026-09-29).
 //
 // The bug both fix is the same shape: a guarantee stated more strongly than it was
 // enforced. Patch 5 — `reviewer` carried bare `Bash` in allowedTools, and --allowedTools

@@ -1,5 +1,5 @@
-// #0 "teammate blocked" signal — fails against current source, passes once the patch
-// (scratchpad/teammate-blocked-signal.patch) is applied.
+// #0 "teammate blocked" signal. The fix has LANDED and this passes; it was written to fail
+// against the source before it (the patch was deleted as spent on 2026-09-29).
 //
 // THE BUG: claudeEngine sets state 'waiting' in exactly ONE place — the permission-prompt
 // handler — so it means precisely "blocked on a permission prompt". But TeamMailbox.drain()

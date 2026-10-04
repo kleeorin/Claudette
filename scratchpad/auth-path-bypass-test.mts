@@ -1,7 +1,7 @@
 // Unauthenticated control-plane bypass: the auth hook prefix-matches the RAW url while
 // Fastify's router percent-DECODES the path before matching, so one encoded character
-// walks between the gate and the route. Fails against current source, passes once
-// scratchpad/auth-path-bypass.patch is applied.
+// walks between the gate and the route. The fix has LANDED and this passes; it was written to
+// fail against the source before it (the patch was deleted as spent on 2026-09-29).
 //
 // Asserts on a SET of encodings, not one literal, so a future variant is caught too.
 import Fastify from 'fastify'

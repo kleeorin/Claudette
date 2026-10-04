@@ -228,9 +228,67 @@ const bin = path.join(repo, 'node_modules', '.bin', 'vitest')
 //     whatever the server returned, so an unrelated refresh reshuffles the list — and
 //     reversing the fallback too would make equal rows swap purely from toggling direction,
 //     which reads as the sort being broken rather than reversed.
+// 197 → 201, 16 → 17 files on 2026-09-23: FileManager.test.tsx, the Files dock's
+// return-to-session-folder button. Counted, not inferred.
+// One of the four is doing the real work and the other three are scaffolding around it: the
+// regression worth catching is `load(initialPath)` → `load(dir)`, one token, which still
+// compiles and still navigates but silently makes the control a second Refresh button. The
+// two disabled-state cases pass under that mutant — verified — so only the case that walks
+// into a subfolder and then asserts WHICH path the click requested can see it.
+// Note for anyone extending this file: FileManager keeps `lastDirByCwd` as MODULE-level state
+// that outlives a mount (the resume-where-you-left-off feature), so tests sharing one cwd
+// become order-dependent. Each case there uses its own cwd for that reason.
+// 201 → 211, 17 → 18 files on 2026-09-24: dismissStore.test.ts, covering the shared
+// clear-a-row store behind BOTH the agent list and the background-process list.
+// ★ That code had been live and UNTESTED since it shipped as agentDismiss.ts. Extracting it so
+// a second feature could use it is the moment to cover it, not a reason to defer: one copy
+// serving two features means a defect now appears in two places at once.
+// The two cases worth not losing are the volatile-key pair — a key like `i7` is minted by a
+// counter that restarts every page load, so it must work for the rest of the session and must
+// NEVER reach localStorage, where it would pre-hide an unrelated item after a reload. Mutating
+// that rule away reds exactly those two and nothing else.
 // It deliberately does not name Tailwind tokens — pinning `bg-black` would go red on a rename
 // that changed nothing visible, and GREEN on a change that made the two identical.
-const MIN_TESTS = 196
+// 196 → 197 on 2026-09-22, counted not inferred. The added case pins that the three settings
+// the server does not consume SAY SO in the UI, and that maxTeamSize — which IS consumed —
+// does not. Both directions are asserted deliberately: marking only some would stay green if
+// someone marked all four, turning an honest warning into a false one, and asserting only the
+// unmarked side would stay green if the three lost their notes. Mutation-checked on a copy —
+// blanking the shared note string reds that one case alone, 10 others still passing.
+// 211 → 225 on 2026-09-29, COUNTED from a run rather than added up. 12 of the 14 are the
+// background-process OUTPUT PANE: 5 decision cases in bashProcLights.test.ts (when to poll,
+// how to classify a response) and 7 wiring cases in the new BashProcDetail.test.tsx. The other
+// 2 had already arrived with other uncommitted work while the floor stayed put. The case worth
+// not losing is the final fetch: when a process settles the pane must ask ONE more time, or it
+// freezes on the last tick before the command finished and never shows its closing lines.
+// 225 → 229 the same day, counted, after QC review of the output pane: 4 cases for two real
+// defects it found — a stale poll response landing after a newer one and scrolling the pane
+// BACKWARDS, and auto-scroll yanking a reader who had scrolled up. Also: the store mock now
+// returns a FRESH record per call, because returning one shared object hid an over-polling
+// regression from mutation testing entirely (zero reds until it was changed).
+// 229 → 242 and 19 → 20 files on 2026-10-01 with the per-session model picker
+// (lib/modelPicker.test.ts, 13 cases). COUNTED from a run, not added up.
+// The two worth not losing: that a BLANK free-text submission CLEARS the override rather than
+// setting a model named "" (the full-id field is the only route to a pinned model such as
+// claude-opus-5-5, so it is the feature, not a power-user extra), and that the apply-now
+// LABEL itself carries "ends this turn" while a turn is running — apply-now is a RESTART, and
+// a user reading it as "make it take effect sooner" would lose work. The warning rides on the
+// value a caller must already render, so a call site cannot show the button and drop it.
+// Also pinned: the pending text never says "applying". The sandbox banner does, because the
+// server auto-applies a pending sandbox when idle; a model is applied inside the next SEND, so
+// while idle nothing is in flight and that wording would assert activity that is not happening.
+// 242 → 252 on 2026-10-04 after QC on the model picker. COUNTED from a run.
+// Three rules moved out of App.tsx into lib/modelPicker and acquired tests:
+//   * isSelected — which row carries the ✓. It takes NO argument for the free-text field's
+//     contents, so a tick keyed on typed text is unwriteable rather than merely discouraged:
+//     the field is editable, and a tick that moved while typing would claim the session had
+//     changed before anything was sent. One case also pins that no choice ticks two rows.
+//   * seedCustomId — the "Full model id" box starts EMPTY unless the session is really on a
+//     custom id. It used to seed from session.model, so an alias like `sonnet` appeared in a
+//     box labelled "full id", and Enter would re-post the alias through the custom path.
+//   * isSameModel — the no-op guard, mirroring the role picker's `if (id !== roleId)`. Both
+//     sides normalised, because undefined / '' / '  ' all mean "account default".
+const MIN_TESTS = 252
 
 // THE DETECTOR IS DELIBERATELY WIDER THAN THE RUNNER, and that relationship is the whole
 // point of it. `web/vitest.config.ts` collects exactly `src/**/*.test.{ts,tsx}`. A detector
@@ -282,7 +340,8 @@ function testShapedUnder(dir, rel = '') {
 // from other sessions, which had arrived without the floor moving.
 // Raised 11 → 12 the same day (api/client.test.ts — the Settings-crash regression).
 // Raised 12 → 13 the same day (lib/autoResume.test.ts — the subsession-context regression).
-const MIN_TEST_FILES = 16
+// Raised 18 → 19 on 2026-09-29 (components/BashProcDetail.test.tsx), counted.
+const MIN_TEST_FILES = 20
 
 const shaped = testShapedUnder(web)
 check(`the walk found at least ${MIN_TEST_FILES} test file(s) — it is not silently looking at nothing`,
