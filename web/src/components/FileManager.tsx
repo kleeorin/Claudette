@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Overlay } from './Overlay'
 import { createPortal } from 'react-dom'
 import { api } from '../api/client'
-import { crumbs, joinPath, isNotebookPath } from '../lib/paths'
+import { crumbs, joinPath, isNotebookPath, prettyPath } from '../lib/paths'
 import {
   SORT_KEYS, SORT_LABEL, SORT_DIR_LABEL, DEFAULT_DIR,
   sortEntries, loadSort, saveSort, type SortKey,
@@ -452,6 +452,29 @@ export function FileManager({ initialPath, onOpenNotebook, onOpenFile, onNewNote
           title={selMode ? 'Leave select mode' : 'Select multiple'}
           className={`text-xs leading-none px-1 rounded ${selMode ? 'text-ctp-accent bg-ctp-surface0' : 'text-ctp-overlay hover:text-ctp-text'}`}
         >☑</button>
+        {/* Back to the session's own folder. This pane deliberately RESUMES where it was last
+            left rather than at the session root (see lastDirByCwd), which is the right default
+            and also the reason this button is needed: after a few days of use a session's pane
+            can open several levels away from the directory the session actually works in, and
+            the only route back was clicking up the breadcrumb one segment at a time.
+
+            DISABLED RATHER THAN HIDDEN when you are already there. Hiding it would shift every
+            control to its right as you navigate, so the Refresh and Close buttons would move
+            under the cursor; disabling keeps the toolbar still and says "you are already home"
+            instead of silently doing nothing — the enabled-control-that-does-nothing shape this
+            codebase has corrected several times. */}
+        <button
+          onClick={() => { if (dir !== initialPath) void load(initialPath) }}
+          disabled={dir === initialPath}
+          aria-disabled={dir === initialPath}
+          data-at-session-dir={dir === initialPath ? 'true' : 'false'}
+          title={dir === initialPath
+            ? `Already in the session's folder (${prettyPath(initialPath)})`
+            : `Back to the session's folder (${prettyPath(initialPath)})`}
+          className={`text-xs leading-none px-1 rounded transition-colors ${dir === initialPath
+            ? 'text-ctp-surface2 cursor-default'
+            : 'text-ctp-overlay hover:text-ctp-text'}`}
+        >⌂</button>
         <button onClick={() => void load(dir)} title="Refresh" className="text-ctp-overlay hover:text-ctp-text text-xs leading-none">⟳</button>
         <button onClick={onClose} title="Close dock" className="text-ctp-overlay hover:text-ctp-text p-1">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
