@@ -115,6 +115,17 @@ export interface SessionInfo {
                                // than silently inheriting whatever the account has connected.
                                // Enforced by a deny rule for everything not listed, since
                                // Claudette holds no credential and so cannot withhold one.
+  // The requested model differs from the one the RUNNING engine was spawned with. `--model`
+  // is a spawn argument read once, so a model change cannot be hot-swapped — it needs a
+  // relaunch, exactly like sandbox and role.
+  //
+  // ★ ITS POLICY IS THE GENTLEST OF THE THREE, DELIBERATELY. A sandbox change relaunches on
+  // the next idle; a role change relaunches immediately. A model change waits for the user's
+  // NEXT TURN, with a force button for "apply now". Rationale: it is the only one of the
+  // three that changes nothing about what the session is ALLOWED to do, so killing a running
+  // turn — or discarding a just-finished one the user is still reading — to apply it is a
+  // worse trade than using the new model from the next message onward.
+  modelPending?: boolean
   agentPending?: boolean   // the ROLE DEFINITION differs from the one the RUNNING engine was
                            // launched with. Third of the configured-vs-effective pair set,
                            // after sandboxPending and connectorsPending, and the one whose

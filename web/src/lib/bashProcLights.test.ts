@@ -21,6 +21,7 @@ import { BASH_PROC_STATES, type BashProcRecord } from '@claudette/shared'
 import {
   isLiveBashProc, bashProcDot, bashProcStatusText, bashProcBadge,
   bashProcElapsed, formatDuration, bashProcLabel, bashOutputAvailable, bashProcKillable,
+  shouldPollOutput, outputDisplay,
 } from './bashProcLights'
 
 const proc = (over: Partial<BashProcRecord> = {}): BashProcRecord => ({
@@ -333,5 +334,54 @@ describe('bashOutputAvailable', () => {
     // sessions and forget for others, with nothing on screen explaining the difference.
     expect(bashOutputAvailable(true)).toBe(true)
     expect(bashOutputAvailable(false)).toBe(false)
+  })
+})
+
+describe('the output pane — when to poll', () => {
+  it('polls exactly one state, and only while the engine is alive', () => {
+    // Over the population, so a new state is not silently granted an endless poll.
+    for (const st of BASH_PROC_STATES) {
+      expect(shouldPollOutput(st, true), `${st} engine up`).toBe(st === 'running')
+      expect(shouldPollOutput(st, false), `${st} engine gone`).toBe(false)
+    }
+  })
+
+  it('★ does NOT poll an unrecognised state — the opposite default to the badge', () => {
+    // isLiveBashProc treats an unknown state as live (safe for a badge: it still shows).
+    // Reused here that would poll forever for a state we do not understand. Pinned so a
+    // "tidy" rewrite onto isLiveBashProc reds.
+    const bogus = 'bogus-future-state' as unknown as (typeof BASH_PROC_STATES)[number]
+    expect(isLiveBashProc(bogus)).toBe(true)
+    expect(shouldPollOutput(bogus, true)).toBe(false)
+  })
+})
+
+describe('the output pane — what to show', () => {
+  it('renders output, carrying the truncation flag through', () => {
+    expect(outputDisplay({ ok: true, retrievable: true, output: 'hi\n', truncated: true }))
+      .toEqual({ kind: 'output', text: 'hi\n', truncated: true })
+  })
+
+  it('treats EMPTY output as output, not as an error or a reason', () => {
+    // A command that has written nothing yet is an ordinary state.
+    expect(outputDisplay({ ok: true, retrievable: true, output: '', truncated: false }).kind).toBe('output')
+  })
+
+  it('passes a not-retrievable reason through VERBATIM', () => {
+    const reason = 'Nothing has been written to the output file yet.'
+    expect(outputDisplay({ ok: true, retrievable: false, reason })).toEqual({ kind: 'reason', text: reason })
+  })
+
+  it('★ keeps ok:false and a thrown request as ERRORS, never as an ordinary reason', () => {
+    // ok:false means the client asked about a row the server does not have — a bug to
+    // surface. Rendering it like "not yet" would hide it behind the most innocent message.
+    expect(outputDisplay({ ok: false, error: 'no such background process' }))
+      .toEqual({ kind: 'error', text: 'no such background process' })
+    expect(outputDisplay(new Error('GET /api/… failed: 404')).kind).toBe('error')
+  })
+
+  it('never renders a blank error', () => {
+    expect(outputDisplay(new Error('')).text).not.toBe('')
+    expect(outputDisplay({ ok: false, error: '' }).text).not.toBe('')
   })
 })

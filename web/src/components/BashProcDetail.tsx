@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useChat } from '../store/chat'
+import { api } from '../api/client'
 import { useSessions } from '../store/sessions'
 import {
   bashProcDot, bashProcStatusText, bashProcElapsed, formatDuration,
   bashProcLabel, bashOutputAvailable, isLiveBashProc, bashProcKillable,
+  shouldPollOutput, outputDisplay, OUTPUT_POLL_MS, type OutputDisplay,
 } from '../lib/bashProcLights'
 import type { BashProcRecord } from '@claudette/shared'
 
@@ -159,7 +161,7 @@ export function BashProcDetail({ sessionId, toolId }: { sessionId: string; toolI
           </section>
         )}
 
-        <BashProcOutput proc={proc} engineAlive={engineAlive} />
+        <BashProcOutput sessionId={sessionId} proc={proc} engineAlive={engineAlive} />
       </div>
     </div>
   )
@@ -182,26 +184,103 @@ export function BashProcDetail({ sessionId, toolId }: { sessionId: string; toolI
 // wired that reason must be rendered as-is: "nothing has been written yet" and "we can no
 // longer reach the output" both look like a blank pane, and only the reason tells them apart.
 // Until then this says where the output is rather than pretending there is none.
-function BashProcOutput({ proc, engineAlive }: { proc: BashProcRecord; engineAlive: boolean }) {
+// Whether the reader was parked at the bottom of a process's output, remembered per (session,
+// process) across remounts — the same pattern AgentDetail uses for the same problem, and for
+// the same reason: two panes in one directory disagreeing about whether auto-scroll respects
+// the reader is an inconsistency a user finds before we do.
+const outputPinnedByKey = new Map<string, boolean>()
+
+function BashProcOutput({ sessionId, proc, engineAlive }: { sessionId: string; proc: BashProcRecord; engineAlive: boolean }) {
+  const [display, setDisplay] = useState<OutputDisplay | null>(null)
+  const preRef = useRef<HTMLPreElement>(null)
+  // ★ ORDERING, NOT JUST CANCELLATION. `cancelled` (below) discards responses from a SUPERSEDED
+  // effect run. It cannot help with two requests from the SAME run: setInterval fires whether or
+  // not the previous request has returned, so on a slow box a stale tail can land after a fresh
+  // one and scroll the pane BACKWARDS, with nothing to say it is stale.
+  // The rule is "newer than the last one APPLIED", not "is the latest one ISSUED". The latter
+  // looks tighter and is worse: if every response is slower than the poll interval — the exact
+  // slow-box case this guards — each is superseded before it lands and the pane NEVER updates.
+  const issuedRef = useRef(0)
+  const appliedRef = useRef(0)
+  const scrollKey = `bashproc:${sessionId}:${proc.toolId}`
+  const pinnedRef = useRef(outputPinnedByKey.get(scrollKey) ?? true)
+  const available = bashOutputAvailable(engineAlive)
+  const polling = shouldPollOutput(proc.status, engineAlive)
+
+  // Fetch on open, then on an interval WHILE the process runs. The effect is keyed on
+  // `proc.status` as well as `polling`, so the transition running → done triggers one final
+  // fetch after polling stops — otherwise the pane would freeze on the last tick before the
+  // command finished and never show its closing lines.
+  useEffect(() => {
+    if (!available) return
+    let cancelled = false
+    const load = () => {
+      const mine = ++issuedRef.current
+      const apply = (d: OutputDisplay) => {
+        if (cancelled || mine < appliedRef.current) return   // superseded run, or a stale tail
+        appliedRef.current = mine
+        setDisplay(d)
+      }
+      api.http.bashProcOutput(sessionId, proc.toolId)
+        .then((r) => apply(outputDisplay(r)))
+        .catch((e: unknown) => apply(outputDisplay(e instanceof Error ? e : new Error(String(e)))))
+    }
+    load()
+    if (!polling) return () => { cancelled = true }
+    const t = setInterval(load, OUTPUT_POLL_MS)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [sessionId, proc.toolId, proc.status, available, polling])
+
+  // Follow the newest line — but ONLY while the reader is parked at the bottom. Unconditional
+  // following yanked a reader back down every 2 s, so an earlier compile error could not be read
+  // at all while the build ran: precisely the window in which it matters.
+  useEffect(() => {
+    const el = preRef.current
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
+  }, [display])
+  const onScroll = () => {
+    const el = preRef.current
+    if (!el) return
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    outputPinnedByKey.set(scrollKey, pinnedRef.current)
+  }
+
   return (
     <section className="space-y-1">
       <h3 className="text-[10px] uppercase tracking-wide text-ctp-overlay">Output</h3>
-      <div className="text-xs text-ctp-overlay italic">
-        {bashOutputAvailable(engineAlive) ? (
-          <>
-            Written to <span className="font-mono not-italic">{proc.outputFile ?? "the session's task output file"}</span>.
-            Reading it from here isn't wired up yet.
-          </>
-        ) : (
-          // The honest end state, and it applies to EVERY session rather than only the
-          // confined ones. A confined session's output file lives on a private tmpfs that
-          // dies with the process; an unconfined session's survives on the real /tmp. We
-          // deliberately withdraw it for both, because a panel that remembers for some
-          // sessions and forgets for others — with nothing on screen explaining which — is
-          // an inconsistency the user would have to discover for themselves.
-          <>This session's engine has stopped, so the command's output is no longer retrievable.</>
-        )}
-      </div>
+      {!available ? (
+        // Not fetched at all: the server would only say the same thing. Applies to EVERY
+        // session, confined or not — a panel that remembers for some sessions and forgets for
+        // others is the two-tier outcome this design rejected.
+        // ⚠ TWIN SENTENCE: byte-identical to the engine-gone reason in
+        // server/src/claude/bashProcOutput.ts. This branch never asks the server, so if one is
+        // reworded the other must be too — nothing compares them.
+        <div className="text-xs text-ctp-overlay italic">This session's engine has stopped, so the command's output is no longer retrievable.</div>
+      ) : display === null ? (
+        <div data-testid="bashproc-output-loading" className="text-xs text-ctp-overlay italic">Loading output…</div>
+      ) : display.kind === 'error' ? (
+        <div data-testid="bashproc-output-error" className="text-xs text-ctp-red">{display.text}</div>
+      ) : display.kind === 'reason' ? (
+        // Verbatim: the server writes these for a person, and the words are what separate
+        // "keep waiting" from "it is not coming".
+        <div data-testid="bashproc-output-reason" className="text-xs text-ctp-overlay italic">{display.text}</div>
+      ) : (
+        <>
+          {display.truncated && (
+            // Without this a reader sees a log starting mid-line and reasonably thinks it is
+            // corrupt; it is the TAIL, deliberately.
+            <div data-testid="bashproc-output-truncated" className="text-[10px] text-ctp-overlay">Showing the most recent output only — the start of the log is not shown.</div>
+          )}
+          {display.text === ''
+            ? <div data-testid="bashproc-output-empty" className="text-xs text-ctp-overlay italic">No output yet.</div>
+            : (
+              <pre ref={preRef} onScroll={onScroll} data-testid="bashproc-output-text"
+                className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words font-mono text-[11.5px] text-ctp-subtext bg-ctp-mantle/60 border border-ctp-surface0 rounded-md p-2.5">
+                {display.text}
+              </pre>
+            )}
+        </>
+      )}
     </section>
   )
 }

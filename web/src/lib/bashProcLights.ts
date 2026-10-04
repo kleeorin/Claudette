@@ -8,7 +8,7 @@
 // A background process is a `Bash` tool call made with `run_in_background: true`. The server
 // keeps the registry (see the BashProcRecord notes in shared) and broadcasts it; the browser
 // never derives one from the transcript, unlike subagents.
-import type { BashProcRecord } from '@claudette/shared'
+import type { BashProcRecord, BashProcOutputResponse } from '@claudette/shared'
 
 // The four lifecycle states, named off the record so this file cannot drift from the wire
 // contract. Deliberately NOT re-declared as a literal union here: a second copy of a
@@ -232,4 +232,40 @@ export function bashProcKillable(p: Pick<BashProcRecord, 'status' | 'shellId'>):
 // lose it, and the pane says why instead of showing an empty box.
 export function bashOutputAvailable(engineAlive: boolean): boolean {
   return engineAlive
+}
+
+// ── The output pane's decisions ─────────────────────────────────────────────────────────
+// Extracted for the same reason as everything above: the component is not where a rule can
+// be tested.
+
+// Should the output pane keep re-fetching? Only while the process is still going AND its
+// engine is alive. Polling a finished process wastes requests on a file that will not change;
+// polling after the engine is gone asks a question the server will always answer "no".
+// Deliberately NOT built on isLiveBashProc: an unrecognised status defaults to live there
+// (the safe direction for a badge), which here would mean polling forever for a state we do
+// not understand. `status === 'running'` is explicit, like bashProcKillable, for that reason.
+export function shouldPollOutput(status: BashProcRecord['status'], engineAlive: boolean): boolean {
+  return status === 'running' && engineAlive
+}
+
+export const OUTPUT_POLL_MS = 2000
+
+// What the pane shows for a response. Three kinds, kept apart ON PURPOSE:
+//   output — text to render (possibly empty, which is an ordinary state, not an error)
+//   reason — the server could not give output, and SAYS WHY, verbatim; "nothing written yet"
+//            and "we can no longer reach it" both look like a blank pane and only the words
+//            separate them, so the words are the content
+//   error  — the request itself failed. Distinct from `reason` because it means something is
+//            wrong (the client asked about a row the server does not have, or the network
+//            failed), and rendering it like an ordinary "not yet" would hide a bug
+export type OutputDisplay =
+  | { kind: 'output'; text: string; truncated: boolean }
+  | { kind: 'reason'; text: string }
+  | { kind: 'error'; text: string }
+
+export function outputDisplay(r: BashProcOutputResponse | Error): OutputDisplay {
+  if (r instanceof Error) return { kind: 'error', text: r.message || 'The output could not be loaded.' }
+  if (!r.ok) return { kind: 'error', text: r.error || 'The output could not be loaded.' }
+  if (!r.retrievable) return { kind: 'reason', text: r.reason }
+  return { kind: 'output', text: r.output, truncated: r.truncated }
 }

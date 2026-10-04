@@ -187,6 +187,12 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     sessions.setPermissionMode(req.body.id, req.body.mode, /* trusted */ true))
 
   // Change a session's role — relaunches (resume-preserving) to apply the new charter.
+  // Set a session's model. Takes effect on the user's NEXT TURN — see setModel. `/api/session/
+  // relaunchApply` is the force button for "apply now" and needs nothing added here.
+  app.post<{ Body: { id: string; model?: string } }>('/api/session/setModel', async (req): Promise<OkResponse> => ({
+    ok: sessions.setModel(req.body.id, req.body.model),
+  }))
+
   app.post<{ Body: SetAgentRequest }>('/api/session/setAgent', async (req): Promise<OkResponse> => ({
     ok: sessions.setAgent(req.body.id, req.body.agentId),
   }))
@@ -298,7 +304,12 @@ export function handleSessionClientMessage(sessions: SessionManager, msg: WsClie
       // The team mailbox has always inspected this same boolean and re-queued on false;
       // only the human path threw it away. We do not retry here — a silent retry is what
       // printed turns twice before — we tell the sender instead.
-      void sessions.sendUserTurn(msg.id, msg.text, msg.turnId)
+      // ★ A PENDING MODEL IS APPLIED HERE, BEFORE THE TURN — this is what "next turn" means.
+      // applyModelForTurn resolves only once the replacement engine is up, so the turn is not
+      // delivered into the `replacing` window that the guards in sendUserTurn reject. It is a
+      // no-op (and resolves immediately) when nothing is pending, which is almost every send.
+      void sessions.applyModelForTurn(msg.id)
+        .then(() => sessions.sendUserTurn(msg.id, msg.text, msg.turnId))
         .then((delivered) => { if (!delivered) hub.broadcast({ type: 'session:sendFailed', id: msg.id, turnId: msg.turnId }) })
         .catch(() => hub.broadcast({ type: 'session:sendFailed', id: msg.id, turnId: msg.turnId }))
       return true
@@ -328,6 +339,16 @@ export function handleSessionClientMessage(sessions: SessionManager, msg: WsClie
         if (!r.ok) console.warn(`[session] kill_bash for ${msg.toolId} declined: ${r.error}`)
       })
       return true
+    case 'session:clearBashProcs': {
+      // Fire-and-forget like killBash: the outcome the user cares about is the list repainting,
+      // and that arrives on the normal `session:bashProcs` broadcast. Nothing is painted here.
+      const r = sessions.clearBashProcs(msg.id, msg.toolIds)
+      // Logged, not surfaced. A refusal means an id named a RUNNING record, which the UI does
+      // not offer to clear — so it indicates a race or a second client, which is worth seeing
+      // in a log and not worth a dialog about a row that is still visibly there and working.
+      if (r.refused > 0) console.warn(`[session] clearBashProcs: refused ${r.refused} still-running record(s)`)
+      return true
+    }
     case 'session:permission':
       sessions.respondPermission(msg.id, msg.requestId, msg.decision)
       return true

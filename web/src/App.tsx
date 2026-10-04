@@ -18,7 +18,8 @@ import { ClaudetteDeck } from './components/ClaudetteDeck'
 import { FileEditorView } from './components/FileEditorView'
 import { AgentDetail, agentTabLabel, AgentStatusDot } from './components/AgentDetail'
 import { BashProcDetail, bashProcTabLabel, BashProcStatusDot } from './components/BashProcDetail'
-import { bashProcBadge, bashProcLabel, bashProcKillable } from './lib/bashProcLights'
+import { bashProcBadge, bashProcLabel, bashProcKillable, isLiveBashProc } from './lib/bashProcLights'
+import { currentModelChoice, modelPendingNotice, normalizeModelInput, MODEL_OPTIONS, isSelected, seedCustomId, isSameModel } from './lib/modelPicker'
 import { elevationLabel } from './lib/permissionBadge'
 import { FileBrowser } from './components/FileBrowser'
 import { ConfirmDialog } from './components/ConfirmDialog'
@@ -1910,7 +1911,7 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
   // This session's subagents, nested under its name. Collapsed by default — the ◈
   // badge is the toggle. Cleared cards are filtered out (see store/agentDismiss), so
   // the badge only appears while there's something left to look at.
-  const { transcriptFor, tasksFor, stopTask, bashProcsFor, killBash } = useChat()
+  const { transcriptFor, tasksFor, stopTask, bashProcsFor, killBash, clearBashProcs } = useChat()
   const items = transcriptFor(session.id)
   const tasks = tasksFor(session.id)
   const dismissed = useDismissedAgents(session.id)
@@ -1934,7 +1935,16 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
   // never saw it at all, so there is nothing to reassemble from. Which is also why there is
   // no dismiss store here to match agentDismiss — the server prunes its own registry, and
   // two mechanisms deciding what is visible would disagree the first time either changed.
+  // ★ NO CLIENT-SIDE FILTERING. The list is exactly what the server's registry holds.
+  // A browser-localStorage dismiss store used to sit here, and it was removed rather than
+  // kept alongside `session:clearBashProcs`: a row cleared on the desktop still showed on the
+  // phone, and this product treats the phone as first-class, so a per-device clear was a
+  // half-built control. Clearing now removes the record server-side and every device repaints
+  // from the same broadcast. Running rows are refused there, so they cannot be hidden.
   const myProcs = bashProcsFor(session.id)
+  // Only settled rows may be cleared — hiding a RUNNING process would leave it working with no
+  // way back to it, which is the one outcome this panel exists to prevent.
+  const finishedProcs = myProcs.filter((p) => !isLiveBashProc(p.status))
   // Whether to draw the badge at all, and what the number is. Decided in lib/bashProcLights
   // rather than inline, because NOTHING IN THIS REPO IMPORTS App.tsx — the same reason the
   // dot lookup above was moved out, and the same class of bug it was moved out to prevent.
@@ -2119,6 +2129,8 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
             onInfo={() => setInfo(true)}
             onRename={beginRename}
             onPickRole={(id) => { if (id !== roleId) void setAgent(session.id, id) }}
+            onPickModel={(m) => api.http.setModel(session.id, m)}
+            onApplyNow={() => api.http.relaunchApply(session.id)}
           />
         )}
         {info && (
@@ -2173,8 +2185,18 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
               key={p.toolId} proc={p}
               onOpen={() => onOpenBashProc(p.toolId, bashProcTabLabel(p))}
               onKill={() => killBash(session.id, p.toolId)}
+              onClear={() => clearBashProcs(session.id, [p.toolId])}
             />
           ))}
+          {finishedProcs.length > 0 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); clearBashProcs(session.id, finishedProcs.map((p) => p.toolId)) }}
+              className="mt-0.5 text-[10px] text-ctp-overlay hover:text-ctp-text transition-colors"
+              title="Clear every finished process from this list"
+            >
+              Clear finished
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -2184,9 +2206,10 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
 // One background process in the sidebar list: status dot, what the command was, and — while
 // it is running — a ■ to kill it.
 //
-// NO × TO CLEAR, mirroring the absence of "Clear finished" above: this list is the server's
-// registry, and the row goes away when the server drops the record.
-function BashProcLine({ proc, onOpen, onKill }: { proc: BashProcRecord; onOpen: () => void; onKill: () => void }) {
+// A × CLEARS A SETTLED ROW, and only a settled one — clearing a running process would hide it
+// while it kept working, with no way back. The clear removes the record server-side;
+// the server's own pruning is a cap, not a user control, and below that cap it never fires.
+function BashProcLine({ proc, onOpen, onKill, onClear }: { proc: BashProcRecord; onOpen: () => void; onKill: () => void; onClear: () => void }) {
   // The rule lives in lib/bashProcLights, not here — this is the one DESTRUCTIVE control in
   // the feature, and App.tsx is precisely where a rule goes untested (nothing in this repo
   // imports it). See bashProcKillable for why it does not reuse isLiveBashProc.
@@ -2209,6 +2232,16 @@ function BashProcLine({ proc, onOpen, onKill }: { proc: BashProcRecord; onOpen: 
           className="shrink-0 opacity-100 md:opacity-0 md:group-hover/proc:opacity-100 text-ctp-overlay hover:text-ctp-red text-[9px] leading-none px-0.5 transition-opacity"
         >
           ■
+        </button>
+      )}
+      {!isLiveBashProc(proc.status) && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onClear() }}
+          title="Clear"
+          aria-label={`Clear background process: ${bashProcLabel(proc)}`}
+          className="shrink-0 opacity-100 md:opacity-0 md:group-hover/proc:opacity-100 text-ctp-overlay hover:text-ctp-red text-[11px] leading-none px-0.5 transition-opacity"
+        >
+          ×
         </button>
       )}
     </div>
@@ -2319,11 +2352,54 @@ function SubsessionDialog({ parent, onClose }: { parent: SessionInfo; onClose: (
 
 // Per-session actions menu (portal to body so the sidebar's scroll never clips it).
 // Two views: the main actions, and a "change role" submenu listing the agents.
-function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onRename, onPickRole }: {
+function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onRename, onPickRole, onPickModel, onApplyNow }: {
   x: number; y: number; session: SessionInfo; agents: AgentInfo[]
   onClose: () => void; onSubsession: () => void; onInfo: () => void; onRename: () => void; onPickRole: (id: string) => void
+  onPickModel: (model: string | undefined) => Promise<{ ok?: boolean }>; onApplyNow: () => Promise<{ ok?: boolean }>
 }) {
-  const [view, setView] = useState<'main' | 'roles'>('main')
+  const [view, setView] = useState<'main' | 'roles' | 'model'>('main')
+  // Seeded ONLY when the session is really on a custom id — see seedCustomId. Seeding from
+  // session.model unconditionally put an alias like `sonnet` in a box labelled "Full model id".
+  const [customId, setCustomId] = useState(() => seedCustomId(session.model))
+  // ★ THE MENU REPORTS ITS OWN FAILURES, AND STAYS OPEN TO DO IT.
+  // These two calls used to be `void api.http.…(…)` with the menu closing immediately, so a
+  // 404, a 500 or an `{ok:false}` was indistinguishable from success. The worst case is
+  // "Apply now (ends this turn)": the user accepts ending their turn and cannot tell whether
+  // it happened. `post()` is deliberately left alone — its header records that POST does not
+  // throw, because other callers read `{error}` off the body — so the check is here, narrow,
+  // on the two call sites that have no other way to speak.
+  const [modelErr, setModelErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  // ★ F3: no post when the pick is already the current model, mirroring the role picker's
+  // `if (id !== roleId)` one level up. Both sides are normalised because undefined, '' and
+  // '  ' all mean "account default" — without that, clearing an already-cleared override would
+  // post and the server would answer a no-op success: a request asserting a change that is not
+  // one. Closing without posting is the correct response to "set it to what it already is".
+  const pickModel = (m: string | undefined) => {
+    if (isSameModel(session.model, m)) { onClose(); return }
+    void run('Setting the model', () => onPickModel(m))
+  }
+
+  // Closes on success; keeps the menu open and shows why on failure.
+  const run = async (what: string, call: () => Promise<{ ok?: boolean }>) => {
+    setBusy(true)
+    setModelErr(null)
+    try {
+      const r = await call()
+      // Covers BOTH shapes a failure arrives in: an explicit `{ok:false}` from the handler,
+      // and a Fastify error body (404/500) where `ok` is simply absent.
+      if (r?.ok !== true) { setModelErr(`${what} failed.`); return }
+      onClose()
+    } catch (e) {
+      setModelErr(e instanceof Error ? `${what} failed: ${e.message}` : `${what} failed.`)
+    } finally {
+      setBusy(false)
+    }
+  }
+  // Decisions live in lib/modelPicker, under test — nothing imports App.tsx, so a rule left
+  // inline here is invisible to the whole suite.
+  const choice = currentModelChoice(session.model)
+  const notice = modelPendingNotice(!!session.modelPending, session.state)
   useDismissOnOutside(true, onClose)
   const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
   const left = Math.min(x, window.innerWidth - 200)
@@ -2337,9 +2413,17 @@ function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onR
           <button className={item} onClick={() => { onClose(); onSubsession() }}>➕ Create subsession</button>
           <button className={item} onClick={() => { onClose(); onInfo() }}>ⓘ Session info</button>
           <button className={item} onClick={() => setView('roles')}>🎭 Change role<span className="ml-auto text-ctp-overlay">›</span></button>
+          {/* The dot marks an override, so "which model is this session on?" is answerable
+              without opening the submenu. */}
+          <button className={item} onClick={() => setView('model')}>
+            🧠 Model
+            <span className="ml-auto text-ctp-overlay flex items-center gap-1">
+              {choice.kind !== 'default' && <span className="w-1.5 h-1.5 rounded-full bg-ctp-accent" />}›
+            </span>
+          </button>
           <button className={item} onClick={() => { onClose(); onRename() }}>✎ Rename</button>
         </>
-      ) : (
+      ) : view === 'roles' ? (
         <>
           <button className="w-full text-left px-3 py-1 text-[10px] uppercase tracking-wide text-ctp-overlay hover:text-ctp-text flex items-center gap-1" onClick={() => setView('main')}>‹ Change role</button>
           {list.map((a) => (
@@ -2348,6 +2432,69 @@ function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onR
               {a.id === curRole && <span className="text-ctp-accent">✓</span>}
             </button>
           ))}
+        </>
+      ) : (
+        <>
+          <button className="w-full text-left px-3 py-1 text-[10px] uppercase tracking-wide text-ctp-overlay hover:text-ctp-text flex items-center gap-1" onClick={() => setView('main')}>‹ Model</button>
+          <button className={item} disabled={busy} onClick={() => pickModel(undefined)}>
+            <span className="flex-1 truncate">Account default</span>
+            {isSelected(choice, { kind: 'default' }) && <span className="text-ctp-accent">✓</span>}
+          </button>
+          {/* Aliases come from MODEL_OPTIONS (= settingsLogic's MODEL_ALIASES), never re-listed
+              here: a second copy would stop offering a newly added family while the settings
+              panel still did. */}
+          {MODEL_OPTIONS.map((m) => (
+            <button key={m} className={item} disabled={busy} onClick={() => pickModel(m)}>
+              <span className="flex-1 truncate">{m}</span>
+              {isSelected(choice, { kind: 'alias', alias: m }) && <span className="text-ctp-accent">✓</span>}
+            </button>
+          ))}
+          {/* ★ THE FULL-ID FIELD IS THE POINT OF THIS MENU, not a power-user extra. An alias
+              tracks the latest model in its family — `opus` is Opus 5 — so pinning a specific
+              one (claude-opus-5-5) is reachable ONLY here. Submitting blank clears the
+              override, matching the server's own trim-to-undefined rule. */}
+          <div className="px-3 py-1.5 border-t border-ctp-surface0 mt-1">
+            <div className="text-[10px] uppercase tracking-wide text-ctp-overlay mb-1">
+              Full model id {isSelected(choice, { kind: 'custom' }) && <span className="text-ctp-accent">✓</span>}
+            </div>
+            <input
+              value={customId}
+              onChange={(e) => setCustomId(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return
+                e.preventDefault()
+                pickModel(normalizeModelInput(customId))
+              }}
+              placeholder="claude-opus-5-5"
+              aria-label="Full model id"
+              className="w-full bg-ctp-base border border-ctp-surface1 rounded px-1.5 py-0.5 text-[11px] text-ctp-text outline-none focus:border-ctp-accent/60"
+            />
+            <div className="text-[10px] text-ctp-overlay mt-0.5">Enter to set · empty clears</div>
+          </div>
+          {/* Pending = the running engine was spawned with a different model. Deliberately NOT
+              the sandbox panel's "Applying changes…": a pending sandbox is auto-applied when
+              the session goes idle, whereas a model is applied inside the next send, so while
+              idle nothing is in flight. Wording and the interrupt warning come from
+              lib/modelPicker, where they are under test. */}
+          {notice && (
+            <div className="px-3 py-1.5 border-t border-ctp-surface0 mt-1 space-y-1">
+              <div className="text-[10px] text-ctp-yellow">{notice.text}</div>
+              {notice.applyNow && (
+                <button
+                  disabled={busy}
+                  onClick={() => { void run('Apply now', onApplyNow) }}
+                  className={`w-full rounded px-2 py-0.5 text-[10px] font-medium ${notice.interrupts ? 'bg-ctp-red/20 text-ctp-red hover:bg-ctp-red/30' : 'bg-ctp-blue/20 text-ctp-blue hover:bg-ctp-blue/30'}`}
+                >
+                  {notice.label}
+                </button>
+              )}
+            </div>
+          )}
+          {/* Inline and persistent: the menu deliberately does NOT close on a failure, because
+              a portal that vanishes has nowhere to say what went wrong. */}
+          {modelErr && (
+            <div className="px-3 py-1.5 border-t border-ctp-surface0 mt-1 text-[10px] text-ctp-red">{modelErr}</div>
+          )}
         </>
       )}
     </div>,

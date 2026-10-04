@@ -709,6 +709,7 @@ interface ContextValue {
   // Keyed by the BASH tool_use id, not the shell id — the server owns that translation.
   // See api.session.killBash for why this is not stopTask with a different argument.
   killBash: (sessionId: string, toolId: string) => void
+  clearBashProcs: (sessionId: string, toolIds: string[]) => void
   respond: (sessionId: string, requestId: string, decision: PermissionDecision) => void
   loadTranscript: (sessionId: string, events: ClaudeEvent[]) => void
   clearTranscript: (sessionId: string) => void
@@ -890,6 +891,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     api.session.killBash(sessionId, toolId)
   }, [])
 
+  // Clear settled rows from the server's registry. No optimistic filtering: the list repaints
+  // from the `session:bashProcs` broadcast, which is also what makes the clear reach every
+  // other device. A client that hid the rows itself would be the localStorage store again,
+  // one layer up.
+  const clearBashProcs = useCallback((sessionId: string, toolIds: string[]) => {
+    api.session.clearBashProcs(sessionId, toolIds)
+  }, [])
+
   const respond = useCallback((sessionId: string, requestId: string, decision: PermissionDecision) => {
     api.session.respondPermission(sessionId, requestId, decision)
     dispatch({ type: 'REMOVE_PENDING', sessionId, requestId })   // reveal the next queued prompt, if any
@@ -921,8 +930,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   // Memoize the context value so a streamed token (which re-renders ChatProvider)
   // doesn't hand every consumer a fresh object identity and re-render them all.
   const value = useMemo(
-    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, bashProcsFor, sendTurn, interrupt, stopTask, killBash, respond, loadTranscript, clearTranscript }),
-    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, bashProcsFor, sendTurn, interrupt, stopTask, killBash, respond, loadTranscript, clearTranscript],
+    () => ({ transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, bashProcsFor, sendTurn, interrupt, stopTask, killBash, clearBashProcs, respond, loadTranscript, clearTranscript }),
+    [transcriptFor, pendingFor, slashCommandsFor, metaFor, tasksFor, bashProcsFor, sendTurn, interrupt, stopTask, killBash, clearBashProcs, respond, loadTranscript, clearTranscript],
   )
   return (
     <ChatContext.Provider value={value}>

@@ -64,6 +64,9 @@ interface Session extends SessionInfo {
   // for: launch() copies the role's tool scope and charter into the spawn once, so editing
   // agents.ts leaves every running session on the OLD scope with nothing able to report it.
   appliedAgentKey?: string
+  // The model the RUNNING engine was spawned with. `--model` is read once at spawn, so this
+  // is what is actually in force; `session.model` is only what has been REQUESTED.
+  appliedModel?: string
   claudeSessionId: string       // claude's own session id (for --resume)
   startedAt: number             // last launch time, for the fast-failure heuristic
   resume: boolean               // whether Claude was launched with --resume
@@ -229,6 +232,43 @@ export class SessionManager extends EventEmitter {
 
   // The background-shell records for a session (connect snapshot + persistence).
   bashProcsOf(id: string): BashProcRecord[] { return [...(this.bashProcs.get(id)?.values() ?? [])] }
+
+  // Remove settled background-process rows from the registry, and broadcast the result.
+  //
+  // Returns how many were actually removed and how many were refused, so a caller can log the
+  // difference. Nothing is painted from the return value — the client repaints from the
+  // `bashProcs` broadcast below, exactly as it does for every other change to this registry.
+  //
+  // ★★ A RUNNING RECORD IS NEVER REMOVED, WHATEVER IS ASKED.
+  // Hiding a live process is the single worst outcome this panel has: the row is the only
+  // handle the user has on it, and the panel exists precisely so that a backgrounded command
+  // cannot get lost. The UI only offers the control for settled rows, so an id naming a
+  // running one arrives either from a race (it was finished when the button rendered and has
+  // since been relaunched) or from another client — neither is a reason to honour it. They are
+  // skipped SILENTLY rather than erroring: the user's intent ("tidy this list") is served by
+  // clearing the rest, and a failure dialog for a row that is still visibly there and still
+  // working would explain nothing.
+  clearBashProcs(id: string, toolIds: readonly string[]): { removed: number; refused: number } {
+    const m = this.bashProcs.get(id)
+    if (!m) return { removed: 0, refused: 0 }
+    let removed = 0
+    let refused = 0
+    for (const toolId of toolIds) {
+      const rec = m.get(toolId)
+      // An unknown id is neither removed nor refused — it is simply absent, which is the
+      // correct outcome for a client asking to clear something already gone.
+      if (!rec) continue
+      if (rec.status === 'running') { refused++; continue }
+      m.delete(toolId)
+      removed++
+    }
+    if (removed > 0) {
+      this.bashProcs.set(id, m)
+      this.emit('bashProcs', id, this.bashProcsOf(id))
+      this.emit('changed')
+    }
+    return { removed, refused }
+  }
 
   // One background shell's output, for GET /api/session/:id/bashProc/:toolId/output.
   //
@@ -591,6 +631,9 @@ export class SessionManager extends EventEmitter {
     // against later. Read from `agent` — the same object launch() spawned from, two lines
     // of divergence away from being a different role than the one actually applied.
     session.appliedAgentKey = agentKey(session.agentId)
+    // Recorded from the value launch() is spawning with, for the same reason the line above
+    // reads from `agent`: anything re-derived later can diverge from what was applied.
+    session.appliedModel = session.model
 
     const engine = new ClaudeEngine({
       command: spawn.command,
@@ -1302,7 +1345,10 @@ export class SessionManager extends EventEmitter {
     // so one edit to agents.ts can flip this for many sessions at once, which is exactly
     // the case that had no way to be reported.
     const agentPending = !!s.engine && agentKey(agentId) !== s.appliedAgentKey
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, agentPending, state }
+    // `?? ''` on both sides: "unset" and "" both mean "let the CLI choose", and comparing
+    // undefined against '' would report a pending change that does not exist.
+    const modelPending = !!s.engine && (s.model ?? '') !== (s.appliedModel ?? '')
+    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, agentPending, modelPending, state }
   }
 
   // A session's granted catalog connectors — the live set the proxy authorizes against,
@@ -1388,6 +1434,58 @@ export class SessionManager extends EventEmitter {
     return true
   }
 
+  // Change a session's model. Stores the request and NOTHING ELSE — deliberately no relaunch.
+  //
+  // ★ CONTRAST WITH ITS TWO SIBLINGS, because the difference IS the feature. setAgent calls
+  // relaunchApply immediately (a role change alters tools and charter, so running on the old
+  // one is wrong). setSandbox calls scheduleApply (idle-debounced — confinement is a safety
+  // boundary and must not wait on a user). A model change does neither: it applies when the
+  // user next SENDS, so the current engine, and whatever the user is still reading, survives
+  // until they are ready for it. `/api/session/relaunchApply` is the force button and already
+  // exists, so nothing is added for it here.
+  //
+  // '' normalises to undefined: the UI's "let the CLI choose" sends an empty string, and
+  // storing that verbatim would make modelPending flap between '' and undefined forever.
+  setModel(id: string, model: string | undefined): boolean {
+    const session = this.sessions.get(id)
+    if (!session) return false
+    const next = model && model.trim() ? model.trim() : undefined
+    if (session.model === next) return true   // no-op: no spurious 'changed' broadcast
+    session.model = next
+    this.emit('changed')
+    return true
+  }
+
+  // Bring a pending model into force, and RESOLVE ONLY ONCE THE REPLACEMENT ENGINE IS UP.
+  //
+  // ★ WHY THIS WAITS AT ALL. relaunchApply is fire-and-forget: it sets `replacing` and kills,
+  // and the new engine appears later on the exit event. sendUserTurn's own comments record
+  // what happens to a turn delivered into that window — `replacing` is exactly the state its
+  // guards reject, so the turn returns false and the user is told it was not delivered, having
+  // already seen their own optimistic echo. So the send must wait rather than race.
+  //
+  // Bounded, and it gives up rather than hanging: if the relaunch never completes we fall
+  // through and let sendUserTurn fail honestly, which surfaces as sendFailed. Polling rather
+  // than awaiting an event because `alive` is the property the send actually guards on — the
+  // same value, read the same way, instead of a second signal that could disagree with it.
+  async applyModelForTurn(id: string): Promise<void> {
+    if (!this.modelPending(id)) return
+    this.relaunchApply(id)
+    const deadline = Date.now() + 15_000
+    while (Date.now() < deadline) {
+      const s = this.sessions.get(id)
+      if (!s) return                                   // session went away; the send will fail
+      if (s.engine?.alive && !s.replacing && !s.closing) return
+      await new Promise((r) => setTimeout(r, 50))
+    }
+  }
+
+  // Is a requested model still waiting for a relaunch to take effect?
+  modelPending(id: string): boolean {
+    const s = this.sessions.get(id)
+    return !!s?.engine && (s.model ?? '') !== (s.appliedModel ?? '')
+  }
+
   // Change a session's sandbox config. Applies on the next launch (relaunch/restart);
   // we don't hot-swap a running engine. Persisted so a restart keeps it.
   setSandbox(id: string, sandbox: SandboxConfig, trusted = false): boolean {
@@ -1452,6 +1550,7 @@ export class SessionManager extends EventEmitter {
     const indexOf = new Map(list.map((s, i) => [s.id, i]))
     return list.map((s) => {
       const tasks = this.tasksOf(s.id)
+      const bashProcs = this.bashProcsOf(s.id)
       return {
         name: s.name, cwd: s.cwd, rootDir: s.rootDir,
         parentIndex: s.parentId != null ? indexOf.get(s.parentId) : undefined,
@@ -1462,6 +1561,11 @@ export class SessionManager extends EventEmitter {
         accountConnectors: s.accountConnectors,
         claudeSessionId: s.claudeSessionId,
         tasks: tasks.length ? tasks : undefined,
+        // Persisted for the same reason `tasks` is: without it every background-process row
+        // vanishes on a server restart, and the panel silently forgets a build the user
+        // started. `SavedSession.bashProcs` has been declared since the registry landed and
+        // was written by nothing, so the field existed while the behaviour did not.
+        bashProcs: bashProcs.length ? bashProcs : undefined,
       }
     })
   }
@@ -1512,6 +1616,36 @@ export class SessionManager extends EventEmitter {
             : t)
         }
         this.tasks.set(id, m)
+      }
+      // Rehydrate the background-shell registry. A background shell is a child of the CLI,
+      // which is a child of THIS server, so a restart killed every one of them.
+      //
+      // ★ SETTLE running → 'unknown', NOT 'failed' — and the difference from the `tasks` block
+      // directly above is deliberate rather than an inconsistency. An agent that died with its
+      // engine genuinely failed: it had a result to produce and never produced one. A shell
+      // did not. `npm test` may well have passed thirty seconds before the restart and written
+      // its exit code to a file nobody will ever read again. 'failed' would assert something
+      // false about the user's own build; 'unknown' says the one true thing — the outcome is
+      // not knowable. The detail pane already has a section written for exactly this state.
+      //
+      // ★ NO TRUST GATE NEEDED HERE, unlike the permission mode a few lines up. A persisted
+      // BashProcRecord is DISPLAY DATA ONLY: nothing in it can launch, kill or elevate
+      // anything. The worst a forged record achieves is a wrong row in a panel, where the
+      // worst a forged permissionMode achieves is allow-all on every tool call.
+      if (s.bashProcs?.length) {
+        const m = new Map<string, BashProcRecord>()
+        for (const r of s.bashProcs) {
+          m.set(r.toolId, r.status === 'running'
+            ? { ...r, status: 'unknown', endedAt: r.endedAt ?? Date.now(),
+                summary: r.summary ?? 'Session stopped — outcome unknown' }
+            : r)
+        }
+        // The cap, for the same reason settleOpenBashProcs applies it: this is a mass
+        // running→finished conversion, and `pruneBashProcs` exempts running records, so a
+        // session restored with many open shells would otherwise sit over the cap with no
+        // further record event coming to trim it.
+        this.pruneBashProcs(m)
+        this.bashProcs.set(id, m)
       }
     }
     for (const session of registered) this.launch(session)

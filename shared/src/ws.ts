@@ -42,6 +42,15 @@ export type WsClientMessage =
   // death, not by the response — the CLI answers unknown-task stops as success). This message
   // exists so the server can hand the SHELL id straight to engine.stopTask().
   | { type: 'session:killBash'; id: string; toolId: string }
+  // Clear settled background-process rows from the SERVER's registry, so a row cleared on one
+  // device is cleared on every device. Replaces a browser-localStorage dismiss store, which
+  // left the phone still showing rows the desktop had cleared — and this product is
+  // phone-first-class, so a desktop-only clear is a half-built control.
+  // ★ The server REFUSES to remove a record that is still 'running'. Hiding a live process is
+  // the worst outcome this panel has, so ids naming one are ignored and left in place rather
+  // than honoured; the client already offers the control only for settled rows, and this is
+  // the backstop for the case where it is asked anyway (a race, or another client).
+  | { type: 'session:clearBashProcs'; id: string; toolIds: string[] }
   | { type: 'session:permission'; id: string; requestId: string; decision: PermissionDecision }
   // What a session is currently viewing (its active content tab), published on tab/
   // session switch. `pane` is null when the Claude tab is focused. Backs the

@@ -8,7 +8,7 @@ import type {
   CreatePaneRequest, CreatePaneResponse, ListPanesResponse, AttachPaneResponse,
   ConversationMeta, ConversationsResponse, ConversationResponse,
   RewindPoint, RewindMode, RewindPreview, RewindPointsResponse, RewindPreviewResponse, RewindResponse,
-  TaskRecord, BashProcRecord,
+  TaskRecord, BashProcRecord, BashProcOutputResponse,
   FsListResponse, FilePreview, WriteResult,
   GitStatus, GitDiff, GitLog, GitBranches, GitResult,
   ActivePane, KernelSpecsResponse, SandboxConfig, SandboxDefaultFolder, SandboxDefaultsResponse,
@@ -356,6 +356,11 @@ export const api = {
     // task id" without the request ever reaching the CLI. The server side of this message
     // looks the toolId up in the bash registry and hands the CLI the shell id instead.
     killBash: (id: string, toolId: string) => send({ type: 'session:killBash', id, toolId }),
+    // Clear settled background-process rows from the SERVER's registry. Replaces a
+    // browser-localStorage dismiss store: a row cleared on the desktop stayed visible on the
+    // phone, and this product treats the phone as first-class, so a per-device clear was a
+    // half-built control. The server refuses ids naming a still-running record.
+    clearBashProcs: (id: string, toolIds: string[]) => send({ type: 'session:clearBashProcs', id, toolIds }),
     respondPermission: (id: string, requestId: string, decision: PermissionDecision) =>
       send({ type: 'session:permission', id, requestId, decision }),
     // Publish what a session is currently viewing (its active content tab, or null
@@ -375,6 +380,12 @@ export const api = {
     destroySession: (id: string) => post<OkResponse>('/api/session/destroy', { id }),
     relaunch: (id: string) => post<OkResponse>('/api/session/relaunch', { id }),
     relaunchApply: (id: string) => post<OkResponse>('/api/session/relaunchApply', { id }),
+    // Per-session model override. `model` omitted clears it back to the role's model / the
+    // account default — the server's setModel() trims and treats a blank the same way, so the
+    // two agree about what "no override" means.
+    // Takes effect on the user's NEXT MESSAGE: `--model` is a spawn argument, so the server
+    // relaunches inside the send (applyModelForTurn). relaunchApply above is the force button.
+    setModel: (id: string, model?: string) => post<OkResponse>('/api/session/setModel', { id, model }),
     setMode: (id: string, mode: PermissionMode) => post<SetModeResult>('/api/session/setMode', { id, mode } as SetModeRequest),
     setAgent: (id: string, agentId: string) => post<OkResponse>('/api/session/setAgent', { id, agentId }),
     rename: (id: string, name: string) => post<OkResponse>('/api/session/rename', { id, name }),
@@ -415,6 +426,12 @@ export const api = {
     // is missing either: the status cannot tell you which, and that is the whole point of
     // writing it down here.
     appSettings: () => get<AppSettingsResponse>('/api/settings'),
+    // One background shell's output — the TAIL of its output file, capped server-side.
+    // Via `get`, so a non-2xx THROWS: the endpoint answers an unknown session/toolId with 404
+    // and `ok:false`, and that must surface as an error rather than render as an empty pane.
+    // Both ids are path segments, hence encoded — a toolId is opaque CLI-issued text.
+    bashProcOutput: (id: string, toolId: string) =>
+      get<BashProcOutputResponse>(`/api/session/${encodeURIComponent(id)}/bashProc/${encodeURIComponent(toolId)}/output`),
     // SET-ONLY. An omitted key is unchanged; this never clears one — see the two-verbs note
     // in lib/settingsContract.ts. The signature is a plain `Partial<AppSettings>` precisely
     // because of that: allowing null here would make the type say two states while carrying
