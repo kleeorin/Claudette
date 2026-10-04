@@ -1,11 +1,73 @@
 # Claudette — Handover
-_Last updated: 2026-09-17._
+_Last updated: 2026-10-04._
 
 <!-- Deliberately no "working tree is clean" line here. The previous one was stale the
      moment it was written and stayed wrong for a month, which is the same failure this
      document's rewrite exists to fix: run `git status` — it is authoritative and this
      file cannot be. -->
 
+
+## ⛔ COORDINATOR HANDOVER — 2026-10-01. READ FIRST. Supersedes the 09-17 block for current state.
+
+Coordinator = this session, named **Claudette** (`list_team` → `youAre: coordinator`, `canEmploy: true`).
+Team: implementers **Landing**, **Backend**, **Builder**; read-only **Planner**; reviewers **QC**, **Critic**.
+Message them BY NAME — session ids have changed mid-task before. Run `git status`: this file is
+not authoritative about the tree (2026-10-01: 38 changed paths — scratchpad 18, web/src 16,
+server/src 2, shared/src 2).
+
+### Status
+**Committed & pushed** — `a6e70b0` (master level with origin): background-process OUTPUT ENDPOINT
+(`server/src/claude/bashProcOutput.ts`, `GET /api/session/:id/bashProc/:toolId/output`) + session
+DEFAULTS (`/api/session/create` falls back to `defaultModel`/`defaultAgentId`/`defaultPermissionMode`).
+
+**Done, verified, UNCOMMITTED** (all green at last check):
+| Item | By | Evidence |
+|---|---|---|
+| Output pane wired in `BashProcDetail.tsx` (poll while running, one final fetch on settle, error≠reason, tail note) + QC fixes F1–F4 | coordinator | 229/229 web; 11 component cases; mutants all killed |
+| Model-dropdown SERVER half (`setModel`/`modelPending`/`applyModelForTurn`, `POST /api/session/setModel`) | Landing | `model-next-turn-test` 0/1→11/0; expected-red + patches removed |
+| `web/dist` rebuilt ×2 | Landing | live bundle `index-DhpMguEd.js` (2026-10-01 13:17), verified by rendered text |
+| Cross-device clear: `session:clearBashProcs`; `web/src/store/bashProcDismiss.ts` DELETED | Landing | `clear-bashprocs-test` 13/13; running rows refused |
+| Registry PERSISTS across server restart; running → `'unknown'` | Backend | `bashprocs-persist-test` 16/16 |
+| 10 spent patches deleted (staged `D`); 4 stale "fails until patch lands" comments fixed | coordinator | the 3 affected tests pass |
+
+**2026-10-04 — items 4–5 DONE and COMMITTED** (commit order: file-manager, settings notes,
+dismissStore, bashProcs+model picker, suite chore, this doc). Model picker = `SessionMenu` "🧠 Model"
+submenu, rules in `web/src/lib/modelPicker.ts`; QC's F1–F4 fixed (failures surface in the menu,
+✓ rule extracted as `isSelected`, no-op pick skips the POST, full-id box seeded only for a custom id).
+Bundle `index-DahrQcAj.js`. Web vitest 252/252, floor 252. Full suite: 112 pass, 1 expected red, 6 jupyter skips.
+
+**Server restart:** every session id changed on 2026-10-04 (likely a restart) — unconfirmed whether the
+2026-09-29..10-01 server work is live. Check by calling `POST /api/session/setModel` from the menu.
+
+### Key decisions (non-obvious)
+- Output is unretrievable once the engine is gone for BOTH confined and unconfined sessions — deliberate levelling-down.
+- Poll ordering applies a response if newer than the last APPLIED, not the latest ISSUED — the latter freezes the pane when every response is slower than the 2 s poll. A mutant proves it.
+- `shouldPollOutput`, `bashProcKillable` are `status === 'running'`, NOT `isLiveBashProc` (which defaults unknown→live: right for a badge, wrong for polling/killing).
+- Clearing rows is SERVER-owned (cross-device); a running process can never be cleared.
+- Persisted running rows restore as `'unknown'`, never `'failed'`.
+- **A2–A6 sandbox migration: HELD for the user's yes** — risk, not access. Plan: the "Migration — A2 onward" block lower in this file. Proposed route: Planner re-derives the open fail-open question first, then Landing one step at a time with QC per step. `authorizer-box-divergence-guard` stays expected-red until A2.
+
+### Gotchas that bit THIS stretch
+- **Mounts flip.** `server/src`, `shared/src`, `web/dist` went writable → read-only mid-session, and differ per session. `test -w` immediately before writing.
+- `patch` exits 0 while failing — check the artefact. A MULTI-FILE `a/`-prefixed patch must be applied from repo root with no target file (naming one target misapplies it).
+- `grep 's\.bashProcs'` also matches `this.bashProcs` — the obvious grep gives the opposite answer.
+- `pkill -f <pattern>` / `pgrep -f` match their OWN command line — killed my shell. Use explicit pids.
+- `ss -ltnp` may show no pid from here; never `stat /proc/$PID` with an empty $PID (it stats `/proc` itself).
+- `web/dist/assets/index-*.js`: several are same-build code-split chunks, NOT stale — never delete them. Probe the file `index.html` references, by RENDERED text, never an identifier.
+- A test mock returning one shared object hid an over-polling regression (0 reds). Mocks of a store must hand out fresh records.
+- Don't run a full `run-suite.sh` while an implementer is editing — the run voids itself.
+- A user turn ending "Continue from where you left off." can still carry a real request — read it.
+
+### Next steps
+1. A2–A6 when/if the user says yes (see Key decisions).
+2. Open user question: default model. `~/.claude/settings.json` has `"model": "opus[1m]"`; Claudette's own default model setting is unset. No answer yet.
+3. Push only on the user's order.
+
+### References
+Plan: `.claude/plans/background-processes-panel.md` · settings backend: `.claude/plans/settings-backend.md` ·
+role handover: `.claude/team-handovers/implementer-builder-bashprocs-2026-09-10.md` · A2–A6 + older history: below.
+
+---
 
 ## ⛔ COORDINATOR HANDOVER — 2026-09-17. READ FIRST. Supersedes the 08-27 block for current state.
 
