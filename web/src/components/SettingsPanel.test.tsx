@@ -195,4 +195,22 @@ describe('SettingsPanel', () => {
     await waitFor(() => expect(row('defaultModel')).toBeTruthy())
     expect(screen.queryByTestId('environment-panel')).toBeNull()
   })
+
+  // ★ THE CONTROL THAT OFFERS FEWER OPTIONS THAN THE USER EXPECTS MUST SAY WHY.
+  // defaultPermissionMode lists only the prompting modes, because the server refuses to store
+  // an elevated one as a default — on save, and again on load, so a hand-edited settings file
+  // cannot plant one either. Without a word here that reads as a truncated list rather than a
+  // deliberate refusal, and the obvious "fix" is to add the missing options to the dropdown.
+  //
+  // This case REPLACED one asserting that three rows were marked "not in effect yet", which was
+  // true while the panel had shipped ahead of its server half and became false the moment
+  // /api/session/create started consulting app settings. Recorded because the note and the
+  // server behaviour must move together: a stale honesty-note is a lie with good intentions.
+  it('explains why the permission-mode default offers no elevated option', async () => {
+    render(<SettingsPanel />)
+    await waitFor(() => expect(row('defaultPermissionMode')).toBeTruthy())
+    expect(row('defaultPermissionMode')?.textContent ?? '').toMatch(/cannot be stored as a default/i)
+    // And nothing anywhere still claims the settings do nothing.
+    expect(document.body.textContent ?? '').not.toMatch(/Not in effect yet/i)
+  })
 })

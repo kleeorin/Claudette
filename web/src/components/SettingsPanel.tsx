@@ -162,7 +162,8 @@ export function SettingsPanel() {
         )}
       </Row>
 
-      <Row name="defaultAgentId" label="Default role for new sessions" overrides={overrides}>
+      <Row name="defaultAgentId" label="Default role for new sessions" overrides={overrides}
+        note="Used when a new session does not name a role of its own. A teammate hired by a coordinator keeps the role it was hired with and ignores this.">
         {(locked) => (
           <select
             disabled={locked || busy} data-testid="default-agent"
@@ -176,7 +177,12 @@ export function SettingsPanel() {
         )}
       </Row>
 
-      <Row name="defaultPermissionMode" label="Default permission mode" overrides={overrides}>
+      {/* ★ WHY THIS CONTROL OFFERS NO "allow all": the server REFUSES to store an elevated
+          mode as a default, on save and again on load, so a hand-edited settings file cannot
+          plant one either. Saying so here means a user who expected the option learns why
+          rather than assuming the list is incomplete. */}
+      <Row name="defaultPermissionMode" label="Default permission mode" overrides={overrides}
+        note="Used when a new session does not specify one. Elevated modes cannot be stored as a default — allow-all is a live decision and has to be granted per session, so only the prompting modes appear here.">
         {(locked) => (
           <select
             disabled={locked || busy} data-testid="default-permission-mode"
