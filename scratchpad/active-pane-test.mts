@@ -3,7 +3,7 @@
 // viewing, that an explicit path to a DIFFERENT visible notebook is refused, and that
 // open_notebook fires a focus for the calling session. Run:
 //   npx tsx scratchpad/active-pane-test.mts
-import { mkdtemp } from 'fs/promises'
+import { mkdtemp, writeFile, readFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { NotebookDocManager } from '../server/src/notebook/notebookDocManager.ts'
@@ -81,10 +81,76 @@ ok('path-less read_notebook → note.ipynb', read.path === nbA)
 ok('edit landed in note.ipynb (the viewed one)', read.cells[0].source === 'IN_NOTE')
 ok('another.ipynb was NOT touched', docs.getByPath(nbB)!.cells[0].source !== 'IN_NOTE')
 
-// Explicit path to the OTHER (not-viewed) notebook is refused — the whole point.
-r = await S('edit_cell', { path: nbB, index: 0, source: 'WRONG' })
-ok(`explicit different-notebook path refused: ${r.text?.slice(0, 60)}…`, r.isError && /Refusing to edit/.test(r.text))
-ok('refused edit did not reach another.ipynb', docs.getByPath(nbB)!.cells[0].source !== 'WRONG')
+// ★ CONTRACT CHANGED 2026-10-06 (F2). This used to assert that an explicit path to the
+// not-VIEWED notebook is refused. That was half the reported wrong-notebook bug: with the
+// turn pin cleared, a CORRECT explicit path was rejected in favour of whatever pane the user
+// had switched to. An explicit path naming a notebook that is OPEN is now the strongest
+// statement of intent available and is HONOURED. The stale-path protection it replaced is
+// case 3 below — a path naming a notebook that is NOT open is still refused.
+r = await S('edit_cell', { path: nbB, index: 0, source: 'RIGHT' })
+ok(`2. explicit path for an OPEN notebook is HONOURED: ${r.text?.slice(0, 48)}…`, !r.isError)
+ok('2a. …and the edit reached that notebook, not the viewed one',
+   docs.getByPath(nbB)!.cells[0].source === 'RIGHT')
+ok('2b. …and the viewed notebook was NOT touched',
+   docs.getByPath(nbA)!.cells[0].source !== 'RIGHT')
+
+// ── 1. THE REPORTED BUG: a TEAM turn must NOT drop the pin ──────────────────────────────
+// Pin to note.ipynb, let a teammate message arrive, then have the user switch panes. The
+// turn's next path-less call must still hit note.ipynb. Before the fix the team turn cleared
+// the pin and the call re-bound to the new pane — the edit landed in the wrong notebook.
+turns.clear('S')
+panes.set('S', { path: nbA, isNotebook: true })
+await S('edit_cell', { index: 0, source: 'PINNED' })          // pins note.ipynb
+turns.onUserTurn('S', 'team')                                  // teammate message arrives
+panes.set('S', { path: nbB, isNotebook: true })                // user switches panes
+r = await S('edit_cell', { index: 0, source: 'STILL_NOTE' })
+ok('1. ★ a TEAM turn does not drop the pin — the edit stays on the original notebook',
+   !r.isError && docs.getByPath(nbA)!.cells[0].source === 'STILL_NOTE')
+ok('1a. …and the pane the user switched to was NOT touched',
+   docs.getByPath(nbB)!.cells[0].source !== 'STILL_NOTE')
+
+// ── 6. A HUMAN turn still clears the pin ────────────────────────────────────────────────
+// The other half of the contract: a fresh human turn does follow the user's eyes, so the
+// pin must drop and the next call re-bind to the live pane. Without this case, "never clear"
+// would pass case 1 while breaking the feature the pin exists for.
+turns.onUserTurn('S', 'user')
+r = await S('edit_cell', { index: 0, source: 'FOLLOWS_EYES' })
+ok('6. ★ a HUMAN turn DOES clear the pin — the next call follows the live pane',
+   !r.isError && docs.getByPath(nbB)!.cells[0].source === 'FOLLOWS_EYES')
+
+// Re-establish the viewed notebook for the cases below.
+turns.clear('S')
+panes.set('S', { path: nbA, isNotebook: true })
+
+// ── 3. A path naming a NOT-OPEN notebook is still refused ────────────────────────────────
+// The stale-path case the old assertion was really protecting: a path copied from earlier in
+// the conversation, naming something nobody is looking at.
+// ★ THE FILE MUST EXIST ON DISK BUT NOT BE OPEN. An earlier version of this case used a
+// path to a file that did not exist at all, and it passed for the wrong reason: the open
+// failed on ENOENT no matter how F2 was scoped, so the mutant that honours a NOT-OPEN path
+// survived it. Measured — that mutant went from red=0 to red=1 once the file was real.
+const nbClosed = join(dir, 'closed.ipynb')
+const nbClosed2 = join(dir, 'closed2.ipynb')
+await writeFile(nbClosed, JSON.stringify({ cells: [{ cell_type: 'code', source: ['OLD'], metadata: {}, outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 }))
+await writeFile(nbClosed2, JSON.stringify({ cells: [{ cell_type: 'code', source: ['OLD2'], metadata: {}, outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 }))
+ok('3. (precondition) closed.ipynb exists on disk and is NOT open', !docs.getByPath(nbClosed))
+r = await S('edit_cell', { path: nbClosed, index: 0, source: 'NOPE' })
+ok('3a. explicit path for a NOT-OPEN notebook is still refused', r.isError)
+ok('3b. …and nothing was written to it', (await readFile(nbClosed, 'utf8')).includes('OLD'))
+
+// ── 4. `expect` ─────────────────────────────────────────────────────────────────────────
+r = await S('edit_cell', { path: nbB, index: 0, source: 'X', expect: nbA })
+ok('4. expect MISMATCH refuses', r.isError && /expect/.test(r.text))
+ok('4a. …naming both sides', r.text.includes(nbA) && r.text.includes(nbB))
+ok('4b. …and the edit did not land', docs.getByPath(nbB)!.cells[0].source !== 'X')
+r = await S('edit_cell', { path: nbB, index: 0, source: 'MATCHED', expect: nbB })
+ok('4c. expect MATCH proceeds', !r.isError && docs.getByPath(nbB)!.cells[0].source === 'MATCHED')
+r = await S('edit_cell', { path: nbB, index: 0, source: 'Y', expect: 'another.ipynb' })
+ok('4d. expect by NAME matches', !r.isError)
+
+// ── 5. Every mutating result echoes the absolute path ───────────────────────────────────
+r = await S('edit_cell', { path: nbB, index: 0, source: 'ECHO' })
+ok('5. a mutating result echoes name + absolute path', !r.isError && r.text.includes(nbB) && r.text.includes('another.ipynb'))
 
 // Explicit path that MATCHES the viewed notebook is allowed.
 r = await S('edit_cell', { path: nbA, index: 0, source: 'IN_NOTE_2' })
@@ -124,6 +190,21 @@ r = await T('read_notebook')
 ok('session with no reported pane: path-less read errors', r.isError)
 r = await T('read_notebook', { path: nbA })
 ok('session with no reported pane: explicit path honored', !r.isError)
+
+// ★ THE OTHER NOT-OPEN BRANCH, previously untested — and the two together are what the
+// `path` description has to state. resolveNotebook refuses a not-open explicit path only when
+// an ANCHOR exists and differs (a pin, or a notebook in the active pane): that is the stale
+// -path case. With NO anchor there is nothing to be stale against, so the path is honoured and
+// opened straight from disk. The case above used an already-OPEN notebook and so could not
+// tell the two apart; this one uses a notebook that exists on disk and is NOT open.
+// Clear T's pin first: the read above pinned nbA, and a pin IS an anchor — without this the
+// call below refuses for that reason and tells us nothing about the no-anchor branch.
+turns.clear('T')
+ok('(precondition) closed2.ipynb is on disk and not open', !docs.getByPath(nbClosed2))
+ok('(precondition) T has no pin and no pane', !panes.get('T'))
+r = await T('read_notebook', { path: nbClosed2 })
+ok('★ no anchor + NOT-open explicit path: honoured and opened from disk', !r.isError)
+ok('…and it is now open', !!docs.getByPath(nbClosed2))
 
 mcp.stop()
 console.log(failed ? `\n${failed} FAILED` : '\nALL PASSED')

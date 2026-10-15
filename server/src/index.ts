@@ -193,7 +193,12 @@ sessions.on('restarted', (id: string) => team.release(id))
 // only a turn the HUMAN typed refills the team's message budget, or every team message
 // would top up the very allowance meant to bound the team's chatter.
 sessions.on('userTurn', (id: string, _text: string, _turnId: string | undefined, origin?: 'user' | 'team') => {
-  turnNotebooks.clear(id)
+  // ★ ONLY A HUMAN TURN CLEARS THE PIN. A team/mailbox-injected turn is a real turn for the
+  // budget below, but it is NOT the user looking somewhere new — nobody moved their eyes. This
+  // line used to clear unconditionally, which is the reported bug: a teammate message arriving
+  // mid-task dropped the pin, and the turn's next path-less call re-bound to whatever pane the
+  // user had since switched to. The edit then landed in the wrong notebook, silently.
+  turnNotebooks.onUserTurn(id, origin)
   if (origin !== 'team') teamMailbox.onHumanTurn(id)
 })
 // Members we have already told their coordinator about, so a turn that hits several

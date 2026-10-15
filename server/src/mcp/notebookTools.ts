@@ -89,7 +89,12 @@ export function registerNotebookTools(
   // stale path from earlier in the conversation (when a different notebook was in
   // focus) is the classic wrong-notebook bug — the unset default always follows the
   // user's current view.
-  const pathProp = { path: { type: 'string', description: "Leave UNSET by default — the tool then targets whatever notebook the user is currently viewing (their active pane), which is almost always what you want. Set `path` (absolute, .ipynb) ONLY when the user explicitly names a DIFFERENT notebook to edit in this request. Never reuse a path from earlier in the conversation: the user may have switched notebooks since, and an unset path always follows their current focus. A path that isn't open is written straight to disk." } }
+  // The three outcomes below are MEASURED against resolveNotebook (scratchpad/active-pane-test
+  // covers each), not inferred. An earlier draft of this description asserted two of them in
+  // the same breath — "not open is refused" and "a path that isn't open is written straight to
+  // disk" — which is a contradiction unless you say what separates them. What separates them is
+  // whether an ANCHOR exists: a pin from earlier this turn, or a notebook in the active pane.
+  const pathProp = { path: { type: 'string', description: "Pass `path` (absolute, .ipynb) whenever you know which notebook you are working in — it is what stops an edit landing in the wrong notebook if the user switches panes mid-task. Omit it only when you deliberately want to follow the user's current view. What happens to a `path` you pass: (1) the notebook is OPEN — honoured, and it becomes this turn's target; (2) NOT open, and you are already working in another notebook this turn or the user is viewing one — REFUSED, because a path naming something nobody is looking at is usually stale; call open_notebook first so the change is visible; (3) NOT open, and there is no such notebook in play — honoured and opened straight from disk." } }
 
   const isErr = (x: NotebookDoc | McpToolResult): x is McpToolResult => 'error' in x
 
@@ -125,6 +130,18 @@ export function registerNotebookTools(
       // pointing at the very same notebook doesn't trip the guard.
       const active = panes.get(sessionId)
       const anchor = pinned ?? (active && active.isNotebook ? active.path : undefined)
+      // ★ F2: AN EXPLICIT PATH FOR AN ALREADY-OPEN NOTEBOOK IS HONOURED, NOT REFUSED.
+      // The refusal below exists for a STALE path — one naming a notebook nobody is looking at,
+      // typically copied from earlier in the conversation. A path that is OPEN in this session
+      // is the opposite case: the caller named a notebook that is right there, which is the
+      // strongest statement of intent available, and it must beat both the pin and the live
+      // pane. Refusing it was half the reported bug — with the pin cleared by a team turn, a
+      // CORRECT explicit path was rejected in favour of whatever pane the user had switched to.
+      // Not-open still refuses (see below): that is the stale-path case and the protection stays.
+      if (docs.getByPath(explicit)) {
+        turns.set(sessionId, explicit)   // re-pin: this is now what the turn is about
+        return explicit
+      }
       if (anchor && resolve(anchor) !== resolve(explicit)) {
         return { error: pinned
           ? `Refusing to edit ${explicit}: this turn is already working in ${pinned}, which is almost certainly the intended notebook. Omit \`path\` to keep targeting it. Only switch to ${explicit} if the user explicitly named that file this turn — and if so, call open_notebook(${explicit}) first so it's visible and becomes the working notebook, then retry.`
@@ -151,6 +168,12 @@ export function registerNotebookTools(
   async function targetDoc(sessionId: string, args: Record<string, unknown>, focus = true, need: 'read' | 'write' = 'write'): Promise<NotebookDoc | McpToolResult> {
     const t = resolveNotebook(sessionId, args)
     if (typeof t !== 'string') return t
+    // ★ F3 CHECKED HERE, AT THE ONE CHOKE POINT, not per tool. Every path-optional tool
+    // resolves through targetDoc, so one call covers all of them and none can be added later
+    // that silently skips the guard. It runs AFTER resolution and does not influence it: the
+    // point is to verify the answer, not to become a second way of choosing one.
+    const mismatch = checkExpect(args.expect, t)
+    if (mismatch) return mismatch
     const g = await gate(sessionId, resolve(t), need)
     if (isGateErr(g)) return g
     const already = docs.getByPath(t)
@@ -251,8 +274,48 @@ export function registerNotebookTools(
     const r = docs.applyOp(op, 'claude')
     if (!r.ok) return { error: r.error }
     await docs.save(doc.notebookId, g.guard)
-    return { text: 'ok' }
+    // ★ F4: ECHO THE IDENTITY, DO NOT SAY 'ok'. A bare 'ok' makes a RETARGET SILENT — the
+    // reported bug wrote into the wrong notebook and reported success in exactly the words it
+    // would have used for the right one. Naming the notebook back is what lets the caller (and
+    // the user reading the transcript) notice a wrong target on the turn it happens rather than
+    // when the diff is read later.
+    return { text: identity(doc, op) }
   }
+
+  // `ok — <name> (<abs path>)`, plus the cell index for the ops that address one. The name is
+  // the basename: it is what the user sees on the tab, so it is the token they can match
+  // against their own screen without reading a long path.
+  function identity(doc: NotebookDoc, op?: NotebookOp): string {
+    const at = op && typeof (op as { index?: unknown }).index === 'number'
+      ? `, cell ${(op as { index: number }).index}` : ''
+    return `ok — ${basename(doc.path)} (${doc.path})${at}`
+  }
+
+  // ★ F3: THE OPTIONAL `expect` GUARD. Resolution happens exactly as it would without it; this
+  // only CHECKS the answer. An absolute path compares canonically; anything else is treated as
+  // a notebook NAME and matched against open notebooks' basenames.
+  //
+  // An AMBIGUOUS name refuses rather than guessing. Two open notebooks called `analysis.ipynb`
+  // in different directories is the precise situation where a name-based check is worth having
+  // and also the one where picking either is a coin flip — and a guard that guesses is worse
+  // than no guard, because it reports confidence it does not have.
+  function checkExpect(expect: unknown, resolved: string): McpToolResult | undefined {
+    if (typeof expect !== 'string' || !expect.trim()) return undefined
+    const want = expect.trim()
+    if (want.startsWith('/')) {
+      if (resolve(want) === resolve(resolved)) return undefined
+      return { error: `Refusing: \`expect\` names ${want}, but this call resolves to ${resolved}. Pass \`path\` to target the notebook you meant, or drop \`expect\` if the resolved one is correct.` }
+    }
+    const matches = docs.list().filter((d) => basename(d.path) === want)
+    if (matches.length > 1) {
+      return { error: `Refusing: \`expect\` is the name "${want}", which matches ${matches.length} open notebooks (${matches.map((d) => d.path).join(', ')}). Pass an absolute path in \`expect\` to say which one.` }
+    }
+    if (basename(resolved) === want) return undefined
+    return { error: `Refusing: \`expect\` names "${want}", but this call resolves to ${basename(resolved)} (${resolved}). Pass \`path\` to target the notebook you meant, or drop \`expect\` if the resolved one is correct.` }
+  }
+
+  // The schema fragment for F3, spread into every mutating/running tool.
+  const expectProp = { expect: { type: 'string', description: 'Optional safety check: the absolute path, or the name, of the notebook you believe you are editing. If the call resolves to a different notebook it is REFUSED rather than applied. Costs nothing when you are right and prevents an edit landing in a notebook the user switched to.' } }
 
   mcp.register({
     name: 'read_active_pane',
@@ -351,7 +414,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'edit_cell',
     description: "Replace the source of a cell (0-based `index`) in a notebook (the active pane unless `path` is given). If that notebook is open it updates live; if not, it's written to disk. The cell KEEPS its existing outputs and execution count (they now describe the previous source) until it is re-run.",
-    inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' }, source: { type: 'string' } }, required: ['index', 'source'] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, index: { type: 'number' }, source: { type: 'string' } }, required: ['index', 'source'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
@@ -362,7 +425,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'add_cell',
     description: "Append a new cell to the end of a notebook (the active pane unless `path` is given). type = 'code' (default), 'markdown', or 'raw'. Optional source. Live if the notebook is open, else written to disk.",
-    inputSchema: { type: 'object', properties: { ...pathProp, type: { type: 'string' }, source: { type: 'string' } }, required: [] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, type: { type: 'string' }, source: { type: 'string' } }, required: [] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       return applyAndSave(sid, doc, { op: 'addCell', notebookId: doc.notebookId, cellType: cellType(args.type), source: strOrUndef(args.source) })
@@ -372,7 +435,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'insert_cell',
     description: 'Insert a new cell before the given 0-based `index` in a notebook (the active pane unless `path` is given). type = code/markdown/raw. Optional source. Live if open, else written to disk.',
-    inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' }, type: { type: 'string' }, source: { type: 'string' } }, required: ['index'] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, index: { type: 'number' }, type: { type: 'string' }, source: { type: 'string' } }, required: ['index'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const index = boundedIndex(args.index, doc.cells.length, 'index'); if (typeof index !== 'number') return index
@@ -383,7 +446,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'delete_cell',
     description: 'Delete the cell at the given 0-based `index` in a notebook (the active pane unless `path` is given). Live if open, else written to disk.',
-    inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' } }, required: ['index'] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, index: { type: 'number' } }, required: ['index'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
@@ -394,7 +457,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'move_cell',
     description: 'Move a cell from one 0-based index (`from`) to another (`to`) in a notebook (the active pane unless `path` is given). Live if open, else written to disk.',
-    inputSchema: { type: 'object', properties: { ...pathProp, from: { type: 'number' }, to: { type: 'number' } }, required: ['from', 'to'] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, from: { type: 'number' }, to: { type: 'number' } }, required: ['from', 'to'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.from); if (typeof id !== 'string') return id
@@ -406,7 +469,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'set_cell_type',
     description: "Change a cell's type (code/markdown/raw) by 0-based `index` in a notebook (the active pane unless `path` is given). Clears its outputs. Live if open, else written to disk.",
-    inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' }, type: { type: 'string' } }, required: ['index', 'type'] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, index: { type: 'number' }, type: { type: 'string' } }, required: ['index', 'type'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
@@ -450,7 +513,7 @@ export function registerNotebookTools(
   mcp.register({
     name: 'run_cell',
     description: "Execute the code cell at 0-based `index` in a notebook (the active pane unless `path` is given) on its kernel (started on first run), then return the cell outputs. Outputs are saved to disk. Blocks until the cell finishes, so a slow cell means a slow tool call — that is the cell working, not a hang. If the cell is ALREADY executing (the user ran it, or a run_all is in flight) it is not re-run and the call reports `started: false`.",
-    inputSchema: { type: 'object', properties: { ...pathProp, index: { type: 'number' } }, required: ['index'] },
+    inputSchema: { type: 'object', properties: { ...pathProp, ...expectProp, index: { type: 'number' } }, required: ['index'] },
     handler: async (sid, args) => {
       const doc = await targetDoc(sid, args); if (isErr(doc)) return doc
       const id = cellIdAt(doc, args.index); if (typeof id !== 'string') return id
