@@ -256,14 +256,30 @@ ok('COST: …and that pushes the composer a further 250px below the visible view
 // with nothing open. Common ancestor with c0bf98f ("a layout computed against a viewport that
 // then shrank"), different bug, disjoint fixes.
 //
-// OPEN ON PURPOSE, AND NOT UNFINISHED WORK: which of the three bands gives up the 33px — the
-// card's 0.55 cap, the transcript's floor, or the composer — is a PRODUCT call about what a
-// phone user loses first when the keyboard is up. It is not an engineering question with one
-// obvious repair, and it should not be closed by whoever next reads this file.
-ok('PRE-EXISTING, unowned: with a pending card + keyboard up, the composer fits inside the shell',
+// ★ CLOSED 2026-10-05, AND THE "PRODUCT CALL" FRAMING ABOVE WAS WRONG ON ITS FACTS.
+// The note used to say the 33px was a choice between three bands — the card's 0.55 cap, the
+// transcript's floor, or the composer — and so a product decision rather than an engineering
+// one. Measuring the bands individually (390x844, --vvh 508) rather than reasoning about them
+// showed only TWO were ever available:
+//     MetaBar 57 + transcript 0 + card 304 + composer 153 = 514 into a 428px column.
+// THE TRANSCRIPT WAS ALREADY COLLAPSED TO ZERO. It had nothing left to give, so "the
+// transcript's floor" was never one of the options.
+//
+// And the two that remained are not interchangeable, which is what removes the choice:
+//   · the CARD owns an inner `overflow-y-auto`, so shrinking it is LOSSLESS — scroll and the
+//     content is all still there;
+//   · the COMPOSER has no scroller, so clipping it is LOSSY — the send row goes under an
+//     overflow-hidden edge with no way to reach it. It is also the only means of answering the
+//     very card that is squeezing it, so losing it makes the state unrecoverable.
+// Lossless-and-recoverable versus lossy-and-unrecoverable is not a matter of taste.
+//
+// FIX: the pending-card band in ChatView.tsx became `shrink min-h-0 flex flex-col` (its
+// centring wrapper too); the composer stays `shrink-0`. After: card 304 → 219, composer
+// unchanged at 153, 57+0+219+153 = 429 into 428, composer bottom 455 against a 508 shell —
+// 53px of headroom where there were 33px of clipping. The assertion below is now REAL.
+ok('★ with a pending card + keyboard up, the composer is NOT clipped by the shell',
    phone.base.composer.bottom <= phone.base.shellBottom,
-   `composer ends at ${phone.base.composer.bottom}, shell ends at ${phone.base.shellBottom} — ${phone.base.composer.bottom - phone.base.shellBottom}px clipped by overflow-hidden. Desktop is clean (composer ${desk.base.composer.bottom} in a ${desk.base.shellBottom}px shell), so this is phone + keyboard only.`,
-   'open')
+   `composer ends at ${phone.base.composer.bottom}, shell ends at ${phone.base.shellBottom} — ${phone.base.shellBottom - phone.base.composer.bottom}px of headroom. Desktop is clean (composer ${desk.base.composer.bottom} in a ${desk.base.shellBottom}px shell), so this was phone + keyboard only.`)
 
 // COST 2 — what it does NOT cost. The bands themselves are untouched by either form: making an
 // ancestor a fixed-position containing block does not change flex layout inside it, and the

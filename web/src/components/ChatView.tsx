@@ -544,12 +544,32 @@ export function ChatView({ sessionId, visible = true }: {
           case, not the edge case. Sitting between the transcript and the composer keeps it
           in view for as long as it is unanswered, which is exactly as long as it matters.
 
-          NB no `overflow-y-auto` on this wrapper: layout-check's `scroller()` helper picks
-          the largest overflowing `.overflow-y-auto` as "the transcript", and a second one
-          here could be misidentified as the thing the card must not be inside. */}
+          NB no `overflow-y-auto` on this wrapper: the card's own body is the scroller that
+          yields under squeeze. layout-check's `scroller()` finds the transcript by its
+          `data-testid` (see the transcript div above), not by scanning for the largest
+          `.overflow-y-auto`, so a scroller here cannot be mistaken for it. */}
       {pending && (
-        <div className="shrink-0 border-t border-ctp-surface0 bg-ctp-base">
-          <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3">
+        // ★ SHRINKABLE, NOT `shrink-0` — AND THE COMPOSER BELOW DELIBERATELY STAYS shrink-0.
+        // MEASURED on a 390x844 phone with the keyboard up (--vvh 508): the chat column has
+        // 428px, and its bands wanted 57 (MetaBar) + 0 (transcript) + 304 (this card) + 153
+        // (composer) = 514. The transcript was ALREADY collapsed to zero, so it had nothing
+        // left to give, and the 86px of overshoot came out of the bottom of the column — the
+        // composer's own textarea ended 33px below an overflow-hidden shell.
+        //
+        // The two remaining bands are NOT interchangeable, which is what makes this an
+        // engineering repair rather than a taste call about which one "should" lose:
+        //   · the CARD already owns an inner `overflow-y-auto` (see AskUserQuestionCard), so
+        //     shrinking it is LOSSLESS — the content is still reachable by scrolling;
+        //   · the COMPOSER has no scroller, so clipping it is LOSSY — the send row goes under
+        //     the shell edge with no way to reach it. And the composer is the only way to
+        //     answer the very card that is squeezing it, so losing it is the one outcome that
+        //     makes the state unrecoverable.
+        // So the card yields first, down to its content's scrollable minimum, and the composer
+        // is never clipped. `min-h-0` on both this band and the centring wrapper is what lets
+        // the constraint reach the card at all — without it the default `min-height: auto`
+        // floors each one at its content height and the shrink never happens.
+        <div className="shrink min-h-0 flex flex-col border-t border-ctp-surface0 bg-ctp-base">
+          <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-3 min-h-0 flex flex-col">
             {/* KEYED BY requestId. Both cards hold their own answer state, and the
               pending queue reveals the next prompt in this same slot — so without a
               key React reused the instance and the new question mounted already
@@ -1248,17 +1268,30 @@ function PermissionCard({
   const headline = toolHeadline(toolName, (input ?? {}) as Record<string, unknown>)
   const always = suggestions.length > 0 ? suggestionLabel(suggestions) : undefined
   return (
-    <div className="rounded-lg border border-ctp-yellow/50 bg-ctp-yellow/10 px-3 py-2.5">
+    // ★ min-h-0 flex flex-col SO THE CARD CAN ACTUALLY YIELD.
+    // The band above is `shrink min-h-0 flex flex-col` so the card gives way instead of the
+    // composer being clipped. That argument rests on the card being able to shrink LOSSLESSLY,
+    // which was true of AskUserQuestionCard (its body is `overflow-y-auto min-h-0`) and NOT of
+    // this one: the only scroller here was a FIXED `max-h-48`, and a fixed height cannot
+    // yield. MEASURED at 390x844 with --vvh 508: the card ran to 431 while the composer began
+    // at 401 — a 30px overlap, with Allow/Deny inside the overlapping region.
+    <div className="rounded-lg border border-ctp-yellow/50 bg-ctp-yellow/10 px-3 py-2.5 min-h-0 flex flex-col">
       <div className="text-xs text-ctp-yellow font-medium mb-0.5">
         {headline}?
       </div>
       <div className="text-[10px] text-ctp-overlay mb-1.5">
         {toolName}{description && description !== headline ? ` · ${description}` : ''}
       </div>
-      <div className="text-[11px] text-ctp-subtext max-h-48 overflow-y-auto mb-2 pr-1">
+      {/* THE SHRINKING PART. `flex-1 min-h-0` lets it take the squeeze; `max-h-48` stays as a
+          CEILING for the roomy case, so a short detail block still does not sprawl. Dropping
+          the ceiling entirely would change desktop layout, which this fix has no business
+          doing. */}
+      <div className="text-[11px] text-ctp-subtext flex-1 min-h-0 max-h-48 overflow-y-auto mb-2 pr-1">
         <ToolDetail name={toolName} input={input} />
       </div>
-      <div className="flex gap-2 flex-wrap">
+      {/* shrink-0: the buttons are the one part that must never be the thing that yields —
+          they are how the user answers the card that is doing the squeezing. */}
+      <div className="flex gap-2 flex-wrap shrink-0">
         <button onClick={onAllow} className="text-xs px-3 py-0.5 rounded bg-ctp-green/80 hover:bg-ctp-green text-ctp-base font-medium">
           Allow once
         </button>
