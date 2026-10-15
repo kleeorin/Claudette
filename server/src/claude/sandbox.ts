@@ -7,6 +7,7 @@ import type { SandboxConfig, SandboxMount } from '@claudette/shared'
 import { ensureUserSettingsPinnable, settingsJsonPaths } from './configProtection'
 import { dataDir } from '../util/dataDir'
 import { tokenFilePath } from '../auth'
+import { viewOf, boxCanReach, refuseIfBoxCouldHavePlaced } from './sandboxPaths'
 
 // Wraps a `claude …` invocation in a bubblewrap sandbox that confines the process
 // to a set of mounts (see SANDBOX.md). We do NOT --unshare-net, so the shared
@@ -536,12 +537,8 @@ export function wrapCommand(
 // wouldn't actually appear. Used to decide whether a venv interpreter chosen for a
 // confined Jupyter server needs its prefix ro-bound so the box can exec it.
 export function pathVisibleInSandbox(mounts: SandboxMount[], p: string): boolean {
-  const t = path.resolve(p)
-  return mounts.some((m) => {
-    if (!existsSync(m.path)) return false
-    const mp = path.resolve(m.path)
-    return mp === t || t.startsWith(mp + path.sep)
-  })
+  // Q1 REACH (sandboxPaths.ts): real on both sides, resolved in box space.
+  return boxCanReach(viewOf(mounts), p, 'read')
 }
 
 // bwrap's `--bind SRC DEST` FOLLOWS a symlink at SRC and mounts its target. So a mount
@@ -677,23 +674,18 @@ function canonicalizeForAccess(p: string): string {
 }
 
 // Can the box built for (cfg, cwd) READ / WRITE the host path `p`? A path is readable
-// when it lies inside ANY data mount, writable only inside a `rw` one; the DEEPEST
-// containing mount decides (matching bwrap's shallow-first layering, where a nested
-// mount wins). Both the target and the mount roots are canonicalized (symlinks
-// resolved) so neither side can be spoofed with a link. Used to confine server-side
+// when some data mount still exposes it in the box, writable when any such mount is `rw`
+// (boxCanReach — see the note in the body). Both the target and the mount roots are
+// realpath'd so neither side can be spoofed with a link. Used to confine server-side
 // file operations acting for a session to the same paths the session's own tools have.
 export function sandboxPathAccess(cfg: SandboxConfig, cwd: string, p: string): { read: boolean; write: boolean } {
   const target = canonicalizeForAccess(p)
-  // Resolve precedence with the SAME rule bwrap uses — shallowest-first emission, last
-  // containing bind wins — so this out-of-band authorizer can't diverge from the box
-  // (a "deepest-wins" variant drifts on same-path rw/ro ties, where bwrap appends the
-  // ro overlay last ⇒ it wins; iterating in emission order and taking the last match
-  // reproduces that for ties and any future overlay alike).
-  let match: SandboxMount | undefined
-  for (const m of sortShallowFirst(sessionDataMounts(cfg, cwd))) {
-    const root = canonicalizeForAccess(m.path)
-    if (target === root || target.startsWith(root + path.sep)) match = m
-  }
+  // Q1 REACH, resolved in BOX space by sandboxPaths.ts: a mount survives only if it still
+  // owns its own box path (last containing bind in emission order), and ANY survivor grants.
+  // Not last-wins over host paths: two mountpoints exposing the same real bytes are both live
+  // in the box, and last-wins denied a write the box performed (authorizer-box-divergence-guard).
+  const view = viewOf(sessionDataMounts(cfg, cwd))
+  const access = { read: boxCanReach(view, p, 'read'), write: boxCanReach(view, p, 'write') }
   // …unless the target is inside a hidden state dir, which the box sees as an empty
   // directory. The authorizer must agree with the box or an unsandboxed MCP tool would be
   // authorized to read the auth token on a session's behalf — the same divergence
@@ -702,23 +694,20 @@ export function sandboxPathAccess(cfg: SandboxConfig, cwd: string, p: string): {
     const root = canonicalizeForAccess(dir)
     if (target === root || target.startsWith(root + path.sep)) return { read: false, write: false }
   }
-  return { read: !!match, write: match?.mode === 'rw' }
+  return access
 }
 
-// Is `p` inside a box-WRITABLE (rw) mount, judged by LOGICAL path (path.resolve, NOT
-// realpath)? Deliberately does NOT follow symlinks — it answers "could a confined
-// session have PLACED or redirected something at this path", which is what decides
-// whether e.g. an interpreter discovered there must be probed/run INSIDE the box rather
-// than executed on the host (SANDBOX.md "Venv-probe escape"). A symlink the box planted
+// Is `p` inside a box-WRITABLE (rw) mount, judged by the LOGICAL path of `p` (never
+// realpath'd; a mount root is matched both ways)? Deliberately does NOT follow `p` — it
+// answers "could a confined session have PLACED or redirected something at this path",
+// which is what decides whether e.g. an interpreter discovered there must be probed/run
+// INSIDE the box rather than executed on the host (SANDBOX.md "Venv-probe escape"). A symlink the box planted
 // at <cwd>/x still has its logical path inside the rw cwd, so it's caught here even
 // though its target resolves elsewhere.
 export function pathInWritableMount(cfg: SandboxConfig, cwd: string, p: string): boolean {
-  const target = path.resolve(p)
-  return sessionDataMounts(cfg, cwd).some((m) => {
-    if (m.mode !== 'rw') return false
-    const mp = path.resolve(m.path)
-    return target === mp || target.startsWith(mp + path.sep)
-  })
+  // Q2 PROVENANCE (sandboxPaths.ts): a refusal, so any doubt — including an rw mount that does
+  // not exist yet — keeps the probe in the box.
+  return refuseIfBoxCouldHavePlaced(viewOf(sessionDataMounts(cfg, cwd)), p) !== undefined
 }
 
 // A stable key for a sandbox config at a cwd: same key ⇒ same effective box. Drives

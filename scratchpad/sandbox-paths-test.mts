@@ -6,7 +6,8 @@ import {
   viewOf, real, boxCanReach, refuseIfBoxCouldHavePlaced, overlayPathFor,
   type RealPath,
 } from '../server/src/claude/sandboxPaths'
-import type { SandboxMount } from '../shared/src/types'
+import { pathInWritableMount, sandboxPathAccess, pathVisibleInSandbox } from '../server/src/claude/sandbox'
+import type { SandboxConfig, SandboxMount } from '../shared/src/types'
 
 import { check, passed as pass, failed as fail } from './assert.mjs'
 const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'claudette-paths-')))
@@ -101,8 +102,37 @@ try {
     const missing = viewOf([{ path: path.join(root, 'gone'), mode: 'rw' }])
     check('19. a non-existent mount is marked, not silently dropped',
       missing.entries[0]?.exists === false)
-    check('20. …and it cannot make anything box-placeable',
-      refuseIfBoxCouldHavePlaced(missing, path.join(root, 'gone', 'x')) === undefined)
+    // RE-SPECIFIED at A2 (user decision 2026-10-05), not a regression: this used to assert
+    // `=== undefined`. Provenance is about a FUTURE exec, and an rw mount absent now may be bound
+    // at the next launch — skipping it ran a candidate under it on the HOST (fail-open).
+    check('20. …and a non-existent RW mount STILL makes its subtree box-placeable',
+      !!refuseIfBoxCouldHavePlaced(missing, path.join(root, 'gone', 'x')),
+      'skipping it is fail-OPEN: the probe would run on the host')
+    // Control, so "refuse everything" cannot pass #20.
+    const missingRo = viewOf([{ path: path.join(root, 'gone'), mode: 'ro' }])
+    check('20b. …while a non-existent RO mount does not',
+      refuseIfBoxCouldHavePlaced(missingRo, path.join(root, 'gone', 'x')) === undefined)
+  }
+
+  // --- the wired callers in sandbox.ts (A2) ---------------------------------
+  {
+    const cfg = (...mounts: SandboxMount[]): SandboxConfig => ({ enabled: true, mounts })
+    const gone = path.join(root, 'gone-rw')
+    const cwd = path.join(root, 'cwd-elsewhere')
+    mkdirSync(cwd, { recursive: true })
+    check('21. pathInWritableMount: a NON-EXISTENT rw mount still refuses (probe stays in the box)',
+      pathInWritableMount(cfg({ path: gone, mode: 'rw' }), cwd, path.join(gone, '.venv', 'bin', 'python3')),
+      'false here means a planted interpreter would be executed on the HOST')
+    check('21b. …while a path outside every mount is not refused',
+      !pathInWritableMount(cfg({ path: gone, mode: 'rw' }), cwd, path.join(root, 'elsewhere', 'python3')))
+    check('22. pathInWritableMount: a symlink planted in an rw mount is refused by its LEXICAL path',
+      pathInWritableMount(cfg({ path: proj, mode: 'rw' }), cwd, planted))
+    check('23. sandboxPathAccess grants write through an rw mount and read-only through a ro one',
+      JSON.stringify(sandboxPathAccess(cfg({ path: proj, mode: 'rw' }), cwd, f)) === '{"read":true,"write":true}'
+      && JSON.stringify(sandboxPathAccess(cfg({ path: proj, mode: 'ro' }), cwd, f)) === '{"read":true,"write":false}')
+    check('24. pathVisibleInSandbox: an ancestor mount makes p visible, a descendant one does not',
+      pathVisibleInSandbox([{ path: proj, mode: 'ro' }], f)
+      && !pathVisibleInSandbox([{ path: path.join(proj, 'sub'), mode: 'ro' }], proj))
   }
 } finally {
   rmSync(root, { recursive: true, force: true })

@@ -44,7 +44,11 @@ try {
   // The guard's whole job: a planted interpreter must be recognised as box-writable, so
   // canImportJupyter runs the probe INSIDE the box instead of on the host.
   check('guard holds for a LOGICAL candidate (today\'s chain)', logicalGuarded, logicalGuarded ? 'recognised as box-writable → probed inside the box' : 'FAILED OPEN')
-  check('guard would FAIL OPEN for a REAL candidate', !realGuarded, realGuarded ? 'still recognised' : 'NOT recognised as box-writable → probe would run UNSANDBOXED on the host')
+  // RE-SPECIFIED at A2. Before A2 this observation was `!realGuarded`: the guard compared
+  // LOGICAL against LOGICAL and FAILED OPEN for a realpath'd candidate. A2 routed
+  // pathInWritableMount through refuseIfBoxCouldHavePlaced, which matches a mount root both
+  // ways, so the latent hole this probe documented is now closed and the assertion says so.
+  check('guard holds for a REAL candidate too (closed at A2)', realGuarded, realGuarded ? 'recognised via the realpath\'d mount root' : 'FAILED OPEN — probe would run UNSANDBOXED on the host')
 
   // Does the chain actually keep the path logical today? doc.path is what
   // KernelManager.serverFor feeds to pythonFor via dirname().
@@ -59,12 +63,13 @@ try {
   // …and one realpathSync in openPath is all it takes to flip it.
   const hypothetical = realpathSync(nbLogical)
   console.log(`\nIF openPath stored realpathSync(path) instead:\n  doc.path  = ${hypothetical}\n  dirname   = ${dirname(hypothetical)}`)
-  check('that one change reopens the escape', !pathInWritableMount(cfg, projLogical, path.join(dirname(hypothetical), '.venv', 'bin', 'python3')), 'candidate no longer matches the logical rw root')
+  // RE-SPECIFIED at A2: was "that one change reopens the escape". It no longer does.
+  check('…and that one change no longer reopens the escape', pathInWritableMount(cfg, projLogical, path.join(dirname(hypothetical), '.venv', 'bin', 'python3')), 'candidate still matched via the realpath\'d rw root')
   docs.close(doc.notebookId)
 } finally {
   rmSync(root, { recursive: true, force: true })
 }
 
-console.log(`\nVERDICT: the guard is load-bearing on an UNSTATED precondition (target must be`)
-console.log(`logical). ${bad === 0 ? 'All four observations hold.' : `${bad} observation(s) did not hold.`}`)
+console.log(`\nVERDICT: before A2 the guard was load-bearing on an UNSTATED precondition (target must be`)
+console.log(`logical); since A2 it holds for either spelling. ${bad === 0 ? 'All four observations hold.' : `${bad} observation(s) did not hold.`}`)
 process.exitCode = bad === 0 ? 0 : 2

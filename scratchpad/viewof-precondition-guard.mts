@@ -1,10 +1,13 @@
-// ⚠ EXPECTED RED — AND IT DOCUMENTS UNBUILT WORK, NOT A LIVE ESCAPE. ⚠
-// Nothing is broken today. This file states a PRECONDITION that must hold before the path
-// layer in server/src/claude/sandboxPaths.ts may be wired to any caller, and that precondition
-// is currently unenforced because the API it needs does not exist yet. Read a red here as
-// "this has not been built", not as "this has regressed". It is the counterpart to
-// scratchpad/layer-not-wired-guard.mts: that one keeps the layer unwired, this one says what
-// must be true before unwiring it is allowed to stop.
+// ★ AN ORDINARY GREEN GUARD. A RED HERE IS A REAL REGRESSION, NOT UNBUILT WORK. ★
+// This file was written as an EXPECTED RED documenting a precondition for wiring the path
+// layer in server/src/claude/sandboxPaths.ts. That precondition LANDED: sandbox.ts exports
+// sessionDataMountPlan, which keeps refused mounts visible with a reason, and this guard is
+// green. It came off EXPECTED_RED in run-suite.sh in that same change. The layer itself was
+// then wired at sandbox-migration step A2 (2026-10-06), when layer-not-wired-guard.mts — the
+// counterpart that kept the layer unwired — was retired. So treat a red here as the
+// exclusion-reason API breaking, never as a to-do.
+//
+// The sections below are the original rationale, kept because it is still why the guard exists.
 //
 // ── WHAT IS MISSING ──────────────────────────────────────────────────────────────────
 // `sessionDataMounts(cfg, cwd)` (sandbox.ts:588) ends with

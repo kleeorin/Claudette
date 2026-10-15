@@ -212,12 +212,13 @@
 // viewOf: a precondition enforced at call sites would be broken by A4 specifically, and broken
 // SILENTLY, because a missing overlay is indistinguishable from a mount that needed none.
 //
-// OPEN, UNRESOLVED — a fail-open judgement call, which is the class that produced three of the
-// four escapes. A mount whose path does NOT exist contributes nothing to provenance (asserted
-// as check #20 in scratchpad/sandbox-paths-test.mts, "a non-existent mount cannot make anything
-// box-placeable"). That is correct today because bwrap will not bind it. But if a caller ever
-// asks about a path under a mount that is ABOUT TO BE CREATED, the answer is wrong AND FAILS
-// OPEN. If that check ever looks inconvenient, re-derive it rather than flip it.
+// RESOLVED AT A2 — formerly an open fail-open judgement call. refuseIfBoxCouldHavePlaced used to
+// skip a mount whose path does not exist (old check #20: "a non-existent mount cannot make
+// anything box-placeable"). Right for Q1, wrong for Q2: provenance is about a FUTURE exec, and an
+// rw mount absent now may be bound at the next launch. A2 made pathInWritableMount — the venv
+// probe's host-vs-box decision — a caller, so the skip would have run a candidate under such a
+// mount on the HOST. The skip was removed and #20 RE-DERIVED, not flipped: it now asserts the
+// refusal. resolveReach and overlayPathFor keep their `exists` filter; for Q1/Q3 it is correct.
 //
 // MIGRATION. The enabling constraint — STATUS: the sandbox tests assert on EXPORTED NAMES and
 // on ARGV, not internals. Keep every export's name and signature and change only bodies; for a
@@ -382,7 +383,11 @@ export interface RefusalReason {
 export function refuseIfBoxCouldHavePlaced(view: MountView, p: string): RefusalReason | undefined {
   const target = logical(p)
   for (const m of view.entries) {
-    if (m.mode !== 'rw' || !m.exists) continue
+    // NO `!m.exists` skip, unlike resolveReach and overlayPathFor. Those answer about the box
+    // as it is NOW, where an unbound mount exposes nothing. This answers about a FUTURE exec:
+    // an rw mount absent now may exist at the next launch, so skipping it would let a
+    // candidate under it run on the HOST — fail-OPEN. Over-refusing is the safe direction.
+    if (m.mode !== 'rw') continue
     const viaLogical = contains(m.logical, target)
     const viaReal = m.real !== null && contains(m.real, target)
     if (!viaLogical && !viaReal) continue
