@@ -23,21 +23,24 @@
 // upstream (one chunked keepalive every 5s) was still open after 150s, because
 // upstream.setTimeout() is Node's socket IDLE timeout and any byte resets it. So:
 //   · silent upstream   → bounded at 120s, 504.   (asserted here)
-//   · dripping upstream → NOT BOUNDED AT ALL.     (an [open] below; no fix exists yet)
+//   · dripping upstream → NOT BOUNDED AT ALL.     (now asserted in
+//                                                   connector-concurrency-cap-test.mts)
 // The history of this one assertion is the whole lesson of this file. It has now claimed, in
 // order: "hangs with no timeout" (false — a defect fixed before the probe was written),
 // "the request is bounded" (false in general — true only for the case measured), and now the
 // narrow thing that is actually true. Each wrong version was CONFIDENT AND SPECIFIC, which is
 // exactly why they survived. Name the case you measured, in the assertion itself.
 //
-// ★ THE TRAP, AND WHY THE `[open]` LINE BELOW MUST NOT BE "SIMPLIFIED" AWAY.
+// ★ THE TRAP, AND WHY A3 STILL ASSERTS ONLY THAT THE REQUEST IS BOUNDED.
 // The obvious repair — widen the wait to 130s — turns this file green and leaves the REAL
 // concern with no representation anywhere: 120 seconds is an absurd bound for a `tools/list`
 // handshake, and a session's tool call sits dead for two minutes before the 504. Silencing a
-// true issue by making a false one go away is the exact failure mode. So A3 now asserts only
-// what is unambiguously true (the request is BOUNDED — it completes rather than hanging) and
-// prints the measured bound as an explicit `[open]`. No threshold is invented here: what
-// counts as an acceptable handshake timeout is a product decision, not a test's to make.
+// true issue by making a false one go away is the exact failure mode. So A3 asserts only what
+// is unambiguously true here (the request is BOUNDED — it completes rather than hanging).
+// The measured bound used to be printed from this file as an `[open]`; it is now an
+// ASSERTION in connector-concurrency-cap-test.mts (case 6: 504, and inside the fast budget
+// rather than the 120s ceiling). An `[open]` is an honest placeholder and is also invisible
+// to anything reading exit codes, which is how a known gap stays open for months.
 //
 // ── FAILS-FIRST for A3, measured 2026-08-26 — the justification for the assertion ────
 // The recalibrated A3 asserts that the request COMPLETES. That is only worth having if it
@@ -46,8 +49,10 @@
 // (a copy, because server/src is read-only from a pinned session — the same discipline used
 // for scratchpad/buffers-guard.mts). Result:
 //   `🚨 SUCCEEDED — … BOUNDED … — HUNG (no response after 130000ms) after 130s`, exit 1.
-// And the `[open]` line correctly SUPPRESSED itself, since it only prints on a completed
-// request — so the mutation cannot leave a stale measurement on screen claiming 120s.
+// (At the time, the `[open]` line this file used to print correctly SUPPRESSED itself under
+// that mutation, since it only printed on a completed request. That self-suppression is no
+// longer this file's to manage — the measurement moved to an assertion, which fails rather
+// than falls silent, which is the better behaviour and the reason it moved.)
 // As shipped: 0 findings, `completed 504 (106B) after 120s`.
 //
 // ★ AND A LESSON ABOUT READING PROBES, WHICH IS WHY THIS SURVIVED TWO BASELINES:
@@ -148,7 +153,9 @@ const took = Math.round((Date.now() - t0) / 1000)
 // never asserted on, so the strongest evidence in this file was pinned by nothing.
 // 5s, not ~120s: this must survive the timeout VALUE changing (a per-method budget is being
 // designed), and the failure mode being excluded is an INSTANT return, not a slightly-wrong
-// one. The measured value is carried by the [open] line below, which is where it belongs.
+// one. The measured VALUE is asserted in connector-concurrency-cap-test.mts (case 6), which
+// is where a number that must stay inside a budget belongs — this file only pins that the
+// request is bounded at all.
 attack('A: upstream never answers AND SENDS NOTHING — is that case bounded?',
   !r3.startsWith('HUNG') && took >= 5,
   `${r3} after ${took}s` + (took < 5 && !r3.startsWith('HUNG')
@@ -168,25 +175,18 @@ attack('A: a DRIPPING upstream (a chunk every 2s) — is the TOTAL duration boun
   `${r4} after ${took4}s` + (r4.startsWith('HUNG')
     ? ' ← no idle timeout can bound this; only a total-duration guard can' : ''))
 
-// Not a finding — a measured fact with no owner, printed where it cannot be missed. Same
-// pattern as scratchpad/shell-fixed-cost-probe.mjs. The number is the point.
-if (!r3.startsWith('HUNG')) {
-  console.log(`\n⚠  [open] MEASURED, unowned: a SILENT upstream still ties up this call for ${took}s`)
-  console.log('   before the 504. That is now the FAST-SET budget (connectorProxy.ts, FAST_TIMEOUT_MS')
-  console.log('   = 15_000) rather than the 120s ceiling, so a handshake no longer costs two minutes —')
-  console.log('   but bounded is still not the same as reasonable, and whether 15s is right for a')
-  console.log('   tools/list is a product decision this file deliberately does not assert.')
-}
-// ★ THE BOUND THAT STILL DOES NOT EXIST. Recorded as its own [open] because the total-duration
-// guard is easy to mistake for it, and that mistake would close the question wrongly.
-console.log('')
-console.log('⚠  [open] NOT BUILT, and NOT what the total-duration guard provides: a CONCURRENCY CAP.')
-console.log('   The guard bounds ONE connection\'s lifetime. With unbounded concurrency an adversary')
-console.log('   opens more of them, and the cap lands on legitimate long streams instead of on the')
-console.log('   attack — the wrong way round. The instrument that bounds the RESOURCE is a cap on')
-console.log('   N in-flight upstream requests per session and/or per connector: not evadable by')
-console.log('   classification, does not kill long streams, and bounds fd cost directly. Nothing')
-console.log('   in connectorProxy.ts limits how many upstream requests one session may have open.')
+// ★ BOTH `[open]` NOTES THAT USED TO PRINT HERE ARE NOW ASSERTIONS.
+// They were honest placeholders — measured facts printed where they could not be missed —
+// but an `[open]` is invisible to anything that reads exit codes, which is how a known gap
+// stays open for months. They now live in scratchpad/connector-concurrency-cap-test.mts:
+//   · the silent-upstream time bound  → case 6  (504, and inside the fast budget, not 120s)
+//   · the missing CONCURRENCY CAP     → cases 1-5
+// The cap is built (connectorProxy.ts, 2026-10-06) and that file is an ordinary green: it
+// measured 7 passed / 4 failed before the cap and 11/0 after, so it is known to FLIP rather
+// than merely known to fail (15/15 since the global-cap case was added).
+//
+// Deliberately NOT re-printed here. Two places reporting the same gap is how one of them goes
+// stale: the assertion is the one that can fail, so it is the one that should speak.
 void modes
 
 // B. Deny-rule injection backstop against catalog state that never went through

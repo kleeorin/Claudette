@@ -1,6 +1,6 @@
 # Connector upstream timeouts — design, measurements, and what was refuted
 
-Status: **DESIGNED, NOT BUILT.** Blocked on write access to `server/src`.
+Status: **TIME BOUNDS BUILT** (verified 2026-10-05 in `server/src/connectors/connectorProxy.ts`); the **concurrency cap is NOT built** — plan: `.claude/plans/connector-concurrency-cap.md`.
 Owner when unblocked: Landing. Design: Architect. Measurements: coordinator.
 
 Written down because six planner exchanges produced this and team messages do not

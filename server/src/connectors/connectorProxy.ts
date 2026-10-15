@@ -80,11 +80,33 @@ const MAX_CLASSIFY_BYTES = 2 * 1024 * 1024
 // few hundred bytes; this is generous.
 const REQ_SNIFF_BYTES = 64 * 1024
 const TOOLS_LIST_RE = /"method"\s*:\s*"tools\/list"/
+// ── CONCURRENCY CAP ───────────────────────────────────────────────────────────────────────
+// The total-duration guard bounds ONE connection's lifetime; it is not a resource bound,
+// because an adversary simply opens more. These bound the resource — fds and upstream
+// sockets. For a sandboxed session they are the ONLY bound: MCP_* env is stripped from the
+// box, so the proxy is the single path out.
+//
+// LOWERING EITHER IS FREE; RAISING EITHER NEEDS AN ARGUMENT. And neither is an excuse to
+// raise UPSTREAM_TIMEOUT_MS — the time bound and the resource bound answer different
+// questions, and trading one for the other re-opens whichever is relaxed.
+// Both values are an unmeasured starting point, chosen by the operator.
+const MAX_INFLIGHT_PER_SESSION_CONNECTOR = 6
+// A per-process backstop under the per-pair cap, so many sessions each under their own
+// limit cannot sum to an unbounded total.
+const MAX_INFLIGHT_GLOBAL = 64
 
 export class ConnectorProxy {
   private server: http.Server | null = null
   private port = 0
   private routes = new Map<string, Route>()
+  // In-flight upstream requests, keyed `${sessionId}\u0000${connectorId}`.
+  // ★ NUL SEPARATOR, not ':' or '/'. Session ids are uuids today, but connector ids are
+  // operator-supplied strings; any printable separator is a character an id could contain,
+  // and a collision here merges two sessions' budgets — which is precisely the
+  // cross-session interference the per-pair key exists to prevent. NUL cannot appear in
+  // either.
+  private inflight = new Map<string, number>()
+  private inflightTotal = 0
 
   constructor(private isGranted: GrantCheck) {}
 
@@ -124,6 +146,17 @@ export class ConnectorProxy {
   // lifetime (each launch mints fresh ones).
   release(sessionId: string): void {
     for (const [tok, r] of this.routes) if (r.sessionId === sessionId) this.routes.delete(tok)
+    // Drop this session's in-flight counters too. Without this a session destroyed while
+    // requests were in flight leaves its slots permanently consumed: the per-request release
+    // below still fires, but the session is gone and nothing ever re-admits against a budget
+    // that now reads full forever. Over a few relaunches that silently converts the cap into
+    // a lockout for a session id that no longer exists.
+    const prefix = `${sessionId}\u0000`
+    for (const [k, n] of this.inflight) {
+      if (!k.startsWith(prefix)) continue
+      this.inflight.delete(k)
+      this.inflightTotal -= n
+    }
   }
 
   private async onRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -224,6 +257,50 @@ export class ConnectorProxy {
     let reqId: string | number | null = null
     let upstreamContentType = ''
     let budgetMs = UPSTREAM_TIMEOUT_MS
+    // ── ADMISSION ─────────────────────────────────────────────────────────────────────
+    // Placed AFTER the grant check (an ungranted caller still gets its 403, consumes no slot
+    // and learns nothing about the cap) and immediately BEFORE the socket is created — which
+    // is the resource being bounded. Not placed right after the grant check, deliberately:
+    // several early returns sit between the two (undialable connector, unparseable URL, a
+    // throwing request build), and a slot taken above them leaks on every one of those paths.
+    // A leaked slot is worse than no cap, because it is a cap that only ever tightens.
+    const inflightKey = `${route.sessionId}\u0000${route.connectorId}`
+    const inflightNow = this.inflight.get(inflightKey) ?? 0
+    if (inflightNow >= MAX_INFLIGHT_PER_SESSION_CONNECTOR) {
+      // 503 + a JSON-RPC error with id:null — the body was never read, so there is no id to
+      // echo. Reject rather than queue: queueing holds the inbound client socket, which is
+      // itself an unbounded resource, and would need its own cap and timeout to be safe.
+      return this.deny(res, 503, `connector "${def.id}" has too many requests in flight for this session (limit ${MAX_INFLIGHT_PER_SESSION_CONNECTOR}); retry shortly`)
+    }
+    if (this.inflightTotal >= MAX_INFLIGHT_GLOBAL) {
+      // Distinct wording from the per-session message above, on purpose. The §3 text names a
+      // per-session limit; emitting it when the GLOBAL backstop is the binding constraint
+      // would tell an operator to look at the wrong number, and the two are fixed by
+      // different actions (one session backing off vs. the process being oversubscribed).
+      return this.deny(res, 503, `the connector proxy is at its global in-flight limit (${MAX_INFLIGHT_GLOBAL}); retry shortly`)
+    }
+    this.inflight.set(inflightKey, inflightNow + 1)
+    this.inflightTotal++
+    // ★ ONCE-GUARD. upstream 'close', upstream 'error' and res 'close' can ALL fire for a
+    // single request — the existing clearTotal below is wired to exactly that triple for the
+    // same reason. A naive decrement therefore runs two or three times per request, the
+    // counter drifts negative, and the cap silently stops rejecting: it FAILS OPEN, which is
+    // the one direction a resource bound must not fail.
+    let slotReleased = false
+    const releaseSlot = (): void => {
+      if (slotReleased) return
+      slotReleased = true
+      const cur = this.inflight.get(inflightKey)
+      // Absent means release(sessionId) already reclaimed this session's whole count while
+      // the request was in flight. Decrementing the total again here would double-count the
+      // same slot and drift negative — the same fail-open as a missing once-guard, reached
+      // from the other direction.
+      if (cur === undefined) return
+      if (cur <= 1) this.inflight.delete(inflightKey)
+      else this.inflight.set(inflightKey, cur - 1)
+      this.inflightTotal--
+    }
+
     const agent = target.protocol === 'https:' ? https : http
     let upstream: http.ClientRequest
     try {
@@ -284,6 +361,9 @@ export class ConnectorProxy {
       },
       )
     } catch (e) {
+      // The slot was taken just above and no lifecycle event will ever fire for a request
+      // that failed to build, so this is the one path that must hand it back by hand.
+      releaseSlot()
       setHealth(def.id, 'error', `could not build the upstream request: ${errMessage(e)}`)
       return this.deny(res, 502, `connector "${def.id}" has an unusable definition: ${errMessage(e)}`)
     }
@@ -343,6 +423,12 @@ export class ConnectorProxy {
     upstream.on('close', clearTotal)
     upstream.on('error', clearTotal)
     res.on('close', clearTotal)
+    // The same three events hand the slot back, via the once-guard above. Wired here rather
+    // than only on 'close' because a request can end on any one of them, and a slot released
+    // on none of them is a slot leaked for the life of the process.
+    upstream.on('close', releaseSlot)
+    upstream.on('error', releaseSlot)
+    res.on('close', releaseSlot)
     upstream.setTimeout(UPSTREAM_TIMEOUT_MS, onIdleTimeout)
     // Tee a bounded prefix of the REQUEST so we know whether this call was a tools/list.
     // learnTools used to run on EVERY JSON reply, so a tools/call response carrying
