@@ -234,7 +234,7 @@ while (Date.now() - start < 45000) {
   // cross-check. total - fresh should stay equal to the marked baseline for the whole run; if
   // it drifts, React recreated marked nodes and the verdict is reading a false positive. That
   // is visible here rather than silent.
-  samples.push({ stop: m.stop, assistant: m.assistant, line: `${t.toFixed(1)}s stop=${m.stop} state=${m.state} assistant=${m.assistant} (fresh ${m.fresh}, total ${m.textCount}, marked ${BASELINE})` })
+  samples.push({ stop: m.stop, assistant: m.assistant, state: m.state, line: `${t.toFixed(1)}s stop=${m.stop} state=${m.state} assistant=${m.assistant} (fresh ${m.fresh}, total ${m.textCount}, marked ${BASELINE})` })
   if (m.stop) sawStop = true
   // Turn done once the ASSISTANT has produced text and Stop is gone. The old form asked
   // whether the page contained the word "hello" — which the harness's own prompt contains, so
@@ -274,7 +274,9 @@ if (verdict.reason === 'no-stop-sample' || verdict.reason === 'no-assistant-samp
   console.log('   This is not a pass and not a failure: the run did not produce the evidence.')
 } else {
   check('indicator SURVIVED init (Stop still up when output began)', verdict.ok,
-    { pass: `Stop last seen at sample ${verdict.lastStop}, output first at ${verdict.firstAssistant}`,
+    { pass: verdict.reason === 'output-arrived-at-turn-end'
+        ? `Stop up through sample ${verdict.lastStop}; output arrived with the turn's end at ${verdict.firstAssistant} (session no longer running)`
+        : `Stop last seen at sample ${verdict.lastStop}, output first at ${verdict.firstAssistant}`,
       fail: `Stop last seen at sample ${verdict.lastStop} but output did not start until ${verdict.firstAssistant} — the indicator died before the turn produced anything` })
 }
 // ★ THIS ASSERTION WAS VACUOUS AND ALWAYS GREEN. It searched document.body for 'hello' —

@@ -68,10 +68,27 @@ export function preSendSettled(counts) {
   }
 }
 
+// ── OUTPUT THAT ARRIVES WITH THE END OF THE TURN ─────────────────────────────────────────
+// MEASURED 2026-10-06, four live runs in a row: the model wrote NO text before its tool call,
+// so the turn's only assistant text landed in the same 200ms tick as the result frame. Stop
+// was up in every sample for 12s, then one sample later read stop=false state=idle
+// assistant=true. `lastStop >= firstAssistant` is false by exactly one sample, and the run
+// went red as "the indicator died before the turn produced anything" — with the indicator
+// having been up the entire turn. Same shape as the 2026-08-24 wall-clock miss: an
+// observation that is ALSO produced by a healthy turn, so it cannot be the verdict alone.
+//
+// The discriminator is the turn's own state, not timing. The clobber signature is Stop DOWN
+// while the session is still RUNNING; a turn that has ended reads idle. So Stop's last sample
+// being immediately before the first output counts as survival ONLY when that first-output
+// sample already shows the turn over (`state` present and not 'running'). A sample with no
+// `state` keeps the strict rule, so old callers lose nothing. A clobber still fails: Stop dies
+// at init, seconds before any output, so the two samples are never adjacent — and if they
+// somehow were while the session still read 'running', this branch refuses.
 /**
- * @param {{stop: boolean, assistant: boolean}[]} samples in observation order
+ * @param {{stop: boolean, assistant: boolean, state?: string|null}[]} samples in observation order
  * @returns {{ok: boolean, reason: string, lastStop: number, firstAssistant: number}}
- *   `ok` is meaningful only when `reason === 'ok'` or `'indicator-died-before-output'`.
+ *   `ok` is meaningful only when `reason` is 'ok', 'output-arrived-at-turn-end' or
+ *   'indicator-died-before-output'.
  */
 export function indicatorSurvivedInit(samples) {
   let lastStop = -1
@@ -85,6 +102,10 @@ export function indicatorSurvivedInit(samples) {
   // never observed — the failure mode this file exists to remove, one level up.
   if (lastStop === -1) return { ok: false, reason: 'no-stop-sample', lastStop, firstAssistant }
   if (firstAssistant === -1) return { ok: false, reason: 'no-assistant-sample', lastStop, firstAssistant }
+  const atOutput = samples[firstAssistant].state
+  if (lastStop === firstAssistant - 1 && typeof atOutput === 'string' && atOutput !== 'running') {
+    return { ok: true, reason: 'output-arrived-at-turn-end', lastStop, firstAssistant }
+  }
   return {
     ok: lastStop >= firstAssistant,
     reason: lastStop >= firstAssistant ? 'ok' : 'indicator-died-before-output',

@@ -429,7 +429,15 @@ EXPECTED_RED=(
   # that wrote the test. Removed 2026-09-29 when both patches landed and it went
   # 0 passed/1 failed → 11 passed/0 failed. Registration below is untouched: the guard keeps
   # running, and a future regression reds it there rather than being excused here.)
-  "authorizer-box-divergence-guard.mts|closed|an ordering fault, caught by failing CLOSED — this is the guard WORKING, not a sandbox escape"
+  # (connector-concurrency-cap-test.mts was listed here as `unbuilt` while the cap existed only
+  # as a reviewed patch, server/src being a read-only mount to the sessions that wrote both the
+  # test and the patch. Removed 2026-10-05 when the patch was applied and it went
+  # 7 passed/4 failed → 11 passed/0 failed. Registration below is untouched: the guard keeps
+  # running, so a future regression reds it there rather than being excused here.)
+  # (authorizer-box-divergence-guard.mts was listed here as `closed` — the authorizer's
+  # last-wins rule denied a write the real box performed. Removed 2026-10-06 at sandbox
+  # migration A2, which routed sandboxPathAccess through boxCanReach (any-survivor-grants,
+  # resolved in box space) and turned it green. Registration below is untouched.)
   # (restore-elevation-guard.mts was listed here as `unbuilt` a SECOND time — the first for the
   # missing downgrade, this one for the opposite reason: the operator corrected the rule, so a
   # session's OWN elevated mode must now SURVIVE a restart while a child still cannot acquire
@@ -674,6 +682,11 @@ SUITE=(
   # shell settles to 'unknown', never 'failed', because its outcome is unknowable rather than
   # known-bad. Asserts on bashProcsOf() after restore, never on restore()'s return value.
   "none:bashprocs-persist-test.mts"
+  # The connector proxy's RESOURCE bound, as distinct from its time bound. Converts both
+  # [open] notes in rt2-connectors-c.mts into assertions. Case 6 (silent upstream) passes
+  # against the unpatched tree on purpose: it is what shows an all-red run means the harness
+  # is broken rather than the feature missing.
+  "none:connector-concurrency-cap-test.mts"
   # session:clearBashProcs — clearing settled background-process rows from the SERVER registry,
   # which is what makes a clear cross-device (it replaced a browser-localStorage store that
   # left the phone showing rows the desktop had cleared). Asserts on the registry via the
@@ -772,17 +785,7 @@ SUITE=(
   # the fixture ever stops exercising the defect it says so instead of passing for the wrong
   # reason.
   "none:authorizer-box-divergence-guard.mts"
-  # STANDING GUARD, green today and green is correct: no file under server/src or shared/src
-  # may reference viewOf / boxCanReach / refuseIfBoxCouldHavePlaced / overlayPathFor. The rule
-  # that the path layer stays unwired until its preconditions are met used to be a sentence in
-  # a comment; this is that sentence as a check.
-  # ★ IT IS MEANT TO GO RED ONE DAY. When the first caller is deliberately wired, RETIRE this
-  # guard in the same commit — do not add an exemption and do not delete it quietly, because
-  # either turns "we decided this is ready" into "someone made the alarm stop". A red you did
-  # NOT cause by wiring something means the layer was imported by accident, which is the whole
-  # point. It self-checks first: if the definer moves or a watched symbol is renamed it fails
-  # LOUDLY rather than going permanently green watching a name that no longer exists.
-  "none:layer-not-wired-guard.mts"
+  # (layer-not-wired-guard.mts retired at A2, 2026-10-06: the path layer is now wired by sandbox.ts.)
   # ⚠ EXPECTED RED — AND IT DOCUMENTS UNBUILT WORK, NOT A LIVE ESCAPE. Distinct from
   # data-dir-containment-guard above: nothing here is broken or exploitable today. It states a
   # PRECONDITION for wiring the path layer — that refused mounts come back as EXCLUSIONS WITH A
@@ -938,6 +941,15 @@ SUITE=(
   # any rule is applied. Phone-only; desktop is clean. Not fixed — which band gives up the
   # 33px is a layout-policy call.
   "chrome:shell-fixed-cost-probe.mjs"
+  # Its sibling: can the pending card actually YIELD without losing its controls?
+  # shell-fixed-cost-probe proved the COMPOSER is no longer clipped; its argument for why that
+  # is safe ("the card owns an inner overflow-y-auto, so shrinking is lossless") was shown for
+  # AskUserQuestionCard and ASSUMED for PermissionCard, whose only scroller was a FIXED
+  # max-h-48. Measured before the fix: at 375x667/--vvh 380 both Allow and Deny sat BELOW the
+  # shell edge — off-screen, with no way to answer the card that was doing the squeezing.
+  # Boots its own server+vite on 4502/5302/9375 (distinct from this file's 4500/5300/9373) so
+  # it compiles the WORKING TREE, not web/dist.
+  "chrome:pending-card-squeeze-probe.mjs"
   # GROUP B — own server (4499), own vite (5299), own Chrome. It compiles the WORKING TREE,
   # so unlike the Group A tests its result is real evidence, which is the whole point: the
   # scroll-memory key fix it tests is in web/src and is NOT in web/dist, so a bundle-serving
@@ -1025,6 +1037,17 @@ SUITE=(
   "srv4321:ratelimit-test.mjs"
   "srv4321:ready-clobber-test.mjs"
   "srv4321:sound-notif-test.mjs"
+  # The per-session MODEL PICKER driven in a real browser. modelPicker.ts is well covered as
+  # pure functions, but the MENU using them had never run in a browser and the FAILURE path
+  # (run() → modelErr, the menu deliberately NOT closing) had no test at any layer — nothing
+  # imports App.tsx, so it was invisible to vitest and typecheck alike.
+  "srv4321:model-picker-browser-test.mjs"
+  # The MODEL PICKER driven in a real browser — in particular its FAILURE path (run() /
+  # modelErr / busy in SessionMenu), which had no coverage at any layer. Serves web/dist, so a
+  # source-only change to App.tsx is invisible here until a rebuild.
+  # ⚠ The error sentence is ASSEMBLED AT RUNTIME (`${what} failed.`), so grepping the bundle
+  # for "Setting the model failed." returns 0 and looks exactly like "never shipped". It is a
+  # false negative; the harness asserts on the rendered DOM instead.
   # Tenth member of the group, and it was NOT here. Registered `chrome:` it sat ABOVE this
   # block, but it boots no server and hardcodes http://127.0.0.1:4321 — and the shared
   # server does not start until the first srv4321 entry. So every full run navigated it to

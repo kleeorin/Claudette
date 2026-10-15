@@ -73,7 +73,12 @@ const notebookTabShown = () => evaluate(`!!([...document.querySelectorAll('butto
 const clickSession = (name) => evaluate(`(()=>{const d=[...document.querySelectorAll('div')].find(x=>x.className.includes('cursor-pointer')&&x.textContent&&x.textContent.includes(${JSON.stringify(name)}));if(!d)return false;d.click();return true})()`)
 
 const SHIM = `
-  const RealWS=window.WebSocket; class CapWS extends RealWS{constructor(...a){super(...a);if(String(a[0]).includes('/ws'))window.__appws=this}} window.WebSocket=CapWS;
+  const RealWS=window.WebSocket; window.__isolate = false;
+  class CapWS extends RealWS { constructor(...a){ super(...a); if(String(a[0]).includes('/ws')){ window.__appws=this;
+    this.addEventListener('message',(ev)=>{ if(!window.__isolate) return; let t='';
+      try{ t=JSON.parse(ev.data).type }catch{}
+      if(t==='session:list'||t==='session:state'||t==='session:exit') ev.stopImmediatePropagation();
+    }, true); } } } window.WebSocket=CapWS;
 `
 await send('Page.enable')
 await send('Page.addScriptToEvaluateOnNewDocument', { source: SHIM })
@@ -83,6 +88,12 @@ await waitFor(`!!([...document.querySelectorAll('button')].find(b=>b.textContent
 await waitFor(`!!window.__appws`)
 await wait(600)
 
+// ISOLATE BEFORE THE FIRST FEED (same fix as sound-notif-test.mjs, 2026-10-05): this file feeds
+// SYNTHETIC sessions into a page still connected to the shared :4321 server, and any real
+// session:list broadcast replaces them wholesale. Measured 2026-10-06: synthetic-feed harnesses
+// in this group went red in rotation, one per run. The harness's own feed() calls onmessage
+// directly and is unaffected.
+await evaluate(`window.__isolate = true`)
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 // Y is first → active/viewed; X is the background session Claude works in.
 await feed({ type: 'session:list', sessions: [

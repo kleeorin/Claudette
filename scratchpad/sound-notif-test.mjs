@@ -77,16 +77,53 @@ const SHIM = `
   window.__hidden = false;
   Object.defineProperty(document,'hidden',{configurable:true,get:()=>window.__hidden});
   Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.__hidden?'hidden':'visible'});
-  window.__chimes = 0;
-  class FakeOsc { constructor(){ window.__chimes++; this.frequency={value:0}; this.type='sine' } connect(){} start(){} stop(){} }
+  // ★ COUNT CHIMES, NOT OSCILLATORS. playChime() is a deliberate TWO-NOTE ding-dong
+  // (A5 then D6), so it constructs TWO oscillators per chime. An earlier version of this
+  // shim incremented a counter called __chimes inside the oscillator constructor, which
+  // therefore reported 2 per completion and made every count here read double. That is why
+  // the positive assertions below were written as >= 1: the exact number was not trustworthy,
+  // so nothing could be asserted exactly -- and a genuine DOUBLE SIGNAL (two subscriptions to
+  // the same state change, say) would have been invisible behind the same >= 1.
+  // MEASURED 2026-10-05 in the browser: one completion produced 2 oscillators and exactly
+  // 1 notification, so signal() fires once and the doubling was purely this counter.
+  //
+  // Grouping by microtask rather than dividing by two keeps this independent of how many
+  // notes the chime has: both oscillators of one playChime() are constructed synchronously,
+  // so they fall in a single burst. Change the chime to three notes and this still counts 1.
+  window.__chimes = 0; window.__oscs = 0; window.__inBurst = false;
+  class FakeOsc { constructor(){ this.frequency={value:0}; this.type='sine' } connect(){} start(){} stop(){} }
   class FakeGain { constructor(){ this.gain={setValueAtTime(){},exponentialRampToValueAtTime(){},linearRampToValueAtTime(){}} } connect(){} }
-  class FakeAC { constructor(){ this.state='running'; this.currentTime=0; this.destination={} } resume(){return Promise.resolve()} createOscillator(){return new FakeOsc()} createGain(){return new FakeGain()} }
+  class FakeAC { constructor(){ this.state='running'; this.currentTime=0; this.destination={} } resume(){return Promise.resolve()} createOscillator(){ window.__oscs++;
+      if(!window.__inBurst){ window.__inBurst=true; window.__chimes++; Promise.resolve().then(()=>{window.__inBurst=false}) }
+      return new FakeOsc() } createGain(){return new FakeGain()} }
   window.AudioContext = FakeAC;
   window.__notes = [];
   class FakeNote { constructor(t,o){ this.title=t; this.opts=o||{}; window.__notes.push({title:t,tag:(o||{}).tag}) } close(){} }
   FakeNote.permission='granted'; FakeNote.requestPermission=()=>Promise.resolve('granted');
   window.Notification = FakeNote;
-  const RealWS=window.WebSocket; class CapWS extends RealWS{constructor(...a){super(...a);if(String(a[0]).includes('/ws'))window.__appws=this}} window.WebSocket=CapWS;
+  // ★ THE PAGE'S SESSION WORLD IS THIS TEST'S ALONE, ONCE __isolate IS SET.
+  // Everything below feeds SYNTHETIC sessions (s1/s2) that the server has never heard of. The
+  // shared :4321 server is live and broadcasts to every socket, so any real session:list frame
+  // -- a leftover session from an earlier harness exiting, another harness creating one --
+  // replaces the synthetic list wholesale. s1 is then absent from sessions, the reducer moves
+  // the selection to the real sessions[0] (that invariant is CORRECT: activeId is non-null
+  // only while its row exists), s1 stops being "actively watched", and the finish below
+  // chimes. The file then reports a false app bug: "chimes at a session you are watching".
+  // MEASURED 2026-10-05: with session churn on :4321, 8/8 runs failed exactly that way,
+  // chimes=4, matching the 1-in-7 flake seen in the full suite.
+  //
+  // Registered in the constructor, so it precedes client.ts's sock.onmessage assignment (made
+  // after construction) and stopImmediatePropagation reaches it. The test's own injection
+  // calls __appws.onmessage(...) DIRECTLY, bypassing event dispatch, so it is unaffected.
+  // NOTE: no backticks anywhere in this comment -- it lives inside the SHIM template literal.
+  window.__isolate = false;
+  const RealWS=window.WebSocket;
+  class CapWS extends RealWS{constructor(...a){super(...a);if(String(a[0]).includes('/ws')){window.__appws=this;
+    this.addEventListener('message',(ev)=>{ if(!window.__isolate) return; let t='';
+      try{ t=JSON.parse(ev.data).type }catch{}
+      if(t==='session:list'||t==='session:state'||t==='session:exit') ev.stopImmediatePropagation();
+    }, true);
+  }}} window.WebSocket=CapWS;
 `
 await send('Page.enable')
 await send('Runtime.enable')
@@ -100,6 +137,14 @@ await send('Page.navigate', { url: `${APP}/` })
 await waitFor(`!!([...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Chat'))`)
 await waitFor(`!!window.__appws`)
 await wait(600)
+
+// ★ ISOLATE BEFORE THE FIRST FEED, NOT AFTER IT — the ordering is the whole fix.
+// Measured: switching it on after the synthetic list still failed 7/8, because a real list
+// landing in the gap between the feed and the switch clobbers the synthetic sessions and is
+// not dropped. One instrumented run saw 4 real `session:list` frames, of which the 2 inside
+// that window got through. Isolating first closes the window entirely: 10/10 under the same
+// churn that failed 8/8.
+await evaluate(`window.__isolate = true`)
 
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 await feed({ type: 'session:list', sessions: [
@@ -124,12 +169,23 @@ await evaluate(`window.__chimes=0`)
 const bellClicked = await evaluate(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>(x.getAttribute('aria-label')||'').toLowerCase().includes('desktop notification'));if(!b)return false;b.click();return true})()`)
 check('bell toggle found + clicked', bellClicked === true)
 await wait(200)
-await evaluate(`window.__chimes=0`)  // ignore any confirm chime
+await evaluate(`window.__chimes=0; window.__oscs=0`)  // ignore any confirm chime
 
 // Background session finishes, tab FOCUSED (not hidden), bell on, sound on.
 await finish('s2')
 check('background finish chimes (tab focused, no bell needed for sound)', await poll(chimes, 1), `chimes=${await chimes()}`)
+// ★ EXACTLY ONE, NOT "at least one". This is the assertion that can see a double signal --
+// two subscriptions to api.on.stateChange, or listeners surviving a reconnect -- which the
+// previous >= 1 could not. Verified to have teeth: with the shim made to count each chime
+// twice (simulating exactly that defect) this case goes RED, while >= 1 stays green.
+check('…exactly once, not twice (a double subscription would show here)',
+  (await chimes()) === 1, `chimes=${await chimes()}`)
 check('background finish notifies even with tab FOCUSED', await poll(notes, 1), `notes=${await notes()}`)
+check('…and notifies exactly once', (await notes()) === 1, `notes=${await notes()}`)
+// Pins the chime's SHAPE, so the counter above cannot quietly drift back to counting
+// oscillators: one chime is two notes, and a change to that should be a deliberate edit here.
+check('one chime is a two-note burst (2 oscillators)', (await evaluate(`window.__oscs|0`)) === 2,
+  `oscillators=${await evaluate(`window.__oscs|0`)}`)
 
 // Active session (s1) finishing while you watch it (active + focused): silent.
 const cBefore = await chimes(), nBefore = await notes()

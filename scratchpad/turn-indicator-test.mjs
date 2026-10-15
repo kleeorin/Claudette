@@ -222,5 +222,52 @@ const s = (stop, assistant) => ({ stop, assistant })
       fail: `reason=${r.reason} — a single sample is being treated as evidence of no change` })
 }
 
+// ★ 13-16 PIN 'output-arrived-at-turn-end' (2026-10-06). The live shape that went red four
+// runs in a row: Stop up for 12s, then ONE sample later stop=false state=idle and the turn's
+// only text on screen — the model wrote nothing before its tool call. 13 is that shape and
+// must pass. 14-16 are the ways the new branch could become a hole: an adjacent pair while the
+// session still reads 'running' (14), the real clobber with Stop dying long before output
+// (15), and a sample set with no `state` at all, which must keep the strict rule (16).
+const ss = (stop, assistant, state) => ({ stop, assistant, state })
+{
+  const r = indicatorSurvivedInit([
+    ss(true, false, 'running'), ss(true, false, 'running'), ss(true, false, 'running'), ss(false, true, 'idle'),
+  ])
+  check('13 output landing in the same tick the turn ends is NOT a clobber',
+    r.ok && r.reason === 'output-arrived-at-turn-end',
+    { pass: 'Stop up through the turn, output with the idle sample — passes',
+      fail: `reason=${r.reason} ok=${r.ok} — a healthy turn whose text came at the end reads as a clobber` })
+}
+{
+  const r = indicatorSurvivedInit([
+    ss(true, false, 'running'), ss(true, false, 'running'), ss(false, true, 'running'),
+  ])
+  // (precondition, so this cannot drift into testing the non-adjacent rule instead: Stop's
+  // last sample is IMMEDIATELY before the first output — the only shape the branch accepts.)
+  check('14 (precondition) the fixture is adjacent', r.lastStop === r.firstAssistant - 1,
+    { pass: `lastStop ${r.lastStop}, firstAssistant ${r.firstAssistant}`, fail: `lastStop ${r.lastStop}, firstAssistant ${r.firstAssistant} — not adjacent` })
+  check('14 adjacent but the session still RUNNING at first output stays a failure',
+    !r.ok && r.reason === 'indicator-died-before-output',
+    { pass: 'Stop down while running is the clobber signature — the new branch does not excuse it',
+      fail: `reason=${r.reason} ok=${r.ok} — the turn-end branch accepted a running session` })
+}
+{
+  const r = indicatorSurvivedInit([
+    ss(true, false, 'running'), ss(false, false, 'running'), ss(false, false, 'running'),
+    ss(false, false, 'running'), ss(false, true, 'idle'),
+  ])
+  check('15 the real clobber (Stop dies at init, output much later) is still caught',
+    !r.ok && r.reason === 'indicator-died-before-output',
+    { pass: 'non-adjacent → strict rule → red',
+      fail: `reason=${r.reason} ok=${r.ok} — the clobber now passes` })
+}
+{
+  const r = indicatorSurvivedInit([s(true, false), s(true, false), s(false, true)])
+  check('16 samples without `state` keep the strict rule',
+    !r.ok && r.reason === 'indicator-died-before-output',
+    { pass: 'no state, no exception',
+      fail: `reason=${r.reason} ok=${r.ok} — the branch fires without evidence the turn ended` })
+}
+
 console.log(`\n${pass}/${pass + fail} passed`)
 process.exit(fail === 0 ? 0 : 1)

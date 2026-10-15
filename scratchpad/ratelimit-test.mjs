@@ -108,7 +108,12 @@ import { check, results } from './assert.mjs'
 // reads the usage chip. That one is still unexplained and still open.
 const SHIM = `
   const RealWS = window.WebSocket;
-  class CapWS extends RealWS { constructor(...a){ super(...a); if(String(a[0]).includes('/ws')) window.__appws=this; } }
+  window.__isolate = false;
+  class CapWS extends RealWS { constructor(...a){ super(...a); if(String(a[0]).includes('/ws')){ window.__appws=this;
+    this.addEventListener('message',(ev)=>{ if(!window.__isolate) return; let t='';
+      try{ t=JSON.parse(ev.data).type }catch{}
+      if(t==='session:list'||t==='session:state'||t==='session:exit') ev.stopImmediatePropagation();
+    }, true); } } }
   window.WebSocket = CapWS;
   const realFetch = window.fetch;
   window.fetch = (input, init) => {
@@ -129,6 +134,12 @@ await waitFor(`!!([...document.querySelectorAll('button')].find(b=>b.textContent
 await waitFor(`!!window.__appws`)
 await wait(600)
 
+// ISOLATE BEFORE THE FIRST FEED (same fix as sound-notif-test.mjs, 2026-10-05): this file feeds
+// SYNTHETIC sessions into a page still connected to the shared :4321 server, and any real
+// session:list broadcast replaces them wholesale. Measured 2026-10-06: synthetic-feed harnesses
+// in this group went red in rotation, one per run. The harness's own feed() calls onmessage
+// directly and is unaffected.
+await evaluate(`window.__isolate = true`)
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 await feed({ type: 'session:list', sessions: [
   { id: 's1', name: 'usage-demo', cwd: '/tmp', rootDir: '/tmp', state: 'idle' },

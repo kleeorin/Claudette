@@ -84,7 +84,12 @@ const SHIM = `
   FakeNote.requestPermission = () => Promise.resolve('granted');
   window.Notification = FakeNote;
   const RealWS = window.WebSocket;
-  class CapWS extends RealWS { constructor(...a) { super(...a); if (String(a[0]).includes('/ws')) window.__appws = this; } }
+  window.__isolate = false;
+  class CapWS extends RealWS { constructor(...a){ super(...a); if(String(a[0]).includes('/ws')){ window.__appws=this;
+    this.addEventListener('message',(ev)=>{ if(!window.__isolate) return; let t='';
+      try{ t=JSON.parse(ev.data).type }catch{}
+      if(t==='session:list'||t==='session:state'||t==='session:exit') ev.stopImmediatePropagation();
+    }, true); } } }
   window.WebSocket = CapWS;
 `
 await send('Page.enable')
@@ -124,6 +129,12 @@ await evaluate(`(()=>{const el=[...document.querySelectorAll('*')].find(n=>n.chi
 await waitFor(`!!document.querySelector('textarea')`)
 await wait(300)
 
+// ISOLATE BEFORE THE FIRST FEED (same fix as sound-notif-test.mjs, 2026-10-05): this file feeds
+// SYNTHETIC session:state frames for a real session into a page still connected to the shared
+// :4321 server, and a real state/list frame arriving mid-run overrides them. In the 2026-10-06 suite runs a different
+// synthetic-feed harness went red each time; this drops real session frames for the rest of
+// the run. The harness's own feed() calls onmessage directly and is unaffected.
+await evaluate(`window.__isolate = true`)
 const feed = (frame) => evaluate(`(()=>{window.__appws.onmessage({data:${JSON.stringify(JSON.stringify(frame))}});return true})()`)
 const noteCount = () => evaluate(`window.__notes.length`)
 const notes = () => evaluate(`window.__notes.map(n=>n.title)`)
