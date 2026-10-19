@@ -288,7 +288,9 @@ const bin = path.join(repo, 'node_modules', '.bin', 'vitest')
 //     box labelled "full id", and Enter would re-post the alias through the custom path.
 //   * isSameModel — the no-op guard, mirroring the role picker's `if (id !== roleId)`. Both
 //     sides normalised, because undefined / '' / '  ' all mean "account default".
-const MIN_TESTS = 252
+// Raised 252 → 260 on 2026-10-19, counted from a run: lib/sessionOrder.test.ts (8) — the
+// sidebar order moved out of App.tsx; black (muted) families sink to the bottom, no pin.
+const MIN_TESTS = 260
 
 // THE DETECTOR IS DELIBERATELY WIDER THAN THE RUNNER, and that relationship is the whole
 // point of it. `web/vitest.config.ts` collects exactly `src/**/*.test.{ts,tsx}`. A detector
@@ -341,7 +343,8 @@ function testShapedUnder(dir, rel = '') {
 // Raised 11 → 12 the same day (api/client.test.ts — the Settings-crash regression).
 // Raised 12 → 13 the same day (lib/autoResume.test.ts — the subsession-context regression).
 // Raised 18 → 19 on 2026-09-29 (components/BashProcDetail.test.tsx), counted.
-const MIN_TEST_FILES = 20
+// Raised 20 → 21 on 2026-10-19 (lib/sessionOrder.test.ts), counted.
+const MIN_TEST_FILES = 21
 
 const shaped = testShapedUnder(web)
 check(`the walk found at least ${MIN_TEST_FILES} test file(s) — it is not silently looking at nothing`,

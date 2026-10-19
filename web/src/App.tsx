@@ -34,6 +34,7 @@ import { MD_PX, usePhone } from './lib/breakpoint'
 import { useVisibleHeight } from './lib/visualViewport'
 import { attachNewNotebooks } from './lib/notebookAttach'
 import { dotStateFor, pruneMutes, busyKernelCount } from './lib/sessionLights'
+import { orderSessions } from './lib/sessionOrder'
 import { StateDot } from './components/StateDot'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord } from '@claudette/shared'
 
@@ -1480,49 +1481,18 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
   const [deckOpen, setDeckOpen] = useState(false)
   const deckCwd = sessions.find((s) => s.id === activeId)?.cwd || homeDir
   const pick = (id: string) => { setActive(id); onClose() }
-  // A subsession belongs UNDER its parent, not at the bottom of the list: order the
-  // flat server list into parent → its children (recursively), keeping each level in
-  // creation order. An orphan (parent already closed) stays a top-level row.
-  // The session you are VIEWING holds its position until you leave it. Everything else
-  // reorders live.
-  //
-  // Pinning is by INDEX, not by freezing its rank: the complaint this answers is "the row
-  // moved under my cursor", and holding a rank still lets other sessions overtake and shift
-  // it down. So the active family is spliced back to the index it occupied last render.
-  // `pinnedRef` holds the previous top-level order, which is the only extra state needed.
+  // Display order lives in lib/sessionOrder (tested; nothing imports App.tsx). Black-light
+  // (muted) families sink to the bottom, and the order is recomputed on every light change —
+  // `muted` and `attention` are dependencies because they decide the light, and there is no
+  // pin holding the viewed row in place (removed 2026-10-19, operator's call).
   const { activity } = useSessions()
-  const pinnedRef = useRef<string[]>([])
-  const ordered = useMemo(() => {
-    const rows = orderSessions(sessions, activity)
-    const roots = rows.filter((r) => r.depth === 0).map((r) => r.session.id)
-    // The active session's family root: the last depth-0 row at or before it. Derived from
-    // the RENDERED rows rather than from parentId, so it agrees with the nesting actually on
-    // screen — an orphan whose parent has closed is its own root here, exactly as it is drawn.
-    let anchor: string | null = null
-    for (const r of rows) {
-      if (r.depth === 0) anchor = r.session.id
-      if (r.session.id === activeId) break
-    }
-    if (!activeId) anchor = null
-    const was = pinnedRef.current.indexOf(anchor ?? '')
-    let finalRoots = roots
-    if (anchor && was >= 0) {
-      const now = roots.indexOf(anchor)
-      if (now >= 0 && now !== was) {
-        const without = roots.filter((id) => id !== anchor)
-        finalRoots = [...without.slice(0, was), anchor, ...without.slice(was)]
-      }
-    }
-    pinnedRef.current = finalRoots
-    if (finalRoots === roots) return rows
-    // Re-emit the rows in the pinned root order, each root followed by its own block.
-    const blocks = new Map<string, { session: SessionInfo; depth: number }[]>()
-    let cur: { session: SessionInfo; depth: number }[] | null = null
-    for (const r of rows) {
-      if (r.depth === 0) { cur = [r]; blocks.set(r.session.id, cur) } else cur?.push(r)
-    }
-    return finalRoots.flatMap((id) => blocks.get(id) ?? [])
-  }, [sessions, activity, activeId])
+  const ordered = useMemo(
+    () => orderSessions(sessions, activity, (id) => {
+      const s = sessions.find((x) => x.id === id)
+      return !!s && dotStateFor(s, muted.has(id), attention) === 'muted'
+    }),
+    [sessions, activity, muted, attention],
+  )
 
   return (
     <>
@@ -1838,62 +1808,6 @@ function SandboxFields({ value, onChange, cwd, available }: { value: SbState; on
       )}
     </div>
   )
-}
-
-// Flatten the server's session list into display order: every subsession sits
-// directly under its parent (nested to any depth). A session whose parent isn't in the list
-// (closed, or not yet loaded) is treated as top-level so it can never vanish from the sidebar.
-//
-// ── MOST RECENTLY ACTIVE FIRST, BY FAMILY ────────────────────────────────────────────
-// Top-level rows are ordered by the newest activity ANYWHERE IN THE FAMILY — a parent and
-// its subsessions travel together as a block, so a subsession doing the work lifts its whole
-// family and the parent→child structure is never broken to do it. That was the operator's
-// choice over floating the subsession out on its own.
-//
-// Within a family, children keep creation order. Sorting there too would mean a nested list
-// reshuffling at two levels, which is harder to track than it is useful.
-//
-// `activity` is a monotonic counter from the store, bumped when a SESSION acts — not when
-// you send to it. Sessions with no recorded activity yet (restored from persistence, never
-// touched this load) rank 0 and therefore sort below anything that has moved, keeping their
-// relative creation order because the sort is stable.
-function orderSessions(
-  sessions: SessionInfo[],
-  activity: ReadonlyMap<string, number>,
-): { session: SessionInfo; depth: number }[] {
-  const byParent = new Map<string, SessionInfo[]>()
-  const ids = new Set(sessions.map((s) => s.id))
-  const roots: SessionInfo[] = []
-  for (const s of sessions) {
-    const pid = s.parentId && ids.has(s.parentId) && s.parentId !== s.id ? s.parentId : null
-    if (!pid) { roots.push(s); continue }
-    const kids = byParent.get(pid) ?? []; kids.push(s); byParent.set(pid, kids)
-  }
-  const out: { session: SessionInfo; depth: number }[] = []
-  const seen = new Set<string>()
-  const walk = (s: SessionInfo, depth: number) => {
-    if (seen.has(s.id)) return   // guards a parentId cycle from recursing forever
-    seen.add(s.id)
-    out.push({ session: s, depth })
-    for (const k of byParent.get(s.id) ?? []) walk(k, depth + 1)
-  }
-  // Rank each root by the newest activity in its whole subtree, then sort roots by it.
-  // Computed by walking the same parent map, so a family's rank cannot disagree with the
-  // nesting that is about to be rendered.
-  const familyRank = (s: SessionInfo, guard = new Set<string>()): number => {
-    if (guard.has(s.id)) return 0        // same parentId-cycle guard as walk()
-    guard.add(s.id)
-    let best = activity.get(s.id) ?? 0
-    for (const k of byParent.get(s.id) ?? []) best = Math.max(best, familyRank(k, guard))
-    return best
-  }
-  const ranked = roots.map((s) => ({ s, rank: familyRank(s) }))
-  // Stable by construction: Array.prototype.sort is stable in every engine this ships to,
-  // so equal ranks (including the all-zero case on a cold load) keep server order.
-  ranked.sort((a, b) => b.rank - a.rank)
-  for (const { s: r } of ranked) walk(r, 0)
-  for (const s of sessions) if (!seen.has(s.id)) out.push({ session: s, depth: 0 })   // cycle leftovers
-  return out
 }
 
 function SessionRow({ session, depth, active, finished, attention, muted, onToggleMute, notebookIds, onSelect, onClose, onOpenAgent, onOpenBashProc }: { session: SessionInfo; depth: number; active: boolean; finished: boolean; attention: ReadonlyMap<string, AttentionReason>; muted: boolean; onToggleMute: () => void; notebookIds: string[]; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void; onOpenBashProc: (id: string, label: string) => void }) {
