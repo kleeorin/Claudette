@@ -1,5 +1,5 @@
 # Claudette — Handover
-_Last updated: 2026-10-06._
+_Last updated: 2026-10-19._
 
 <!-- Deliberately no "working tree is clean" line here. The previous one was stale the
      moment it was written and stayed wrong for a month, which is the same failure this
@@ -7,39 +7,36 @@ _Last updated: 2026-10-06._
      file cannot be. -->
 
 
-## ⛔ COORDINATOR HANDOVER — 2026-10-06. READ FIRST.
+## ⛔ COORDINATOR HANDOVER — 2026-10-19. READ FIRST.
 
-Coordinator = this session, named **Claudette**. **The team is EMPTY** — all six teammates were
-dismissed on 2026-10-06 at the user's order and the work consolidated here. Their exit reports are
-the role notes in `.claude/team-handovers/` (Landing's: `implementer-landing-2026-10-06.md`).
+Coordinator = this session, named **Claudette**. Team: one implementer, **Landing**, hired 2026-10-15 for the
+paths this session cannot write (`server/src`, `shared/src`, `web/dist` — probe with `test -w`; mounts flip).
+The user approves Landing's permission prompts by hand, so it is often paused; that is expected.
+Earlier teammates' exit reports are the role notes in `.claude/team-handovers/`.
 
-**This session can NOT write `server/src`, `shared/src` or `web/dist`** (probe with `test -w`; mounts
-flip). The user said: do NOT do anything needing those for now — they will be handled later.
+### Status
+**master is ahead of origin, NOT pushed** (the user is holding the push). Local commits since `a68acf3`:
+connector concurrency cap · notebook target identity · sandbox A2 · phone layout · test de-flakes ·
+handover split (all 2026-10-14) · sidebar order: muted families sink to the bottom, every light change
+re-sorts, no pin (`web/src/lib/sessionOrder.ts`, 2026-10-19) · the sandbox fixes below (2026-10-19).
+Run `git log origin/master..` for the exact list.
 
-### Status — last commit `a68acf3` (pushed). Everything below is UNCOMMITTED, verified green.
-| Item | Evidence |
-|---|---|
-| Connector concurrency cap — 503 at 6 per (session, connector), 64 global; handshake 15s / ceiling 120s unchanged (`connectorProxy.ts`) | `connector-concurrency-cap-test` 15/15; mutants C1–C5 killed; plan `.claude/plans/connector-concurrency-cap.md` |
-| Notebook target identity (user bug: edits landed in the NEW active pane) — pin survives team turns (`TurnNotebookRegistry.onUserTurn`), explicit path honoured when open, optional `expect`, every result echoes name+path, `pathProp` rewritten | `active-pane-test` 35 assertions; plan `.claude/plans/notebook-target-identity.md` |
-| Sandbox **A2** — `sandbox.ts` authorizers wired through `sandboxPaths.ts`; `!m.exists` fail-open removed first; `layer-not-wired-guard` retired; `authorizer-box-divergence-guard` green | all sandbox tests green, mutants 5/5; reviewed by QC + coordinator, no logic defect. Plan `.claude/plans/sandbox-migration-a2.md` |
-| Phone layout — pending-card band and PermissionCard yield so the composer and Allow/Deny stay on screen (`ChatView.tsx`) | `shell-fixed-cost-probe`, `pending-card-squeeze-probe` 33/33 (now asserts a squeeze was needed) |
-| Test fixes — `sound-notif-test` (flake + exact chime count), `real-turn` verdict (`turn-indicator.mjs` `output-arrived-at-turn-end`, 17/17, mutants 4/4), `model-picker-browser-test` (polled notice; opens ITS OWN row's menu, not the first), and the isolate-before-feed fix copied to the 7 other synthetic-feed :4321 harnesses (attention, history-resume, notebook-session, notifications, optimistic-busy, ratelimit, ready-clobber) | :4321 group 5/5 runs green; full suite 2026-10-06: 115 pass, 0 fail, 6 jupyter skips |
-| `HANDOVER.md` split; history in `HANDOVER-ARCHIVE.md` | — |
+**Live server :4319** has none of the server-side items until a restart — the user's call. `web/dist`
+(`index-aVaKRvrT.js`, 2026-10-19) is current and has the sidebar change; reload the browser to see it.
 
-**Live server :4319** runs the 2026-10-04 code (confirmed by Landing): it does NOT have the items above
-until a restart — the user's call. **`web/dist`** (`index-BvFpsqG7.js`) has both layout fixes, but a later
-comment-only edit to `ChatView.tsx` makes it older than its sources, so the suite calls the 12 bucket-1
-browser harnesses uninterpretable until the next rebuild (needs `web/dist` write access).
-
-### Open — deferred by the user (need read-only paths)
-1. **Possible residual fail-open, settle BEFORE A3** (QC, [likely], unexecuted): `refuseIfBoxCouldHavePlaced`
-   (`sandboxPaths.ts`) never realpaths the candidate. Logical path outside every mount, real path inside an
-   rw mount (`/elsewhere/link` → `/srv/app/x`, rw mount `/proj` → `/srv/app`) ⇒ no refusal ⇒ venv probe on
-   the HOST. Pre-dates A2. Fix: also compare `real(p)` against `m.real`.
-2. Stale comment `sandbox.ts` ~:599 (still says sandbox.ts does not import sandboxPaths.ts).
-3. A3–A6 (outline in the A2 plan §7). Open precondition: `viewOf` is unbranded and applies no refusal;
-   close it before or with A4 (the only argv change).
-4. `web/dist` rebuild (see above).
+### Open — sandbox (as of 2026-10-19)
+Committed 2026-10-19: QC's symlinked-candidate fail-open fix, A3, F1 (state dirs hidden under ro mounts
+and at their real spelling), F2 (a `/` mount: containment, overlays, cwd). All verified by Landing and the
+coordinator; NOT live until :4319 restarts.
+1. **F3 — KNOWN, fails CLOSED, unfixed.** Since A3, `symlinkMountRefusal` builds its roots with `viewOf`,
+   so a REFUSED rw symlinked mount still contributes its real target as a root. A box-planted link at a path
+   the user lists as an rw mount can then get OTHER symlinked mounts refused at next launch. F2 amplifies it:
+   a planted link to `/` refuses every symlinked mount, including the project — the session cannot start.
+   Not an escape. Also: `appSourceProtections` / `hiddenStateDests` consume the UNREFUSED mount list (the A4
+   precondition). Landing could not write the F3 analysis (a safety classifier stopped it); the user chose to
+   ship without F3 and handle it later.
+2. A4–A6 (outline in `.claude/plans/sandbox-migration-a2.md` §7). A4 must take only refused-clean mounts.
+3. B — `normalizeSandbox` does not trust-gate mount widening for untrusted callers.
 
 ### Open — other
 - Confined background-output read via `/proc/<inner pid>/root` never verified end to end (needs a logged-in sandboxed session).
@@ -59,9 +56,10 @@ browser harnesses uninterpretable until the next rebuild (needs `web/dist` write
 - `pkill -f` / `pgrep -f` match their own command line.
 - Mutate a COPY; report `ran=N` + an XX control; a surviving mutant is only as good as the mutant.
 
-### Next steps
-1. Commit only on the user's order (scope by feature: connector cap · notebook target · A2 · layout · test fixes · docs).
-2. When the user enables write access: items 1–4 above, in that order; then restart :4319 (user's call).
+### Next steps (one item at a time; present each to the user and ask)
+1. Push — on the user's order.
+2. Restart :4319 — the user's call; it makes the connector cap, notebook fix and sandbox fixes (incl. F1) live.
+3. F3, then A4–A6, then B — see "Open — sandbox".
 
 ### References
 Plans: `.claude/plans/` · role notes: `.claude/team-handovers/` · all older history (2026-07-13 .. 2026-10-04): `HANDOVER-ARCHIVE.md` — read on demand.
