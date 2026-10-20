@@ -132,14 +132,21 @@ function appSourceDirs(): string[] {
 // so an overlay at a path nothing else binds just materializes an unrelated empty dir inside
 // the box and protects nothing, while the real subtree stays writable through the rw mount.
 // Returns that dest when `rd` is inside the mount by either spelling, else null.
-function overlayDestFor(mount: SandboxMount, rd: string): string | null {
-  if (mount.mode !== 'rw') return null
+// `anyMode`: rw-only is right for appSourceProtections, where WRITING is the escape and an ro
+// mount needs no overlay. It is wrong for hiddenStateDests, where READING is the escape and an
+// ro mount exposes the token exactly as well as an rw one — so that caller passes true.
+function overlayDestFor(mount: SandboxMount, rd: string, anyMode = false): string | null {
+  if (!anyMode && mount.mode !== 'rw') return null
   const logical = path.resolve(mount.path)
   // Same both-ways probe as isUnsafeSymlinkMount, for the same reason and the same bug.
   for (const root of [logical, tryRealpath(logical)]) {
     if (root === null) continue
     if (root === rd) return logical
-    if (rd.startsWith(root + path.sep)) return path.join(logical, rd.slice(root.length + 1))
+    // `/` already ends in a separator: `root + sep` would be '//' and match nothing, so a `/`
+    // mount got no app-source overlay and no state-dir hide (sandbox-paths-test #27c,
+    // auth-token-containment-guard §5d). Same fix as sandboxPaths.ts contains().
+    const prefix = root.endsWith(path.sep) ? root : root + path.sep
+    if (rd.startsWith(prefix)) return path.join(logical, rd.slice(prefix.length))
   }
   return null
 }
@@ -175,12 +182,28 @@ function stateDirsToHide(): string[] {
 // reason appSourceProtections does: an overlay bound at the canonical path binds a path
 // nothing else binds, and (Critic proved live) sorts first under shallow-first ordering and
 // LOSES the last-match-wins race — actively defeated while appearing present.
+//
+// EVERY MOUNT MODE, AND BOTH SPELLINGS OF THE DIR. This used to inherit overlayDestFor's
+// rw-only rule, so an ro mount of $HOME (or of any ancestor) bound no hide at all and the box
+// READ the token — measured live with bwrap, while auth-token-containment-guard stayed green
+// because it only ever mounted $HOME rw. And stateDirsToHide() is lexical, so with ~/.config a
+// symlink into a dotfiles tree and that tree mounted by its REAL path, the dir matched no
+// mount spelling and was exposed even rw. overlayDestFor already probes the mount root both
+// ways; the dir is now probed both ways too (sandboxPathAccess's own check canonicalizes it).
+// Pinned by auth-token-containment-guard §5/§5b.
+// Under a NON-rw mount a dest is emitted only if the dir exists: bwrap cannot create a
+// mountpoint inside a read-only bind, so a missing dir would fail the launch — and a missing
+// dir has nothing to hide. Under rw the old unconditional emission is kept byte-for-byte.
 function hiddenStateDests(dataMounts: SandboxMount[]): string[] {
   const out: string[] = []
   for (const dir of stateDirsToHide()) {
-    for (const m of dataMounts) {
-      const dest = overlayDestFor(m, dir)
-      if (dest && !out.includes(dest)) out.push(dest)
+    const real = tryRealpath(dir)
+    for (const rd of real && real !== dir ? [dir, real] : [dir]) {
+      for (const m of dataMounts) {
+        if (m.mode !== 'rw' && !existsSync(rd)) continue
+        const dest = overlayDestFor(m, rd, /* anyMode */ true)
+        if (dest && !out.includes(dest)) out.push(dest)
+      }
     }
   }
   return out
@@ -440,7 +463,10 @@ function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[], gpu = false): st
   const cwdReachable = allMounts.some((m) => {
     if (!existsSync(m.path)) return false
     const mp = path.resolve(m.path)
-    return mp === c || c.startsWith(mp + path.sep) || mp.startsWith(c + path.sep)
+    // `/` ends in a separator, so `mp + sep` would be '//' and a `/` mount would read as off
+    // the lineage — binding an EMPTY dir over the very project (sandbox-paths-test #27e).
+    const withSep = (p: string) => (p.endsWith(path.sep) ? p : p + path.sep)
+    return mp === c || c.startsWith(withSep(mp)) || mp.startsWith(withSep(c))
   })
   if (cwd && !cwdReachable) {
     const empty = emptyMountpoint()
@@ -574,11 +600,20 @@ function symlinkMountRefusal(p: string, rwRoots: string[]): MountExclusionReason
   // the writable set — and make the PROBE the thing that covers both spellings. OR-ing is
   // strictly more restrictive than either test alone, so this can only refuse more, never
   // less.
-  const logicalParent = path.dirname(path.resolve(p))
-  const realParent = tryRealpath(logicalParent)
-  const under = (dir: string): boolean => rwRoots.some((r) => dir === r || dir.startsWith(r + path.sep))
-  const boxWritable = under(logicalParent) || (realParent !== null && under(realParent))
-  if (!boxWritable) return undefined
+  //
+  // A3: the question "could the box have planted the link node?" is Q2 PROVENANCE, so it is
+  // asked of the path layer — refuseIfBoxCouldHavePlaced on the link's PARENT — rather than
+  // re-derived here. The roots go in as given (logical), and the layer matches the parent in
+  // both spellings against each root in both spellings. That is a superset of the old
+  // probe, and the extra reach is a hole the old probe had: a link whose parent lies under
+  // the REAL root of a SYMLINKED rw mount (rw ~/proj -> /srv/app, mount /srv/app/x -> /) is
+  // writable by the box through ~/proj, yet matched no logical root, so it was bound and
+  // bwrap followed it out. The commonest form: a session opened at the real spelling of a
+  // project mounted by its link, whose obligatory rw <cwd>/.claude the box can plant.
+  // Pinned by sandbox-paths-test #26/#26b. Only the WHETHER comes from the layer; the
+  // message below is unchanged, because it names the refused MOUNT, not the rw root.
+  const roots = viewOf(rwRoots.map((r): SandboxMount => ({ path: r, mode: 'rw' })))
+  if (refuseIfBoxCouldHavePlaced(roots, path.dirname(path.resolve(p))) === undefined) return undefined
   const message = `refusing symlinked mount source ${p} → ${tryRealpath(p) ?? '?'}: its parent is writable inside the box, so binding it would follow the link out of the sandbox (potential escape). Mount the real path instead.`
   // Still warned, unchanged, so nothing that greps logs for this line loses it. The message
   // is now ALSO returned — which is the whole of step (ii): the refusal, its subject and its
@@ -594,12 +629,14 @@ function symlinkMountRefusal(p: string, rwRoots: string[]): MountExclusionReason
 // session's behalf (e.g. the notebook MCP tools, which run UNSANDBOXED in the server
 // process) can be authorized against exactly what the box itself could reach.
 // Why a refused mount was refused. The `code` deliberately MATCHES the one in
-// sandboxPaths.ts, but this does NOT import that module's RefusalReason type, and that is a
-// decision rather than an oversight: sandboxPaths.ts is the unfinished path layer that
-// scratchpad/layer-not-wired-guard.mts exists to keep unwired, so importing from it here
-// would wire production code to it in the same change that was only asked to stop discarding
-// a reason. Unifying the two shapes is A2's job, done deliberately and in one place. Sharing
-// a five-character string costs nothing and commits to nothing.
+// sandboxPaths.ts, but this is its own type, not that module's RefusalReason, and A3 kept it
+// so on purpose. Since A3 symlinkMountRefusal asks the layer WHETHER to refuse, yet the two
+// reasons are about different things: RefusalReason.mount is the rw ROOT that makes a path
+// box-placeable, while the subject of THIS reason is the refused mount itself, which
+// sessionDataMountPlan already carries beside it as `mount`. Folding one into the other would
+// put the wrong path in a field of the same name, and would change sessionDataMountPlan's
+// exported return type, which the migration keeps byte-identical. Sharing a five-character
+// string costs nothing.
 export interface MountExclusionReason {
   code: 'box-writable-mount'
   message: string

@@ -321,8 +321,19 @@ export function viewOf(mounts: SandboxMount[]): MountView {
   return { entries }
 }
 
+// THE FILESYSTEM ROOT IS THE ONE RESOLVED PATH THAT ENDS IN A SEPARATOR, so `root + sep` is
+// '//' for it and matched nothing but '/' itself. Nothing rejects a `/` mount (UI picker,
+// normalizeSandbox, defaults store), and under one every question here answered "outside":
+// Q2 stopped refusing (venv probe on the HOST), Q1 denied everything, Q3 emitted no overlay.
+// Pinned by sandbox-paths-test #27 and auth-token-containment-guard §5d.
 function contains(root: string, target: string): boolean {
-  return target === root || target.startsWith(root + path.sep)
+  return target === root || target.startsWith(root.endsWith(path.sep) ? root : root + path.sep)
+}
+
+// `target` relative to a `root` that contains it — '' when they are equal. NOT
+// `slice(root.length + 1)`, which for root '/' also eats the first character of the path.
+function under(root: string, target: string): string {
+  return path.relative(root, target)
 }
 
 // Which mounts actually expose `target` INSIDE THE BOX — the box-space resolution, pulled
@@ -353,9 +364,7 @@ export function resolveReach(entriesInEmissionOrder: ResolvedMount[], target: Re
   for (const m of live) {
     if (!contains(m.real as string, target as string)) continue
     // Map the host path into box space through THIS mount.
-    const rel = (target as string) === (m.real as string)
-      ? ''
-      : (target as string).slice((m.real as string).length + 1)
+    const rel = under(m.real as string, target as string)
     const boxPath = rel ? path.join(m.logical, rel) : (m.logical as string)
     // Step 1: is this mount still the owner of its own box path, or has a later bind
     // covered it? Depth never enters — only position in emission order.
@@ -382,6 +391,16 @@ export interface RefusalReason {
 
 export function refuseIfBoxCouldHavePlaced(view: MountView, p: string): RefusalReason | undefined {
   const target = logical(p)
+  // The CANDIDATE's real path too, not only the mount's. A candidate reached through a symlink
+  // outside every mount (/elsewhere/link -> /srv/app/x) has a logical path no mount contains,
+  // while the bytes it execs live under an rw mount's real root — matching the logical path
+  // alone ran that box-written interpreter on the HOST (fail-OPEN, pinned by
+  // sandbox-paths-test #25/#25b). The extra match can only ADD a refusal, so this stays an
+  // over-approximation (invariant A3). real(p) is not also compared against m.logical: a
+  // realpath contains no symlinks, so it can lie under m.logical only when m.logical IS m.real,
+  // which the m.real comparison already covers. If the candidate cannot be resolved, the
+  // logical match is all there is.
+  const targetReal = real(p)
   for (const m of view.entries) {
     // NO `!m.exists` skip, unlike resolveReach and overlayPathFor. Those answer about the box
     // as it is NOW, where an unbound mount exposes nothing. This answers about a FUTURE exec:
@@ -389,12 +408,15 @@ export function refuseIfBoxCouldHavePlaced(view: MountView, p: string): RefusalR
     // candidate under it run on the HOST — fail-OPEN. Over-refusing is the safe direction.
     if (m.mode !== 'rw') continue
     const viaLogical = contains(m.logical, target)
-    const viaReal = m.real !== null && contains(m.real, target)
+    const viaReal = m.real !== null
+      && (contains(m.real, target) || (targetReal !== null && contains(m.real, targetReal)))
     if (!viaLogical && !viaReal) continue
     return {
       code: 'box-writable-mount',
       mount: m.logical,
-      message: `${target} lies inside the box-writable mount ${m.logical}`
+      message: `${target}`
+        + (targetReal !== null && (targetReal as string) !== (target as string) ? ` (resolving to ${targetReal})` : '')
+        + ` lies inside the box-writable mount ${m.logical}`
         + (m.symlinked && m.real ? ` (which binds ${m.real})` : ''),
     }
   }
@@ -408,7 +430,6 @@ export function overlayPathFor(view: MountView, target: RealPath): LogicalPath |
     if (contains(m.real, target)) best = m
   }
   if (!best || best.real === null) return null
-  if ((target as string) === (best.real as string)) return best.logical
-  const rel = (target as string).slice((best.real as string).length + 1)
-  return path.join(best.logical, rel) as LogicalPath
+  const rel = under(best.real as string, target as string)
+  return (rel ? path.join(best.logical, rel) : best.logical) as LogicalPath
 }
