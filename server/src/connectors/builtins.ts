@@ -20,37 +20,25 @@ import type { ConnectorDef } from '@claudette/shared'
 // A user-defined connector with the same id WINS OUTRIGHT and hides the built-in; the two
 // are not merged field-by-field, because silently blending two things the operator thinks
 // are separate produces a definition nobody can explain.
+//
+// ── CONFLUENCE WAS REMOVED 2026-10-21 (operator's decision) ───────────────────────────
+// A 'confluence' built-in (Atlassian's remote MCP server, https://mcp.atlassian.com/v1/mcp/authv2,
+// authorized by Dynamic Client Registration) shipped here until then. Atlassian is still
+// SUPPORTED as a USER-ADDED connector: the `atlassian` provider preset (oauthProviders.ts) is
+// matched on the connector's host, not on this list, and the DCR flow is generic. Use
+// `/v1/mcp/authv2`, not the legacy `/v1/sse`, if you add one.
+// What an install that had it is left with, and why none of it can crash anything: a
+// `builtinOverrides.confluence` patch is ignored (listConnectors iterates this list only);
+// stored tokens and a DCR registration are inert (nothing iterates them); a session grant is
+// skipped at launch and dropped on the next setConnectors. Disconnect BEFORE upgrading if you
+// want the Atlassian-side grant REVOKED — afterwards revokeUrlFor() has no definition to
+// resolve an endpoint from, so disconnect can only forget the local copy.
 export const BUILTIN_CONNECTORS: readonly ConnectorDef[] = [
-  {
-    id: 'confluence',
-    name: 'Confluence (Atlassian)',
-    transport: 'http',
-    // ★ DO NOT "FIX" THIS TO https://mcp.atlassian.com/v1/sse.
-    // Sources disagree about whether the legacy SSE endpoint is already dead: one says it
-    // was dropped after 2026-06-30, Atlassian's own repo says still supported but not
-    // recommended. `/v1/mcp/authv2` is correct under BOTH readings, so the disagreement
-    // does not need resolving — but a future reader who finds `/sse` in a tutorial will
-    // otherwise change us backwards, which is why the reasoning is here and not in a
-    // commit message. Streamable HTTP, not SSE.
-    url: 'https://mcp.atlassian.com/v1/mcp/authv2',
-    // No `requiresOAuthClient`: Atlassian supports OAuth 2.1 Dynamic Client Registration,
-    // so the client self-registers on first connect. Nothing for the operator to create or
-    // paste — which is the whole reason this one can honestly ship "available by default".
-    //
-    // The same endpoint also serves Jira, JSM, Bitbucket and Compass; a Jira entry would be
-    // this definition with a different id and name, if it is ever asked for.
-    //
-    // ⚠ One precondition we cannot satisfy from here, and it is in the description because
-    // it otherwise presents as OUR bug: an Atlassian SITE ADMIN must switch the remote MCP
-    // server on for Confluence (Atlassian Admin → Products). A connect can legitimately
-    // fail with everything correct on this side.
-    builtin: true,
-  },
   // ── GOOGLE WORKSPACE ────────────────────────────────────────────────────────────────
   // Per-product endpoints, and every one of them REQUIRES the operator to create their own
   // OAuth client (Cloud Console → Web application client ID + secret, consent screen with
   // product-specific scopes such as gmail.readonly / gmail.compose). Google offers no
-  // Dynamic Client Registration, so unlike Confluence these CANNOT work out of the box.
+  // Dynamic Client Registration, so these CANNOT work out of the box.
   // That is a property of Google's design, not something to engineer around — so they ship
   // VISIBLE, OFF, and marked `needsSetup`, with the toggle blocked until a client exists.
   // The two rejected alternatives are worth knowing: hiding them until credentials exist

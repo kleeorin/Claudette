@@ -52,7 +52,9 @@ export function registerConnectorRoutes(app: FastifyInstance, sessions: SessionM
   // Deleting a connector does NOT rewrite the grants that name it. A stale grant is inert
   // (connectorServers skips an unknown id) and re-adding the same id restores it, whereas
   // rewriting every session's grant list on a delete would silently discard the operator's
-  // intent if the delete was a mistake.
+  // intent if the delete was a mistake. Since 2026-10-21 that restore holds only until the
+  // session's grants are next SET: setConnectors (below) drops a held id that no longer
+  // exists, because keeping it locked the session out of every toggle.
   app.post<{ Body: { id: string } }>('/api/connectors/delete', async (req): Promise<OkResponse> => ({
     ok: removeConnector(req.body.id),
   }))
@@ -123,9 +125,21 @@ export function registerConnectorRoutes(app: FastifyInstance, sessions: SessionM
     // Reject an unknown catalog id here rather than letting it sit inert in the grant
     // list: a typo that silently grants nothing is worse than a visible error, because
     // the session looks configured and isn't.
+    //
+    // …EXCEPT an id the session ALREADY holds. The UI toggles by re-sending the whole grant
+    // list plus or minus one id, so once a granted connector disappears (deleted, or a
+    // built-in removed from the code — Confluence, 2026-10-21) every toggle carried the
+    // stale id back and got 400: the session could change none of its connectors, and the
+    // error named one nobody had touched. A stale grant is not a typo — it was valid when
+    // granted — so it is DROPPED, and launch was already skipping it. Only ids NEW to this
+    // session are judged, so a stale id riding along cannot launder a new unknown one.
+    // Pinned by scratchpad/connector-stale-grant-test.mts.
+    const held = new Set(sessions.grantsOf(id))
     const unknown = connectors.filter((c) => !getConnector(c))
-    if (unknown.length) { reply.code(400); return { error: `No such connector: ${unknown.join(', ')}.` } }
-    const ok = sessions.setConnectors(id, connectors, accountConnectors, /* trusted */ true)
+    const rejected = unknown.filter((c) => !held.has(c))
+    if (rejected.length) { reply.code(400); return { error: `No such connector: ${rejected.join(', ')}.` } }
+    if (unknown.length) console.warn(`[connectors] dropping stale grant(s) on ${id}: ${unknown.join(', ')} no longer exist`)
+    const ok = sessions.setConnectors(id, connectors.filter((c) => !unknown.includes(c)), accountConnectors, /* trusted */ true)
     if (!ok) { reply.code(404); return { error: 'No such session.' } }
     return { ok: true }
   })

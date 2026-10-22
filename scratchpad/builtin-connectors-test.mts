@@ -67,8 +67,13 @@ ok('[3] every built-in id satisfies CONNECTOR_ID_RE and contains no comma',
   BUILTIN_CONNECTORS.map((b) => b.id).join(','))
 
 // ── [4] the three-state distinction: needs-setup is DERIVED ────────────────────────
-ok('[4a] Confluence does NOT need setup (Atlassian does Dynamic Client Registration)',
-  view('confluence')?.needsSetup !== true)
+// [4a] used to assert that the Confluence built-in needs no setup (Atlassian does DCR). That
+// built-in was REMOVED on 2026-10-21 at the operator's request, so the assertion is retired
+// rather than re-pointed — no remaining built-in uses DCR, and DCR itself is pinned by
+// connector-dcr-test.mts against a user-defined connector. What stays checkable is the removal.
+ok('[4a] the Confluence built-in is gone (removed 2026-10-21), and nothing else ships an Atlassian URL',
+  !BUILTIN_CONNECTORS.some((b) => b.id === 'confluence' || /atlassian\.com/.test(b.url ?? '')) && !view('confluence'),
+  BUILTIN_CONNECTORS.map((b) => `${b.id}=${b.url}`).join(' '))
 ok('[4b] a Google entry DOES need setup (Google has no DCR)',
   view('gmail')?.needsSetup === true)
 // ★ A HALF-CONFIGURED CLIENT MUST NOT COUNT. saveOAuthClient requires a clientId but not a
@@ -146,8 +151,17 @@ creds.removeToken('gmail')
 ok('[4e] a needs-setup row carries its per-product setupHint',
   !!view('gmail')?.setupHint && view('gmail')!.setupHint!.includes('Gmail'),
   JSON.stringify(view('gmail')?.setupHint))
+// Re-pointed 2026-10-21 from the removed Confluence built-in (which never needed setup) to a
+// Google row whose chain is COMPLETE — the only no-setup state a remaining built-in can be in.
+store.saveOAuthClient({ id: 'goog-done', name: 'GD', clientId: 'cid', clientSecret: 'sec' })
+store.setBuiltinOverride('gmail', { oauthClientRef: 'goog-done' })
+creds.saveToken({ connectorId: 'gmail', account: 'default', accessToken: 'at', scopes: ['s'] })
 ok('[4e2] …and a row that needs NO setup carries none (an instruction to do nothing reads as a fault)',
-  view('confluence')?.setupHint === undefined)
+  view('gmail')?.needsSetup === undefined && view('gmail')?.setupHint === undefined,
+  `needsSetup=${String(view('gmail')?.needsSetup)} hint=${JSON.stringify(view('gmail')?.setupHint)}`)
+store.setBuiltinOverride('gmail', { oauthClientRef: undefined })
+store.removeOAuthClient('goog-done')
+creds.removeToken('gmail')
 
 // ── [5] an edit is an OVERRIDE, not a stored copy ──────────────────────────────────
 // This is the assertion that catches the whole design silently reverting to seeding.
@@ -165,11 +179,13 @@ ok('[6c] …and un-hiding brings it back (hiding is reversible, unlike deleting)
 // ── [7] a user connector with the same id wins OUTRIGHT ────────────────────────────
 // Not a field-by-field merge: blending two definitions the operator thinks are separate
 // produces behaviour neither of them describes.
-store.saveConnector({ id: 'confluence', name: 'My own Confluence', transport: 'http', url: 'https://example.invalid/mcp' })
-const conf = store.listConnectors().filter((c) => c.id === 'confluence')
+// Re-pointed 2026-10-21 from the removed 'confluence' built-in to 'gsheets', which nothing
+// else in this file touches (gdrive is used by [8] and must stay the built-in there).
+store.saveConnector({ id: 'gsheets', name: 'My own Sheets', transport: 'http', url: 'https://example.invalid/mcp' })
+const conf = store.listConnectors().filter((c) => c.id === 'gsheets')
 ok('[7a] exactly ONE entry survives the id collision', conf.length === 1, `count=${conf.length}`)
 ok('[7b] …and it is the USER\'s, with no field inherited from the built-in',
-  conf[0]?.name === 'My own Confluence' && conf[0]?.url === 'https://example.invalid/mcp' && !conf[0]?.builtin,
+  conf[0]?.name === 'My own Sheets' && conf[0]?.url === 'https://example.invalid/mcp' && !conf[0]?.builtin,
   `name=${conf[0]?.name} builtin=${conf[0]?.builtin}`)
 
 // ── [8] built-in tool classification survives a restart ────────────────────────────

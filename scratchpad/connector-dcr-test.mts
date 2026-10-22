@@ -1,5 +1,7 @@
 // Dynamic Client Registration (RFC 7591) — the path that lets a connector authorize with NO
-// operator console step, and the reason Confluence can work at all.
+// operator console step, and the reason a user-added Atlassian connector can work at all (as
+// the Confluence built-in did until its removal on 2026-10-21). The fixture below is a LOCAL
+// fake named for that history; it never depended on the built-in.
 //
 // ITS OWN HARNESS, deliberately, because DCR is a second way to ACQUIRE a credential and it has a
 // different trust model from the operator-configured path: a JSON document from a third party

@@ -156,6 +156,22 @@ common as an `Authorization` header. Because the client never receives a secret,
 **omit-means-keep**; treating an omitted field as "clear it" would silently break every
 round-tripped edit form.
 
+## Built-in connectors
+
+Shipped in code (`server/src/connectors/builtins.ts`) and merged into the catalog at read time,
+never seeded into `connectors.json`. Today they are the five Google Workspace entries, each
+needing an operator-created OAuth client.
+
+**Confluence (Atlassian) was removed as a built-in on 2026-10-21**, at the operator's request.
+Atlassian remains supported as a **user-added** connector: the `atlassian` provider preset
+(`prompt=consent` + `offline_access`) is matched on the connector's host, and Dynamic Client
+Registration is generic. A user-added one must declare its own `scopes`; with none it is refused
+at authorize time. An install that had the built-in keeps inert leftovers — an ignored
+`builtinOverrides.confluence`, unused tokens / DCR registration, and a grant that launch skips and
+the next `setConnectors` drops — none of which can affect startup or the catalog. **Disconnect it
+before upgrading** if the Atlassian-side grant should be revoked: once the definition is gone,
+disconnect can only forget our copy.
+
 ## Validation rules that are not cosmetic
 
 - **No underscores in an id.** The CLI attributes a tool call by splitting

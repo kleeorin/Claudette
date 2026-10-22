@@ -35,8 +35,9 @@ export type OAuthConnectorFields =
 // version of this function read `needsSetup || oauthClientRef` and was described as exact. It
 // was not: it is exact only for connectors that need an OPERATOR-CREATED client.
 //
-// A connector using DYNAMIC CLIENT REGISTRATION has neither field. Confluence is precisely
-// that — Atlassian supports OAuth 2.1 DCR, so the builtin carries no `requiresOAuthClient`,
+// A connector using DYNAMIC CLIENT REGISTRATION has neither field. A user-added Atlassian
+// connector is precisely that, as the Confluence built-in was until its removal on 2026-10-21
+// — Atlassian supports OAuth 2.1 DCR, so the def carries no `requiresOAuthClient`,
 // `oauthReady()` therefore short-circuits to true, and the server emits no `needsSetup`, no
 // `oauthClientRef` and no `oauthClientReady`. The old test returned FALSE for it, so the whole
 // authorization block was skipped and the one connector that can work with no operator setup
@@ -82,8 +83,9 @@ export function authState(c: OAuthConnectorFields, accounts: readonly string[]):
   // The old rule was `if (!c.needsSetup) return 'ready'`, which is correct ONLY for connectors
   // that need an operator client — for those, the server folds "has a token" into needsSetup.
   // A DCR connector short-circuits that check server-side, so `needsSetup` is absent whether or
-  // not anybody has ever authorized it, and Confluence with ZERO authorized accounts reported
-  // 'ready'. The proxy would have dialled unauthenticated while the UI said it was connected:
+  // not anybody has ever authorized it, and the (since removed) Confluence built-in with ZERO
+  // authorized accounts reported 'ready'. The proxy would have dialled unauthenticated while
+  // the UI said it was connected:
   // the same invisible failure the multi-account refusal exists to prevent, arrived at from the
   // other direction. Counting the authorizations answers the question directly instead of
   // inferring it from a flag that means something narrower.

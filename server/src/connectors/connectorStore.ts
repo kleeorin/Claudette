@@ -435,10 +435,10 @@ export function saveConnector(input: ConnectorDef): SaveResult {
 
 // Edit a BUILT-IN. Deliberately its own function rather than a branch inside
 // saveConnector: through saveConnector the two cases are indistinguishable — "change the
-// built-in's OAuth client" and "create my own connector that happens to use the id
-// `confluence`" arrive as the same call, and guessing between them silently does the wrong
-// one. Measured: a harness case creating a user connector called `confluence` was swallowed
-// as an override, and the operator's definition vanished.
+// built-in's OAuth client" and "create my own connector that happens to use a built-in's
+// id" arrive as the same call, and guessing between them silently does the wrong one.
+// Measured: a harness case creating a user connector called `confluence` (then a built-in,
+// removed 2026-10-21) was swallowed as an override, and the operator's definition vanished.
 // Only fields an operator can meaningfully change are accepted; url/transport/name keep
 // tracking what we ship, which is the entire reason built-ins are not seeded.
 export function setBuiltinOverride(id: string, patch: BuiltinOverride): ConnectorDef | undefined {

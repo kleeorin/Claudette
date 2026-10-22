@@ -92,20 +92,12 @@ export const BUILTIN_SCOPES: Record<string, string[]> = {
   // `gmail.modify` rather than `https://mail.google.com/`: read/compose/modify without the
   // unrestricted-mailbox scope, which includes permanent deletion.
   gmail: ['https://www.googleapis.com/auth/gmail.modify'],
-  // CONFLUENCE ONLY. The Atlassian MCP endpoint advertises Jira, Compass and TWG scopes on the
-  // SAME resource, so the advertised set is emphatically not the right ask: it would put Jira
-  // write access on a consent screen for someone who asked for Confluence. Same over-grant
-  // argument that put scopes on the connector rather than the client, and the same answer.
-  // `offline_access` is NOT listed here — it is a provider requirement, merged in from the
-  // atlassian preset, because a connector author has no reason to know Atlassian issues no
-  // refresh token without it.
-  confluence: [
-    'read:confluence-user',
-    'search:confluence',
-    'read:page:confluence', 'write:page:confluence',
-    'read:comment:confluence', 'write:comment:confluence',
-    'read:space:confluence', 'read:hierarchical-content:confluence',
-  ],
+  // No `confluence` entry since the built-in was removed (2026-10-21, see builtins.ts). A
+  // USER-ADDED Atlassian connector declares its own ConnectorDef.scopes — with none it is
+  // refused at authorize time rather than handed an unscoped token. Ask for the product you
+  // mean: the Atlassian MCP endpoint advertises Jira, Compass and TWG scopes on the SAME
+  // resource, so its advertised set is not the right ask (the over-grant argument above).
+  // `offline_access` need not be declared — it is merged in from the atlassian preset.
 }
 
 // What to ask for when authorizing a connector: its own declared scopes, else the built-in

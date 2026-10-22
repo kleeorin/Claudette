@@ -1,5 +1,10 @@
 # Atlassian Dynamic Client Registration — measured reference
 
+> **2026-10-21: the `confluence` built-in was removed** at the operator's request (see
+> `server/src/connectors/builtins.ts` and CONNECTORS.md "Built-in connectors"). Atlassian is
+> still supported as a USER-ADDED connector, so the DCR and metadata facts below remain the
+> reference for that path; read "the built-ins" below as history.
+
 **Purpose.** Everything needed to build DCR for the `confluence` / `atlassian` built-ins, measured
 from the live metadata on 2026-09-08 rather than remembered. Written because the research outlived
 the context that produced it: Landing cleared before building this, and three queued messages are a

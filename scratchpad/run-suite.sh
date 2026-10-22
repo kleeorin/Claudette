@@ -565,7 +565,8 @@ SUITE=(
   # attached — guessing would act as one person while looking like another, which is the exact
   # failure the (connector, account) keying exists to prevent.
   "none:connector-oauth-flow-test.mts"
-  # Dynamic Client Registration (RFC 7591) — the path that lets Confluence authorize with NO
+  # Dynamic Client Registration (RFC 7591) — the path that lets a user-added Atlassian connector
+  # (formerly the Confluence built-in, removed 2026-10-21) authorize with NO
   # operator console step, no pasted secret and no pre-registered redirect URI. Its own harness
   # because DCR is a SECOND way to acquire a credential with a different trust model: a third-party
   # JSON document tells us where to register, and we then present the result as our own identity.
@@ -632,7 +633,7 @@ SUITE=(
   # event passes everything else. Exits 77 if inotify is unavailable rather than reporting
   # six failures for a missing prerequisite.
   "none:live-file-sync-test.mts"
-  # GROUP C. Built-in connectors (Confluence + five Google Workspace). Every check is one
+  # GROUP C. Built-in connectors (five Google Workspace; Confluence removed 2026-10-21). Every check is one
   # question — "is this still a MERGE, or has something quietly turned it into a COPY?" —
   # because seeding is what regression looks like here and it is invisible from the UI on
   # the day it happens. [4d] is the sharp one: deleting the OAuth client must put the row
@@ -687,6 +688,11 @@ SUITE=(
   # against the unpatched tree on purpose: it is what shows an all-red run means the harness
   # is broken rather than the feature missing.
   "none:connector-concurrency-cap-test.mts"
+  # A grant naming a connector that no longer exists (deleted, or a built-in removed — the
+  # Confluence removal, 2026-10-21) used to 400 every later setConnectors, because the UI
+  # re-sends the whole list: the session could change none of its connectors. Pins both
+  # halves — a HELD stale id is dropped, a NEW unknown id is still rejected.
+  "none:connector-stale-grant-test.mts"
   # session:clearBashProcs — clearing settled background-process rows from the SERVER registry,
   # which is what makes a clear cross-device (it replaced a browser-localStorage store that
   # left the phone showing rows the desktop had cleared). Asserts on the registry via the

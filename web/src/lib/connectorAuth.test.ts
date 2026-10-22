@@ -38,8 +38,9 @@ import { authState, canConnect, isOAuthConnector, CONNECTOR_AUTH_STATES, type OA
 const C = (over: Partial<OAuthConnectorFields> = {}): OAuthConnectorFields =>
   ({ headerKeys: [], envKeys: [], transport: 'http', ...over })
 
-// ★ THE CONFLUENCE SHAPE — a DCR connector, exactly as toView builds it. NO needsSetup, NO
-// oauthClientRef, NO oauthClientReady, because the builtin declares no `requiresOAuthClient`
+// ★ THE DCR SHAPE — first met as the Confluence built-in (removed 2026-10-21); a user-added
+// Atlassian connector has it today — exactly as toView builds it. NO needsSetup, NO
+// oauthClientRef, NO oauthClientReady, because the def declares no `requiresOAuthClient`
 // and `oauthReady()` short-circuits to true before any of them are set. This fixture is the
 // one the old code got wrong, and it is written from the server's actual output rather than
 // from what the states looked like they ought to be.
@@ -111,7 +112,7 @@ describe('isOAuthConnector', () => {
   // ⚠ THIS TEST CHANGED SHAPE ON 2026-09-09, and the change is a real behaviour change rather
   // than a fixture tidy-up. It used to pass `C()` — no fields at all — and expect false. Under
   // the DCR fallback that same shape (http, no header names, no env names) is now treated as
-  // OAuth-capable ON PURPOSE, because it is indistinguishable from Confluence. So "ordinary"
+  // OAuth-capable ON PURPOSE, because it is indistinguishable from a DCR connector. So "ordinary"
   // has to mean "carries some other credential mechanism, or is not dialled by us at all",
   // which is what the cases below assert. The old assertion caught the change correctly; it is
   // updated rather than deleted so the reason is recorded where the expectation lives.
@@ -136,8 +137,8 @@ describe('isOAuthConnector', () => {
 // ★★ DYNAMIC CLIENT REGISTRATION — the shape that was invisible to this module until
 // 2026-09-09, found by a user asking whether their Confluence tool worked. ★★
 //
-// Atlassian supports OAuth 2.1 DCR, so the Confluence builtin carries no
-// `requiresOAuthClient`. The server's `oauthReady()` returns true immediately for such a
+// Atlassian supports OAuth 2.1 DCR, so the Confluence built-in (removed 2026-10-21) carried no
+// `requiresOAuthClient` — nor does a user-added Atlassian connector. The server's `oauthReady()` returns true immediately for such a
 // connector, so it emits NO needsSetup, NO oauthClientRef and NO oauthClientReady — and both
 // functions here read exactly those fields. The result was the worst possible pairing: the one
 // connector that needs no operator setup was the one with no way to authorize it, and it
@@ -153,7 +154,7 @@ describe('isOAuthConnector', () => {
 //   C10 isOAuthConnector ignores `oauthCapable` and falls through to the inference
 //       → the server-says-no case reds. Pins that the server's answer OUTRANKS the guess, so
 //         adding the field cannot be undone by the fallback still being there.
-describe('a DCR connector (Confluence) — no client fields at all', () => {
+describe('a DCR connector (e.g. a user-added Atlassian one) — no client fields at all', () => {
   it('is recognised as an OAuth connector, so the authorization block renders', () => {
     expect(isOAuthConnector(DCR())).toBe(true)
   })
