@@ -32,12 +32,13 @@ import { attachNewNotebooks } from '../web/src/lib/notebookAttach'
 
 import { check, passed as pass, failed as fail } from './assert.mjs'
 
-const local = () => true
-const remote = () => false
+// localOpener: the session a notebook was opened FROM by this client, or null (server-pushed).
+const local = () => 's1'
+const remote = () => null
 
 {
   const seen = new Set<string>()
-  const got = attachNewNotebooks(['nb1'], seen, { activeId: 's1', wasLocallyOpened: local })
+  const got = attachNewNotebooks(['nb1'], seen, { activeId: 's1', localOpener: local })
   check('1 a locally-opened notebook attaches once a session is active',
     got.join() === 'nb1' && [...seen].join() === 'nb1', `got ${got.join()}, seen ${[...seen].join()}`)
 }
@@ -45,13 +46,13 @@ const remote = () => false
 {
   // *** THE H6 REGRESSION. ***
   const seen = new Set<string>()
-  const first = attachNewNotebooks(['nb1'], seen, { activeId: null, wasLocallyOpened: local })
+  const first = attachNewNotebooks(['nb1'], seen, { activeId: null, localOpener: local })
   // SNAPSHOT the state between the two calls. Reading `seen` after the second call and
   // describing it as "seen-after-first" printed "CONSUMED — this is the bug" on a PASSING run,
   // because by then the second call had legitimately marked the id. A diagnostic that lies on
   // green is worse than none: it is read on the day it goes red, when it will still be wrong.
   const seenAfterFirst = [...seen]
-  const second = attachNewNotebooks(['nb1'], seen, { activeId: 's1', wasLocallyOpened: local })
+  const second = attachNewNotebooks(['nb1'], seen, { activeId: 's1', localOpener: local })
   check('2 an id whose precondition was not yet met is RETRIED, not consumed',
     first.length === 0 && seenAfterFirst.length === 0 && second.join() === 'nb1',
     `first ${JSON.stringify(first)}, seen after first ${JSON.stringify(seenAfterFirst)}` +
@@ -60,7 +61,7 @@ const remote = () => false
 
 {
   const seen = new Set<string>()
-  const ctx = { activeId: 's1', wasLocallyOpened: local }
+  const ctx = { activeId: 's1', localOpener: local }
   attachNewNotebooks(['nb1'], seen, ctx)
   const again = attachNewNotebooks(['nb1'], seen, ctx)
   check('3 an id is never attached twice', again.length === 0, `second call returned ${JSON.stringify(again)}`)
@@ -73,17 +74,45 @@ const remote = () => false
   // hold exactly the ids that HAVE a tab. An unmarked id is one with no tab to prune, so it can
   // neither leak nor be double-pruned.
   const seen = new Set<string>()
-  const got = attachNewNotebooks(['nb1'], seen, { activeId: 's1', wasLocallyOpened: remote })
+  const got = attachNewNotebooks(['nb1'], seen, { activeId: 's1', localOpener: remote })
   check('4 a server-pushed notebook is left unmarked, so focusPane still owns it',
     got.length === 0 && seen.size === 0, `got ${JSON.stringify(got)}, seen ${seen.size}`)
 }
 
 {
   const seen = new Set<string>()
-  const isLocal = (id: string) => id !== 'nb2'
-  const got = attachNewNotebooks(['nb1', 'nb2', 'nb3'], seen, { activeId: 's1', wasLocallyOpened: isLocal })
+  const isLocal = (id: string) => id !== 'nb2' ? 's1' : null
+  const got = attachNewNotebooks(['nb1', 'nb2', 'nb3'], seen, { activeId: 's1', localOpener: isLocal })
   check('5 out of a mixed batch, only the attached ids are marked (nb2 stays retryable)',
     got.join() === 'nb1,nb3' && [...seen].sort().join() === 'nb1,nb3', `got ${got.join()}, seen ${[...seen].sort().join()}`)
+}
+
+{
+  // *** THE CROSS-SESSION LEAK (operator report 2026-10-28: "working on a notebook in session A,
+  // switch to session B, the notebook opens there as well"). The ws `notebook:update` raced
+  // ahead of the HTTP reply, so the first effect pass saw the id as not-yet-local and left it
+  // unmarked; the session switch re-ran the effect with activeId = B and attached A's notebook
+  // to B. With the opener recorded, the switch must attach NOTHING.
+  const seen = new Set<string>()
+  let opener: string | null = null                       // reply not in yet → not local
+  const ctx = (activeId: string) => ({ activeId, localOpener: () => opener })
+  const racedFirst = attachNewNotebooks(['nbA'], seen, ctx('A'))
+  opener = 'A'                                           // HTTP reply lands: opened from A
+  const afterSwitch = attachNewNotebooks(['nbA'], seen, ctx('B'))
+  check('6 a notebook opened in A never attaches to B on a session switch',
+    racedFirst.length === 0 && afterSwitch.length === 0 && !seen.has('nbA'),
+    `first ${JSON.stringify(racedFirst)}, after switch to B ${JSON.stringify(afterSwitch)}, seen ${[...seen].join()}`)
+  const back = attachNewNotebooks(['nbA'], seen, ctx('A'))
+  check('7 …and it still attaches to A, its opener, when A is on screen',
+    back.join() === 'nbA' && seen.has('nbA'), `back in A ${JSON.stringify(back)}`)
+}
+
+{
+  // A local open with no session (opened before any session existed) has opener null: it must
+  // not adopt whatever session appears later.
+  const seen = new Set<string>()
+  const got = attachNewNotebooks(['nb1'], seen, { activeId: 's9', localOpener: () => null })
+  check('8 an opener-less notebook attaches to no session', got.length === 0, `got ${JSON.stringify(got)}`)
 }
 
 console.log(`\n${pass}/${pass + fail} passed`)

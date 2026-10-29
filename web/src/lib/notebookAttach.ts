@@ -29,10 +29,13 @@
 /** What the decision needs from the app: who is on screen, and who opened the notebook. */
 export interface AttachContext {
   activeId: string | null
-  /** False for a notebook a Claude tool pushed from the server — those attach to the CALLING
-   *  session via the focusPane handler, and must never leak into whatever session the user
-   *  happens to be looking at. */
-  wasLocallyOpened: (id: string) => boolean
+  /** The session this client opened the notebook FROM, or null for a notebook a Claude tool
+   *  pushed from the server (those attach to the CALLING session via the focusPane handler).
+   *  An id attaches only while its opener is the session on screen. Comparing against the
+   *  opener, not merely "was it local", is the fix for the cross-session leak: an open in A
+   *  whose attach was deferred (the ws update raced ahead of the HTTP reply) used to attach to
+   *  whatever session the user switched to next. */
+  localOpener: (id: string) => string | null
 }
 
 /**
@@ -51,7 +54,7 @@ export function attachNewNotebooks(
     if (seen.has(id)) continue
     // PRECONDITION FIRST. Not yet actionable is not the same as handled: leave the id unmarked
     // so the next run — the one the dep array exists to provide — tries it again.
-    if (!ctx.activeId || !ctx.wasLocallyOpened(id)) continue
+    if (!ctx.activeId || ctx.localOpener(id) !== ctx.activeId) continue
     seen.add(id)
     attach.push(id)
   }

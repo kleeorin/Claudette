@@ -427,10 +427,16 @@ function Shell() {
   }
   // Focus an already-open notebook's tab (adding it if somehow absent) — used by the
   // Files dock's open-notebook and by the Kernels tab's notebook list.
-  const focusNotebook = (id: string) => {
-    if (!activeId) return
-    setPhonePane('content')
-    setPane(activeId, (p) => ({
+  // `sid` is the session the user acted in, captured BEFORE any await by the caller: the open
+  // round-trip can outlive a session switch, and attaching to the then-current activeId put
+  // A's notebook into B. Creating the tab and marking it seen are one step here, exactly as in
+  // the focusPane handler — an id with a tab but no seen-mark was retried by the attach effect
+  // on the next session switch, which was the other half of the same leak.
+  const focusNotebook = (id: string, sid: string | null = activeId) => {
+    if (!sid) return
+    seenNb.current.add(id)
+    if (sid === activeId) setPhonePane('content')
+    setPane(sid, (p) => ({
       tabs: p.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'notebook', id }],
       active: { kind: 'notebook', id },
     }))
@@ -518,7 +524,7 @@ function Shell() {
     // Guarded rather than asserted with `!`: attachNewNotebooks returns ids only when activeId
     // is set, but that guarantee lives in another file, and a non-null assertion here would be
     // load-bearing on it silently. This costs nothing — with no activeId the call returns [].
-    if (activeId) for (const id of attachNewNotebooks(ids, seenNb.current, { activeId, wasLocallyOpened: notebooks.wasLocallyOpened })) {
+    if (activeId) for (const id of attachNewNotebooks(ids, seenNb.current, { activeId, localOpener: notebooks.localOpener })) {
       setPane(activeId, (p) => ({
         tabs: p.tabs.some((t) => t.kind === 'notebook' && t.id === id) ? p.tabs : [...p.tabs, { kind: 'notebook', id }],
         active: { kind: 'notebook', id },
@@ -1103,11 +1109,14 @@ function Shell() {
                       <FileManager
                         key={termCwd}
                         initialPath={termCwd}
-                        onOpenNotebook={(p) => void notebooks.openPath(p, activeId ?? undefined).then((id) => {
-                          // Focus the notebook's tab — including when it was already open,
-                          // where the newly-seen effect above wouldn't fire.
-                          if (id) focusNotebook(id)
-                        })}
+                        onOpenNotebook={(p) => {
+                          const sid = activeId   // the session acted in — not whichever is on screen when the reply lands
+                          void notebooks.openPath(p, sid ?? undefined).then((id) => {
+                            // Focus the notebook's tab — including when it was already open,
+                            // where the newly-seen effect above wouldn't fire.
+                            if (id) focusNotebook(id, sid)
+                          })
+                        }}
                         onOpenFile={openFile}
                         onNewNotebook={async (p) => {
                           // Focus explicitly, exactly as onOpenNotebook does above. Do NOT rely on
@@ -1115,9 +1124,10 @@ function Shell() {
                           // can attach, so a create while `activeId` is still null consumes the id
                           // and the retry its dep array provides is dead. FileManager's contract is
                           // unchanged — error string, or null on success.
-                          const r = await notebooks.createPath(p, activeId ?? undefined)
+                          const sid = activeId   // captured before the await, as in onOpenNotebook
+                          const r = await notebooks.createPath(p, sid ?? undefined)
                           if (r.error) return r.error
-                          if (r.id) focusNotebook(r.id)
+                          if (r.id) focusNotebook(r.id, sid)
                           return null
                         }}
                         onClose={() => setDock(null)}

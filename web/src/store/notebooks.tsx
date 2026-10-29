@@ -31,10 +31,13 @@ interface ContextValue {
   createPath: (path: string, sessionId?: string) => Promise<CreateResult>  // → { id } | { error }
   // `save`: persist unsaved changes before closing (from the close prompt).
   close: (notebookId: string, save?: boolean) => void
-  // Did THIS client open the notebook locally (Files dock / New), vs it arriving
-  // pushed from the server (a Claude tool)? Locally-opened ones attach to the active
-  // session; server-pushed ones attach only via `focusPane` (the calling session).
-  wasLocallyOpened: (notebookId: string) => boolean
+  // WHICH SESSION this client opened the notebook from (Files dock / New), or null when it
+  // arrived pushed from the server (a Claude tool) or was opened with no session. A locally
+  // opened notebook attaches ONLY to the session it was opened from — never to whichever
+  // session happens to be on screen when the attach effect runs (that was the cross-session
+  // leak: open in A, switch to B, the notebook appeared in B). Server-pushed ones attach only
+  // via `focusPane` (the calling session).
+  localOpener: (notebookId: string) => string | null
   // per-notebook view state
   locksFor: (notebookId: string) => CellLock[]
   kernelFor: (notebookId: string) => KernelStatus
@@ -81,9 +84,9 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
   const [kernels, setKernels] = useState<Record<string, KernelStatus>>({})
   const [running, setRunning] = useState<Record<string, Set<string>>>({})
   const docsRef = useRef<Record<string, NotebookDoc>>({}); docsRef.current = docs
-  // Notebooks this client opened via a user action (Files dock / New) — the only
-  // ones the shell auto-attaches to the active session.
-  const localIds = useRef<Set<string>>(new Set())
+  // Notebooks this client opened via a user action (Files dock / New), mapped to the session
+  // they were opened from — the only ones the shell auto-attaches, and only to that session.
+  const localIds = useRef<Map<string, string | null>>(new Map())
 
   useEffect(() => {
     const offUpd = api.on.notebookUpdate((doc) => {
@@ -108,7 +111,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     const res = await api.notebook.open(path, sessionId)
     if (res.error || !res.doc) return null
     const doc = res.doc
-    localIds.current.add(doc.notebookId)
+    localIds.current.set(doc.notebookId, sessionId ?? null)
     setDocs((prev) => ({ ...prev, [doc.notebookId]: doc }))
     setOrder((prev) => prev.includes(doc.notebookId) ? prev : [...prev, doc.notebookId])
     return doc.notebookId
@@ -125,7 +128,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
     const res = await api.notebook.create(path, sessionId)
     if (res.error || !res.doc) return { error: res.error ?? 'failed to create notebook' }
     const doc = res.doc
-    localIds.current.add(doc.notebookId)
+    localIds.current.set(doc.notebookId, sessionId ?? null)
     setDocs((prev) => ({ ...prev, [doc.notebookId]: doc }))
     setOrder((prev) => prev.includes(doc.notebookId) ? prev : [...prev, doc.notebookId])
     return { id: doc.notebookId }
@@ -177,7 +180,7 @@ export function NotebooksProvider({ children }: { children: ReactNode }) {
   const value = useMemo<ContextValue>(() => ({
     open: order.map((id) => docs[id]).filter(Boolean),
     openPath, createPath, close,
-    wasLocallyOpened: (id) => localIds.current.has(id),
+    localOpener: (id) => localIds.current.get(id) ?? null,
     locksFor: (id) => locks[id] ?? [],
     kernelFor: (id) => kernels[id] ?? 'none',
     isRunning: (id, cellId) => running[id]?.has(cellId) ?? false,
