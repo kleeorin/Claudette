@@ -1,7 +1,7 @@
 import type {
   ClaudeEvent, PermissionRequest, PermissionDecision, PermissionMode,
   SessionInfo, SessionState, BashProcRecord, SetModeResult, ConversationMeta, RewindPoint, RewindMode, RewindPreview, ActivePane, SandboxConfig,
-  AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult, TaskRecord,
+  AgentInfo, EffectivePermissions, PermissionScope, PermissionAction, WriteResult, TaskRecord, ProjectInfo,
 } from './types'
 import type { NotebookDoc, NotebookOp, CellLock, LockReason, KernelStatus, KernelSpec } from './notebook'
 
@@ -88,6 +88,8 @@ export type WsServerMessage =
   | { type: 'pong'; ts: number }
   // A snapshot of all sessions, sent on connect so a fresh tab renders the list.
   | { type: 'session:list'; sessions: SessionInfo[] }
+  // Every project, broadcast on any project change and sent on connect (before session:list).
+  | { type: 'project:list'; projects: ProjectInfo[] }
   // Per-session connect-time snapshot: the buffered transcript so far + ALL
   // still-unanswered permission prompts (the CLI can have several outstanding at once
   // when an assistant message fires multiple tool_uses). Sent to a freshly-connected
@@ -196,8 +198,59 @@ export interface CreateSessionRequest {
   model?: string
   permissionMode?: PermissionMode
   sandbox?: SandboxConfig  // omit ⇒ server seeds the default (enabled, cwd rw) when available
+  // Create the session INSIDE this project (top-level only). The server takes the cwd from
+  // the project, and refuses an explicit `cwd` that does not match it.
+  projectId?: string
+  // With projectId: run the session in a NEW git worktree of the project's repo instead of
+  // the project dir itself. `branch` defaults to a slug of the session name.
+  isolated?: { branch?: string }
 }
-export interface CreateSessionResponse { id: string }
+export interface CreateSessionResponse { id: string; error?: string }
+
+// POST /api/project/repoStatus { id } → can an isolated (worktree) session be made here?
+// `repo` is null when the project dir is not inside a git work tree.
+export interface ProjectRepoStatusResponse {
+  ok: boolean
+  repo: { root: string; commonDir: string; hasCommit: boolean } | null
+  error?: string
+}
+
+// POST /api/session/worktreeStatus { id } → what removing an isolated session's worktree
+// would lose. `dirty`: `git status --porcelain` lines. `unmerged`: commits on its branch that
+// are on no other local branch and no remote-tracking ref (`git log --oneline`, newest first).
+export interface WorktreeStatusResponse {
+  ok: boolean
+  dirty: string[]
+  unmerged: string[]
+  error?: string
+}
+
+// POST /api/session/destroy { id, removeWorktree?, force? }. For an isolated session,
+// removeWorktree deletes the worktree DIR (never the branch). Without `force`, a worktree with
+// dirty files or unmerged commits is refused (409, `needsConfirm` + the status) and the
+// session is NOT closed, so the client can show what would be lost and ask again.
+export interface DestroySessionBody {
+  id: string
+  removeWorktree?: boolean
+  force?: boolean
+}
+export interface DestroySessionResponse {
+  ok: boolean
+  needsConfirm?: boolean
+  status?: WorktreeStatusResponse
+  error?: string
+}
+
+// --- Projects (auth-gated, like every control route) ---------------------------------
+// GET  /api/project/list                          → { projects }
+// POST /api/project/fromSession { sessionId }     → a project from a TOP-LEVEL session's cwd
+// POST /api/project/create      { name, cwd }
+// POST /api/project/rename      { id, name }
+// POST /api/project/setCollapsed { id, collapsed }
+// POST /api/project/delete      { id }            → ungroups its sessions; closes none
+// POST /api/session/setProject  { id, projectId } → top-level only; null removes
+export interface ProjectListResponse { projects: ProjectInfo[] }
+export interface ProjectResponse { ok: boolean; project?: ProjectInfo; error?: string }
 
 // GET /api/session/list
 export interface ListSessionsResponse { sessions: SessionInfo[] }

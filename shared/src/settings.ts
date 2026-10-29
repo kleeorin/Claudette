@@ -38,6 +38,11 @@ export interface AppSettings {
   defaultAgentId?: string
   defaultPermissionMode?: PermissionMode
   maxTeamSize?: number
+  // The folder the new-session dialog starts in instead of $HOME. Absent = $HOME (today's
+  // behaviour). Saved only as the REALPATH of an existing directory; a stored folder deleted
+  // since is kept (and reported as AppSettingsResponse.defaultCwdMissing) rather than dropped,
+  // so the dialog can say why it fell back instead of the setting silently vanishing.
+  defaultCwd?: string
 }
 
 // The settable keys AS A VALUE, for the same reason BASH_PROC_STATES is a value: the save and
@@ -51,7 +56,7 @@ export interface AppSettings {
 // AppSettings and forgotten here — nothing in the type system can — so that direction is
 // covered by an exhaustiveness assertion in scratchpad/settings-store-test.mts instead.
 export const APP_SETTINGS_KEYS = [
-  'defaultModel', 'defaultAgentId', 'defaultPermissionMode', 'maxTeamSize',
+  'defaultModel', 'defaultAgentId', 'defaultPermissionMode', 'maxTeamSize', 'defaultCwd',
 ] as const satisfies ReadonlyArray<keyof AppSettings>
 
 export type AppSettingsKey = (typeof APP_SETTINGS_KEYS)[number]
@@ -124,6 +129,9 @@ export interface AppSettingsResponse {
   settings: AppSettings
   overrides: SettingsOverride[]
   environment: SettingsEnvironment
+  // true when settings.defaultCwd is set but no longer an existing directory (computed per
+  // request). The new-session dialog then falls back to $HOME and says so.
+  defaultCwdMissing?: boolean
 }
 
 // The body of POST /api/settings/reset. A single key, because reset clears exactly one thing —

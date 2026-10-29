@@ -11,7 +11,7 @@ import { SessionConfinement } from './claude/sessionConfinement'
 import { reclaimStrandedHostConfigs } from './claude/configProtection'
 import { WsHub } from './ws/hub'
 import { FileWatchRegistry } from './fs/fileWatchRegistry'
-import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage, sendSessionSnapshots } from './session/sessionApi'
+import { bridgeSessionEvents, registerSessionRoutes, handleSessionClientMessage, sendSessionSnapshots, broadcastSessionLists } from './session/sessionApi'
 import { loadState, saveState } from './session/sessionPersistence'
 import { NotebookDocManager } from './notebook/notebookDocManager'
 import { bridgeNotebookEvents, registerNotebookRoutes, handleNotebookClientMessage } from './notebook/notebookApi'
@@ -28,6 +28,8 @@ import { bridgePaneEvents, registerPaneRoutes, handlePaneClientMessage } from '.
 import { registerFsRoutes } from './fs/fsApi'
 import { registerGitRoutes } from './git/gitApi'
 import { registerConnectorRoutes } from './connectors/connectorApi'
+import { ProjectStore } from './projects/projectStore'
+import { registerProjectRoutes } from './projects/projectApi'
 import { registerConnectorOAuthRoutes } from './connectors/connectorOAuthApi'
 import { registerSandboxDefaultsRoutes } from './claude/sandboxDefaultsApi'
 import { ConnectorProxy } from './connectors/connectorProxy'
@@ -167,7 +169,10 @@ sessions.on('ready', persistSessions)     // claudeSessionId finalized
 // Push a fresh session list to every tab whenever the set or a session's config
 // changes, so new sessions and edited fields (e.g. sandbox status) reconcile live
 // across tabs instead of only on reconnect.
-sessions.on('changed', () => hub.broadcast({ type: 'session:list', sessions: sessions.list() }))
+broadcastSessionLists(sessions, hub)   // on 'changed' AND 'ready' (claudeSessionId) — see sessionApi.ts
+// Projects: the same live-reconcile, on every create / rename / collapse / delete.
+const projects = new ProjectStore()
+projects.on('changed', () => hub.broadcast({ type: 'project:list', projects: projects.list() }))
 // When a session goes away, drop its active-pane record and its MCP url tokens
 // (the latter was never released before — a small unbounded-map leak).
 sessions.on('exit', (id: string) => {
@@ -293,7 +298,8 @@ app.get<{ Querystring: { token?: string } }>('/api/auth', async (req, reply) => 
   return { ok: true, required: true }
 })
 
-registerSessionRoutes(app, sessions)
+registerSessionRoutes(app, sessions, projects)
+registerProjectRoutes(app, sessions, projects)
 registerNotebookRoutes(app, notebooks, kernels)
 registerPaneRoutes(app, panes)
 registerFsRoutes(app)
@@ -350,6 +356,9 @@ wss.on('connection', (ws: WebSocket) => {
   // per-session catch-up (transcript-so-far + any pending permission) so a device
   // joining an in-progress session isn't left with a blank stream / stuck prompt.
   hub.send(ws, { type: 'hello', version: VERSION })
+  // Projects BEFORE sessions, so a fresh tab never renders a grouped session as ungrouped
+  // for one frame and then jumps it under its header.
+  hub.send(ws, { type: 'project:list', projects: projects.list() })
   hub.send(ws, { type: 'session:list', sessions: sessions.list() })
   sendSessionSnapshots(sessions, hub, ws)
   ws.on('message', (data) => {
@@ -393,6 +402,8 @@ async function start(): Promise<void> {
   const proxyPort = await connectorProxy.start()
   app.log.info(`Connector proxy on http://127.0.0.1:${proxyPort}${strictMode() ? ' (strict MCP mode ON)' : ''}`)
   // Restore persisted sessions (each re-launched with --resume) before serving.
+  // Projects load before sessions are restored, so the first list a client sees has both.
+  await projects.load()
   const restored = sessions.restore(await loadState())
   if (restored.length) app.log.info(`Restored ${restored.length} session(s) from disk`)
   await app.listen({ host: HOST, port: PORT })

@@ -131,6 +131,27 @@ describe('autoResumePlan', () => {
       .toEqual({ kind: 'skip' })
   })
 
+  it('★ after a RESTART, resumes by the id the SERVER persisted — no init needed, shared cwd or not', () => {
+    // The browser learns an id from system/init, which the CLI sends only once a turn starts —
+    // so after a server restart every session sharing a cwd (projects, subsessions) used to
+    // open EMPTY until something was sent. The server always knew the id (it --resume'd the
+    // engine into it); SessionInfo now carries it.
+    const shared = [{ cwd: '/w' }, { cwd: '/w' }]
+    expect(autoResumePlan({ ...ok, sessions: shared, session: { cwd: '/w', claudeSessionId: 'conv-saved' }, claudeSessionId: undefined }))
+      .toEqual({ kind: 'byId', conversationId: 'conv-saved' })
+  })
+
+  it('a LIVE init id beats the server-listed one (newest word on where the engine is)', () => {
+    expect(autoResumePlan({ ...ok, session: { cwd: '/w', claudeSessionId: 'conv-listed' }, claudeSessionId: 'conv-live' }))
+      .toEqual({ kind: 'byId', conversationId: 'conv-live' })
+  })
+
+  it('the server-listed id still respects every disqualifier', () => {
+    const s = { ...ok, session: { cwd: '/w', claudeSessionId: 'conv-saved' }, claudeSessionId: undefined }
+    expect(autoResumePlan({ ...s, hasItems: true })).toEqual({ kind: 'skip' })
+    expect(autoResumePlan({ ...s, isFresh: true })).toEqual({ kind: 'skip' })
+  })
+
   it('applies every disqualifier to the byId path too, not just to the guess', () => {
     // The blockers are about whether resuming is WANTED — a running turn, a transcript already
     // on screen — and none of them stop mattering because we happen to know the id. This is the

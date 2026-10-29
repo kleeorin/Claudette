@@ -721,6 +721,49 @@ SUITE=(
   # claiming an unbounded hang; the cost is what it takes to stop lying. See its header.
   "none:rt2-connectors-c.mts"
   "none:review-fixes-test.mts"
+  # /rewind's code restore is SCOPED to the rewinding session's own file-edit-tool edits
+  # (subagents included, failed edits excluded): another session's edits, the operator's edits
+  # and files nobody in the session created survive, and a file another live session also
+  # edited after the turn is flagged as a conflict. Drives the real routes; measured RED 8/19
+  # against the pre-fix whole-tree restore.
+  "none:rewind-scope-test.mts"
+  # PROJECTS (server half): a grouping level above top-level sessions. Pins the routes, that
+  # only top-level sessions carry a projectId (stripped on create/restore, inherited on
+  # promote), delete-ungroups-never-closes, persistence across the last session closing, and
+  # that projects.json sits in dataDir() out of every box's reach. Measured RED 4/21 on a tree
+  # without the feature (the four greens there pin pre-existing properties).
+  "none:projects-test.mts"
+  # PROJECTS (browser half): builds the current web tree to a temp dir and boots its own
+  # server (:4341, proxy :4342, CDP 9381, isolated HOME/data, no credentials) — never web/dist,
+  # never :4319. Header + count + indent, collapse persisted across reload, the session-menu
+  # rules, "+" locked to the project's dir, rename, delete-ungroups, and the phone layout.
+  "chrome:projects-sidebar-probe.mjs"
+  # GIT EXEC-VECTOR PROTECTION: every rw mount's git dirs get config/hooks/commondir/
+  # config.worktree/worktree pointers/submodule gitdirs/core.hooksPath/include.path pinned ro,
+  # plus self-binds (rename guard). Argv, authorizer, and the attacks run inside a real box.
+  # Measured RED on a HEAD copy: 24 failed / 12 passed, then 7g crashed because the box had
+  # renamed .git away (the greens there pin pre-existing properties, or are vacuous on HEAD).
+  "none:git-exec-protection-test.mts"
+  # ISOLATED (git worktree) SESSIONS, server half: creation (git calls, exclude entry,
+  # .worktreeinclude copy), membership by common dir, the box (main tree not mounted, pins on
+  # the common dir, live commit), restore with the dir gone, close keep/remove/dirty/unmerged,
+  # and rewind inside a worktree. Drives the real routes with launch() stubbed.
+  "none:worktree-sessions-test.mts"
+  # ISOLATED SESSIONS, browser half: builds the current web tree to a temp dir and boots its own
+  # server (:4345, proxy :4346, CDP 9382, isolated HOME/data, no credentials) — never web/dist,
+  # never :4319. The option disabled-with-reason off a repo / enabled on one, the branch field's
+  # slug default, create → worktree on disk + branch on the row, close Keep, close Remove on a
+  # dirty worktree with its second confirm.
+  "chrome:worktree-sessions-probe.mjs"
+  # DEFAULT CWD SETTING (server half): save accepts only an absolute path to an existing
+  # directory and stores its realpath; load KEEPS a stored folder deleted since and GET
+  # /api/settings reports defaultCwdMissing; a hand-edited relative value is dropped; reset
+  # clears. Measured RED on a tree without the key: 10 failed, 3 passed, then a crash.
+  "none:default-cwd-setting-test.mts"
+  # SessionInfo.claudeSessionId (server half): toInfo/list carry each session's own persisted
+  # conversation id (also after restore), and session:list is re-broadcast on 'ready' so a tab
+  # never trails an id the engine replaced. Measured RED 7/7 on a HEAD copy.
+  "none:session-claudeid-info-test.mts"
   "none:iframe-output-adversarial-test.mts"
   "none:output-sanitizer-test.mts"
   # The chat meta-bar sandbox chip's folder picker. `none:` even though it needs jsdom: the
@@ -956,6 +999,9 @@ SUITE=(
   # Boots its own server+vite on 4502/5302/9375 (distinct from this file's 4500/5300/9373) so
   # it compiles the WORKING TREE, not web/dist.
   "chrome:pending-card-squeeze-probe.mjs"
+  # The Other… field typed BACKWARDS on Android Chrome (2026-10-19); this pins the fix's
+  # contract on every input route. Own ports 4506/5306/9379.
+  "chrome:ask-other-typing-probe.mjs"
   # GROUP B — own server (4499), own vite (5299), own Chrome. It compiles the WORKING TREE,
   # so unlike the Group A tests its result is real evidence, which is the whole point: the
   # scroll-memory key fix it tests is in web/src and is NOT in web/dist, so a bundle-serving
@@ -999,9 +1045,6 @@ SUITE=(
   # web tests run (see web-vitest-shim.mjs below). This stays as-is regardless: it is pure and
   # costs ~3ms, and rewriting a green pinning test to use a runner it does not need would risk
   # the pin to gain nothing.
-  # The Other… field typed BACKWARDS on Android Chrome (2026-10-19); this pins the fix's
-  # contract on every input route. Own ports 4506/5306/9379.
-  "chrome:ask-other-typing-probe.mjs"
   "none:notebook-attach-test.mts"
   # The WEB vitest suite (web/src/**/*.test.{ts,tsx}) as a single member — the runner itself,
   # not one file. Registered because a whole test RUNNER was sitting outside the suite:

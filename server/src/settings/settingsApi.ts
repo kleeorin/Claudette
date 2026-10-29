@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify'
+import { statSync } from 'fs'
 import type { AppSettings, AppSettingsResponse, ResetSettingRequest } from '@claudette/shared'
 import { getSettings, saveSettings, resetSetting } from './settingsStore'
 import { listOverrides, buildEnvironment } from './settingsEnv'
@@ -36,7 +37,12 @@ import { listOverrides, buildEnvironment } from './settingsEnv'
 // operator. Keep them human-readable; they are the UI copy.
 
 function snapshot(): AppSettingsResponse {
-  return { settings: getSettings(), overrides: listOverrides(), environment: buildEnvironment() }
+  const settings = getSettings()
+  return { settings, overrides: listOverrides(), environment: buildEnvironment(), defaultCwdMissing: !!settings.defaultCwd && !isDir(settings.defaultCwd) }
+}
+
+function isDir(p: string): boolean {
+  try { return statSync(p).isDirectory() } catch { return false }
 }
 
 export function registerSettingsRoutes(app: FastifyInstance): void {

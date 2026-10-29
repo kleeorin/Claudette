@@ -8,6 +8,7 @@ import type { PermissionMode } from '@claudette/shared'
 import { DEFAULT_MAX_TEAM_SIZE } from '@claudette/shared'
 import { api } from '../api/client'
 import { useSessions } from '../store/sessions'
+import { FileBrowser } from './FileBrowser'
 import type { AppSettings, AppSettingsResponse, SettingsOverride } from '../lib/settingsContract'
 import {
   isLocked, overrideFor, parseTeamSize, MODEL_ALIASES, isCustomModel,
@@ -58,19 +59,22 @@ function Row(
 }
 
 export function SettingsPanel() {
-  const { agents } = useSessions()
+  const { agents, homeDir } = useSessions()
   const [data, setData] = useState<AppSettingsResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [teamRaw, setTeamRaw] = useState('')
   const [teamErr, setTeamErr] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [cwdRaw, setCwdRaw] = useState('')
+  const [browsingCwd, setBrowsingCwd] = useState(false)
 
   const load = useCallback(async () => {
     try {
       const r = await api.http.appSettings()
       setData(r)
       setTeamRaw(r.settings.maxTeamSize === undefined ? '' : String(r.settings.maxTeamSize))
+      setCwdRaw(r.settings.defaultCwd ?? '')
     } catch { setError('Could not load settings.') }
   }, [])
   useEffect(() => { void load() }, [load])
@@ -78,7 +82,7 @@ export function SettingsPanel() {
   const apply = async (r: (AppSettingsResponse & { error?: string }) | undefined) => {
     setBusy(false)
     if (r?.error) { setError(r.error); return }
-    if (r?.settings) setData(r)
+    if (r?.settings) { setData(r); setCwdRaw(r.settings.defaultCwd ?? '') }
   }
 
   // ★ SET AND CLEAR ARE TWO VERBS, AND THE ROUTING LIVES HERE SO EVERY CONTROL AGREES.
@@ -116,6 +120,14 @@ export function SettingsPanel() {
       : <div data-testid="settings-loading" className="text-ctp-overlay">Loading settings…</div>
   }
   const { settings, overrides, environment } = data
+
+  // Empty = no preference ($HOME) = a CLEAR, never a save of ''. The server validates (absolute,
+  // exists, directory) and stores the realpath, which comes back through apply().
+  const commitDefaultCwd = (raw: string) => {
+    const v = raw.trim()
+    if (v === (settings.defaultCwd ?? '')) return
+    setOrClear('defaultCwd', v === '' ? undefined : v)
+  }
 
   const commitTeamSize = () => {
     const r = parseTeamSize(teamRaw)
@@ -226,6 +238,36 @@ export function SettingsPanel() {
               className="px-1.5 py-0.5 rounded bg-ctp-base border border-ctp-surface1 text-ctp-text w-20 disabled:opacity-40"
             />
             {teamErr && <span data-testid="team-size-error" className="text-ctp-red/90">{teamErr}</span>}
+          </div>
+        )}
+      </Row>
+
+      <Row name="defaultCwd" label="Default folder for new sessions" overrides={overrides}
+        note="Where the New session dialog starts. Empty means your home folder. Projects always use their own folder.">
+        {(locked) => (
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5">
+              <input
+                type="text" disabled={locked || busy} data-testid="default-cwd"
+                value={cwdRaw} placeholder={homeDir || 'home folder'}
+                onChange={(e) => setCwdRaw(e.target.value)}
+                onBlur={() => commitDefaultCwd(cwdRaw)}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitDefaultCwd(cwdRaw) } }}
+                className="flex-1 min-w-0 px-1.5 py-0.5 rounded bg-ctp-base border border-ctp-surface1 text-ctp-text font-mono disabled:opacity-40"
+              />
+              <button type="button" disabled={locked || busy} onClick={() => setBrowsingCwd(true)}
+                className="px-1.5 py-0.5 rounded bg-ctp-surface0 text-ctp-subtext hover:text-ctp-text disabled:opacity-40">Browse…</button>
+              <button type="button" disabled={locked || busy || settings.defaultCwd === undefined} onClick={() => { setCwdRaw(''); void clearValue('defaultCwd') }}
+                className="px-1.5 py-0.5 rounded bg-ctp-surface0 text-ctp-subtext hover:text-ctp-text disabled:opacity-40">Clear</button>
+            </div>
+            {data.defaultCwdMissing && (
+              <div data-testid="default-cwd-missing" className="text-ctp-yellow">This folder no longer exists — new sessions start in your home folder until you change it.</div>
+            )}
+            {browsingCwd && (
+              <FileBrowser initialPath={cwdRaw.trim() || settings.defaultCwd || homeDir}
+                onPick={(p) => { setBrowsingCwd(false); setCwdRaw(p); commitDefaultCwd(p) }}
+                onClose={() => setBrowsingCwd(false)} />
+            )}
           </div>
         )}
       </Row>

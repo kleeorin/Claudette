@@ -3,11 +3,13 @@ import type { RewindPoint, RewindMode, RewindPreview } from '@claudette/shared'
 import { api } from '../api/client'
 import { useEscape } from '../lib/useDismiss'
 import { ago } from '../lib/ago'
+import { conflictLines, nothingToRestore } from '../lib/rewindPreview'
 
 // Native replacement for the TUI's `/rewind` (unavailable in headless stream-json
 // mode). Two steps: pick a past user turn, then choose what to restore —
 //   • Chat    — fork the transcript to before the turn and continue from there
-//   • Code    — restore the working tree to that turn's snapshot
+//   • Code    — restore the files THIS session edited since that turn to its snapshot (scoped:
+//               other sessions' and the operator's files are never touched; see rewindScope.ts)
 //   • Both    — do both
 // Conversation rewind is non-destructive (the original is an untouched fork, undoable
 // via /resume). Code restore overwrites working files, so it shows a preview + confirm
@@ -167,18 +169,33 @@ function RewindConfirm({
             {preview && preview !== 'loading' && (
               <div className="space-y-1.5">
                 <div className="text-ctp-subtext">
-                  <span className="text-ctp-peach font-medium">{preview.reverted.length}</span> file{preview.reverted.length === 1 ? '' : 's'} will be reverted to this turn's snapshot.
+                  <span className="text-ctp-peach font-medium">{preview.reverted.length}</span> file{preview.reverted.length === 1 ? '' : 's'} this session edited will be reverted to this turn's snapshot. Other sessions' and your own edits to other files are left alone.
                 </div>
+                {conflictLines(preview).length > 0 && (
+                  <div className="rounded border border-ctp-yellow/40 bg-ctp-yellow/10 px-2 py-1.5 text-ctp-subtext" data-testid="rewind-conflicts">
+                    <div className="text-ctp-yellow font-medium">⚠ Another session also edited {conflictLines(preview).length === 1 ? 'this file' : 'these files'} since this turn — restoring overwrites its change:</div>
+                    <ul className="mt-1 space-y-0.5">
+                      {conflictLines(preview).map((c) => (
+                        <li key={c.path} className="font-mono text-[10.5px] break-all">{c.path} <span className="font-sans text-ctp-overlay">— {c.who}</span></li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {(preview.skipped ?? []).length > 0 && (
+                  <div className="text-ctp-overlay">
+                    Not restored ({preview.skipped!.length}): {preview.skipped!.map((s) => `${s.path} (${s.reason})`).join('; ')}
+                  </div>
+                )}
                 {preview.deleted.length > 0 && (
                   <label className="flex items-start gap-2 text-ctp-subtext cursor-pointer">
                     <input type="checkbox" checked={deleteNewer} onChange={(e) => setDeleteNewer(e.target.checked)} className="mt-0.5 accent-ctp-red" />
                     <span>
-                      Also delete <span className="text-ctp-red font-medium">{preview.deleted.length}</span> file{preview.deleted.length === 1 ? '' : 's'} created since (untracked). Unchecked, they're left in place.
+                      Also delete <span className="text-ctp-red font-medium">{preview.deleted.length}</span> file{preview.deleted.length === 1 ? '' : 's'} this session created since. Unchecked, they're left in place.
                     </span>
                   </label>
                 )}
-                {preview.reverted.length === 0 && preview.deleted.length === 0 && (
-                  <div className="text-ctp-overlay">The working tree already matches this snapshot — nothing to restore.</div>
+                {nothingToRestore(preview) && (
+                  <div className="text-ctp-overlay">This session's files already match this snapshot — nothing to restore.</div>
                 )}
                 <div className="text-ctp-overlay pt-0.5">Your branch, HEAD, and staged changes are not touched — only file contents.</div>
               </div>

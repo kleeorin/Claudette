@@ -87,6 +87,18 @@ export interface SessionInfo {
   cwd: string        // where Claude runs (a subsession shares its parent's cwd)
   rootDir: string    // root for the terminal pane + file browser (a subdir for subsessions)
   parentId?: string  // set on subsessions; points at the owning session
+  // The PROJECT this session is grouped under (see ProjectInfo). Carried by TOP-LEVEL sessions
+  // only — a subsession belongs to its parent's project implicitly, and the server strips the
+  // field from children. A projectId naming no known project renders as an ungrouped row.
+  projectId?: string
+  // Claude's own conversation id for this session — the one persisted in sessions.json and
+  // passed to --resume on restore; updated when the engine reports another (system/init).
+  // Lets the client load THIS session's history at startup even when several sessions share a
+  // cwd (lib/autoResume.ts), instead of waiting for an init that only comes with a turn.
+  claudeSessionId?: string
+  // Set when the session runs in its OWN git worktree (an "isolated" session created inside a
+  // project): cwd and rootDir are `worktree.path`. See WorktreeInfo.
+  worktree?: WorktreeInfo
   remoteId?: string  // set when the session runs on a remote host (see RemoteConfig)
   agentId?: string   // the role this session runs as (see main/agents.ts); undefined = 'general'
   model?: string     // per-session model override; undefined = the role's model, else account default
@@ -154,9 +166,43 @@ export interface ActivePane {
   isNotebook: boolean // true for a .ipynb (cell tools) vs a text file editor
 }
 
+// A PROJECT: a sidebar grouping level above top-level sessions. Every session in it shares
+// the project's cwd; otherwise they are fully independent — projects do NOT share a team
+// roster (team / MCP / mailbox scope stays parentId-based). `cwd` is IMMUTABLE after creation:
+// --resume is keyed by cwd, so moving a project would orphan every conversation in it.
+// Persisted in <dataDir>/projects.json; a project outlives its last session and is removed
+// only by an explicit delete, which UNGROUPS its sessions and closes none of them.
+export interface ProjectInfo {
+  id: string
+  name: string
+  cwd: string
+  createdAt: number
+  collapsed?: boolean
+  // `git rev-parse --git-common-dir` of `cwd` (realpath), when cwd is in a repo. Lets the
+  // client offer "move into project" to a worktree session of the same repo; the server
+  // recomputes it live for every check that matters (cwdFitsProject).
+  gitCommonDir?: string
+}
+
+// An isolated session's git worktree, created by the server with
+// `git worktree add <repoRoot>/.claude/worktrees/<slug> -b <branch>` from HEAD.
+//   path       — the worktree (the session's cwd AND rootDir)
+//   branch     — the branch it was created on; kept when the worktree is removed
+//   repoRoot   — the MAIN work tree's top level (the project's repo)
+//   commonDir  — the shared git dir (realpath); the box mounts it rw, with the git
+//                exec-vector pins (SANDBOX.md "Git exec-vector escape") layered on top
+export interface WorktreeInfo {
+  path: string
+  branch: string
+  repoRoot: string
+  commonDir: string
+}
+
 export interface SavedSession {
   name: string
   cwd: string
+  projectId?: string     // top-level sessions only (see SessionInfo.projectId)
+  worktree?: WorktreeInfo  // isolated session (re-applied on restore; never recreated)
   rootDir?: string       // defaults to cwd when absent (older saves)
   parentIndex?: number   // index of the parent within the saved array (subsessions only)
   paneCount?: number     // number of stacked terminal panes to restore
@@ -393,9 +439,22 @@ export type RewindMode = 'conversation' | 'code' | 'both'
 // What restoring a turn's code snapshot would change, for the confirm dialog. Paths
 // are relative to the repo root. `reverted` = files whose contents differ from the
 // snapshot; `deleted` = untracked files created since (removed only when deleteNewer).
+//
+// SCOPED: all three lists cover only the files THIS session edited with its file-edit tools
+// from the turn on (never Bash effects, never another session's or the operator's edits).
+// `skipped` = paths in that set the restore cannot handle (outside the repo, gitignored);
+// `conflicts` = paths in the set another live session in the same repo ALSO edited after the
+// turn — the restore still proceeds if confirmed, overwriting that session's change.
 export interface RewindPreview {
   reverted: string[]
   deleted: string[]
+  skipped?: { path: string; reason: string }[]
+  conflicts?: RewindConflict[]
+}
+
+export interface RewindConflict {
+  path: string                                // repo-relative
+  sessions: { id: string; name: string }[]    // the other live sessions that edited it
 }
 
 // --- Remotes -----------------------------------------------------------------

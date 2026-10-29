@@ -1,4 +1,4 @@
-import type { SessionInfo } from '@claudette/shared'
+import type { SessionInfo, ProjectInfo } from '@claudette/shared'
 
 // Flatten the server's session list into display order: every subsession sits
 // directly under its parent (nested to any depth). A session whose parent isn't in the list
@@ -76,5 +76,77 @@ export function orderSessions(
   ranked.sort((a, b) => (Number(a.black) - Number(b.black)) || (b.rank - a.rank))
   for (const { s: r } of ranked) walk(r, 0)
   for (const s of sessions) if (!seen.has(s.id)) out.push({ session: s, depth: 0 })   // cycle leftovers
+  return out
+}
+
+// ── PROJECTS ─────────────────────────────────────────────────────────────────────────────
+// The sidebar with a level above families: Project → top-level sessions → subsessions.
+//
+// A family's project is its ROOT's projectId — only top-level sessions carry one, and a
+// subsession belongs to its parent's project whatever it might carry itself. A projectId
+// naming no known project is treated like a missing parent: the family renders as an ordinary
+// ungrouped row, so nothing can vanish from the sidebar.
+//
+// GROUPS — each project, and each ungrouped family — sort among each other by the same two keys
+// families always used: black (muted) last, then newest activity. A project's rank is the
+// newest activity anywhere inside it, and it is black only when ALL its sessions are black. A
+// project with no sessions is kept (projects outlive their last session) and, having nothing
+// to watch, sorts like an all-black group. Inside a project, families order exactly as
+// orderSessions orders them. A collapsed project contributes its header only; `count` is every
+// session in it, subsessions included, so a collapsed header still says what it is hiding.
+export type SidebarRow =
+  | { kind: 'project'; project: ProjectInfo; count: number }
+  | { kind: 'session'; session: SessionInfo; depth: number; projectId?: string }
+
+export function orderSidebar(
+  sessions: SessionInfo[],
+  projects: ProjectInfo[],
+  activity: ReadonlyMap<string, number>,
+  isBlack: (id: string) => boolean = () => false,
+): SidebarRow[] {
+  // orderSessions already yields families in order, each root followed by its subtree. Cut that
+  // stream into families (a depth-0 row starts one), then group families by the root's project.
+  const flat = orderSessions(sessions, activity, isBlack)
+  const known = new Map(projects.map((p) => [p.id, p]))
+  type Family = { rows: { session: SessionInfo; depth: number }[]; rank: number; black: boolean }
+  const families: Family[] = []
+  for (const r of flat) {
+    if (r.depth === 0 || !families.length) families.push({ rows: [], rank: 0, black: true })
+    const f = families[families.length - 1]
+    f.rows.push(r)
+    f.rank = Math.max(f.rank, activity.get(r.session.id) ?? 0)
+    f.black = f.black && isBlack(r.session.id)
+  }
+  type Group = { project?: ProjectInfo; families: Family[]; rank: number; black: boolean; order: number }
+  const groups: Group[] = []
+  const byProject = new Map<string, Group>()
+  // Initial order is first appearance, so the stable sort below keeps server order on ties.
+  for (const f of families) {
+    const pid = f.rows[0].session.projectId
+    const project = pid ? known.get(pid) : undefined
+    if (!project) { groups.push({ families: [f], rank: f.rank, black: f.black, order: groups.length }); continue }
+    let g = byProject.get(project.id)
+    if (!g) { g = { project, families: [], rank: 0, black: true, order: groups.length }; byProject.set(project.id, g); groups.push(g) }
+    g.families.push(f)
+    g.rank = Math.max(g.rank, f.rank)
+    g.black = g.black && f.black
+  }
+  for (const p of [...projects].sort((a, b) => a.createdAt - b.createdAt)) {
+    if (!byProject.has(p.id)) groups.push({ project: p, families: [], rank: 0, black: true, order: groups.length })
+  }
+  // ★ REDUNDANT TODAY, KEPT ON PURPOSE — measured by mutation (2026-10-26). `flat` already
+  // arrives sorted by (black, rank), so a group's first appearance IS its best family's place
+  // and its first family's rank IS its max: removing this sort, or replacing the Math.max above
+  // with "first family's rank", changes no output for any input (both mutants survive every
+  // test, and no test could kill them). It stays so this function's order does not silently
+  // depend on orderSessions' — change that sort and this one is what still holds.
+  groups.sort((a, b) => (Number(a.black) - Number(b.black)) || (b.rank - a.rank) || (a.order - b.order))
+  const out: SidebarRow[] = []
+  for (const g of groups) {
+    if (!g.project) { for (const r of g.families[0].rows) out.push({ kind: 'session', ...r }); continue }
+    out.push({ kind: 'project', project: g.project, count: g.families.reduce((n, f) => n + f.rows.length, 0) })
+    if (g.project.collapsed) continue
+    for (const f of g.families) for (const r of f.rows) out.push({ kind: 'session', ...r, projectId: g.project.id })
+  }
   return out
 }

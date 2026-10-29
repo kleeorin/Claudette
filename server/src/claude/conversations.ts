@@ -1,5 +1,5 @@
 import { readdir, readFile, stat, writeFile } from 'fs/promises'
-import { join } from 'path'
+import { join, isAbsolute, resolve } from 'path'
 import crypto from 'crypto'
 import type { ConversationMeta, ClaudeEvent, RewindPoint } from '@claudette/shared'
 import { snapshottedUuids } from '../git/shadowSnapshots'
@@ -141,6 +141,120 @@ export async function listRewindPoints(cwd: string, id: string): Promise<RewindP
   const snapped = await snapshottedUuids(cwd)
   for (const p of points) p.hasSnapshot = snapped.has(p.uuid)
   return points
+}
+
+// --- /rewind code-restore SCOPE ----------------------------------------------------
+//
+// A code restore used to re-materialise the WHOLE snapshot tree, so rewinding one session
+// reverted every other session's edits in the same repo — and the operator's own. The
+// restore set is now what THIS conversation changed with its file-edit tools, read back
+// from its own transcript, which is Claude Code's own checkpointing rule. Bash-made changes
+// are NOT covered (same as Claude Code): a shell command's file effects are not recoverable
+// from the transcript.
+//
+// WHICH TOOLS. The built-ins that write the file on disk: Edit, Write, MultiEdit (input
+// `file_path`) and NotebookEdit (`notebook_path`). Claudette's own notebook MCP tools
+// (mcp__app__edit_cell, add_cell, …) are DELIBERATELY EXCLUDED: they edit an in-memory
+// notebook document that reaches disk only when it is saved, and restoring the file under
+// an open, dirty document would be silently overwritten by the next save — a restore that
+// reports success and is undone later. Their path is also optional (they can follow the
+// user's pane), so it is not always in the transcript at all.
+//
+// A FAILED edit is not an edit. A tool_use whose tool_result carries `is_error` (a denied
+// permission, an old_string that did not match) changed nothing, and counting it would
+// revert a file this session never touched.
+//
+// SUBAGENT EDITS ARE INCLUDED. A subagent's transcript is a separate file,
+// <projectDir>/<sessionId>/subagents/agent-*.jsonl, so it is unambiguously THIS session's;
+// what it lacks is a link to the main transcript's turn, so those edits are attributed to
+// turns by TIMESTAMP (at or after the target turn's own timestamp). Chosen over excluding
+// them because a rewind that leaves a subagent's edits in place undoes half of what the
+// turn did. Known limit: after a conversation-rewind the current transcript is a FORK whose
+// prefix was copied from another session id, and that id's subagent files are not followed
+// — edits a subagent made in the copied prefix are not in the set.
+export interface FileEdit {
+  path: string        // absolute, as the tool received it (resolved against the line's cwd)
+  ts: number          // the assistant line's timestamp (ms), 0 if absent
+  tool: string
+  subagent: boolean
+}
+
+const FILE_EDIT_TOOLS: Record<string, string> = {
+  Edit: 'file_path', Write: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path',
+}
+
+// Successful file edits in one transcript file's lines, each tagged with its line index.
+function editsInLines(lines: string[], cwd: string, subagent: boolean): (FileEdit & { line: number })[] {
+  const pending = new Map<string, FileEdit & { line: number }>()
+  const failed = new Set<string>()
+  lines.forEach((line, i) => {
+    if (!line.trim()) return
+    let o: Record<string, unknown>
+    try { o = JSON.parse(line) } catch { return }
+    const content = (o.message as { content?: unknown })?.content
+    if (!Array.isArray(content)) return
+    for (const b of content as Record<string, unknown>[]) {
+      if (!b || typeof b !== 'object') continue
+      if (o.type === 'assistant' && b.type === 'tool_use' && typeof b.name === 'string' && b.name in FILE_EDIT_TOOLS) {
+        const p = (b.input as Record<string, unknown> | undefined)?.[FILE_EDIT_TOOLS[b.name]]
+        if (typeof p !== 'string' || !p.trim() || typeof b.id !== 'string') continue
+        const base = typeof o.cwd === 'string' ? o.cwd : cwd
+        const ts = typeof o.timestamp === 'string' ? Date.parse(o.timestamp) : NaN
+        pending.set(b.id, { path: isAbsolute(p) ? p : resolve(base, p), ts: Number.isNaN(ts) ? 0 : ts, tool: b.name, subagent, line: i })
+      } else if (o.type === 'user' && b.type === 'tool_result' && b.is_error === true && typeof b.tool_use_id === 'string') {
+        failed.add(b.tool_use_id)
+      }
+    }
+  })
+  return [...pending.entries()].filter(([id]) => !failed.has(id)).map(([, e]) => e)
+}
+
+async function subagentEdits(cwd: string, id: string): Promise<FileEdit[]> {
+  const dir = join(projectDir(cwd), id, 'subagents')
+  let names: string[]
+  try { names = (await readdir(dir)).filter((f) => f.endsWith('.jsonl')) } catch { return [] }
+  const out: FileEdit[] = []
+  for (const n of names) {
+    try { out.push(...editsInLines((await readFile(join(dir, n), 'utf8')).split('\n'), cwd, true)) } catch { /* unreadable → skip */ }
+  }
+  return out
+}
+
+// The successful file edits this conversation made FROM user turn `uuid` onward (the turn's
+// own edits included), main agent and subagents. `fromMs` is that turn's timestamp, which
+// other sessions' edits are compared against for conflicts. Null when `uuid` is not a line
+// in this transcript.
+export async function fileEditsFrom(cwd: string, id: string, uuid: string): Promise<{ edits: FileEdit[]; fromMs: number } | null> {
+  let raw: string
+  try { raw = await readFile(join(projectDir(cwd), `${id}.jsonl`), 'utf8') } catch { return null }
+  const lines = raw.split('\n')
+  let cut = -1, fromMs = 0
+  for (let i = 0; i < lines.length && cut < 0; i++) {
+    if (!lines[i].includes(uuid)) continue
+    try {
+      const o = JSON.parse(lines[i]) as Record<string, unknown>
+      if (o.uuid !== uuid) continue
+      cut = i
+      const ts = typeof o.timestamp === 'string' ? Date.parse(o.timestamp) : NaN
+      fromMs = Number.isNaN(ts) ? 0 : ts
+    } catch { /* not JSON */ }
+  }
+  if (cut < 0) return null
+  const main = editsInLines(lines, cwd, false).filter((e) => e.line > cut)
+  const subs = (await subagentEdits(cwd, id)).filter((e) => e.ts >= fromMs)
+  return { edits: [...main, ...subs].map(({ path, ts, tool, subagent }) => ({ path, ts, tool, subagent })), fromMs }
+}
+
+// Every successful file edit this conversation made at or after `sinceMs` — the view of
+// ANOTHER session used for conflict detection, where only wall-clock time relates its turns
+// to ours.
+export async function fileEditsSince(cwd: string, id: string, sinceMs: number): Promise<FileEdit[]> {
+  let raw: string
+  try { raw = await readFile(join(projectDir(cwd), `${id}.jsonl`), 'utf8') } catch { return [] }
+  const main = editsInLines(raw.split('\n'), cwd, false)
+  return [...main, ...(await subagentEdits(cwd, id))]
+    .filter((e) => e.ts >= sinceMs)
+    .map(({ path, ts, tool, subagent }) => ({ path, ts, tool, subagent }))
 }
 
 // Result of forking before a turn: the new fork's id, or `{ empty: true }` when there is

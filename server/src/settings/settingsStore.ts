@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, chmodSync, statSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, chmodSync, statSync, realpathSync } from 'fs'
 import path from 'path'
 import { dataDir } from '../util/dataDir'
 import { errMessage } from '../util/errMessage'
@@ -36,7 +36,14 @@ import {
 //                           inherit the operator's allow-all. Moving the lookup would hand it
 //                           to every teammate silently.
 //
-// All four are now wired. Anyone wiring up another key should start by grepping for importers
+//   defaultCwd            — ★ CONSUMED, CLIENT-SIDE ONLY: the new-session dialog's starting
+//                           folder (web/src/lib/defaultCwd.ts). The create route does NOT fall
+//                           back to it — a create always carries an explicit cwd. Save accepts
+//                           only an existing directory and stores its realpath (SAVE_NORMALIZE);
+//                           load keeps any ABSOLUTE path even if the folder is gone, and
+//                           settingsApi reports that as `defaultCwdMissing`.
+//
+// All five are now wired. Anyone wiring up another key should start by grepping for importers
 // of this file, and should update this list in the same change — a stale entry here is the
 // "enabled control that silently does nothing" shape the settings contract exists to prevent,
 // and it fails in both directions: claiming CONSUMED when it is not sends someone looking for
@@ -131,6 +138,28 @@ const CHECKS: Record<AppSettingsKey, Check> = {
     typeof v === 'number' && Number.isInteger(v) && v >= MIN_TEAM_SIZE && v <= MAX_TEAM_SIZE_LIMIT
       ? null
       : `The team size must be a whole number between ${MIN_TEAM_SIZE} and ${MAX_TEAM_SIZE_LIMIT}.`,
+  // LOAD-SAFE half only: an absolute path. Existence is deliberately NOT checked here — this
+  // runs on load too, and a folder deleted since must survive the load so the dialog can say
+  // "your default folder is gone" instead of the preference silently disappearing. Existence
+  // and directory-ness are enforced on SAVE, in SAVE_NORMALIZE below.
+  defaultCwd: (v) =>
+    typeof v === 'string' && v.trim() !== '' && path.isAbsolute(v.trim())
+      ? null
+      : 'The default folder must be an absolute path (e.g. /home/you/projects).',
+}
+
+// Save-only rules, applied AFTER CHECKS passes: stricter than load, and allowed to rewrite the
+// value into its canonical form. One entry today.
+const SAVE_NORMALIZE: Partial<Record<AppSettingsKey, (v: unknown) => { value: unknown } | { error: string }>> = {
+  // Must exist and be a directory NOW; stored as its realpath, so the dialog, the sandbox's
+  // seeded cwd mount and --resume's cwd key all see one spelling of the folder.
+  defaultCwd: (v) => {
+    const p = path.resolve((v as string).trim())
+    let st
+    try { st = statSync(p) } catch { return { error: `The default folder ${p} does not exist.` } }
+    if (!st.isDirectory()) return { error: `The default folder ${p} is not a directory.` }
+    try { return { value: realpathSync(p) } } catch (e) { return { error: `The default folder ${p} could not be resolved: ${errMessage(e)}` } }
+  },
 }
 
 export function isAppSettingsKey(k: unknown): k is AppSettingsKey {
@@ -244,9 +273,17 @@ export function saveSettings(patch: unknown): SaveSettingsResult {
     const err = CHECKS[k](v)
     if (err) return { ok: false, error: err }
   }
+  const values = new Map<string, unknown>()
+  for (const [k, v] of entries) {
+    const norm = SAVE_NORMALIZE[k as AppSettingsKey]
+    if (!norm) { values.set(k, v); continue }
+    const r = norm(v)
+    if ('error' in r) return { ok: false, error: r.error }
+    values.set(k, r.value)
+  }
 
   const next: AppSettings = { ...load() }
-  for (const [k, v] of entries) (next as Record<string, unknown>)[k] = v
+  for (const [k, v] of values) (next as Record<string, unknown>)[k] = v
   persist(next)
   return { ok: true, settings: { ...next } }
 }

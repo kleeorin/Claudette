@@ -290,7 +290,17 @@ const bin = path.join(repo, 'node_modules', '.bin', 'vitest')
 //     sides normalised, because undefined / '' / '  ' all mean "account default".
 // Raised 252 → 260 on 2026-10-19, counted from a run: lib/sessionOrder.test.ts (8) — the
 // sidebar order moved out of App.tsx; black (muted) families sink to the bottom, no pin.
-const MIN_TESTS = 260
+// Raised 260 → 266 on 2026-10-23, counted from a run: lib/rewindPreview.test.ts (6) — the
+// scoped-rewind confirm's conflict lines and its never-claim-"already matches"-while-skipping rule.
+// Raised 266 → 280 on 2026-10-26, counted from a run: lib/sessionOrder.test.ts +9 (orderSidebar —
+// the project level) and lib/projectMenu.test.ts (5 — which project actions a row offers).
+// Raised 280 → 286 on 2026-10-27, counted from a run: lib/projectMenu.test.ts +2 (worktree
+// sessions fit by common dir; ordinary ones still by cwd) and lib/worktreeSession.test.ts (4).
+// Raised 286 → 291 on 2026-10-28, counted from a run: lib/defaultCwd.test.ts (5 — the new-session
+// dialog's cwd precedence, late arrival, edit-wins, deleted-default fallback).
+// Raised 291 → 294 on 2026-10-28, counted from a run: lib/autoResume.test.ts +3 (resume by the
+// server-listed claudeSessionId after a restart; live init id wins; disqualifiers still apply).
+const MIN_TESTS = 294
 
 // THE DETECTOR IS DELIBERATELY WIDER THAN THE RUNNER, and that relationship is the whole
 // point of it. `web/vitest.config.ts` collects exactly `src/**/*.test.{ts,tsx}`. A detector
@@ -344,7 +354,11 @@ function testShapedUnder(dir, rel = '') {
 // Raised 12 → 13 the same day (lib/autoResume.test.ts — the subsession-context regression).
 // Raised 18 → 19 on 2026-09-29 (components/BashProcDetail.test.tsx), counted.
 // Raised 20 → 21 on 2026-10-19 (lib/sessionOrder.test.ts), counted.
-const MIN_TEST_FILES = 21
+// Raised 21 → 22 on 2026-10-23 (lib/rewindPreview.test.ts), counted.
+// Raised 22 → 23 on 2026-10-26 (lib/projectMenu.test.ts), counted.
+// Raised 23 → 24 on 2026-10-27 (lib/worktreeSession.test.ts), counted.
+// Raised 24 → 25 on 2026-10-28 (lib/defaultCwd.test.ts), counted.
+const MIN_TEST_FILES = 25
 
 const shaped = testShapedUnder(web)
 check(`the walk found at least ${MIN_TEST_FILES} test file(s) — it is not silently looking at nothing`,

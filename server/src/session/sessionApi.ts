@@ -8,6 +8,7 @@ import type {
   PermissionsResponse, EditRuleRequest, WriteResult,
   RewindPointsResponse, RewindPreviewResponse, RewindRequest, RewindResponse,
   TaskRecord, BashProcRecord, BashProcOutputResponse, TrustQueryResponse, TrustFolderRequest,
+  WorktreeInfo, WorktreeStatusResponse, DestroySessionBody, DestroySessionResponse,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { isTrusted, setTrusted } from '../claude/trust'
@@ -15,6 +16,9 @@ import { listAgents } from '../claude/agents'
 import { getEffective, addRule, removeRule } from '../claude/permissions'
 import { listConversations, readConversation, listRewindPoints, forkConversationBefore } from '../claude/conversations'
 import { previewRestore, restore } from '../git/shadowSnapshots'
+import { rewindScope } from '../claude/rewindScope'
+import { ProjectStore, cwdFitsProject } from '../projects/projectStore'
+import { createWorktree, slugify, worktreeStatus, removeWorktree } from '../git/worktrees'
 import { WsHub } from '../ws/hub'
 import { getSettings } from '../settings/settingsStore'
 
@@ -79,8 +83,20 @@ export function sendSessionSnapshots(sessions: SessionManager, hub: WsHub, ws: i
   }
 }
 
+// Push a fresh session:list to every tab whenever the set or a session's config changes, AND
+// when an engine reports its conversation id ('ready' — SessionInfo.claudeSessionId), so a
+// tab's copy never trails the id the server will --resume into (claude may hand back a
+// different one). A function rather than two lines in index.ts so a test can wire it.
+export function broadcastSessionLists(sessions: SessionManager, hub: Pick<WsHub, 'broadcast'>): void {
+  const push = () => hub.broadcast({ type: 'session:list', sessions: sessions.list() })
+  sessions.on('changed', push)
+  sessions.on('ready', push)
+}
+
 // Register the HTTP lifecycle routes on the Fastify app.
-export function registerSessionRoutes(app: FastifyInstance, sessions: SessionManager): void {
+// `projects` is optional so a harness exercising only session routes need not build a store;
+// without it, a create naming a projectId is refused rather than silently ungrouped.
+export function registerSessionRoutes(app: FastifyInstance, sessions: SessionManager, projects?: ProjectStore): void {
   // One background shell's output. GET because it is a read; the id and toolId are path
   // params so the route is cacheable-shaped and shows up in Fastify's route table, which is
   // what auth-route-coverage-test.mts enumerates — a route added another way could ship
@@ -100,8 +116,37 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
         : { ok: true, retrievable: false, reason: r.read.reason }
     })
 
-  app.post<{ Body: CreateSessionRequest }>('/api/session/create', async (req): Promise<CreateSessionResponse> => {
+  app.post<{ Body: CreateSessionRequest }>('/api/session/create', async (req, reply): Promise<CreateSessionResponse | { error: string }> => {
     const b = req.body
+    // CREATE INSIDE A PROJECT: the cwd comes FROM the project (an omitted cwd is filled in),
+    // and an explicit cwd that does not fit it is refused rather than overridden — a silently
+    // replaced directory is a session running somewhere the operator did not ask for.
+    let cwd = b.cwd, rootDir = b.rootDir, projectId: string | undefined
+    if (b.projectId) {
+      if (b.parentId) { reply.code(400); return { error: 'A subsession belongs to its parent\'s project; do not pass a projectId with a parentId.' } }
+      const p = projects?.get(b.projectId)
+      if (!p) { reply.code(404); return { error: 'No such project.' } }
+      if (b.cwd?.trim() && !cwdFitsProject(b.cwd, p)) { reply.code(400); return { error: `The project's directory is ${p.cwd}; a session in it cannot run in ${b.cwd}.` } }
+      cwd = p.cwd
+      rootDir = b.rootDir?.trim() ? b.rootDir : p.cwd
+      projectId = p.id
+    }
+    // ISOLATED: a new git worktree of the project's repo becomes the session's cwd AND rootDir
+    // (git/worktrees.ts). Only inside a project — that is where the dialog offers it, and the
+    // project is what keeps the session grouped with the repo it branched from.
+    let worktree: WorktreeInfo | undefined
+    if (b.isolated) {
+      if (!projectId) { reply.code(400); return { error: 'An isolated (git worktree) session is created inside a project.' } }
+      const slug = slugify(b.isolated.branch?.trim() || b.name)
+      const r = await createWorktree(cwd, slug, b.isolated.branch?.trim() || slugify(b.name))
+      if (!r.ok) { reply.code(400); return { error: r.error } }
+      worktree = r.worktree
+      // Same repo, same contents: a worktree of a trusted project dir is trusted too, or its
+      // checked-in .claude/settings.local.json would silently stop applying in the new dir.
+      // (`cwd` is still the project's here.)
+      if (isTrusted(cwd)) setTrusted(worktree.path)
+      cwd = rootDir = worktree.path
+    }
     // ★ THE APP-SETTINGS FALLBACK, AND `??` IS THE WHOLE OF IT — OMITTED, NOT FALSY.
     // `??` falls back only for null/undefined, which is exactly the rule these three need: a
     // request that OMITS the field gets the operator's stored default, and a request that
@@ -120,15 +165,26 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     // silently hand every teammate the operator's allow-all.
     const settings = getSettings()
     const id = sessions.create(
-      b.name, b.cwd, b.rootDir, b.parentId, b.resume,
+      b.name, cwd, rootDir, b.parentId, b.resume,
       b.claudeSessionId,
       b.agentId ?? settings.defaultAgentId,
       b.model ?? settings.defaultModel,
       b.permissionMode ?? settings.defaultPermissionMode,
       b.sandbox,
       /* trusted */ true,   // this route is auth-gated → the operator, may disable the sandbox
+      projectId,
+      worktree,
     )
     return { id }
+  })
+
+  // What removing an isolated session's worktree would lose (the close dialog's second step).
+  app.post<{ Body: SessionIdRequest }>('/api/session/worktreeStatus', async (req, reply): Promise<WorktreeStatusResponse> => {
+    const wt = sessions.get(req.body?.id)?.worktree
+    if (!wt) { reply.code(404); return { ok: false, dirty: [], unmerged: [], error: 'Not an isolated session.' } }
+    try { return { ok: true, ...(await worktreeStatus(wt)) } } catch (e) {
+      reply.code(500); return { ok: false, dirty: [], unmerged: [], error: e instanceof Error ? e.message : String(e) }
+    }
   })
 
   // Update a session's bwrap sandbox config (enable/disable, edit mounts). Applies
@@ -166,8 +222,28 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     sessions: sessions.list(),
   }))
 
-  app.post<{ Body: SessionIdRequest }>('/api/session/destroy', async (req): Promise<OkResponse> => {
-    sessions.destroy(req.body.id)
+  // Close. For an ISOLATED session the client asks "Keep worktree" / "Remove worktree":
+  // keep = this plain close (the worktree stays on disk; reopening it is not offered in v1);
+  // remove = removeWorktree. A worktree with dirty files or commits no other ref holds is
+  // refused without `force` — and the SESSION IS LEFT OPEN — so the client can show what would
+  // be lost and ask a second time. Removal deletes the DIRECTORY only; the branch is kept.
+  app.post<{ Body: DestroySessionBody }>('/api/session/destroy', async (req, reply): Promise<DestroySessionResponse> => {
+    const b = req.body
+    const wt = b?.removeWorktree ? sessions.get(b.id)?.worktree : undefined
+    if (b?.removeWorktree && !wt) { reply.code(400); return { ok: false, error: 'Not an isolated session — there is no worktree to remove.' } }
+    if (wt && !b.force) {
+      const st = await worktreeStatus(wt).catch(() => null)
+      if (!st) { reply.code(500); return { ok: false, error: 'Could not read the worktree\'s git status; not removing it.' } }
+      if (st.dirty.length || st.unmerged.length) {
+        reply.code(409)
+        return { ok: false, needsConfirm: true, status: { ok: true, ...st } }
+      }
+    }
+    sessions.destroy(b.id)
+    if (wt) {
+      const r = await removeWorktree(wt, !!b.force)
+      if (!r.ok) { reply.code(500); return { ok: false, error: `The session was closed, but its worktree was kept: ${r.error}` } }
+    }
     return { ok: true }
   })
 
@@ -247,17 +323,34 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     return { points: await listRewindPoints(info.cwd, claudeId) }
   })
 
-  // /rewind — what a code-restore to this turn would change (files reverted/deleted),
-  // for the confirm dialog. null when the turn has no working-tree snapshot.
+  // The restore set for rewinding session `id` to `uuid` — the files that session itself
+  // edited from the turn on — plus conflicts with every other live session in the repo.
+  // One helper for preview AND restore, so the dialog can never describe a different set
+  // from the one the restore then touches.
+  const scopeFor = (id: string, uuid: string) => {
+    const info = sessions.get(id)
+    const claudeId = sessions.claudeSessionId(id)
+    if (!info || !claudeId) return Promise.resolve(null)
+    const others = sessions.list().map((s) => ({ id: s.id, name: s.name, cwd: s.cwd, claudeId: sessions.claudeSessionId(s.id) }))
+    return rewindScope({ id, name: info.name, cwd: info.cwd, claudeId }, uuid, others)
+  }
+
+  // /rewind — what a code-restore to this turn would change, SCOPED to this session's own
+  // edits (see rewindScope.ts), with conflicts for the confirm dialog. null when the turn has
+  // no working-tree snapshot.
   app.get<{ Querystring: { id: string; uuid: string } }>('/api/session/rewindPreview', async (req): Promise<RewindPreviewResponse> => {
     const info = sessions.get(req.query.id)
     if (!info) return { preview: null }
-    return { preview: await previewRestore(info.cwd, req.query.uuid) }
+    const scope = await scopeFor(req.query.id, req.query.uuid)
+    if (!scope) return { preview: null }
+    const preview = await previewRestore(info.cwd, req.query.uuid, scope.paths)
+    return { preview: preview && { ...preview, conflicts: scope.conflicts } }
   })
 
   // /rewind — rewind to just before `uuid`. Per `mode`: 'conversation' forks the
   // transcript + resumes into the fork (original left intact, undoable via /resume);
-  // 'code' restores the working tree to the turn's snapshot; 'both' does both. The
+  // 'code' restores THIS session's edited files to the turn's snapshot (scoped — see
+  // rewindScope.ts; other sessions' and the operator's files are untouched); 'both' does both. The
   // code restore runs FIRST so a failure there aborts before the conversation moves.
   app.post<{ Body: RewindRequest }>('/api/session/rewind', async (req): Promise<RewindResponse> => {
     const { id, uuid, mode, deleteNewer } = req.body
@@ -267,7 +360,9 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
 
     let reverted: number | undefined, deleted: number | undefined
     if (mode === 'code' || mode === 'both') {
-      const res = await restore(info.cwd, uuid, !!deleteNewer)
+      const scope = await scopeFor(id, uuid)
+      if (!scope) return { ok: false, error: 'rewind point not found in this conversation' }
+      const res = await restore(info.cwd, uuid, !!deleteNewer, scope.paths)
       if (!res.ok) return { ok: false, error: res.error }
       reverted = res.reverted; deleted = res.deleted
     }

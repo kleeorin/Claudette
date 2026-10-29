@@ -8,6 +8,7 @@ import { ensureUserSettingsPinnable, settingsJsonPaths } from './configProtectio
 import { dataDir } from '../util/dataDir'
 import { tokenFilePath } from '../auth'
 import { viewOf, boxCanReach, refuseIfBoxCouldHavePlaced } from './sandboxPaths'
+import { gitPins } from './gitProtection'
 
 // Wraps a `claude …` invocation in a bubblewrap sandbox that confines the process
 // to a set of mounts (see SANDBOX.md). We do NOT --unshare-net, so the shared
@@ -251,6 +252,40 @@ function hookSettingsProtections(cwd: string): SandboxMount[] {
     .filter((f) => existsSync(f)).map((f) => ({ path: path.resolve(f), mode: 'ro' as const }))
 }
 
+// Pins for every git dir a rw mount exposes (gitProtection.ts says what and why), mapped to
+// the paths the BOX writes through — overlayDestFor, both spellings, rw mounts only, exactly
+// like appSourceProtections: an overlay at a path nothing binds protects nothing.
+// `forBox`: the launch path materializes what must exist to be pinnable (hooks/, commondir).
+// An ro pin at a path that is still absent is harmless to return: bwrapBaseArgs skips every
+// mount whose source does not exist, so no mountpoint is ever created on the host for it.
+// A `self` pin (rw bind onto itself — the rename guard) is emitted only where the box can
+// ALREADY write that path: it must never turn an ro-mounted gitdir writable.
+function gitExecProtections(dataMounts: SandboxMount[], forBox: boolean): SandboxMount[] {
+  const rw = dataMounts.filter((m) => m.mode === 'rw' && existsSync(m.path))
+  if (!rw.length) return []
+  const view = viewOf(dataMounts)
+  const pins = gitPins(rw.map((m) => m.path), { materialize: forBox, canCreate: (p) => boxCanReach(view, p, 'write') })
+  const mountPaths = new Set(dataMounts.map((m) => path.resolve(m.path)))
+  const out = new Map<string, SandboxMount['mode']>()
+  for (const pin of pins) {
+    const real = tryRealpath(pin.path)
+    for (const rd of real && real !== pin.path ? [pin.path, real] : [pin.path]) {
+      for (const m of rw) {
+        const dest = overlayDestFor(m, rd)
+        if (!dest) continue
+        if (pin.kind === 'ro') {
+          out.set(dest, 'ro')
+        } else {
+          if (out.has(dest) || mountPaths.has(dest) || isSymlink(dest) || !existsSync(dest)) continue
+          if (!boxCanReach(view, dest, 'write')) continue
+          out.set(dest, 'rw')
+        }
+      }
+    }
+  }
+  return [...out].map(([p, mode]) => ({ path: p, mode }))
+}
+
 // The OBLIGATORY data mounts every confined session gets, whatever the caller asked for:
 // the global config dir (creds + memory) and the project-local .claude, both rw. They are
 // always present so Claude keeps its config and memory even when the caller makes cwd
@@ -418,7 +453,7 @@ function bwrapBaseArgs(cwd: string, dataMounts: SandboxMount[], gpu = false): st
   // correctly (bwrap applies binds in argv order; a later, deeper bind wins). Fold in
   // the app-source ro overlays (self-modification fix): being deeper than the rw mount
   // that exposes them, they sort AFTER it and win, pinning the server's own source ro.
-  const allMounts = sortShallowFirst([...dataMounts, ...appSourceProtections(dataMounts)])
+  const allMounts = sortShallowFirst([...dataMounts, ...appSourceProtections(dataMounts), ...gitExecProtections(dataMounts, true)])
   // The box-WRITABLE mountpoints (by their logical/dest path — that's where the box
   // writes, regardless of where a symlink source points). Used to catch a dangerous
   // symlinked mount source below.
@@ -688,7 +723,7 @@ function sessionDataMountCandidates(cfg: SandboxConfig, cwd: string): SandboxMou
   // pinned ro UNCONDITIONALLY (even when absent) so an in-process actor can't create
   // one where the box's seed bind stops its own tools — matching Layer 1's effect.
   const settingsRo: SandboxMount[] = settingsJsonPaths(cwd).map((p) => ({ path: path.resolve(p), mode: 'ro' as const }))
-  const full = [...mounts, ...appSourceProtections(mounts), ...settingsRo]
+  const full = [...mounts, ...appSourceProtections(mounts), ...gitExecProtections(mounts, false), ...settingsRo]
   // Apply the SAME symlinked-mount escape guard the box does (bwrapBaseArgs), or the two
   // diverge: bwrap drops a box-writable symlinked mount source (e.g. a planted
   // <cwd>/.claude -> /outside) via isUnsafeSymlinkMount, but this authorizer would
@@ -827,6 +862,15 @@ export function sandboxSystemPrompt(cfg: SandboxConfig, cwd: string): string {
     // subagents get their own system prompt and are otherwise blind to the confinement.
     'Subagents you spawn do NOT inherit this note. When you delegate work that touches the',
     'filesystem, state these limits in the subagent prompt yourself.',
+    // Part of the git exec-vector fix (gitExecProtections): without this, the EROFS/EBUSY from
+    // `git config` reads like a broken repo and invites a "repair" of .git.
+    'In every git repo you can write, .git/config, .git/hooks, .git/commondir (and a linked',
+    "worktree's .git file) are READ-ONLY by design: the host runs git unsandboxed, so a",
+    'writable config or hook would run code outside this sandbox. Commits, branches, fetch and',
+    'push work; anything that WRITES git config fails (git config, git remote add, git push -u,',
+    'git branch --set-upstream-to, checking out a remote branch with tracking, installing hooks).',
+    'Do not try to work around it or repair',
+    '.git — tell the user to run that command on the host themselves.',
     // Told explicitly because the box's /dev is otherwise minimal enough that a GPU
     // failure reads as "this machine has no GPU" — the same misdiagnosis the mount note
     // above prevents for files.

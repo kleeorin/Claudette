@@ -105,7 +105,10 @@ export type AutoResumePlan =
 // into its own saved claudeSessionId). Reading a conversation and repointing an engine are
 // different acts, and only the first is wanted here.
 export function autoResumePlan(args: {
-  session: { cwd: string } | undefined
+  // `claudeSessionId` here is the id the SERVER reports for the session (SessionInfo) — the
+  // one it persisted and --resume'd the engine into. Present from creation, so it covers the
+  // post-restart window in which no system/init has arrived yet.
+  session: { cwd: string; claudeSessionId?: string } | undefined
   sessions: readonly { cwd: string }[]
   alreadyTried: boolean
   isFresh: boolean
@@ -117,8 +120,12 @@ export function autoResumePlan(args: {
 }): AutoResumePlan {
   if (resumeBlocked(args)) return { kind: 'skip' }
   // Exact beats heuristic, and it needs no cwd guard: knowing the id answers the question the
-  // guard was protecting against.
-  if (args.claudeSessionId) return { kind: 'byId', conversationId: args.claudeSessionId }
+  // guard was protecting against. The LIVE init id first (the newest word on where the engine
+  // is), then the server-listed one. Without the second, every session sharing a cwd opened
+  // EMPTY after a restart: the CLI sends init only once a turn starts, so the client had no id
+  // and the cwd guess was (rightly) refused, even though the server knew the id all along.
+  const id = args.claudeSessionId ?? args.session!.claudeSessionId
+  if (id) return { kind: 'byId', conversationId: id }
   if (cwdIdentifiesSession(args.session!, args.sessions)) return { kind: 'byCwd' }
   // ★ A SKIP HERE MUST NOT BE RECORDED AS "tried". The id typically arrives moments later, in
   // the connect snapshot, and the caller re-runs this on that change — so a session that

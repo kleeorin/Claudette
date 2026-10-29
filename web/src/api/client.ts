@@ -16,6 +16,8 @@ import type {
   EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
   UsageResponse,
   ConnectorsResponse, ConnectorDef, ConnectorView, AccountConnector, StrictPreflight,
+  ProjectInfo, ProjectListResponse, ProjectResponse,
+  ProjectRepoStatusResponse, WorktreeStatusResponse, DestroySessionResponse,
 } from '@claudette/shared'
 import type { AppSettings, AppSettingsResponse } from '../lib/settingsContract'
 
@@ -132,6 +134,7 @@ const states = channel<[string, SessionState]>()
 const readies = channel<[string, string]>()
 const exits = channel<[string, boolean, string]>()
 const lists = channel<[SessionInfo[]]>()
+const projectLists = channel<[ProjectInfo[]]>()   // project:list — every project, on connect and on change
 const connected = channel<[boolean]>()
 const nbUpdates = channel<[NotebookDoc]>()
 const nbFocuses = channel<[string, string, boolean]>()   // [notebookId, cellId, reveal]
@@ -175,6 +178,7 @@ function sendLive(msg: WsClientMessage): void {
 function dispatch(msg: WsServerMessage): void {
   switch (msg.type) {
     case 'session:list': lists.emit(msg.sessions); break
+    case 'project:list': projectLists.emit(msg.projects); break
     case 'session:snapshot': snapshots.emit(msg.id, msg.events, msg.pending, msg.tasks, msg.bashProcs); break
     case 'session:tasks': tasks.emit(msg.id, msg.tasks); break
     case 'session:bashProcs': bashProcs.emit(msg.id, msg.procs); break
@@ -324,6 +328,7 @@ export const api = {
     ready: (fn: Fn<[string, string]>) => readies.on(fn),
     exit: (fn: Fn<[string, boolean, string]>) => exits.on(fn),
     list: (fn: Fn<[SessionInfo[]]>) => lists.on(fn),
+    projects: (fn: Fn<[ProjectInfo[]]>) => projectLists.on(fn),
     connected: (fn: Fn<[boolean]>) => connected.on(fn),
     notebookUpdate: (fn: Fn<[NotebookDoc]>) => nbUpdates.on(fn),
     // The cell a just-applied op touched (notebookId, cellId, reveal).
@@ -377,7 +382,22 @@ export const api = {
     trustFolder: (cwd: string) => post<OkResponse>('/api/session/trust', { cwd } as TrustFolderRequest),
     listSessions: async (): Promise<SessionInfo[]> =>
       (await get<ListSessionsResponse>('/api/session/list')).sessions,
-    destroySession: (id: string) => post<OkResponse>('/api/session/destroy', { id }),
+    // Projects (see ProjectInfo). Every mutator returns the server's answer; the project:list
+    // broadcast is what actually updates the store, on this tab and every other.
+    listProjects: async (): Promise<ProjectInfo[]> => (await get<ProjectListResponse>('/api/project/list')).projects,
+    projectFromSession: (sessionId: string) => post<ProjectResponse>('/api/project/fromSession', { sessionId }),
+    createProject: (name: string, cwd: string) => post<ProjectResponse>('/api/project/create', { name, cwd }),
+    renameProject: (id: string, name: string) => post<ProjectResponse>('/api/project/rename', { id, name }),
+    setProjectCollapsed: (id: string, collapsed: boolean) => post<ProjectResponse>('/api/project/setCollapsed', { id, collapsed }),
+    deleteProject: (id: string) => post<OkResponse & { ungrouped?: number; error?: string }>('/api/project/delete', { id }),
+    setSessionProject: (id: string, projectId: string | null) => post<OkResponse & { error?: string }>('/api/session/setProject', { id, projectId }),
+    // `removeWorktree` (isolated sessions): delete its worktree dir too — never the branch. A
+    // dirty/unmerged worktree comes back `needsConfirm` with the status and the session still
+    // open; re-send with `force` after the operator confirms.
+    destroySession: (id: string, opts?: { removeWorktree?: boolean; force?: boolean }) =>
+      post<DestroySessionResponse>('/api/session/destroy', { id, ...opts }),
+    worktreeStatus: (id: string) => post<WorktreeStatusResponse>('/api/session/worktreeStatus', { id }),
+    projectRepoStatus: (id: string) => post<ProjectRepoStatusResponse>('/api/project/repoStatus', { id }),
     relaunch: (id: string) => post<OkResponse>('/api/session/relaunch', { id }),
     relaunchApply: (id: string) => post<OkResponse>('/api/session/relaunchApply', { id }),
     // Per-session model override. `model` omitted clears it back to the role's model / the

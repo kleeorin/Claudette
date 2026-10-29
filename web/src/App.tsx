@@ -34,9 +34,12 @@ import { MD_PX, usePhone } from './lib/breakpoint'
 import { useVisibleHeight } from './lib/visualViewport'
 import { attachNewNotebooks } from './lib/notebookAttach'
 import { dotStateFor, pruneMutes, busyKernelCount } from './lib/sessionLights'
-import { orderSessions } from './lib/sessionOrder'
+import { orderSidebar } from './lib/sessionOrder'
+import { projectMenuItems } from './lib/projectMenu'
+import { slugify, isolatedUnavailableReason } from './lib/worktreeSession'
+import { cwdField } from './lib/defaultCwd'
 import { StateDot } from './components/StateDot'
-import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord } from '@claudette/shared'
+import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord, ProjectInfo } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
 // file editors open as CONTENT tabs beside it (a companion split); Files and Git
@@ -1495,13 +1498,18 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
   // (muted) families sink to the bottom, and the order is recomputed on every light change —
   // `muted` and `attention` are dependencies because they decide the light, and there is no
   // pin holding the viewed row in place (removed 2026-10-19, operator's call).
-  const { activity } = useSessions()
+  //
+  // PROJECTS add a level above families (lib/sessionOrder orderSidebar): a header row, then
+  // its families indented under it. Same ranking keys at the project level — newest activity
+  // inside, black only when ALL of it is black. A collapsed project shows its header only.
+  const { activity, projects } = useSessions()
+  const [newInProject, setNewInProject] = useState<ProjectInfo | null>(null)
   const ordered = useMemo(
-    () => orderSessions(sessions, activity, (id) => {
+    () => orderSidebar(sessions, projects, activity, (id) => {
       const s = sessions.find((x) => x.id === id)
       return !!s && dotStateFor(s, muted.has(id), attention) === 'muted'
     }),
-    [sessions, activity, muted, attention],
+    [sessions, projects, activity, muted, attention],
   )
 
   return (
@@ -1547,7 +1555,9 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
         </div>
         <div className="flex-1 overflow-y-auto px-2 space-y-0.5">
           {sessions.length === 0 && <div className="px-2 py-2 text-xs text-ctp-overlay">No sessions yet.</div>}
-          {ordered.map(({ session: s, depth }) => (
+          {ordered.map((row) => row.kind === 'project' ? (
+            <ProjectHeader key={`project:${row.project.id}`} project={row.project} count={row.count} onNewSession={() => setNewInProject(row.project)} />
+          ) : (({ session: s, depth, projectId: inProject }) => (
             <SessionRow
               // TWO PROPS, TWO DIFFERENT QUESTIONS, and the history of this line is worth the
               // space because it has now been wrong in both directions.
@@ -1561,14 +1571,14 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
               //     is simply untrue. Only the reason itself lets each case say what is true,
               //     and `dotStateFor` in lib/sessionLights.ts is where that is decided — and,
               //     unlike this file, where it is TESTED.
-              key={s.id} session={s} depth={depth} active={s.id === activeId}
+              key={s.id} session={s} depth={depth} inProject={!!inProject} active={s.id === activeId}
               finished={attention.get(s.id) === 'finished'} attention={attention}
               muted={muted.has(s.id)} onToggleMute={() => toggleMute(s.id)} notebookIds={notebookIdsFor(s.id)}
               onSelect={() => pick(s.id)} onClose={() => setConfirmClose(s)}
               onOpenAgent={(id, label) => { onOpenAgent(s.id, id, label); onClose() }}
               onOpenBashProc={(id, label) => { onOpenBashProc(s.id, id, label); onClose() }}
             />
-          ))}
+          ))(row))}
         </div>
 
         <div className="border-t border-ctp-surface0 p-3 shrink-0">
@@ -1578,8 +1588,12 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
         </div>
 
         {showNew && <NewSessionDialog onClose={() => setShowNew(false)} onCreated={() => { setShowNew(false); onClose() }} />}
+        {newInProject && <NewSessionDialog project={newInProject} onClose={() => setNewInProject(null)} onCreated={() => { setNewInProject(null); onClose() }} />}
         {deckOpen && <ClaudetteDeck cwd={deckCwd} onClose={() => setDeckOpen(false)} />}
-        {confirmClose && (
+        {confirmClose?.worktree && (
+          <WorktreeCloseDialog session={confirmClose} onDone={() => setConfirmClose(null)} />
+        )}
+        {confirmClose && !confirmClose.worktree && (
           <ConfirmDialog
             danger
             title="Close this session?"
@@ -1595,13 +1609,30 @@ function Sidebar({ open, onClose, width, notif, autoOpenEdits, onToggleAutoOpenE
 }
 
 // Centered modal for creating a session — name + working directory + role + model.
-function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreated?: () => void }) {
+// `project`: create the session INSIDE that project. Its cwd is the project's and is not
+// editable here — every session in a project shares the project's cwd, and the server refuses
+// a mismatching one anyway.
+function NewSessionDialog({ onClose, onCreated, project }: { onClose: () => void; onCreated?: () => void; project?: ProjectInfo }) {
   const { create, agents, sandboxAvailable, homeDir } = useSessions()
   const [name, setName] = useState('')
-  const [cwd, setCwd] = useState(homeDir)
-  // homeDir may resolve after this dialog mounts (health probe is async); adopt it as
-  // the default the moment it arrives, unless the user has already typed a path.
-  useEffect(() => { setCwd((c) => c || homeDir) }, [homeDir])
+  // The working directory: project cwd, else the operator's default folder (Settings), else
+  // $HOME — DERIVED (lib/defaultCwd.ts) rather than seeded once, because homeDir (health probe)
+  // and the default folder (settings fetch) both arrive asynchronously, in either order. Until
+  // the user edits the field it follows whichever answer is current; after, it is theirs.
+  const [typedCwd, setTypedCwd] = useState('')
+  const [cwdEdited, setCwdEdited] = useState(false)
+  const [cwdDefaults, setCwdDefaults] = useState<{ defaultCwd?: string; missing?: boolean }>({})
+  useEffect(() => {
+    if (project) return   // a project-locked dialog never consults the default folder
+    let live = true
+    api.http.appSettings()
+      .then((r) => { if (live) setCwdDefaults({ defaultCwd: r.settings?.defaultCwd, missing: r.defaultCwdMissing }) })
+      .catch(() => { /* no settings ⇒ $HOME, today's behaviour */ })
+    return () => { live = false }
+  }, [project])
+  const cwdState = cwdField({ edited: cwdEdited, typed: typedCwd, projectCwd: project?.cwd, defaultCwd: cwdDefaults.defaultCwd, defaultCwdMissing: cwdDefaults.missing, homeDir })
+  const cwd = cwdState.value
+  const setCwd = (v: string) => { setTypedCwd(v); setCwdEdited(true) }
   const [agentId, setAgentId] = useState('general')
   const [model, setModel] = useState('')
   const [sb, setSb] = useState<SbState>(defaultSb())
@@ -1609,7 +1640,23 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
   const [err, setErr] = useState<string | null>(null)
   const [browsing, setBrowsing] = useState(false)
   const [pendingTrust, setPendingTrust] = useState(false)
+  // ISOLATED (git worktree) — offered only inside a project, and enabled only for a repo with
+  // a commit (/api/project/repoStatus; undefined while loading). The branch field follows a
+  // slug of the name until the user types in it.
+  const [repo, setRepo] = useState<{ hasCommit: boolean } | null | undefined>(undefined)
+  const [isolated, setIsolated] = useState(false)
+  const [branch, setBranch] = useState<string | null>(null)
   const nameRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (!project) return
+    let live = true
+    api.http.projectRepoStatus(project.id)
+      .then((r) => { if (live) setRepo(r?.ok ? r.repo : null) })
+      .catch(() => { if (live) setRepo(null) })
+    return () => { live = false }
+  }, [project])
+  const isolatedBlocked = isolatedUnavailableReason(repo)
+  const branchValue = branch ?? slugify(name.trim() || basename(cwd.trim()) || 'session')
 
   useEffect(() => { nameRef.current?.focus() }, [])
   useEscape(onClose)
@@ -1617,7 +1664,8 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
   // The actual session creation, once the cwd is known-trusted. Assumes busy is set.
   const doCreate = async (dir: string) => {
     try {
-      await create(name.trim() || basename(dir) || 'session', dir, { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, dir) })
+      const useWorktree = !!project && isolated && !isolatedBlocked
+      await create(name.trim() || basename(dir) || 'session', dir, { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, dir), projectId: project?.id, ...(useWorktree ? { isolated: { branch: branchValue.trim() } } : {}) })
       ;(onCreated ?? onClose)()
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Failed to create session.')
@@ -1654,7 +1702,7 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
       <div className="w-[420px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
           <Mark className="w-4 h-4 text-ctp-accent" />
-          <span className="text-sm font-semibold text-ctp-text">New session</span>
+          <span className="text-sm font-semibold text-ctp-text truncate">{project ? <>New session in <span className="text-ctp-accent">{project.name}</span></> : 'New session'}</span>
           <button onClick={onClose} className="ml-auto text-ctp-overlay hover:text-ctp-text text-sm">✕</button>
         </div>
         <div className="p-5 space-y-3.5">
@@ -1663,10 +1711,25 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
           </Field>
           <Field label="Working directory">
             <div className="flex gap-2">
-              <input value={cwd} onChange={(e) => setCwd(e.target.value)} onKeyDown={onEnter} placeholder="/path/to/project" className="modal-input font-mono text-[12px] flex-1" />
-              <button type="button" onClick={() => setBrowsing(true)} className="text-xs px-3 rounded-md text-ctp-subtext hover:bg-ctp-surface0 border border-ctp-surface1 transition-colors whitespace-nowrap" title="Browse for a folder">Browse…</button>
+              <input value={cwd} onChange={(e) => setCwd(e.target.value)} onKeyDown={onEnter} placeholder="/path/to/project" readOnly={!!project} title={project ? 'Every session in a project runs in the project\'s directory' : undefined} className={`modal-input font-mono text-[12px] flex-1 ${project ? 'opacity-70' : ''}`} />
+              {!project && <button type="button" onClick={() => setBrowsing(true)} className="text-xs px-3 rounded-md text-ctp-subtext hover:bg-ctp-surface0 border border-ctp-surface1 transition-colors whitespace-nowrap" title="Browse for a folder">Browse…</button>}
             </div>
+            {cwdState.note && <div data-testid="default-cwd-note" className="text-[10px] text-ctp-yellow mt-1">{cwdState.note}</div>}
           </Field>
+          {project && (
+            <div className="space-y-1.5">
+              <label className={`flex items-center gap-2 text-[12px] ${isolatedBlocked ? 'text-ctp-overlay' : 'text-ctp-subtext'}`} title={isolatedBlocked ?? 'Run this session in its own git worktree on a new branch, so it does not share a checkout with other sessions'}>
+                <input type="checkbox" checked={isolated && !isolatedBlocked} disabled={!!isolatedBlocked} onChange={(e) => setIsolated(e.target.checked)} />
+                Isolated (git worktree)
+              </label>
+              {isolatedBlocked && repo !== undefined && <div className="text-[10px] text-ctp-overlay pl-6">{isolatedBlocked}</div>}
+              {isolated && !isolatedBlocked && (
+                <Field label="Branch" hint="new, from HEAD">
+                  <input value={branchValue} onChange={(e) => setBranch(e.target.value)} onKeyDown={onEnter} className="modal-input font-mono text-[12px]" />
+                </Field>
+              )}
+            </div>
+          )}
           <Field label="Role">
             <RolePicker agents={agents} value={agentId} onChange={setAgentId} />
           </Field>
@@ -1708,6 +1771,61 @@ function NewSessionDialog({ onClose, onCreated }: { onClose: () => void; onCreat
           onCancel={cancelTrust}
         />
       )}
+    </Overlay>
+  )
+}
+
+// Closing an ISOLATED session: keep its worktree on disk, or remove it. Remove asks the server,
+// which refuses (needsConfirm) when the worktree has uncommitted changes or commits no other
+// branch/remote holds — then this shows exactly that and needs a second, explicit confirm.
+// The branch is never deleted. A kept worktree is not reopenable from the UI in v1.
+function WorktreeCloseDialog({ session, onDone }: { session: SessionInfo; onDone: () => void }) {
+  const { destroy } = useSessions()
+  const wt = session.worktree!
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [risk, setRisk] = useState<{ dirty: string[]; unmerged: string[] } | null>(null)
+  useEscape(() => { if (!busy) onDone() })
+  const run = async (opts?: { removeWorktree?: boolean; force?: boolean }) => {
+    setBusy(true); setErr(null)
+    try {
+      const r = await destroy(session.id, opts)
+      if (r.needsConfirm && r.status) { setRisk({ dirty: r.status.dirty, unmerged: r.status.unmerged }); setBusy(false); return }
+      if (r.ok === false) { setErr(r.error ?? 'The server refused.'); setBusy(false); return }
+      onDone()
+    } catch (e) { setErr(e instanceof Error ? e.message : 'Failed.'); setBusy(false) }
+  }
+  const btn = 'text-xs px-3 py-1.5 rounded-md transition disabled:opacity-40'
+  return (
+    <Overlay onClose={() => { if (!busy) onDone() }}>
+      <div className={`w-[460px] max-w-[calc(100vw-2rem)] rounded-xl border ${risk ? 'border-ctp-red/40' : 'border-ctp-surface1'} bg-ctp-mantle shadow-pop p-5`} onClick={(e) => e.stopPropagation()}>
+        <div className={`text-sm font-semibold mb-1 ${risk ? 'text-ctp-red' : 'text-ctp-text'}`}>{risk ? 'Remove a worktree with unsaved work?' : 'Close this isolated session?'}</div>
+        <div className="text-xs text-ctp-subtext mb-3 leading-relaxed">
+          {risk ? (
+            <>Removing <span className="font-mono">{prettyPath(wt.path)}</span> deletes this work. The branch <span className="font-mono text-ctp-text">{wt.branch}</span> is kept either way, so committed work stays reachable from it.</>
+          ) : (
+            <><b>{session.name || 'This session'}</b> runs in the git worktree <span className="font-mono">{prettyPath(wt.path)}</span> on branch <span className="font-mono text-ctp-text">{wt.branch}</span>. Keep it on disk, or remove the worktree directory? The branch is kept either way. A kept worktree cannot be reopened from here yet.</>
+          )}
+        </div>
+        {risk && (
+          <div className="mb-3 space-y-2 text-[11px] font-mono max-h-48 overflow-y-auto">
+            {risk.dirty.length > 0 && <div><div className="text-ctp-red font-sans text-[11px] mb-0.5">Uncommitted changes ({risk.dirty.length})</div>{risk.dirty.slice(0, 30).map((l) => <div key={l} className="text-ctp-subtext truncate">{l}</div>)}</div>}
+            {risk.unmerged.length > 0 && <div><div className="text-ctp-red font-sans text-[11px] mb-0.5">Commits on no other branch or remote ({risk.unmerged.length})</div>{risk.unmerged.slice(0, 30).map((l) => <div key={l} className="text-ctp-subtext truncate">{l}</div>)}</div>}
+          </div>
+        )}
+        {err && <div className="text-[11px] text-ctp-red mb-3">{err}</div>}
+        <div className="flex justify-end gap-2">
+          <button disabled={busy} onClick={onDone} className={`${btn} text-ctp-subtext hover:bg-ctp-surface0`}>Cancel</button>
+          {risk ? (
+            <button disabled={busy} onClick={() => void run({ removeWorktree: true, force: true })} className={`${btn} font-medium bg-ctp-red/20 text-ctp-red hover:bg-ctp-red/30`}>Remove anyway</button>
+          ) : (
+            <>
+              <button disabled={busy} onClick={() => void run()} className={`${btn} font-medium bg-ctp-accent/20 text-ctp-accent hover:bg-ctp-accent/30`}>Keep worktree</button>
+              <button disabled={busy} onClick={() => void run({ removeWorktree: true })} className={`${btn} font-medium bg-ctp-red/20 text-ctp-red hover:bg-ctp-red/30`}>Remove worktree</button>
+            </>
+          )}
+        </div>
+      </div>
     </Overlay>
   )
 }
@@ -1820,7 +1938,7 @@ function SandboxFields({ value, onChange, cwd, available }: { value: SbState; on
   )
 }
 
-function SessionRow({ session, depth, active, finished, attention, muted, onToggleMute, notebookIds, onSelect, onClose, onOpenAgent, onOpenBashProc }: { session: SessionInfo; depth: number; active: boolean; finished: boolean; attention: ReadonlyMap<string, AttentionReason>; muted: boolean; onToggleMute: () => void; notebookIds: string[]; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void; onOpenBashProc: (id: string, label: string) => void }) {
+function SessionRow({ session, depth, inProject = false, active, finished, attention, muted, onToggleMute, notebookIds, onSelect, onClose, onOpenAgent, onOpenBashProc }: { session: SessionInfo; depth: number; inProject?: boolean; active: boolean; finished: boolean; attention: ReadonlyMap<string, AttentionReason>; muted: boolean; onToggleMute: () => void; notebookIds: string[]; onSelect: () => void; onClose: () => void; onOpenAgent: (id: string, label: string) => void; onOpenBashProc: (id: string, label: string) => void }) {
   const { sessions, agents, setAgent, rename } = useSessions()
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const [subOpen, setSubOpen] = useState(false)
@@ -1925,7 +2043,10 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
 
   // Nesting indent: subsessions sit under their parent, one step per level (the ↳ mark
   // is drawn at the row's own left edge, so the indent moves with it).
-  const indent = depth > 0 ? { paddingLeft: 20 + (depth - 1) * 12 } : undefined
+  // Inside a project every row shifts one step right, so the header visibly owns its sessions;
+  // `depth` still says only whether this is a subsession (it drives the ↳).
+  const shift = inProject ? 12 : 0
+  const indent = depth > 0 ? { paddingLeft: 20 + (depth - 1) * 12 + shift } : inProject ? { paddingLeft: 10 + shift } : undefined
 
   return (
     <div>
@@ -1954,6 +2075,8 @@ function SessionRow({ session, depth, active, finished, attention, muted, onTogg
           ) : (
             <div className="flex items-center gap-1.5 min-w-0">
               <span className={`truncate text-sm ${finished ? 'text-ctp-text font-medium' : active ? 'text-ctp-text' : 'text-ctp-subtext'}`} title={prettyPath(session.cwd)}>{session.name}</span>
+              {/* An ISOLATED session runs on its own branch in its own worktree — say which. */}
+              {session.worktree && <span className="shrink-0 max-w-[45%] truncate font-mono text-[10px] px-1 py-0.5 rounded bg-ctp-surface0 text-ctp-subtext" title={`Isolated: git worktree ${prettyPath(session.worktree.path)} on branch ${session.worktree.branch}`}>⎇ {session.worktree.branch}</span>}
               {roleBadge && <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide px-1 py-0.5 rounded bg-ctp-accent/15 text-ctp-accent" title={`Role: ${roleBadge}`}>{roleBadge}</span>}
               {/* ★ ELEVATED PERMISSIONS — FIRST IN THE ROW, AND RED, BECAUSE IT IS THE ONE
                   BADGE THAT REPORTS A PRIVILEGE RATHER THAN ACTIVITY.
@@ -2276,12 +2399,105 @@ function SubsessionDialog({ parent, onClose }: { parent: SessionInfo; onClose: (
 
 // Per-session actions menu (portal to body so the sidebar's scroll never clips it).
 // Two views: the main actions, and a "change role" submenu listing the agents.
+// A PROJECT's sidebar header: collapse chevron (persisted on the server — every tab and device
+// sees the same fold), name, session count, a "+" that opens New session locked to the
+// project's directory, and a menu with Rename and Delete. Delete UNGROUPS: its sessions become
+// ordinary rows and none is closed, which the confirm says in so many words.
+// Phone is first-class: the actions are always visible below md (no hover there), and every
+// control keeps a finger-sized hit area.
+function ProjectHeader({ project, count, onNewSession }: { project: ProjectInfo; count: number; onNewSession: () => void }) {
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const [renameVal, setRenameVal] = useState(project.name)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const done = useRef(false)
+  // Every call here reports a refusal in place: the project:list broadcast is what updates the
+  // row, so a failed call would otherwise look exactly like a slow one.
+  const call = async (what: string, fn: () => Promise<{ ok?: boolean; error?: string }>) => {
+    setErr(null)
+    try {
+      const r = await fn()
+      if (r?.ok !== true) setErr(r?.error ?? `${what} failed.`)
+    } catch (e) { setErr(e instanceof Error ? `${what} failed: ${e.message}` : `${what} failed.`) }
+  }
+  const toggle = () => void call('Collapsing', () => api.http.setProjectCollapsed(project.id, !project.collapsed))
+  const beginRename = () => { done.current = false; setRenameVal(project.name); setRenaming(true) }
+  const submitRename = () => {
+    if (done.current) return
+    done.current = true
+    setRenaming(false)
+    const n = renameVal.trim()
+    if (n && n !== project.name) void call('Renaming', () => api.http.renameProject(project.id, n))
+  }
+  const openMenu = (e: React.MouseEvent) => {
+    e.stopPropagation(); e.preventDefault()
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    setMenu({ x: r.right, y: r.bottom + 2 })
+  }
+  return (
+    <div className="pt-1.5" data-testid="project-header" data-project-id={project.id}>
+      <div onClick={toggle} className="group flex items-center gap-1.5 rounded-md pl-1 pr-1 py-1.5 cursor-pointer hover:bg-ctp-surface0/50 transition-colors" title={project.cwd}>
+        <span className={`w-5 h-5 flex items-center justify-center text-ctp-overlay text-[10px] transition-transform ${project.collapsed ? '' : 'rotate-90'}`} aria-label={project.collapsed ? 'Expand project' : 'Collapse project'} role="button">▶</span>
+        <div className="flex-1 min-w-0">
+          {renaming ? (
+            <input
+              autoFocus
+              value={renameVal}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => setRenameVal(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitRename() } else if (e.key === 'Escape') { e.preventDefault(); done.current = true; setRenaming(false) } }}
+              onBlur={submitRename}
+              aria-label="Project name"
+              className="w-full bg-ctp-base border border-ctp-surface1 rounded px-1.5 py-0.5 text-xs text-ctp-text outline-none focus:border-ctp-accent/60"
+            />
+          ) : (
+            <span className="block truncate text-[11px] font-semibold uppercase tracking-wide text-ctp-subtext">{project.name}</span>
+          )}
+        </div>
+        <span className="shrink-0 text-[10px] text-ctp-overlay tabular-nums" title={`${count} session${count === 1 ? '' : 's'}`}>{count}</span>
+        <button onClick={(e) => { e.stopPropagation(); onNewSession() }} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-accent text-base leading-none w-7 h-7 flex items-center justify-center rounded transition-opacity" title={`New session in ${project.name}`} aria-label={`New session in ${project.name}`}>+</button>
+        <button onClick={openMenu} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text text-sm leading-none w-7 h-7 flex items-center justify-center rounded transition-opacity" title="Project actions" aria-label="Project actions">⋯</button>
+      </div>
+      {err && <div className="px-2 pb-1 text-[10px] text-ctp-red">{err}</div>}
+      {menu && <ProjectMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)} onRename={beginRename} onDelete={() => setConfirmDelete(true)} />}
+      {confirmDelete && (
+        <ConfirmDialog
+          danger
+          title={`Delete the project “${project.name}”?`}
+          body={<>This only <b>ungroups</b> it: its {count} session{count === 1 ? '' : 's'} stay open and become ordinary rows in the sidebar. No session is closed, and nothing on disk is touched.</>}
+          confirmLabel="Delete project"
+          onConfirm={() => { setConfirmDelete(false); void call('Deleting', () => api.http.deleteProject(project.id)) }}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+function ProjectMenu({ x, y, onClose, onRename, onDelete }: { x: number; y: number; onClose: () => void; onRename: () => void; onDelete: () => void }) {
+  useDismissOnOutside(true, onClose)
+  const item = 'w-full text-left px-3 py-2 md:py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
+  return createPortal(
+    <div style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - 120) }} onClick={(e) => e.stopPropagation()} className="fixed z-[60] w-48 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs">
+      <button className={item} onClick={() => { onClose(); onRename() }}>✎ Rename</button>
+      <button className={`${item} text-ctp-red`} onClick={() => { onClose(); onDelete() }}>🗑 Delete project…</button>
+    </div>,
+    document.body,
+  )
+}
+
 function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onRename, onPickRole, onPickModel, onApplyNow }: {
   x: number; y: number; session: SessionInfo; agents: AgentInfo[]
   onClose: () => void; onSubsession: () => void; onInfo: () => void; onRename: () => void; onPickRole: (id: string) => void
   onPickModel: (model: string | undefined) => Promise<{ ok?: boolean }>; onApplyNow: () => Promise<{ ok?: boolean }>
 }) {
-  const [view, setView] = useState<'main' | 'roles' | 'model'>('main')
+  const [view, setView] = useState<'main' | 'roles' | 'model' | 'projects'>('main')
+  // Project actions, decided in lib/projectMenu (tested): top-level sessions only, and "Move"
+  // offers only projects whose directory this session fits. Each goes through `run`, so a
+  // refusal is shown here instead of the menu closing as if it had worked.
+  const { projects } = useSessions()
+  const pm = projectMenuItems(session, projects)
   // Seeded ONLY when the session is really on a custom id — see seedCustomId. Seeding from
   // session.model unconditionally put an alias like `sonnet` in a box labelled "Full model id".
   const [customId, setCustomId] = useState(() => seedCustomId(session.model))
@@ -2327,7 +2543,7 @@ function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onR
   useDismissOnOutside(true, onClose)
   const item = 'w-full text-left px-3 py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
   const left = Math.min(x, window.innerWidth - 200)
-  const top = Math.min(y, window.innerHeight - 220)
+  const top = Math.max(4, Math.min(y, window.innerHeight - 300))   // taller since the project items
   const curRole = session.agentId ?? 'general'
   const list = agents.length ? agents : [{ id: 'general', name: 'General', description: '' }]
   return createPortal(
@@ -2346,6 +2562,21 @@ function SessionMenu({ x, y, session, agents, onClose, onSubsession, onInfo, onR
             </span>
           </button>
           <button className={item} onClick={() => { onClose(); onRename() }}>✎ Rename</button>
+          {(pm.canMakeProject || pm.moveTargets.length > 0 || pm.canRemove) && <div className="my-1 border-t border-ctp-surface0" />}
+          {pm.canMakeProject && <button className={item} disabled={busy} onClick={() => void run('Making a project', () => api.http.projectFromSession(session.id))}>📁 Make project</button>}
+          {pm.moveTargets.length > 0 && <button className={item} onClick={() => setView('projects')}>📂 Move to project…<span className="ml-auto text-ctp-overlay">›</span></button>}
+          {pm.canRemove && <button className={item} disabled={busy} onClick={() => void run('Removing from the project', () => api.http.setSessionProject(session.id, null))}>⤴ Remove from project</button>}
+          {modelErr && view === 'main' && <div className="px-3 py-1 text-[10px] text-ctp-red">{modelErr}</div>}
+        </>
+      ) : view === 'projects' ? (
+        <>
+          <button className="w-full text-left px-3 py-1 text-[10px] uppercase tracking-wide text-ctp-overlay hover:text-ctp-text flex items-center gap-1" onClick={() => setView('main')}>‹ Move to project</button>
+          {pm.moveTargets.map((p) => (
+            <button key={p.id} className={item} disabled={busy} onClick={() => void run('Moving to the project', () => api.http.setSessionProject(session.id, p.id))}>
+              <span className="flex-1 truncate">{p.name}</span>
+            </button>
+          ))}
+          {modelErr && <div className="px-3 py-1 text-[10px] text-ctp-red">{modelErr}</div>}
         </>
       ) : view === 'roles' ? (
         <>

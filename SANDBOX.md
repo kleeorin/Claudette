@@ -657,6 +657,113 @@ another session's terminal — currently any authed client can, but the token is
 even on loopback (done) and a confined box holds no token, so this is hardening, not a
 live hole.
 
+## Git exec-vector escape (a rw repo's .git runs code on the host) — fixed 2026-10-27
+
+**The hole.** A git dir inside a box-writable mount is a host code-execution channel. The
+operator runs `git` on the HOST, unsandboxed, in the same repo, and git executes what the
+repo tells it to: `.git/hooks/*`, and from `.git/config` `core.hooksPath`, `core.fsmonitor`,
+`core.sshCommand`, `core.pager`, filter/diff drivers, aliases, `include.path`. So a confined
+session that writes `.git/config` or plants `.git/hooks/pre-commit` gets its payload run
+outside the box at the operator's next commit. Nothing in the sandbox handled `.git`.
+
+**Two further vectors found while fixing it (both verified live, git 2.43 + bwrap):**
+- *Rename bypass.* ro overlays alone do not hold: `mv .git .gitx && mkdir .git` succeeds
+  inside the box (Linux renames a dir that merely *contains* mounts), shedding every overlay.
+- *`commondir`.* A MAIN gitdir honours `<gitdir>/commondir` exactly as a linked worktree's
+  does: a `commondir` naming another repo whose config sets `core.fsmonitor` ran the payload
+  on `git status`. The file is normally absent, and an absent path cannot be pinned.
+
+**The fix** (`server/src/claude/gitProtection.ts` discovers, `gitExecProtections` in
+`sandbox.ts` maps to box paths via `overlayDestFor` — both spellings, rw mounts only — and
+feeds BOTH the box (`bwrapBaseArgs`, so `wrapSandbox` and `wrapCommand`/Jupyter alike) and
+the authorizer (`sessionDataMountCandidates`)). For every repo whose work-tree top is inside
+a rw mount (or encloses one), to depth 3 below each mount root:
+
+| pinned | how |
+|---|---|
+| gitdir, common dir, work-tree top, submodule work trees | rw bind onto itself → a mountpoint, so rename/rm fails EBUSY. Emitted only where the box can ALREADY write the path (never widens an ro mount). |
+| `config`, `hooks/`, `config.worktree`, `commondir` | ro overlay |
+| `worktrees/*/config.worktree`, `worktrees/*/commondir`, each linked worktree's `.git` pointer file (named by `worktrees/*/gitdir`) | ro overlay |
+| a work tree's own `.git` FILE (`gitdir:` pointer) — resolved and its gitdir pinned too | ro overlay |
+| `modules/**` — each submodule gitdir gets all of the above, plus its work tree's `.git` file | ro overlay |
+| `core.hooksPath` target, `include.path`/`includeIf.*.path` targets | ro overlay |
+
+**Absent paths.** bwrap creates a missing mountpoint through the rw bind and leaves it on the
+host, so absent paths are materialized BEFORE launch, the way `ensureUserSettingsPinnable`
+does settings.json: an empty `hooks/` (git init creates one anyway) and an empty
+`core.hooksPath` dir. Materialization only happens at a path the box could itself have written
+(`boxCanReach(…, 'write')`), so a box-written `.git` pointer aimed outside the box cannot steer
+an unsandboxed host mkdir/write.
+
+**The `.git/commondir` file Claudette writes into your repos** (operator decision 2026-10-27).
+- *What:* every MAIN git dir (and submodule git dir) inside a rw mount of a confined session gets
+  a file `<repo>/.git/commondir` containing `./` (plus a newline), created before the session
+  launches and then ro-pinned inside the box. Toggle: `PIN_MAIN_COMMONDIR` in `gitProtection.ts`.
+- *Why:* git honours `commondir` in a main git dir, so without a pinned one a confined session
+  could write `.git/commondir` → a repo it built, and the operator's next host `git status`
+  would run that repo's `core.fsmonitor`/hooks unsandboxed. An absent file cannot be pinned
+  (bwrap would leave an empty mountpoint behind, and git dies on an empty commondir), so a
+  benign one is created: `./` resolves to the git dir itself.
+- *Why `./` and not `.`:* libgit2 1.9.7 (pygit2 1.20.1) refuses to open a repo whose commondir
+  is `.` ("Repository not found") and opens `./` normally — measured. git accepts both.
+- *Visible effect:* `git rev-parse --git-common-dir` prints an ABSOLUTE path (`/path/repo/.git`)
+  instead of `.git`. Verified unchanged: git status/commit/worktree add|list|remove/gc/fsck, and
+  libgit2 open/status/commit/list_worktrees plus opening a linked worktree. JGit (JetBrains, Eclipse) is NOT verified.
+- *Idempotent, never overwritten:* created with `O_EXCL` only when absent. An EXISTING commondir is
+  accepted only if git or Claudette could have written it — it resolves to the git dir itself
+  (`./`, or a legacy `.`), or it sits in a linked worktree's `<common>/worktrees/<name>/` and
+  resolves to `<common>` (git's own `../..`). **Anything else makes the session REFUSE TO LAUNCH**
+  (shown as exited, naming the file and where it points): a main git dir never has a foreign
+  commondir unless something planted one. Refusing does not protect a host `git` you run before
+  reading the message — inspect the file first. The out-of-band authorizer does not refuse; it
+  keeps pinning.
+- *Removing it — operator instruction:*
+  1. Stop (close, or wait for exit) every CONFINED Claudette session whose sandbox mounts the
+     repo, or any ancestor of it, read-write — teammates and notebook kernels included.
+  2. `cat <repo>/.git/commondir`. Remove it only if it says `./` (or `.`): `rm <repo>/.git/commondir`.
+     Anything else is not Claudette's file — see the refusal above; inspect it before deleting.
+  3. git then behaves exactly as before. The next confined launch with the repo mounted rw
+     re-creates it; to stop that for good, set `PIN_MAIN_COMMONDIR = false` (and accept the
+     redirect hole above).
+  *If a confined session is still running when you `rm` it:* the `rm` succeeds (Linux detaches a
+  bind mount whose mountpoint is unlinked from another mount namespace), and the pin silently
+  disappears INSIDE that live box — the box can then write `.git/commondir` itself, and the
+  redirect reaches the host. Verified live with bwrap: host `rm`, then an in-box write succeeded
+  and the host saw its content. The hole stays open until that session ends; its next launch
+  refuses over the planted file (above), but a host `git` run in between follows it.
+
+**Accepted cost.** Anything that WRITES git config from inside the box fails: `git config`,
+`git remote add`, `git push -u`, `git branch --set-upstream-to`, checking out a remote branch
+with tracking, installing hooks (husky/pre-commit). The failure is git's own
+`error: could not write config file <repo>/.git/config: Device or resource busy` (git
+writes config.lock then renames it over the ro-bound mountpoint); the box's
+system prompt says these paths are read-only by design and to ask the operator to run the
+command on the host. Renaming/removing a pinned work-tree top or gitdir from the box fails
+EBUSY too.
+
+**Residuals (documented, not fixed).**
+- A repo created (`git init`, `git clone`) AFTER launch is unprotected until the session's
+  next launch; so is a repo deeper than 3 levels below a mount root, or past the 4000-dir
+  scan cap (`$HOME` / `/` mounts — which are an escape anyway via dotfiles and `~/.gitconfig`).
+- A parent directory of a NESTED repo (one that is not itself a mount root) can still be
+  renamed, and a look-alike repo created at the old path. Same class as the item above.
+- A `.git` that is a SYMLINK cannot be pinned (a bind follows the link); its target is.
+- An `include.path` target that does not exist at launch is not pinned.
+
+**Isolated (git worktree) sessions** reuse this unchanged. Their box (`worktreeSandbox` in
+`sessionManager.ts`) is the worktree rw plus the repo's COMMON git dir rw — commits, branches
+and fetches in a linked worktree write objects and refs there, and its own
+`<common>/worktrees/<name>` gitdir lives inside it — with every pin above layered over the
+common-dir mount. The main work tree is NOT mounted (a mount of exactly the repo root, which
+the new-session dialog seeds from the project dir, is dropped); its directory appears in the
+box only as the empty auto-created parent of the two mounts, so the main checkout is invisible
+and a write there lands in the box's tmpfs (the usual write decoy), never on the host. Pinned
+by `scratchpad/worktree-sessions-test.mts` §4 (authorizer, argv, and a live box commit).
+
+Pinned by `scratchpad/git-exec-protection-test.mts` (argv, authorizer, and the attacks run
+inside a real box: config write, hook plant, `mv .git`, commondir redirect, `git config` —
+all refused, while an ordinary commit still succeeds).
+
 ## Symlinked-mount escape (bwrap follows a symlinked bind source)
 
 `bwrap --bind SRC DEST` **follows a symlink at SRC and mounts its target** (verified

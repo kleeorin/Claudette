@@ -5,7 +5,7 @@ import path from 'path'
 import crypto from 'crypto'
 import type {
   SessionInfo, SessionState, ClaudeEvent, PermissionRequest, PermissionDecision,
-  PermissionMode, SetModeResult, SavedSession, SandboxConfig, TaskRecord, BashProcRecord,
+  PermissionMode, SetModeResult, SavedSession, SandboxConfig, TaskRecord, BashProcRecord, WorktreeInfo,
 } from '@claudette/shared'
 import {
   isSubagentTool, isAsyncLaunchAck, parseTaskNotification, parseSystemTaskNotification,
@@ -352,10 +352,19 @@ export class SessionManager extends EventEmitter {
     // which refuses an untrusted grant precisely so a confined session can't hire itself
     // a team. Boot restore reaches register() directly, so nothing needs it here; a live
     // grant goes through the auth-gated setTeamEmploy route.
+    //
+    // The PROJECT to group this session under. Top-level only — register() drops it for a
+    // subsession. Not validated here (this method has no project store); the project routes
+    // check that the project exists and that its cwd fits before passing it.
+    projectId?: string,
+    // An ISOLATED session's worktree (git/worktrees.ts created it; cwd/rootDir are its path).
+    // The create route is the only caller that passes one.
+    worktree?: WorktreeInfo,
   ): string {
     const session = this.register(
       name, cwd, rootDir, parentId, resume, claudeSessionId,
       agentId, model, permissionMode, sandbox, trusted,
+      undefined, undefined, undefined, projectId, worktree,
     )
     this.launch(session)
     // This session's parent may have just gained its first member and become a
@@ -387,6 +396,8 @@ export class SessionManager extends EventEmitter {
     teamEmploy?: boolean,
     connectors?: string[],
     accountConnectors?: string[],
+    projectId?: string,
+    worktree?: WorktreeInfo,
   ): Session {
     const id = crypto.randomUUID()
     // CANONICALISE THE SESSION'S DIRECTORIES ONCE, HERE, before anything stores or compares
@@ -489,6 +500,9 @@ export class SessionManager extends EventEmitter {
     const wantedAccount = accountConnectors ?? effectiveAccount ?? []
     const session: Session = {
       id, name, cwd, rootDir, parentId, agentId, model, teamEmploy,
+      // ONLY a top-level session carries a projectId: a subsession belongs to its parent's
+      // project implicitly, so a stored one could only ever disagree with the parent's.
+      ...(projectId && !parentId ? { projectId } : {}),
       // Gated, not passed through — see downgradeUntrustedMode. Written as an explicit key
       // rather than shorthand precisely so the gate is visible at the construction site.
       permissionMode: downgradeUntrustedMode(name, permissionMode, trusted),
@@ -497,6 +511,12 @@ export class SessionManager extends EventEmitter {
       state: 'idle', engine: null, startedAt: 0, resume,
       claudeSessionId: claudeSessionId ?? crypto.randomUUID(),
       stderrTail: '',
+    }
+    // ISOLATED (worktree) session: top-level only, like projectId — a teammate shares its
+    // parent's cwd and inherits its box, so it needs no record of its own.
+    if (worktree && !parentId) {
+      session.worktree = { ...worktree }
+      session.sandbox = worktreeSandbox(session.sandbox!, worktree)
     }
     this.sessions.set(id, session)
     return session
@@ -521,6 +541,17 @@ export class SessionManager extends EventEmitter {
   // session stays usable even if Claude fails to start.
   private launch(session: Session): void {
     const { id, resume, claudeSessionId } = session
+    // An isolated session whose worktree is gone (removed on the host, or a "Remove worktree"
+    // close that a restore predates) is shown EXITED with the reason — never recreated: a
+    // silently re-made worktree would be a fresh checkout on the old branch, wearing the old
+    // session's history, with whatever uncommitted work the operator expected simply absent.
+    if (session.worktree && !existsSync(session.worktree.path)) {
+      session.engine = null
+      session.state = 'exited'
+      this.emit('stateChange', id, 'exited')
+      this.emit('exit', id, true, `This isolated session's git worktree no longer exists (${session.worktree.path}, branch ${session.worktree.branch}). It is not recreated automatically — the branch is still in the repo; close this session and start a new one.`)
+      return
+    }
     // The session runs as its agent (role): charter + tool scope + model. `general`
     // (the default) contributes nothing, so a plain session is unchanged.
     const agent = getAgent(session.agentId)
@@ -1326,7 +1357,7 @@ export class SessionManager extends EventEmitter {
   }
 
   private toInfo(s: Session): SessionInfo {
-    const { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, teamEmploy, connectors, accountConnectors, state } = s
+    const { id, name, cwd, rootDir, parentId, projectId, worktree, agentId, model, permissionMode, sandbox, sandboxed, teamEmploy, connectors, accountConnectors, state, claudeSessionId } = s
     // Pending = a running engine whose applied sandbox differs from the requested one
     // (auto-applies on idle; visible only while a turn holds it off).
     // runDirOf, NOT s.cwd: launch() runs in `cwd || homedir()` and keys the applied
@@ -1348,7 +1379,7 @@ export class SessionManager extends EventEmitter {
     // `?? ''` on both sides: "unset" and "" both mean "let the CLI choose", and comparing
     // undefined against '' would report a pending change that does not exist.
     const modelPending = !!s.engine && (s.model ?? '') !== (s.appliedModel ?? '')
-    return { id, name, cwd, rootDir, parentId, agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, agentPending, modelPending, state }
+    return { id, name, cwd, rootDir, parentId, claudeSessionId, ...(projectId && !parentId ? { projectId } : {}), ...(worktree ? { worktree: { ...worktree } } : {}), agentId, model, permissionMode, sandbox, sandboxed, sandboxPending, teamEmploy, connectors, accountConnectors, connectorsPending, agentPending, modelPending, state }
   }
 
   // A session's granted catalog connectors — the live set the proxy authorizes against,
@@ -1356,6 +1387,27 @@ export class SessionManager extends EventEmitter {
   // revocation take effect without a relaunch.
   grantsOf(id: string): string[] {
     return this.sessions.get(id)?.connectors ?? []
+  }
+
+  // Group a TOP-LEVEL session under a project, or ungroup it (null). Refuses a subsession:
+  // it belongs to its parent's project and carries no projectId of its own. Whether the
+  // project exists and whether the session's cwd fits it is the ROUTE's check (it holds the
+  // project store); this only enforces the shape.
+  setProject(id: string, projectId: string | null): 'ok' | 'no-session' | 'not-top-level' {
+    const s = this.sessions.get(id)
+    if (!s) return 'no-session'
+    if (s.parentId) return 'not-top-level'
+    if (projectId) s.projectId = projectId; else delete s.projectId
+    this.emit('changed')
+    return 'ok'
+  }
+
+  // Ungroup every session in a project (its delete). Closes nothing. Returns how many moved.
+  clearProject(projectId: string): number {
+    let n = 0
+    for (const s of this.sessions.values()) if (s.projectId === projectId) { delete s.projectId; n++ }
+    if (n) this.emit('changed')
+    return n
   }
 
   isGranted(sessionId: string, connectorId: string): boolean {
@@ -1554,6 +1606,8 @@ export class SessionManager extends EventEmitter {
       return {
         name: s.name, cwd: s.cwd, rootDir: s.rootDir,
         parentIndex: s.parentId != null ? indexOf.get(s.parentId) : undefined,
+        projectId: s.parentId ? undefined : s.projectId,
+        worktree: s.worktree,
         agentId: s.agentId, model: s.model, permissionMode: s.permissionMode,
         sandbox: s.sandbox,
         teamEmploy: s.teamEmploy,
@@ -1601,6 +1655,8 @@ export class SessionManager extends EventEmitter {
         s.teamEmploy,         // …including the employment grant
         s.connectors,         // …and the connector grants (same reasoning)
         s.accountConnectors,
+        s.projectId,          // top-level only; register() drops it for a subsession
+        s.worktree,           // launch() refuses (exited + reason) if its dir is gone
       )
       registered.push(session)
       const id = session.id
@@ -1679,6 +1735,10 @@ export class SessionManager extends EventEmitter {
     for (const child of this.sessions.values()) {
       if (child.parentId !== id) continue
       child.parentId = undefined
+      // A promoted member stays in the project its family was in. It had no projectId of its
+      // own (only top-level sessions carry one), so without this it would drop out of the
+      // project the moment its coordinator closed.
+      if (s?.projectId) child.projectId = s.projectId
       this.scheduleApply(child.id)
     }
     this.transcripts.delete(id)   // free the snapshot buffers with the session
@@ -1725,6 +1785,20 @@ export function normalizeGrants(
   // Store absent rather than empty: `connectors?: string[]` treats absent as "none", and
   // an empty array round-tripping through persistence is just noise.
   return { connectors: c.length ? c : undefined, accountConnectors: a.length ? a : undefined }
+}
+
+// The box of an ISOLATED session. The worktree is the session's cwd and is mounted rw; the
+// repo's COMMON git dir is mounted rw too, because every commit/branch/fetch in a linked
+// worktree writes objects and refs THERE (and its own <common>/worktrees/<name> gitdir lives
+// inside it). The git exec-vector pins (sandbox.ts gitExecProtections) are layered over that
+// mount like any other: config, hooks/, commondir and every worktree's pointer stay ro.
+// The MAIN work tree is NOT mounted: a mount of exactly repoRoot (what the dialog seeds from
+// the project's cwd) is dropped. A broader mount the operator added explicitly (an ancestor
+// of the repo) is left alone — that is the operator's choice, not a seed.
+export function worktreeSandbox(cfg: SandboxConfig, wt: WorktreeInfo): SandboxConfig {
+  const root = path.resolve(wt.repoRoot)
+  const mounts = cfg.mounts.filter((m) => path.resolve(m.path) !== root)
+  return { ...cfg, mounts: dedupeMounts([...mounts, { path: wt.path, mode: 'rw' }, { path: wt.commonDir, mode: 'rw' }]) }
 }
 
 // One spelling for a directory the operator typed. Exported so a test can pin the empty-stays-

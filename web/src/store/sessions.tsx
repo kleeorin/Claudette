@@ -44,7 +44,7 @@
 import {
   createContext, useContext, useEffect, useState, useCallback, useMemo, useReducer, type ReactNode,
 } from 'react'
-import type { SessionInfo, PermissionMode, SetModeResult, SandboxConfig, SandboxDefaultFolder, AgentInfo } from '@claudette/shared'
+import type { SessionInfo, PermissionMode, SetModeResult, SandboxConfig, SandboxDefaultFolder, AgentInfo, ProjectInfo, DestroySessionResponse } from '@claudette/shared'
 import { api, getHealth } from '../api/client'
 import { reduceSessionStore, initialSessionStore, type AttentionReason } from './sessionReducer'
 
@@ -57,7 +57,9 @@ interface ContextValue {
   // === 0`, which is also true at mount. Anything pruning per-session state must gate on
   // this — see the note on SessionStoreState.listLoaded.
   listLoaded: boolean
-  create: (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig }) => Promise<string>
+  // `projectId` creates the session inside that project (the server takes the cwd from it).
+  // `isolated` (with projectId): run it in a new git worktree of the project's repo.
+  create: (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig; projectId?: string; isolated?: { branch?: string } }) => Promise<string>
   // Spawn a child session under `parentId` (shares the parent's cwd/rootDir, carries
   // parentId so the server appends the report-to-parent instruction). Own role + sandbox.
   spawnSubsession: (parentId: string, opts?: { name?: string; agentId?: string; sandbox?: SandboxConfig }) => Promise<string | null>
@@ -66,7 +68,9 @@ interface ContextValue {
   rename: (id: string, name: string) => Promise<void>
   // The selectable roles (fetched once); empty until loaded. `general` always exists.
   agents: AgentInfo[]
-  destroy: (id: string) => Promise<void>
+  // Resolves with the server's answer; the row is dropped only when the close happened
+  // (a worktree removal refused for dirty/unmerged work leaves the session open).
+  destroy: (id: string, opts?: { removeWorktree?: boolean; force?: boolean }) => Promise<DestroySessionResponse>
   setMode: (id: string, mode: PermissionMode) => Promise<SetModeResult>
   // Whether THIS host can actually confine sessions (bwrap present + userns ok).
   // false ⇒ the sandbox controls explain it's unavailable + how to enable it.
@@ -113,6 +117,10 @@ interface ContextValue {
   // Recency rank per session — a monotonic counter, not a clock, because only relative
   // order is needed. Drives the sidebar's most-recently-active-first ordering.
   activity: ReadonlyMap<string, number>
+  // Every project (see ProjectInfo), as the server last broadcast it. Mutations go straight
+  // through api.http (projectFromSession, renameProject, …) and come back as a project:list,
+  // so there is no optimistic copy here to drift from the server's.
+  projects: ProjectInfo[]
 }
 
 const SessionsContext = createContext<ContextValue | null>(null)
@@ -126,6 +134,13 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false)
   const [sandboxAvailable, setSandboxAvailable] = useState(false)
   const [gpuDevices, setGpuDevices] = useState<string[]>([])
+  const [projects, setProjects] = useState<ProjectInfo[]>([])
+  useEffect(() => {
+    const off = api.on.projects(setProjects)
+    // Snapshot too, for a provider mounted after the WS hello (same reason as listSessions).
+    api.http.listProjects().then(setProjects).catch(() => { /* the WS snapshot will fill in */ })
+    return off
+  }, [])
   const [homeDir, setHomeDir] = useState('')
   const [agents, setAgents] = useState<AgentInfo[]>([])
   const [sandboxDefaults, setSandboxDefaults] = useState<SandboxDefaultFolder[]>([])
@@ -194,9 +209,13 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     return () => { offList(); offState(); offReady(); offExit(); offConn() }
   }, [])
 
-  const create = useCallback(async (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig }): Promise<string> => {
+  const create = useCallback(async (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig; projectId?: string; isolated?: { branch?: string } }): Promise<string> => {
     const rootDir = opts?.rootDir ?? cwd
-    const { id } = await api.http.createSession({ name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox })
+    const r = await api.http.createSession({ name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox, projectId: opts?.projectId, ...(opts?.isolated ? { isolated: opts.isolated } : {}) })
+    // A refused create (e.g. a cwd that does not fit the project) has no id. Throw rather than
+    // dispatch `created` for `undefined`, which would select a phantom row.
+    if (!r.id) throw new Error(r.error ?? 'The server refused to create the session.')
+    const { id } = r
     // ONE action where there used to be three statements (mark fresh, add optimistically,
     // select). They were always meant to be one thing.
     dispatch({
@@ -230,10 +249,14 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     await api.http.rename(id, trimmed)
   }, [patch])
 
-  const destroy = useCallback(async (id: string): Promise<void> => {
-    await api.http.destroySession(id)
+  const destroy = useCallback(async (id: string, opts?: { removeWorktree?: boolean; force?: boolean }): Promise<DestroySessionResponse> => {
+    const r = await api.http.destroySession(id, opts)
+    // A refused worktree removal (needsConfirm) did NOT close the session — keep its row.
+    // An older/absent body (no `ok` field) is treated as closed, as before.
+    if (r?.needsConfirm || (opts?.removeWorktree && r?.ok === false)) return r
     // Drops the row AND moves the selection off it if it was active — one transition.
     dispatch({ type: 'destroyed', id })
+    return r ?? { ok: true }
   }, [])
 
   // Live permission-mode switch (P1.4). Optimistically reflect the chosen mode; the
@@ -325,8 +348,8 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
   // permanently stable (they close over nothing but `dispatch`), so this list is shorter
   // in practice than it looks.
   const value = useMemo(
-    () => ({ sessions, activeId, setActive, connected, listLoaded: store.listLoaded, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity }),
-    [sessions, activeId, setActive, connected, store.listLoaded, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity],
+    () => ({ sessions, activeId, setActive, connected, listLoaded: store.listLoaded, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity, projects }),
+    [sessions, activeId, setActive, connected, store.listLoaded, create, spawnSubsession, setAgent, rename, agents, destroy, setMode, sandboxAvailable, gpuDevices, homeDir, setSandbox, sandboxDefaults, saveSandboxDefault, removeSandboxDefault, setTeamEmploy, isFresh, markBusy, attention, activity, projects],
   )
   return (
     <SessionsContext.Provider value={value}>

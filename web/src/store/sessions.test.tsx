@@ -15,7 +15,7 @@
 // CONSEQUENCE, which is a proxy, not a proof.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, act, cleanup } from '@testing-library/react'
-import type { SessionInfo, SessionState } from '@claudette/shared'
+import type { SessionInfo, SessionState, ProjectInfo } from '@claudette/shared'
 
 // A FAITHFUL FAKE, not a stub. The real client's channels are plain Sets with on/emit
 // (client.ts:66-72) whose `on` returns a delete-me closure; this reproduces that exactly and
@@ -55,6 +55,9 @@ const H = vi.hoisted(() => {
   conn.reset = () => { connState.ever = false; connState.up = false; rawReset() }
   return {
     lists: makeChannel<[SessionInfo[]]>(),
+    // project:list (added 2026-10-26 with Projects). In the subscribe-once / unsubscribe-all
+    // checks below like every other channel the provider opens.
+    projects: makeChannel<[ProjectInfo[]]>(),
     states: makeChannel<[string, SessionState]>(),
     readies: makeChannel<[string, string]>(),
     exits: makeChannel<[string, boolean, string]>(),
@@ -75,10 +78,11 @@ vi.mock('../api/client', () => ({
     isConnected: () => H.connState.up,
     on: {
       list: H.lists.on, stateChange: H.states.on, ready: H.readies.on,
-      exit: H.exits.on, connected: H.conn.on,
+      exit: H.exits.on, connected: H.conn.on, projects: H.projects.on,
     },
     http: {
       listSessions: async () => [],
+      listProjects: async () => [],
       listAgents: async () => [],
       createSession: async () => { const r = { id: 'new-1' }; H.created.push(r); return r },
       destroySession: async () => ({ ok: true }),
@@ -131,7 +135,7 @@ async function mount() {
 const emit = async (fn: () => void) => { await act(async () => { fn() }) }
 
 beforeEach(() => {
-  for (const c of [H.lists, H.states, H.readies, H.exits, H.conn]) c.reset()
+  for (const c of [H.lists, H.states, H.readies, H.exits, H.conn, H.projects]) c.reset()
   H.created.length = 0
   ctx = null; renders = 0; commits.length = 0
 })
@@ -141,8 +145,8 @@ describe('SessionsProvider wiring', () => {
   // ── 1. THE EMPTY DEP ARRAY ────────────────────────────────────────────────
   it('subscribes exactly once and never resubscribes, however much state churns', async () => {
     await mount()
-    const channels = [H.lists, H.states, H.readies, H.exits, H.conn]
-    expect(channels.map((c) => c.subscribes)).toEqual([1, 1, 1, 1, 1])
+    const channels = [H.lists, H.states, H.readies, H.exits, H.conn, H.projects]
+    expect(channels.map((c) => c.subscribes)).toEqual([1, 1, 1, 1, 1, 1])
 
     await emit(() => H.lists.emit([sess('a'), sess('b')]))
     for (let i = 0; i < 20; i++) {
@@ -152,17 +156,17 @@ describe('SessionsProvider wiring', () => {
 
     // If the dep array regresses to [patch] (or gains any value that changes identity), the
     // effect re-runs and these climb. That is the entire reason this file exists.
-    expect(channels.map((c) => c.subscribes)).toEqual([1, 1, 1, 1, 1])
-    expect(channels.map((c) => c.listeners)).toEqual([1, 1, 1, 1, 1])
-    expect(channels.map((c) => c.unsubscribes)).toEqual([0, 0, 0, 0, 0])
+    expect(channels.map((c) => c.subscribes)).toEqual([1, 1, 1, 1, 1, 1])
+    expect(channels.map((c) => c.listeners)).toEqual([1, 1, 1, 1, 1, 1])
+    expect(channels.map((c) => c.unsubscribes)).toEqual([0, 0, 0, 0, 0, 0])
   })
 
   // ── 2. cleanup ────────────────────────────────────────────────────────────
   it('unsubscribes every channel on unmount', async () => {
     const r = await mount()
     r.unmount()
-    const channels = [H.lists, H.states, H.readies, H.exits, H.conn]
-    expect(channels.map((c) => c.listeners)).toEqual([0, 0, 0, 0, 0])
+    const channels = [H.lists, H.states, H.readies, H.exits, H.conn, H.projects]
+    expect(channels.map((c) => c.listeners)).toEqual([0, 0, 0, 0, 0, 0])
     for (const c of channels) expect(c.unsubscribes).toBe(c.subscribes)
   })
 

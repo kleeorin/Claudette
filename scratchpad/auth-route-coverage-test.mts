@@ -54,6 +54,7 @@ import { registerGitRoutes } from '../server/src/git/gitApi'
 import { registerConnectorRoutes } from '../server/src/connectors/connectorApi'
 import { registerUsageRoutes } from '../server/src/usage/usageApi'
 import { registerSettingsRoutes } from '../server/src/settings/settingsApi'
+import { registerProjectRoutes } from '../server/src/projects/projectApi'
 
 import { check, passed as pass, failed as fail } from './assert.mjs'
 
@@ -100,6 +101,9 @@ function buildApp(hook: (req: FastifyRequest, reply: FastifyReply) => Promise<vo
   // shares the network namespace and can reach this port, so "are they behind the gate?" is a
   // real question rather than a formality.
   registerSettingsRoutes(app)
+  // Projects (2026-10-26). projects.json is replayed at boot as trusted, so its writers — create,
+  // rename, delete, setProject — must sit behind the same gate as everything above.
+  registerProjectRoutes(app, stub(), stub())
   // index.ts:259 registers this directly rather than via a register*Routes function, so
   // it is re-declared here. See the LIMITATION note at the bottom of this file.
   app.all('/jupyter/*', async () => ({ proxied: true }))

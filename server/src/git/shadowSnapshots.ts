@@ -1,6 +1,7 @@
 import { execFile } from 'child_process'
 import { unlink } from 'fs/promises'
-import { join } from 'path'
+import { join, relative, resolve, dirname, basename, isAbsolute, sep } from 'path'
+import { lstatSync, realpathSync, type Stats } from 'fs'
 import { errMessage } from '../util/errMessage'
 import { tmpdir } from 'os'
 import crypto from 'crypto'
@@ -12,10 +13,10 @@ import crypto from 'crypto'
 // from gc with a ref under refs/claudette/rewind/<uuid>. Because snapshots are
 // ordinary refs they persist across server restarts with no separate ledger.
 //
-// Restoring re-materialises the snapshot's files into the working tree (again via a
-// temp index, so the real index/branch are untouched) and, optionally, deletes
-// untracked files created since — so a rewind can faithfully undo Claude's edits
-// without ever rewriting history or the current branch.
+// Restoring re-materialises snapshot content for a SCOPED set of paths — the files the
+// rewinding session edited (see THE RESTORE IS SCOPED below) — again via a temp index so the
+// real index/branch are untouched, and optionally deletes the set's files created since. It
+// never rewrites history or the current branch, and never touches a path outside the set.
 
 const REF_PREFIX = 'refs/claudette/rewind'
 
@@ -34,16 +35,17 @@ function warnOnce(key: string, msg: string): void {
 
 // execFile git with an optional GIT_INDEX_FILE override. Rejects with the trimmed
 // stderr on failure; `.gitCode === 128` marks "not a repo" for callers to swallow.
-function git(dir: string, args: string[], indexFile?: string): Promise<string> {
+function git(dir: string, args: string[], indexFile?: string, input?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const env = indexFile ? { ...process.env, GIT_INDEX_FILE: indexFile } : process.env
-    execFile('git', ['-C', dir, ...args], { env, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const child = execFile('git', ['-C', dir, ...args], { env, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         const e = new Error((stderr || err.message).trim())
         ;(e as { gitCode?: number | string }).gitCode = (err as NodeJS.ErrnoException & { code?: number | string }).code
         reject(e)
       } else resolve(stdout)
     })
+    if (input !== undefined) child.stdin?.end(input)
   })
 }
 
@@ -164,57 +166,130 @@ export async function snapshottedUuids(cwd: string): Promise<Set<string>> {
   } catch { return new Set() }
 }
 
+// ── THE RESTORE IS SCOPED ─────────────────────────────────────────────────────────────
+// Snapshots stay WHOLE-TREE (storage above is unchanged), but a restore touches only the
+// paths the caller names: the files the rewinding session itself edited from the target turn
+// on (conversations.ts fileEditsFrom). It used to `read-tree` + `checkout-index -a -f` the
+// entire snapshot and, with deleteNewer, unlink every untracked file created since — so a
+// rewind in one session reverted every OTHER session's edits in the same repo, and the
+// operator's own. Per path in the set:
+//   in the snapshot      → rewritten to the snapshot's content iff it differs now
+//   absent from it       → deleted iff deleteNewer (created after the snapshot)
+//   outside the repo     → skipped — a snapshot cannot contain it
+//   gitignored + absent  → skipped — ignored files are never snapshotted, so "absent" says
+//                          nothing about when it was created and deleting it would be a guess
+// Nothing outside the set is read for writing, let alone touched.
+export interface Skipped { path: string; reason: string }
 export interface RestorePreview {
-  reverted: string[]   // tracked/known files whose contents differ → will be rewritten
-  deleted: string[]    // untracked files created since the snapshot → removed iff deleteNewer
+  reverted: string[]   // repo-relative paths that will be rewritten to the snapshot's content
+  deleted: string[]    // repo-relative paths created since → removed iff deleteNewer
+  skipped: Skipped[]   // paths in the set that cannot be restored, and why
 }
 
-// What restoring a turn's snapshot would change, for the confirm dialog. Null if the
-// turn has no snapshot. `reverted` = files differing from the snapshot (relative to
-// repo root); `deleted` = untracked files absent from the snapshot.
-export async function previewRestore(cwd: string, uuid: string): Promise<RestorePreview | null> {
+// `abs` as a repo-relative path, or null when it lies outside `root`. `root` comes from
+// `rev-parse --show-toplevel` and is canonical, while an edit tool's path can be spelled
+// through a symlink, so a miss is retried with the parent realpath'd.
+export function repoRel(root: string, abs: string): string | null {
+  const inside = (p: string): string | null => {
+    const r = relative(root, p)
+    return r && !r.startsWith('..') && !isAbsolute(r) ? r.split(sep).join('/') : null
+  }
+  const direct = inside(resolve(abs))
+  if (direct) return direct
+  try { return inside(join(realpathSync(dirname(resolve(abs))), basename(abs))) } catch { return null }
+}
+
+interface Plan { root: string; commit: string; revert: string[]; remove: string[]; skipped: Skipped[] }
+
+async function plan(cwd: string, uuid: string, paths: string[]): Promise<Plan | null> {
   const root = await repoRoot(cwd)
   if (!root) return null
   const commit = await commitFor(cwd, uuid)
   if (!commit) return null
-  // Files differing between the snapshot and the current working tree.
-  const reverted = splitZ(await git(root, ['diff', '--name-only', '-z', commit, '--']).catch(() => ''))
-  const deleted = await untrackedNotIn(root, commit)
-  return { reverted, deleted }
+  const skipped: Skipped[] = []
+  const rels = new Set<string>()
+  for (const p of paths) {
+    const r = repoRel(root, p)
+    if (r) rels.add(r)
+    else if (!skipped.some((s) => s.path === p)) skipped.push({ path: p, reason: 'outside the repository' })
+  }
+  const list = [...rels].sort()
+  if (!list.length) return { root, commit, revert: [], remove: [], skipped }
+  // Mode + blob of each listed path that IS in the snapshot (`ls-tree` with pathspecs; a
+  // path absent from the snapshot simply produces no line).
+  const inSnap = new Map<string, { mode: string; sha: string }>()
+  for (const rec of splitZ(await git(root, ['ls-tree', '-r', '-z', '--full-tree', commit, '--', ...list]).catch(() => ''))) {
+    const m = /^(\d+) \w+ ([0-9a-f]+)\t(.*)$/s.exec(rec)
+    if (m) inSnap.set(m[3], { mode: m[1], sha: m[2] })
+  }
+  const absent = list.filter((r) => !inSnap.has(r))
+  // `-z` is valid ONLY with `--stdin` ("fatal: -z only makes sense with --stdin"); passing
+  // paths as arguments with -z fails outright, and a swallowed failure here reads as
+  // "nothing is ignored" — which plans an ignored, pre-existing file (.env) for DELETION.
+  // check-ignore exits 1 when nothing matches, which is the one failure that means "none";
+  // any other failure refuses the delete for every absent path rather than guessing.
+  let ignored: Set<string>
+  let ignoreUnknown = false
+  try {
+    ignored = new Set(absent.length ? splitZ(await git(root, ['check-ignore', '--stdin', '-z'], undefined, absent.join('\0') + '\0')) : [])
+  } catch (e) {
+    const code = (e as { gitCode?: number | string }).gitCode
+    ignored = code === 1 ? new Set() : new Set(absent)
+    ignoreUnknown = code !== 1
+  }
+  const revert: string[] = [], remove: string[] = []
+  for (const r of list) {
+    const full = join(root, r)
+    let st: Stats | null = null
+    try { st = lstatSync(full) } catch { /* not on disk */ }
+    const snap = inSnap.get(r)
+    if (snap) {
+      // Rewrite only what differs. A symlink is always rewritten (hashing would follow it),
+      // and anything we cannot hash is treated as differing — a no-op checkout is harmless.
+      if (!st || st.isDirectory() || snap.mode === '120000') { revert.push(r); continue }
+      const now = (await git(root, ['hash-object', '--', r]).catch(() => '')).trim()
+      if (now !== snap.sha) revert.push(r)
+    } else if (ignored.has(r)) {
+      skipped.push({ path: r, reason: ignoreUnknown
+        ? 'could not check .gitignore — not deleted on a guess'
+        : 'gitignored — not part of any snapshot' })
+    } else if (st && !st.isDirectory()) {
+      remove.push(r)
+    }
+  }
+  return { root, commit, revert, remove, skipped }
 }
 
-// Untracked (gitignore-respecting) files that are NOT part of the snapshot tree —
-// i.e. created since. These are the delete-newer candidates.
-async function untrackedNotIn(root: string, commit: string): Promise<string[]> {
-  const untracked = splitZ(await git(root, ['ls-files', '--others', '--exclude-standard', '-z']).catch(() => ''))
-  if (untracked.length === 0) return []
-  const inSnap = new Set(splitZ(await git(root, ['ls-tree', '-r', '--name-only', '-z', commit]).catch(() => '')))
-  return untracked.filter((f) => !inSnap.has(f))
+// What restoring this turn's snapshot would change for `paths`, for the confirm dialog.
+// Null if the turn has no snapshot (or cwd is not a repo).
+export async function previewRestore(cwd: string, uuid: string, paths: string[]): Promise<RestorePreview | null> {
+  const p = await plan(cwd, uuid, paths)
+  return p && { reverted: p.revert, deleted: p.remove, skipped: p.skipped }
 }
 
 export interface RestoreResult { ok: boolean; error?: string; reverted?: number; deleted?: number }
 
-// Restore the working tree to a turn's snapshot. Rewrites every snapshot file into
-// the working tree via a temp index (real index/HEAD/branch untouched); when
-// `deleteNewer`, also removes untracked files created since the snapshot. Never
-// deletes tracked files. Returns counts for the toast.
-export async function restore(cwd: string, uuid: string, deleteNewer: boolean): Promise<RestoreResult> {
+// Restore `paths` to a turn's snapshot (see THE RESTORE IS SCOPED). Rewrites through a temp
+// index, so the real index / HEAD / branch are untouched; deletes only listed paths absent
+// from the snapshot, and only when `deleteNewer`. Returns counts for the toast.
+export async function restore(cwd: string, uuid: string, deleteNewer: boolean, paths: string[]): Promise<RestoreResult> {
   const root = await repoRoot(cwd)
   if (!root) return { ok: false, error: 'not a git repository' }
-  const commit = await commitFor(cwd, uuid)
-  if (!commit) return { ok: false, error: 'no snapshot for this turn' }
-  // Compute the delete set BEFORE we touch the tree (checkout-index would recreate
-  // snapshot files, but the untracked-since set is defined against the live tree).
-  const toDelete = deleteNewer ? await untrackedNotIn(root, commit) : []
-  const preview = await git(root, ['diff', '--name-only', '-z', commit, '--']).then(splitZ).catch(() => [])
+  const p = await plan(cwd, uuid, paths)
+  if (!p) return { ok: false, error: 'no snapshot for this turn' }
   const idx = join(tmpdir(), `claudette-idx-${crypto.randomUUID()}`)
   try {
-    // Load the snapshot tree into a temp index, then materialise all of it into the
-    // working tree, overwriting whatever's there (-f), recreating deletions.
-    await git(root, ['read-tree', commit], idx)
-    await git(root, ['checkout-index', '-a', '-f'], idx)
+    if (p.revert.length) {
+      await git(root, ['read-tree', p.commit], idx)
+      // Batched so a large set cannot overflow argv; `--` keeps a path that starts with '-'
+      // from being read as an option.
+      for (let i = 0; i < p.revert.length; i += 200) {
+        await git(root, ['checkout-index', '-f', '--', ...p.revert.slice(i, i + 200)], idx)
+      }
+    }
+    const toDelete = deleteNewer ? p.remove : []
     for (const rel of toDelete) await unlink(join(root, rel)).catch(() => {})
-    return { ok: true, reverted: preview.length, deleted: toDelete.length }
+    return { ok: true, reverted: p.revert.length, deleted: toDelete.length }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'restore failed' }
   } finally {
