@@ -999,6 +999,9 @@ SUITE=(
   # web tests run (see web-vitest-shim.mjs below). This stays as-is regardless: it is pure and
   # costs ~3ms, and rewriting a green pinning test to use a runner it does not need would risk
   # the pin to gain nothing.
+  # The Other… field typed BACKWARDS on Android Chrome (2026-10-19); this pins the fix's
+  # contract on every input route. Own ports 4506/5306/9379.
+  "chrome:ask-other-typing-probe.mjs"
   "none:notebook-attach-test.mts"
   # The WEB vitest suite (web/src/**/*.test.{ts,tsx}) as a single member — the runner itself,
   # not one file. Registered because a whole test RUNNER was sitting outside the suite:

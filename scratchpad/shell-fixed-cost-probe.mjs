@@ -127,7 +127,7 @@ console.log('AskUserQuestion card rendered:', card)
 const BANDS = `(() => {
   const shell = document.getElementById('root').firstElementChild
   const card = document.querySelector('[class*="border-ctp-blue"]')
-  const ta = document.querySelector('textarea')
+  const ta = document.querySelector('[data-testid="composer"]')
   const root = document.getElementById('root').getBoundingClientRect()
   // The transcript scroller: the tallest scrollable ancestor chain in the shell. Identified by
   // computed overflow rather than by class, so a Tailwind rename does not silently void this.

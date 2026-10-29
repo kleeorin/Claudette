@@ -150,7 +150,7 @@ await fetch(`${API}/api/session/create`, { method: 'POST',
 // `?token=` — the documented way this rig authenticates; a localStorage write before the
 // app has loaded is written into the wrong origin's store and the app never mounts.
 await send('Page.navigate', { url: `${APP}/?token=${TOKEN}` })
-for (let i = 0; i < 60; i++) { if (await ev(`!!document.querySelector('textarea')`)) break; await wait(500) }
+for (let i = 0; i < 60; i++) { if (await ev(`!!document.querySelector('[data-testid="composer"]')`)) break; await wait(500) }
 await writeFile(GO, 'go')
 // Wait for a card to actually mount, rather than sleeping a fixed amount and measuring
 // whatever happened to be on screen.
@@ -162,7 +162,7 @@ await wait(800)
 // of silently measuring the wrong element.
 const MEASURE = (labels) => `(() => {
   const shell = document.querySelector('[data-phone]');
-  const ta = document.querySelector('textarea');
+  const ta = document.querySelector('[data-testid="composer"]');
   const card = document.querySelector('[class*="border-ctp-yellow"], [class*="border-ctp-blue"]');
   const r = (e) => e ? { top: Math.round(e.getBoundingClientRect().top), bottom: Math.round(e.getBoundingClientRect().bottom) } : null;
   const btns = ${JSON.stringify(labels)}.map(t => {

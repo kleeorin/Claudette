@@ -664,7 +664,11 @@ export function ChatView({ sessionId, visible = true }: {
                 )}
               </div>
             )}
+            {/* data-testid: harnesses find THE composer by this, not by "the first textarea" —
+                the question card's Other… field became a textarea on 2026-10-19 and sits above
+                this one in the DOM, so `querySelector('textarea')` started measuring it instead. */}
             <textarea
+              data-testid="composer"
               ref={taRef}
               value={draft}
               onChange={(e) => {
@@ -1237,11 +1241,21 @@ function AskUserQuestionCard({ input, onAnswer, onDismiss }: {
                 </button>
               )
             })}
-            <input
-              value={other[qi] ?? ''}
-              onChange={(e) => setOther((s) => ({ ...s, [qi]: e.target.value }))}
+            {/* UNCONTROLLED, and a textarea — reported 2026-10-19: on Android Chrome this field
+                typed BACKWARDS (every character landed at the start), while the composer on the
+                same phone was fine. The composer is a <textarea>; this was a controlled <input>
+                whose value React wrote back on each keystroke, and a script write to a focused
+                field can reset the IME's caret to 0 on Android. Not reproducible in headless
+                Chrome (scratchpad/ask-other-typing-probe.mjs types correctly either way), so
+                the fix removes the mechanism rather than a reproduced trigger: React never
+                writes this node's value — `defaultValue` seeds it, onChange only reads it. The
+                card is keyed by requestId, so a new question still mounts a fresh, empty box. */}
+            <textarea
+              rows={1}
+              defaultValue=""
+              onChange={(e) => { const v = e.currentTarget.value; setOther((s) => ({ ...s, [qi]: v })) }}
               placeholder="Other…"
-              className="text-xs px-2 py-1 rounded bg-ctp-surface0 text-ctp-text outline-none placeholder:text-ctp-overlay focus:ring-1 focus:ring-ctp-blue"
+              className="resize-none text-xs px-2 py-1 rounded bg-ctp-surface0 text-ctp-text outline-none placeholder:text-ctp-overlay focus:ring-1 focus:ring-ctp-blue"
             />
           </div>
         </div>
