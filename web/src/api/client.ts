@@ -16,7 +16,7 @@ import type {
   EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
   UsageResponse,
   ConnectorsResponse, ConnectorDef, ConnectorView, AccountConnector, StrictPreflight,
-  ProjectInfo, ProjectListResponse, ProjectResponse,
+  ProjectInfo, ProjectListResponse, ProjectResponse, SetProjectDefaultsRequest,
   ProjectRepoStatusResponse, WorktreeStatusResponse, DestroySessionResponse,
 } from '@claudette/shared'
 import type { AppSettings, AppSettingsResponse } from '../lib/settingsContract'
@@ -390,6 +390,9 @@ export const api = {
     renameProject: (id: string, name: string) => post<ProjectResponse>('/api/project/rename', { id, name }),
     setProjectCollapsed: (id: string, collapsed: boolean) => post<ProjectResponse>('/api/project/setCollapsed', { id, collapsed }),
     deleteProject: (id: string) => post<OkResponse & { ungrouped?: number; error?: string }>('/api/project/delete', { id }),
+    // Project defaults — two verbs: set REPLACES them with exactly the fields given; reset clears.
+    setProjectDefaults: (req: SetProjectDefaultsRequest) => post<ProjectResponse>('/api/project/setDefaults', req),
+    resetProjectDefaults: (id: string) => post<ProjectResponse>('/api/project/resetDefaults', { id }),
     setSessionProject: (id: string, projectId: string | null) => post<OkResponse & { error?: string }>('/api/session/setProject', { id, projectId }),
     // `removeWorktree` (isolated sessions): delete its worktree dir too — never the branch. A
     // dirty/unmerged worktree comes back `needsConfirm` with the status and the session still

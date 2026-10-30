@@ -250,6 +250,18 @@ export interface DestroySessionResponse {
 // POST /api/project/delete      { id }            → ungroups its sessions; closes none
 // POST /api/session/setProject  { id, projectId } → top-level only; null removes
 export interface ProjectListResponse { projects: ProjectInfo[] }
+
+// Project defaults — TWO VERBS, like app settings (shared/src/settings.ts):
+// POST /api/project/setDefaults   { id, sandbox?, permissionMode? } → REPLACES the project's
+//      defaults with exactly the fields given (an omitted field = no default for it). At least
+//      one field is required — clearing is the other verb.
+// POST /api/project/resetDefaults { id } → removes them; creates fall back as if never set.
+// Both answer ProjectResponse.
+export interface SetProjectDefaultsRequest {
+  id: string
+  sandbox?: SandboxConfig
+  permissionMode?: PermissionMode
+}
 export interface ProjectResponse { ok: boolean; project?: ProjectInfo; error?: string }
 
 // GET /api/session/list

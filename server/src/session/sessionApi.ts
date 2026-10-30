@@ -8,7 +8,7 @@ import type {
   PermissionsResponse, EditRuleRequest, WriteResult,
   RewindPointsResponse, RewindPreviewResponse, RewindRequest, RewindResponse,
   TaskRecord, BashProcRecord, BashProcOutputResponse, TrustQueryResponse, TrustFolderRequest,
-  WorktreeInfo, WorktreeStatusResponse, DestroySessionBody, DestroySessionResponse,
+  WorktreeInfo, WorktreeStatusResponse, DestroySessionBody, DestroySessionResponse, ProjectDefaults,
 } from '@claudette/shared'
 import { SessionManager } from '../claude/sessionManager'
 import { isTrusted, setTrusted } from '../claude/trust'
@@ -122,6 +122,8 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     // and an explicit cwd that does not fit it is refused rather than overridden — a silently
     // replaced directory is a session running somewhere the operator did not ask for.
     let cwd = b.cwd, rootDir = b.rootDir, projectId: string | undefined
+    // The project's defaults (ProjectInfo.defaults) — consulted only for a create IN a project.
+    let projectDefaults: ProjectDefaults | undefined
     if (b.projectId) {
       if (b.parentId) { reply.code(400); return { error: 'A subsession belongs to its parent\'s project; do not pass a projectId with a parentId.' } }
       const p = projects?.get(b.projectId)
@@ -130,6 +132,7 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
       cwd = p.cwd
       rootDir = b.rootDir?.trim() ? b.rootDir : p.cwd
       projectId = p.id
+      projectDefaults = p.defaults
     }
     // ISOLATED: a new git worktree of the project's repo becomes the session's cwd AND rootDir
     // (git/worktrees.ts). Only inside a project — that is where the dialog offers it, and the
@@ -169,8 +172,11 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
       b.claudeSessionId,
       b.agentId ?? settings.defaultAgentId,
       b.model ?? settings.defaultModel,
-      b.permissionMode ?? settings.defaultPermissionMode,
-      b.sandbox,
+      // Per field: explicit request > project default > app setting > built-in. Same `??` rule
+      // as above — only an OMITTED field falls through. An isolated create's sandbox (project
+      // default or not) is rewritten by worktreeSandbox in register(), as before.
+      b.permissionMode ?? projectDefaults?.permissionMode ?? settings.defaultPermissionMode,
+      b.sandbox ?? (projectDefaults?.sandbox ? structuredClone(projectDefaults.sandbox) : undefined),
       /* trusted */ true,   // this route is auth-gated → the operator, may disable the sandbox
       projectId,
       worktree,

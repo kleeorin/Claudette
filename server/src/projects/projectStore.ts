@@ -2,9 +2,10 @@ import { EventEmitter } from 'events'
 import { join, basename } from 'path'
 import { readFile, writeFile, mkdir, rename } from 'fs/promises'
 import crypto from 'crypto'
-import type { ProjectInfo, WorktreeInfo } from '@claudette/shared'
+import type { ProjectInfo, ProjectDefaults, SandboxConfig, SandboxMount, WorktreeInfo } from '@claudette/shared'
+import { PERMISSION_MODES } from '@claudette/shared'
 import { dataDir } from '../util/dataDir'
-import { canonicalDir } from '../claude/sessionManager'
+import { canonicalDir, normalizeSandbox } from '../claude/sessionManager'
 import { gitCommonDirSync } from '../git/worktrees'
 
 // PROJECTS — a sidebar grouping level above top-level sessions (see ProjectInfo).
@@ -38,10 +39,47 @@ export function cwdFitsProject(cwd: string, project: ProjectInfo, worktree?: Wor
   return !!mine && mine === gitCommonDirSync(project.cwd)
 }
 
+// PROJECT DEFAULTS (ProjectInfo.defaults): what a NEW session created in the project starts
+// with when the create request does not say — explicit > project default > app setting >
+// built-in (sessionApi.ts /api/session/create). Only ever read at that moment.
+// Validated on LOAD and on SET by the one function below: a bad permissionMode or a malformed
+// sandbox drops ONLY the defaults (with a warn), never the project. The sandbox goes through
+// normalizeSandbox — the path session configs take — so mounts are canonicalised and deduped
+// exactly as a session's would be. Trusted (operator config, auth-gated): enabled:false and an
+// ELEVATED permissionMode are kept as given — a deliberate exception to settingsStore.ts's
+// refusal of elevated APP-WIDE defaults (see the note on CHECKS.defaultPermissionMode there):
+// a project default is per-project, operator-set, and shown pre-filled in red before every
+// create. projects.json sits in dataDir(), out of every box's reach (see the header).
+export function validateDefaults(raw: unknown, cwd: string): { ok: true; defaults: ProjectDefaults | undefined } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, defaults: undefined }
+  if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'Project defaults must be an object.' }
+  const r = raw as { sandbox?: unknown; permissionMode?: unknown }
+  const out: ProjectDefaults = {}
+  if (r.permissionMode !== undefined) {
+    if (typeof r.permissionMode !== 'string' || !(PERMISSION_MODES as readonly string[]).includes(r.permissionMode)) {
+      return { ok: false, error: `The default permission mode must be one of: ${PERMISSION_MODES.join(', ')}.` }
+    }
+    out.permissionMode = r.permissionMode as ProjectDefaults['permissionMode']
+  }
+  if (r.sandbox !== undefined) {
+    const sb = r.sandbox as Partial<SandboxConfig> | null
+    const mountsOk = !!sb && typeof sb === 'object' && typeof sb.enabled === 'boolean' && Array.isArray(sb.mounts)
+      && sb.mounts.every((m: Partial<SandboxMount>) => !!m && typeof m.path === 'string' && m.path.trim() !== '' && (m.mode === 'rw' || m.mode === 'ro'))
+    if (!mountsOk) return { ok: false, error: 'The default sandbox must be { enabled: boolean, mounts: [{ path, mode: "rw" | "ro" }] }.' }
+    const n = normalizeSandbox(sb as SandboxConfig, cwd, /* trusted */ true)
+    out.sandbox = {
+      enabled: n.enabled, mounts: n.mounts,
+      ...(n.sandboxTerminals !== undefined ? { sandboxTerminals: n.sandboxTerminals } : {}),
+      ...(n.gpu !== undefined ? { gpu: n.gpu } : {}),
+    }
+  }
+  return { ok: true, defaults: out.sandbox || out.permissionMode ? out : undefined }
+}
+
 export class ProjectStore extends EventEmitter {
   private projects: ProjectInfo[] = []
 
-  list(): ProjectInfo[] { return this.projects.map((p) => ({ ...p })) }
+  list(): ProjectInfo[] { return this.projects.map((p) => structuredClone(p)) }
 
   // Fill ProjectInfo.gitCommonDir (client-side membership hint only — see cwdFitsProject).
   // Computed when a project is created or loaded; a repo initialised later shows up on the
@@ -53,7 +91,7 @@ export class ProjectStore extends EventEmitter {
   }
   get(id: string): ProjectInfo | undefined {
     const p = this.projects.find((x) => x.id === id)
-    return p && { ...p }
+    return p && structuredClone(p)
   }
 
   // Validated per entry: a malformed row is dropped loudly rather than taking the file with it.
@@ -68,10 +106,14 @@ export class ProjectStore extends EventEmitter {
         continue
       }
       if (this.projects.some((x) => x.id === p.id)) continue
+      const cwd = canonicalDir(p.cwd)
+      const dv = validateDefaults(p.defaults, cwd)
+      if (!dv.ok) console.warn(`[projects] dropping invalid defaults of project "${p.name}" in projects.json (the project is kept): ${dv.error}`)
       this.projects.push(this.withRepo({
-        id: p.id, name: p.name.trim() || basename(p.cwd), cwd: canonicalDir(p.cwd),
+        id: p.id, name: p.name.trim() || basename(p.cwd), cwd,
         createdAt: typeof p.createdAt === 'number' ? p.createdAt : 0,
         ...(p.collapsed ? { collapsed: true } : {}),
+        ...(dv.ok && dv.defaults ? { defaults: dv.defaults } : {}),
       }))
     }
   }
@@ -93,13 +135,16 @@ export class ProjectStore extends EventEmitter {
     this.emit('changed')
   }
 
-  create(name: string, cwd: string): { ok: true; project: ProjectInfo } | { ok: false; error: string } {
+  // `defaults` (optional, already validated or validated here): the fromSession snapshot.
+  create(name: string, cwd: string, defaults?: ProjectDefaults): { ok: true; project: ProjectInfo } | { ok: false; error: string } {
     const dir = canonicalDir(cwd ?? '')
     if (!dir) return { ok: false, error: 'A project needs a working directory.' }
-    const project: ProjectInfo = this.withRepo({ id: crypto.randomUUID(), name: (name ?? '').trim() || basename(dir) || dir, cwd: dir, createdAt: Date.now() })
+    const dv = validateDefaults(defaults, dir)
+    if (!dv.ok) return { ok: false, error: dv.error }
+    const project: ProjectInfo = this.withRepo({ id: crypto.randomUUID(), name: (name ?? '').trim() || basename(dir) || dir, cwd: dir, createdAt: Date.now(), ...(dv.defaults ? { defaults: dv.defaults } : {}) })
     this.projects.push(project)
     this.changed()
-    return { ok: true, project: { ...project } }
+    return { ok: true, project: structuredClone(project) }
   }
 
   rename(id: string, name: string): ProjectInfo | undefined {
@@ -108,7 +153,7 @@ export class ProjectStore extends EventEmitter {
     if (!p || !n) return undefined
     p.name = n
     this.changed()
-    return { ...p }
+    return structuredClone(p)
   }
 
   setCollapsed(id: string, collapsed: boolean): ProjectInfo | undefined {
@@ -116,11 +161,31 @@ export class ProjectStore extends EventEmitter {
     if (!p) return undefined
     if (collapsed) p.collapsed = true; else delete p.collapsed
     this.changed()
-    return { ...p }
+    return structuredClone(p)
   }
 
   // Removes ONLY the project record. Ungrouping its sessions is the caller's job (the route
   // does it through SessionManager), because sessions are not this store's to touch.
+  // REPLACES the defaults with exactly what is given (validated). Refuses an empty set —
+  // clearing is clearDefaults, the second verb.
+  setDefaults(id: string, defaults: unknown): { ok: true; project: ProjectInfo } | { ok: false; error: string; notFound?: true } {
+    const p = this.projects.find((x) => x.id === id)
+    if (!p) return { ok: false, error: 'No such project.', notFound: true }
+    const dv = validateDefaults(defaults, p.cwd)
+    if (!dv.ok) return { ok: false, error: dv.error }
+    if (!dv.defaults) return { ok: false, error: 'No defaults were supplied — to clear them, use resetDefaults.' }
+    p.defaults = dv.defaults
+    this.changed()
+    return { ok: true, project: structuredClone(p) }
+  }
+
+  clearDefaults(id: string): ProjectInfo | undefined {
+    const p = this.projects.find((x) => x.id === id)
+    if (!p) return undefined
+    if (p.defaults) { delete p.defaults; this.changed() }
+    return structuredClone(p)
+  }
+
   delete(id: string): boolean {
     const before = this.projects.length
     this.projects = this.projects.filter((x) => x.id !== id)

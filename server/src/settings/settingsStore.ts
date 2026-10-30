@@ -96,6 +96,9 @@ const CHECKS: Record<AppSettingsKey, Check> = {
   // being silently refused by a validator nobody remembered to update.
   //
   // ★★ AN ELEVATED MODE MAY NOT BE STORED AS A DEFAULT. ★★
+  // (APP-WIDE. A PROJECT default may be elevated — the deliberate, operator-approved exception
+  // documented at validateDefaults in projects/projectStore.ts: per project, operator-set, and
+  // shown pre-filled in red in the new-session dialog before every create.)
   // THE PRINCIPLE: elevation is a LIVE DECISION, NOT A PERSISTED ATTRIBUTE. This is the same
   // rule downgradeRestoredMode enforces for a restored session's own mode — a human must
   // re-grant it after a restart — and this closes the sibling case it does not reach: a stored

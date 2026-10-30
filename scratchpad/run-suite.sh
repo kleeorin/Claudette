@@ -764,6 +764,19 @@ SUITE=(
   # conversation id (also after restore), and session:list is re-broadcast on 'ready' so a tab
   # never trails an id the engine replaced. Measured RED 7/7 on a HEAD copy.
   "none:session-claudeid-info-test.mts"
+  # PROJECT DEFAULTS (server half): fromSession snapshot (deep clone; elevated mode and
+  # enabled:false kept; an isolated source's worktree mounts translated back to the repo),
+  # setDefaults/resetDefaults validation + persistence + reload, a malformed entry drops only
+  # its defaults, create precedence explicit > project > app setting > built-in, an isolated
+  # create through worktreeSandbox, teammates untouched. Measured RED on a HEAD copy: 16
+  # failed, 9 passed (the greens pin pre-existing behaviour; 3d/3i are vacuous there — the
+  # routes did not exist, so they 404 for that reason).
+  "none:project-defaults-test.mts"
+  # PROJECT DEFAULTS, browser half: builds the current web tree to a temp dir and boots its own
+  # server (:4347, proxy :4348, CDP 9383, isolated HOME/data, no credentials) — never web/dist,
+  # never :4319. Elevated project mode pre-filled red with its warning + sandbox prefill in the
+  # new-session dialog; "Defaults…" opens, saves, and the next dialog follows; Clear removes.
+  "chrome:project-defaults-probe.mjs"
   "none:iframe-output-adversarial-test.mts"
   "none:output-sanitizer-test.mts"
   # The chat meta-bar sandbox chip's folder picker. `none:` even though it needs jsdom: the

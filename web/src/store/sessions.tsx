@@ -59,7 +59,7 @@ interface ContextValue {
   listLoaded: boolean
   // `projectId` creates the session inside that project (the server takes the cwd from it).
   // `isolated` (with projectId): run it in a new git worktree of the project's repo.
-  create: (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig; projectId?: string; isolated?: { branch?: string } }) => Promise<string>
+  create: (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig; projectId?: string; isolated?: { branch?: string }; permissionMode?: PermissionMode }) => Promise<string>
   // Spawn a child session under `parentId` (shares the parent's cwd/rootDir, carries
   // parentId so the server appends the report-to-parent instruction). Own role + sandbox.
   spawnSubsession: (parentId: string, opts?: { name?: string; agentId?: string; sandbox?: SandboxConfig }) => Promise<string | null>
@@ -209,9 +209,9 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
     return () => { offList(); offState(); offReady(); offExit(); offConn() }
   }, [])
 
-  const create = useCallback(async (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig; projectId?: string; isolated?: { branch?: string } }): Promise<string> => {
+  const create = useCallback(async (name: string, cwd: string, opts?: { model?: string; agentId?: string; parentId?: string; rootDir?: string; sandbox?: SandboxConfig; projectId?: string; isolated?: { branch?: string }; permissionMode?: PermissionMode }): Promise<string> => {
     const rootDir = opts?.rootDir ?? cwd
-    const r = await api.http.createSession({ name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox, projectId: opts?.projectId, ...(opts?.isolated ? { isolated: opts.isolated } : {}) })
+    const r = await api.http.createSession({ name, cwd, rootDir, model: opts?.model, agentId: opts?.agentId, parentId: opts?.parentId, sandbox: opts?.sandbox, projectId: opts?.projectId, ...(opts?.isolated ? { isolated: opts.isolated } : {}), ...(opts?.permissionMode ? { permissionMode: opts.permissionMode } : {}) })
     // A refused create (e.g. a cwd that does not fit the project) has no id. Throw rather than
     // dispatch `created` for `undefined`, which would select a phantom row.
     if (!r.id) throw new Error(r.error ?? 'The server refused to create the session.')

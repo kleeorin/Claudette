@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
-import type { ProjectListResponse, ProjectResponse, OkResponse, ProjectRepoStatusResponse } from '@claudette/shared'
+import path from 'path'
+import type { ProjectListResponse, ProjectResponse, OkResponse, ProjectRepoStatusResponse, ProjectDefaults, SandboxConfig, SessionInfo, SetProjectDefaultsRequest } from '@claudette/shared'
 import type { SessionManager } from '../claude/sessionManager'
 import { ProjectStore, cwdFitsProject } from './projectStore'
 import { repoInfo } from '../git/worktrees'
@@ -8,6 +9,34 @@ import { repoInfo } from '../git/worktrees'
 // changes only the SIDEBAR grouping and which cwd a new session gets — it grants nothing, and
 // team / MCP / mailbox scope stays parentId-based — but projects.json is replayed at boot, so
 // only the operator writes it.
+// The defaults "Make project" snapshots from its source session: a DEEP clone of its sandbox
+// and its permissionMode, as-is (enabled:false and an elevated mode included — operator
+// decision; both are shown pre-filled in the new-session dialog).
+// An ISOLATED source's box is about its private worktree, not the project dir, so it is
+// translated back: a mount AT or UNDER the worktree moves to the same place under repoRoot
+// (the project cwd) — the worktree itself becomes the repoRoot mount worktreeSandbox dropped;
+// a mount at or under the git COMMON dir is dropped (worktreeSandbox adds it again for the next
+// isolated create, and a plain session never needs it); every OTHER mount — one the operator
+// added explicitly (a docs tree, a sibling repo) — is kept unchanged.
+export function snapshotDefaults(info: SessionInfo): ProjectDefaults | undefined {
+  const out: ProjectDefaults = {}
+  if (info.permissionMode) out.permissionMode = info.permissionMode
+  if (info.sandbox) {
+    const sb: SandboxConfig = structuredClone(info.sandbox)
+    const wt = info.worktree
+    if (wt) {
+      const under = (p: string, root: string) => p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep)
+      sb.mounts = sb.mounts
+        .filter((m) => !under(path.resolve(m.path), path.resolve(wt.commonDir)))
+        .map((m) => under(path.resolve(m.path), path.resolve(wt.path))
+          ? { ...m, path: path.join(wt.repoRoot, path.relative(wt.path, path.resolve(m.path))) }
+          : m)
+    }
+    out.sandbox = sb
+  }
+  return out.sandbox || out.permissionMode ? out : undefined
+}
+
 export function registerProjectRoutes(app: FastifyInstance, sessions: SessionManager, projects: ProjectStore): void {
   app.get('/api/project/list', async (): Promise<ProjectListResponse> => ({ projects: projects.list() }))
 
@@ -19,7 +48,7 @@ export function registerProjectRoutes(app: FastifyInstance, sessions: SessionMan
     if (info.parentId) { reply.code(400); return { ok: false, error: 'Only a top-level session can become a project — a subsession belongs to its parent\'s.' } }
     if (!info.cwd) { reply.code(400); return { ok: false, error: 'This session has no working directory to base a project on.' } }
     // An isolated session's project is its REPO, not its private worktree dir.
-    const r = projects.create('', info.worktree?.repoRoot ?? info.cwd)
+    const r = projects.create('', info.worktree?.repoRoot ?? info.cwd, snapshotDefaults(info))
     if (!r.ok) { reply.code(400); return { ok: false, error: r.error } }
     sessions.setProject(info.id, r.project.id)
     return { ok: true, project: r.project }
@@ -37,6 +66,24 @@ export function registerProjectRoutes(app: FastifyInstance, sessions: SessionMan
     const r = projects.create(req.body?.name ?? '', req.body?.cwd ?? '')
     if (!r.ok) { reply.code(400); return { ok: false, error: r.error } }
     return { ok: true, project: r.project }
+  })
+
+  // Project defaults — two verbs (see SetProjectDefaultsRequest). Auth-gated: the operator may
+  // store enabled:false and an elevated mode here (see validateDefaults in projectStore.ts).
+  app.post<{ Body: SetProjectDefaultsRequest }>('/api/project/setDefaults', async (req, reply): Promise<ProjectResponse> => {
+    const b = req.body ?? ({} as SetProjectDefaultsRequest)
+    const r = projects.setDefaults(b.id, {
+      ...(b.sandbox !== undefined ? { sandbox: b.sandbox } : {}),
+      ...(b.permissionMode !== undefined ? { permissionMode: b.permissionMode } : {}),
+    })
+    if (!r.ok) { reply.code(r.notFound ? 404 : 400); return { ok: false, error: r.error } }
+    return { ok: true, project: r.project }
+  })
+
+  app.post<{ Body: { id: string } }>('/api/project/resetDefaults', async (req, reply): Promise<ProjectResponse> => {
+    const p = projects.clearDefaults(req.body?.id)
+    if (!p) { reply.code(404); return { ok: false, error: 'No such project.' } }
+    return { ok: true, project: p }
   })
 
   app.post<{ Body: { id: string; name: string } }>('/api/project/rename', async (req, reply): Promise<ProjectResponse> => {

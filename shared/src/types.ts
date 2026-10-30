@@ -182,6 +182,21 @@ export interface ProjectInfo {
   // client offer "move into project" to a worktree session of the same repo; the server
   // recomputes it live for every check that matters (cwdFitsProject).
   gitCommonDir?: string
+  // What a NEW session created IN this project starts with, per field, when the create request
+  // does not say: explicit request > project default > app setting > built-in. Used ONLY at
+  // that moment — never applied to existing sessions, and teammates (parentId) keep inheriting
+  // their coordinator's config. Snapshotted from the source session by "Make project"
+  // (fromSession); edited via "Defaults…" (POST /api/project/setDefaults / resetDefaults).
+  // ★ An ELEVATED permissionMode IS allowed here — a deliberate exception to settingsStore's
+  // refusal of elevated APP-WIDE defaults: it is scoped to one project, set by the operator per
+  // project, and shown pre-filled (in red) in the dialog before every create. sandbox
+  // enabled:false is likewise kept as given and shown in the dialog's sandbox picker.
+  defaults?: ProjectDefaults
+}
+
+export interface ProjectDefaults {
+  sandbox?: SandboxConfig
+  permissionMode?: PermissionMode
 }
 
 // An isolated session's git worktree, created by the server with

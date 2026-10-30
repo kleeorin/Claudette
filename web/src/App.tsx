@@ -38,8 +38,10 @@ import { orderSidebar } from './lib/sessionOrder'
 import { projectMenuItems } from './lib/projectMenu'
 import { slugify, isolatedUnavailableReason } from './lib/worktreeSession'
 import { cwdField } from './lib/defaultCwd'
+import { dialogPrefill, modeToSend, modeOptions } from './lib/projectDefaults'
 import { StateDot } from './components/StateDot'
-import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord, ProjectInfo } from '@claudette/shared'
+import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord, ProjectInfo, PermissionMode } from '@claudette/shared'
+import { isElevatedMode } from '@claudette/shared'
 
 // App shell. Claude is the permanent anchor: it is always on screen. Notebooks and
 // file editors open as CONTENT tabs beside it (a companion split); Files and Git
@@ -1635,7 +1637,13 @@ function NewSessionDialog({ onClose, onCreated, project }: { onClose: () => void
   const setCwd = (v: string) => { setTypedCwd(v); setCwdEdited(true) }
   const [agentId, setAgentId] = useState('general')
   const [model, setModel] = useState('')
-  const [sb, setSb] = useState<SbState>(defaultSb())
+  // PROJECT DEFAULTS (lib/projectDefaults): the sandbox picker is seeded from the project's
+  // default sandbox (enabled:false included), and a project dialog gets a mode select seeded
+  // from its default mode — both VISIBLE, and editable, before Create.
+  const prefill = dialogPrefill(project)
+  const [sb, setSb] = useState<SbState>(() => (prefill.sandbox && project ? sbFromConfig(prefill.sandbox, project.cwd) : defaultSb()))
+  const [mode, setMode] = useState<PermissionMode | undefined>(prefill.mode)
+  const [modeTouched, setModeTouched] = useState(false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [browsing, setBrowsing] = useState(false)
@@ -1665,7 +1673,7 @@ function NewSessionDialog({ onClose, onCreated, project }: { onClose: () => void
   const doCreate = async (dir: string) => {
     try {
       const useWorktree = !!project && isolated && !isolatedBlocked
-      await create(name.trim() || basename(dir) || 'session', dir, { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, dir), projectId: project?.id, ...(useWorktree ? { isolated: { branch: branchValue.trim() } } : {}) })
+      await create(name.trim() || basename(dir) || 'session', dir, { model: model.trim() || undefined, agentId, sandbox: sbToConfig(sb, dir), projectId: project?.id, ...(useWorktree ? { isolated: { branch: branchValue.trim() } } : {}), ...(project ? { permissionMode: modeToSend({ projectDefault: prefill.mode, chosen: mode, touched: modeTouched }) } : {}) })
       ;(onCreated ?? onClose)()
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Failed to create session.')
@@ -1736,6 +1744,18 @@ function NewSessionDialog({ onClose, onCreated, project }: { onClose: () => void
           <Field label="Model" hint="optional">
             <input value={model} onChange={(e) => setModel(e.target.value)} onKeyDown={onEnter} placeholder="account default (e.g. sonnet, opus, haiku)" className="modal-input font-mono text-[12px]" />
           </Field>
+          {project && (
+            <Field label="Permission mode" hint={prefill.mode ? 'project default' : undefined}>
+              <select
+                data-testid="new-session-mode" value={mode ?? ''}
+                onChange={(e) => { setModeTouched(true); setMode((e.target.value || undefined) as PermissionMode | undefined) }}
+                className={`modal-input text-[12px] ${isElevatedMode(mode) ? 'text-ctp-red border-ctp-red/60' : ''}`}
+              >
+                {modeOptions(prefill.mode).map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+              {isElevatedMode(mode) && <div data-testid="new-session-mode-warning" className="text-[10px] text-ctp-red mt-1">Elevated: this session will run tools without asking you first.</div>}
+            </Field>
+          )}
           <Field label="Sandbox">
             <SandboxFields value={sb} onChange={setSb} cwd={cwd.trim() || homeDir} available={sandboxAvailable} />
           </Field>
@@ -2410,6 +2430,7 @@ function ProjectHeader({ project, count, onNewSession }: { project: ProjectInfo;
   const [renaming, setRenaming] = useState(false)
   const [renameVal, setRenameVal] = useState(project.name)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [editDefaults, setEditDefaults] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const done = useRef(false)
   // Every call here reports a refusal in place: the project:list broadcast is what updates the
@@ -2460,7 +2481,8 @@ function ProjectHeader({ project, count, onNewSession }: { project: ProjectInfo;
         <button onClick={openMenu} className="opacity-100 md:opacity-0 md:group-hover:opacity-100 text-ctp-overlay hover:text-ctp-text text-sm leading-none w-7 h-7 flex items-center justify-center rounded transition-opacity" title="Project actions" aria-label="Project actions">⋯</button>
       </div>
       {err && <div className="px-2 pb-1 text-[10px] text-ctp-red">{err}</div>}
-      {menu && <ProjectMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)} onRename={beginRename} onDelete={() => setConfirmDelete(true)} />}
+      {menu && <ProjectMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)} onRename={beginRename} onDefaults={() => setEditDefaults(true)} onDelete={() => setConfirmDelete(true)} />}
+      {editDefaults && <ProjectDefaultsDialog project={project} onClose={() => setEditDefaults(false)} />}
       {confirmDelete && (
         <ConfirmDialog
           danger
@@ -2475,12 +2497,64 @@ function ProjectHeader({ project, count, onNewSession }: { project: ProjectInfo;
   )
 }
 
-function ProjectMenu({ x, y, onClose, onRename, onDelete }: { x: number; y: number; onClose: () => void; onRename: () => void; onDelete: () => void }) {
+// "Defaults…": what a NEW session created in this project starts with (ProjectInfo.defaults).
+// Save REPLACES them with the sandbox shown plus the mode chosen ("no default" = none for
+// mode); "Clear defaults" removes both. Never touches existing sessions or teammates.
+function ProjectDefaultsDialog({ project, onClose }: { project: ProjectInfo; onClose: () => void }) {
+  const { sandboxAvailable } = useSessions()
+  const [sb, setSb] = useState<SbState>(() => (project.defaults?.sandbox ? sbFromConfig(project.defaults.sandbox, project.cwd) : defaultSb()))
+  const [mode, setMode] = useState<PermissionMode | undefined>(project.defaults?.permissionMode)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  useEscape(() => { if (!busy) onClose() })
+  const run = async (fn: () => Promise<{ ok?: boolean; error?: string }>) => {
+    setBusy(true); setErr(null)
+    try {
+      const r = await fn()
+      if (r?.ok !== true) { setErr(r?.error ?? 'The server refused.'); setBusy(false); return }
+      onClose()
+    } catch (e) { setErr(e instanceof Error ? e.message : 'Failed.'); setBusy(false) }
+  }
+  return (
+    <Overlay onClose={() => { if (!busy) onClose() }}>
+      <div data-testid="project-defaults-dialog" className="w-[460px] max-w-[calc(100vw-2rem)] rounded-xl border border-ctp-surface1 bg-ctp-mantle shadow-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2.5 px-5 h-12 border-b border-ctp-surface0">
+          <span className="text-sm font-semibold text-ctp-text truncate">Defaults for <span className="text-ctp-accent">{project.name}</span></span>
+          <button onClick={onClose} className="ml-auto text-ctp-overlay hover:text-ctp-text text-sm">✕</button>
+        </div>
+        <div className="p-5 space-y-3.5">
+          <div className="text-[11px] text-ctp-overlay leading-snug">Used only when a NEW session is created in this project. Existing sessions and teammates are not changed.</div>
+          <Field label="Permission mode">
+            <select data-testid="project-defaults-mode" value={mode ?? ''} onChange={(e) => setMode((e.target.value || undefined) as PermissionMode | undefined)}
+              className={`modal-input text-[12px] ${isElevatedMode(mode) ? 'text-ctp-red border-ctp-red/60' : ''}`}>
+              <option value="">no default (app setting)</option>
+              {modeOptions('default').map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+            {isElevatedMode(mode) && <div className="text-[10px] text-ctp-red mt-1">Elevated: new sessions here will run tools without asking first.</div>}
+          </Field>
+          <Field label="Sandbox">
+            <SandboxFields value={sb} onChange={setSb} cwd={project.cwd} available={sandboxAvailable} />
+          </Field>
+          {err && <div className="text-[11px] text-ctp-red">{err}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-5 py-3.5 border-t border-ctp-surface0">
+          <button disabled={busy || !project.defaults} onClick={() => void run(() => api.http.resetProjectDefaults(project.id))} className="mr-auto text-xs px-3 py-1.5 rounded-md text-ctp-subtext hover:bg-ctp-surface0 disabled:opacity-40">Clear defaults</button>
+          <button disabled={busy} onClick={onClose} className="text-xs px-3.5 py-1.5 rounded-md text-ctp-subtext hover:bg-ctp-surface0">Cancel</button>
+          <button disabled={busy} onClick={() => void run(() => api.http.setProjectDefaults({ id: project.id, sandbox: sbToConfig(sb, project.cwd), ...(mode ? { permissionMode: mode } : {}) }))}
+            className="text-xs font-medium px-4 py-1.5 rounded-md bg-ctp-accent text-ctp-base hover:brightness-110 disabled:opacity-40">Save</button>
+        </div>
+      </div>
+    </Overlay>
+  )
+}
+
+function ProjectMenu({ x, y, onClose, onRename, onDefaults, onDelete }: { x: number; y: number; onClose: () => void; onRename: () => void; onDefaults: () => void; onDelete: () => void }) {
   useDismissOnOutside(true, onClose)
   const item = 'w-full text-left px-3 py-2 md:py-1.5 hover:bg-ctp-surface0 text-ctp-text flex items-center gap-2'
   return createPortal(
     <div style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - 120) }} onClick={(e) => e.stopPropagation()} className="fixed z-[60] w-48 rounded-md border border-ctp-surface1 bg-ctp-mantle shadow-pop py-1 text-xs">
       <button className={item} onClick={() => { onClose(); onRename() }}>✎ Rename</button>
+      <button className={item} onClick={() => { onClose(); onDefaults() }}>⚙ Defaults…</button>
       <button className={`${item} text-ctp-red`} onClick={() => { onClose(); onDelete() }}>🗑 Delete project…</button>
     </div>,
     document.body,

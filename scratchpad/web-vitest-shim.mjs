@@ -300,7 +300,9 @@ const bin = path.join(repo, 'node_modules', '.bin', 'vitest')
 // dialog's cwd precedence, late arrival, edit-wins, deleted-default fallback).
 // Raised 291 → 294 on 2026-10-28, counted from a run: lib/autoResume.test.ts +3 (resume by the
 // server-listed claudeSessionId after a restart; live init id wins; disqualifiers still apply).
-const MIN_TESTS = 294
+// Raised 294 → 303 on 2026-10-29, counted from a run: lib/projectDefaults.test.ts (9 — the
+// new-session-in-project dialog's prefill, when permissionMode is sent, the mode options).
+const MIN_TESTS = 303
 
 // THE DETECTOR IS DELIBERATELY WIDER THAN THE RUNNER, and that relationship is the whole
 // point of it. `web/vitest.config.ts` collects exactly `src/**/*.test.{ts,tsx}`. A detector
@@ -358,7 +360,8 @@ function testShapedUnder(dir, rel = '') {
 // Raised 22 → 23 on 2026-10-26 (lib/projectMenu.test.ts), counted.
 // Raised 23 → 24 on 2026-10-27 (lib/worktreeSession.test.ts), counted.
 // Raised 24 → 25 on 2026-10-28 (lib/defaultCwd.test.ts), counted.
-const MIN_TEST_FILES = 25
+// Raised 25 → 26 on 2026-10-29 (lib/projectDefaults.test.ts), counted.
+const MIN_TEST_FILES = 26
 
 const shaped = testShapedUnder(web)
 check(`the walk found at least ${MIN_TEST_FILES} test file(s) — it is not silently looking at nothing`,
