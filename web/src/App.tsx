@@ -2523,7 +2523,12 @@ function ProjectDefaultsDialog({ project, onClose }: { project: ProjectInfo; onC
           <button onClick={onClose} className="ml-auto text-ctp-overlay hover:text-ctp-text text-sm">✕</button>
         </div>
         <div className="p-5 space-y-3.5">
-          <div className="text-[11px] text-ctp-overlay leading-snug">Used only when a NEW session is created in this project. Existing sessions and teammates are not changed.</div>
+          {/* The project's folder, VISIBLE: elsewhere it is only the header's hover title, which a
+              phone never shows. Read-only — ProjectInfo.cwd is immutable (--resume is keyed by it). */}
+          <Field label="Folder" hint="fixed for the life of the project">
+            <div data-testid="project-defaults-cwd" className="font-mono text-[12px] text-ctp-text break-all select-all px-2 py-1.5 rounded-md bg-ctp-base border border-ctp-surface1" title={project.cwd}>{prettyPath(project.cwd)}</div>
+          </Field>
+          <div className="text-[11px] text-ctp-overlay leading-snug">Defaults are used only when a NEW session is created in this project. Existing sessions and teammates are not changed.</div>
           <Field label="Permission mode">
             <select data-testid="project-defaults-mode" value={mode ?? ''} onChange={(e) => setMode((e.target.value || undefined) as PermissionMode | undefined)}
               className={`modal-input text-[12px] ${isElevatedMode(mode) ? 'text-ctp-red border-ctp-red/60' : ''}`}>

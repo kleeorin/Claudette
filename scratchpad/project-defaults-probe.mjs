@@ -145,6 +145,8 @@ const projectNow = async () => (await getJ('/api/project/list')).projects.find((
   await evaluate(`[...document.querySelectorAll('button')].find((b) => b.textContent.includes('Defaults…')).click()`)
   const open = await waitFor(`!!document.querySelector('[data-testid="project-defaults-dialog"]') && document.querySelector('[data-testid="project-defaults-mode"]').value === 'bypassPermissions'`)
   check('2. "Defaults…" opens the dialog showing the current defaults', open)
+  const cwdShown = await evaluate(`document.querySelector('[data-testid="project-defaults-cwd"]')?.title`)
+  check('2a …and shows the project\'s folder (not only as a header hover title)', cwdShown === P.cwd && !!P.cwd, String(cwdShown))
   await shot('defaults-dialog')
   await evaluate(`__pick('[data-testid="project-defaults-mode"]', 'plan')`)
   await evaluate(`__btn('Save').click()`)
