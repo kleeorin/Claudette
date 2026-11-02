@@ -43,7 +43,12 @@ import {
 //                           load keeps any ABSOLUTE path even if the folder is gone, and
 //                           settingsApi reports that as `defaultCwdMissing`.
 //
-// All five are now wired. Anyone wiring up another key should start by grepping for importers
+//   starredFoldersInNewSessions — ★ CONSUMED, CLIENT-SIDE ONLY: the new-session dialog seeds its
+//                           sandbox with the starred folders (web/src/lib/newSessionSandbox.ts).
+//                           The server deliberately never reads it — nor the star list — on
+//                           create/restore; see sandboxDefaults.ts.
+//
+// All six are now wired. Anyone wiring up another key should start by grepping for importers
 // of this file, and should update this list in the same change — a stale entry here is the
 // "enabled control that silently does nothing" shape the settings contract exists to prevent,
 // and it fails in both directions: claiming CONSUMED when it is not sends someone looking for
@@ -137,6 +142,10 @@ const CHECKS: Record<AppSettingsKey, Check> = {
   // the FORMULATION, not of the values — flip this to a rejection (`if (v < MIN || v > MAX)
   // return error`) and NaN passes both tests and sails through, with only isInteger left
   // standing between it and the file. Keep the acceptance form.
+  // A real boolean only; "no" is stored as ABSENT (the panel resets rather than saving false),
+  // but an explicit false is accepted too — it means the same as absent.
+  starredFoldersInNewSessions: (v) =>
+    typeof v === 'boolean' ? null : 'Mounting starred folders in new sessions must be true or false.',
   maxTeamSize: (v) =>
     typeof v === 'number' && Number.isInteger(v) && v >= MIN_TEAM_SIZE && v <= MAX_TEAM_SIZE_LIMIT
       ? null

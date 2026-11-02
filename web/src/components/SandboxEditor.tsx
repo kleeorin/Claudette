@@ -91,7 +91,8 @@ export function SandboxEditor({ session, compact = false }: { session: SessionIn
         <span className="text-ctp-text font-medium">Sandbox</span>
         <button
           onClick={toggleEnabled}
-          className={`px-2 py-0.5 rounded text-[10px] font-medium ${enabled ? 'bg-ctp-green/20 text-ctp-green' : 'bg-ctp-surface0 text-ctp-overlay'}`}
+          className={`px-2 py-0.5 rounded text-[10px] font-medium ${!enabled ? 'bg-ctp-surface0 text-ctp-overlay' : sandboxAvailable ? 'bg-ctp-green/20 text-ctp-green' : 'bg-ctp-yellow/20 text-ctp-yellow'}`}
+          title={enabled && !sandboxAvailable ? 'Requested, but this host can’t confine — running unsandboxed' : undefined}
         >
           {enabled ? 'ON' : 'OFF'}
         </button>

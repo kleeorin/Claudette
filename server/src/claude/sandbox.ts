@@ -311,15 +311,39 @@ function obligatoryMounts(cwd: string, existing = true): SandboxMount[] {
 // AppArmor userns clamp). The only reliable test is to actually build a throwaway
 // sandbox. Bind the whole root ro so the test binary's dynamic loader is present —
 // a partial bind fails execvp with a misleading ENOENT and would false-negative.
-// Probed once and cached; call resetSandboxProbe() after the host is reconfigured.
+//
+// TRUE IS CACHED FOR GOOD; FALSE IS NOT. A false used to be latched for the life of the
+// server, and a probe can fail TRANSIENTLY: measured in the field, a server restarted right
+// after an OOM kill probed while the box was still thrashing, the 5s spawnSync timeout fired,
+// and from then on every session the operator had configured `enabled: true` ran UNCONFINED
+// until the next restart — with "host can't sandbox" in the UI and nothing in the log. So a
+// failure is re-probed on a later call once PROBE_RETRY_MS have passed (throttled, because
+// this is called per launch and per /api/health, and a failing probe can block for the full
+// timeout), and every failure is logged with WHY (see probe()).
+// resetSandboxProbe() still forces a fresh probe after the host is reconfigured.
+const PROBE_RETRY_MS = 30_000
 let cachedAvailable: boolean | undefined
+let lastFailedAt = 0
+let probeNow: () => number = () => Date.now()
 
 export function sandboxAvailable(): boolean {
-  if (cachedAvailable === undefined) cachedAvailable = probe()
-  return cachedAvailable
+  if (cachedAvailable === true) return true
+  if (cachedAvailable === false && probeNow() - lastFailedAt < PROBE_RETRY_MS) return false
+  const wasFalse = cachedAvailable === false
+  const ok = probe()
+  cachedAvailable = ok
+  if (ok) {
+    if (wasFalse) console.warn('[sandbox] availability probe now SUCCEEDS after an earlier failure — sessions launched from here on are confined again (running ones keep the box they started with).')
+  } else {
+    lastFailedAt = probeNow()
+  }
+  return ok
 }
 
-export function resetSandboxProbe(): void { cachedAvailable = undefined; whichCache.clear() }
+export function resetSandboxProbe(): void { cachedAvailable = undefined; lastFailedAt = 0; whichCache.clear() }
+
+// Test seam: a clock for the retry throttle (null restores the real one).
+export function setSandboxProbeClockForTest(now: (() => number) | null): void { probeNow = now ?? (() => Date.now()) }
 
 function probe(): boolean {
   // Resolve the test binary rather than hardcoding /usr/bin/true, which everything else
@@ -335,16 +359,26 @@ function probe(): boolean {
   const argv = trueBin?.startsWith('/')
     ? [trueBin]
     : ['/bin/sh', '-c', ':']   // POSIX-guaranteed fallback; exits 0 and needs no coreutils
+  // stderr is CAPTURED, not ignored: it is the only place an AppArmor/userns denial says so
+  // ("setting up uid map: Permission denied"), and without it a timeout, a missing binary and
+  // a policy denial all looked identical — silence, and an unconfined session.
   try {
     const r = spawnSync(BWRAP, [
       '--ro-bind', '/', '/',
       '--dev', '/dev', '--proc', '/proc',
       '--unshare-user', '--die-with-parent',
       ...argv,
-    ], { stdio: 'ignore', timeout: 5000 })
-    return r.status === 0
-  } catch {
-    return false  // bwrap not on PATH, or spawn failed
+    ], { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: 5000 })
+    if (r.status === 0) return true
+    const err = r.error as NodeJS.ErrnoException | undefined
+    const stderr = (r.stderr ?? '').trim().split('\n').slice(-5).join(' | ').slice(0, 500)
+    console.warn(`[sandbox] availability probe FAILED (${BWRAP} ${argv.join(' ')}): `
+      + `status=${r.status ?? 'none'} signal=${r.signal ?? 'none'} error=${err ? (err.code ?? err.message) : 'none'}`
+      + `${stderr ? ` stderr: ${stderr}` : ''} — sessions requesting a sandbox will run UNCONFINED until a later probe succeeds (re-probed after ${PROBE_RETRY_MS / 1000}s).`)
+    return false
+  } catch (e) {
+    console.warn(`[sandbox] availability probe could not run ${BWRAP}: ${e instanceof Error ? e.message : String(e)} — sessions requesting a sandbox will run UNCONFINED until a later probe succeeds.`)
+    return false
   }
 }
 

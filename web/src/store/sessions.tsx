@@ -274,6 +274,13 @@ export function SessionsProvider({ children }: { children: ReactNode }) {
 
   // Learn once whether this host can sandbox (drives the sandbox controls' messaging).
   useEffect(() => { getHealth().then((h) => { setSandboxAvailable(!!h.sandboxAvailable); setGpuDevices(h.gpuDevices ?? []); if (h.homeDir) setHomeDir(h.homeDir) }).catch(() => {}) }, [])
+  // A false is not final: the server re-probes a failed sandbox check (it can fail transiently,
+  // e.g. right after an OOM restart), so poll while false and let the UI recover without a reload.
+  useEffect(() => {
+    if (sandboxAvailable) return
+    const t = setInterval(() => { getHealth().then((h) => { if (h.sandboxAvailable) setSandboxAvailable(true) }).catch(() => {}) }, 30_000)
+    return () => clearInterval(t)
+  }, [sandboxAvailable])
 
   // Fetch the selectable roles once (drives the role pickers + sidebar badge).
   useEffect(() => { api.http.listAgents().then(setAgents).catch(() => {}) }, [])

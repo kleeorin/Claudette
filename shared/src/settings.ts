@@ -43,6 +43,14 @@ export interface AppSettings {
   // since is kept (and reported as AppSettingsResponse.defaultCwdMissing) rather than dropped,
   // so the dialog can say why it fell back instead of the setting silently vanishing.
   defaultCwd?: string
+  // Seed every NEW session's sandbox with the starred folders (SandboxDefaultFolder), each in
+  // its saved mode. Absent/false = today: stars are an inert one-click menu. ★ A CLIENT-SIDE
+  // PREFILL ONLY: the new-session dialog shows the mounts before Create and the request
+  // carries them explicitly through the auth-gated route. The server never consults the star
+  // list on create or restore — that would make it a confinement-widening channel needing a
+  // trust gate (see sandboxDefaults.ts). Precedence: explicit > project defaults > this >
+  // built-in; teammates still inherit from their parent.
+  starredFoldersInNewSessions?: boolean
 }
 
 // The settable keys AS A VALUE, for the same reason BASH_PROC_STATES is a value: the save and
@@ -56,7 +64,7 @@ export interface AppSettings {
 // AppSettings and forgotten here — nothing in the type system can — so that direction is
 // covered by an exhaustiveness assertion in scratchpad/settings-store-test.mts instead.
 export const APP_SETTINGS_KEYS = [
-  'defaultModel', 'defaultAgentId', 'defaultPermissionMode', 'maxTeamSize', 'defaultCwd',
+  'defaultModel', 'defaultAgentId', 'defaultPermissionMode', 'maxTeamSize', 'defaultCwd', 'starredFoldersInNewSessions',
 ] as const satisfies ReadonlyArray<keyof AppSettings>
 
 export type AppSettingsKey = (typeof APP_SETTINGS_KEYS)[number]

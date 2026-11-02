@@ -777,6 +777,18 @@ SUITE=(
   # never :4319. Elevated project mode pre-filled red with its warning + sandbox prefill in the
   # new-session dialog; "Defaults…" opens, saves, and the next dialog follows; Clear removes.
   "chrome:project-defaults-probe.mjs"
+  # SANDBOX PROBE: true is latched, FALSE is not (re-probed after 30s, throttled), reset still
+  # forces a probe, and every failure is logged with status/signal/error/stderr — a timeout,
+  # a missing bwrap and an AppArmor denial now read differently. Fake bwrap scripts on PATH +
+  # an injected clock; ends with the real probe. Measured RED on a HEAD copy: 6 failed, 4 passed.
+  "none:sandbox-probe-retry-test.mts"
+  # STARRED FOLDERS IN NEW SESSIONS (server half): the boolean app setting validates, persists,
+  # drops a hand-edited non-boolean on load, resets to absent; and the server stays STAR-BLIND —
+  # a session created with no sandbox gets no star even with the setting on and a star saved,
+  # and sessionManager.ts still does not import sandboxDefaults. (The prefill itself is
+  # client-side: web/src/lib/newSessionSandbox.test.ts.) RED on a HEAD copy: 1 failed, 1 passed,
+  # then a crash (the HEAD server resolves @claudette/shared to the live tree's key list).
+  "none:starred-new-sessions-setting-test.mts"
   "none:iframe-output-adversarial-test.mts"
   "none:output-sanitizer-test.mts"
   # The chat meta-bar sandbox chip's folder picker. `none:` even though it needs jsdom: the

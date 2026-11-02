@@ -9,9 +9,9 @@ import { SandboxEditor } from './SandboxEditor'
 // wraps the shared SandboxEditor (toggle confinement + edit mounts); the same editor
 // also backs the full-height SandboxPanel in the right dock.
 
-type Effective = 'on' | 'off' | 'unavailable'
+export type Effective = 'on' | 'off' | 'unavailable'
 
-function effectiveState(session: SessionInfo, hostCanSandbox: boolean): Effective {
+export function effectiveState(session: SessionInfo, hostCanSandbox: boolean): Effective {
   if (!session.sandbox?.enabled) return 'off'
   // Enabled but not actually confined (host lacks bwrap/userns, or not relaunched yet).
   if (session.sandboxed) return 'on'
@@ -47,7 +47,7 @@ export function SandboxControl({ session }: { session: SessionInfo }) {
   const chip = {
     on:          { icon: '🔒', label: 'sandboxed',   cls: 'text-ctp-green',  title: 'Filesystem-isolated · network open. Claude can only write inside the mounts below.' },
     off:         { icon: '○',  label: 'unsandboxed', cls: 'text-ctp-overlay', title: 'No filesystem confinement — Claude can touch anything you can.' },
-    unavailable: { icon: '⚠',  label: 'sandbox n/a', cls: 'text-ctp-yellow', title: 'Sandbox requested but this host can’t confine — run scripts/enable-sandbox.sh. Running unconfined.' },
+    unavailable: { icon: '⚠',  label: 'unsandboxed', cls: 'text-ctp-yellow', title: 'Sandbox requested but this host can’t confine — run scripts/enable-sandbox.sh. Running unconfined.' },
   }[eff]
 
   return (

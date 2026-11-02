@@ -39,6 +39,7 @@ import { projectMenuItems } from './lib/projectMenu'
 import { slugify, isolatedUnavailableReason } from './lib/worktreeSession'
 import { cwdField } from './lib/defaultCwd'
 import { dialogPrefill, modeToSend, modeOptions } from './lib/projectDefaults'
+import { sandboxSeed } from './lib/newSessionSandbox'
 import { StateDot } from './components/StateDot'
 import type { SessionInfo, ActivePane, AgentInfo, SandboxConfig, SandboxMount, BashProcRecord, ProjectInfo, PermissionMode } from '@claudette/shared'
 import { isElevatedMode } from '@claudette/shared'
@@ -1623,13 +1624,14 @@ function NewSessionDialog({ onClose, onCreated, project }: { onClose: () => void
   // the user edits the field it follows whichever answer is current; after, it is theirs.
   const [typedCwd, setTypedCwd] = useState('')
   const [cwdEdited, setCwdEdited] = useState(false)
-  const [cwdDefaults, setCwdDefaults] = useState<{ defaultCwd?: string; missing?: boolean }>({})
+  const [cwdDefaults, setCwdDefaults] = useState<{ defaultCwd?: string; missing?: boolean; starsOn?: boolean }>({})
+  // Fetched for EVERY dialog: a project-locked one ignores defaultCwd (cwdField lets the project
+  // cwd win) but still needs starredFoldersInNewSessions for its sandbox seed.
   useEffect(() => {
-    if (project) return   // a project-locked dialog never consults the default folder
     let live = true
     api.http.appSettings()
-      .then((r) => { if (live) setCwdDefaults({ defaultCwd: r.settings?.defaultCwd, missing: r.defaultCwdMissing }) })
-      .catch(() => { /* no settings ⇒ $HOME, today's behaviour */ })
+      .then((r) => { if (live) setCwdDefaults({ defaultCwd: r.settings?.defaultCwd, missing: r.defaultCwdMissing, starsOn: r.settings?.starredFoldersInNewSessions }) })
+      .catch(() => { /* no settings ⇒ $HOME and no star seed, today's behaviour */ })
     return () => { live = false }
   }, [project])
   const cwdState = cwdField({ edited: cwdEdited, typed: typedCwd, projectCwd: project?.cwd, defaultCwd: cwdDefaults.defaultCwd, defaultCwdMissing: cwdDefaults.missing, homeDir })
@@ -1641,7 +1643,15 @@ function NewSessionDialog({ onClose, onCreated, project }: { onClose: () => void
   // default sandbox (enabled:false included), and a project dialog gets a mode select seeded
   // from its default mode — both VISIBLE, and editable, before Create.
   const prefill = dialogPrefill(project)
-  const [sb, setSb] = useState<SbState>(() => (prefill.sandbox && project ? sbFromConfig(prefill.sandbox, project.cwd) : defaultSb()))
+  // The sandbox picker's seed (lib/newSessionSandbox): project default > starred folders (when
+  // the setting is on; the cwd star left out) > built-in. DERIVED until the user edits the
+  // picker — the settings fetch and the star list both arrive asynchronously — then theirs.
+  const { sandboxDefaults: starred } = useSessions()
+  const seed = sandboxSeed({ starsOn: cwdDefaults.starsOn, starred, cwd, projectDefault: project ? prefill.sandbox : undefined })
+  const [sbEdited, setSbEdited] = useState<SbState | null>(null)
+  const sb: SbState = sbEdited ?? (seed.kind === 'project' ? sbFromConfig(seed.config, project!.cwd)
+    : seed.kind === 'stars' ? { ...defaultSb(), extra: seed.extra } : defaultSb())
+  const setSb = (v: SbState) => setSbEdited(v)
   const [mode, setMode] = useState<PermissionMode | undefined>(prefill.mode)
   const [modeTouched, setModeTouched] = useState(false)
   const [busy, setBusy] = useState(false)

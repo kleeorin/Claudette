@@ -242,6 +242,18 @@ export function SettingsPanel() {
         )}
       </Row>
 
+      <Row name="starredFoldersInNewSessions" label="Mount starred folders in new sessions" overrides={overrides}
+        note="Pre-ticks your starred sandbox folders (each in its saved mode) in the New session dialog, where you can still untick them before Create. Off: stars stay a one-click menu. Project defaults take precedence; teammates still inherit from their coordinator.">
+        {(locked) => (
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" data-testid="starred-in-new-sessions" disabled={locked || busy}
+              checked={settings.starredFoldersInNewSessions === true}
+              onChange={(e) => setOrClear('starredFoldersInNewSessions', e.target.checked ? true : undefined)} />
+            <span className="text-ctp-subtext">{settings.starredFoldersInNewSessions ? 'on' : 'off'}</span>
+          </label>
+        )}
+      </Row>
+
       <Row name="defaultCwd" label="Default folder for new sessions" overrides={overrides}
         note="Where the New session dialog starts. Empty means your home folder. Projects always use their own folder.">
         {(locked) => (

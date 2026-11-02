@@ -214,3 +214,22 @@ describe('SettingsPanel', () => {
     expect(document.body.textContent ?? '').not.toMatch(/Not in effect yet/i)
   })
 })
+
+describe('SettingsPanel — "Mount starred folders in new sessions"', () => {
+  const box = () => row('starredFoldersInNewSessions').querySelector('input[type="checkbox"]') as HTMLInputElement
+  it('is off when unset (today\'s behaviour), and ticking it SAVES true', async () => {
+    render(<SettingsPanel />)
+    await waitFor(() => expect(row('starredFoldersInNewSessions')).toBeTruthy())
+    expect(box().checked).toBe(false)
+    fireEvent.click(box())
+    await waitFor(() => expect(H.saved).toContainEqual({ starredFoldersInNewSessions: true }))
+  })
+  it('unticking it RESETS the key (absent = off) rather than saving false', async () => {
+    H.settings = { starredFoldersInNewSessions: true }
+    render(<SettingsPanel />)
+    await waitFor(() => expect(box()?.checked).toBe(true))
+    fireEvent.click(box())
+    await waitFor(() => expect(H.reset).toContain('starredFoldersInNewSessions'))
+    expect(H.saved.some((p) => 'starredFoldersInNewSessions' in p)).toBe(false)
+  })
+})
