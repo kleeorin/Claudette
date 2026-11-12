@@ -10,6 +10,7 @@ import { ChatView, SidebarUsage } from './components/ChatView'
 import { NotebookView } from './components/NotebookView'
 import { TerminalView } from './components/TerminalView'
 import { GitPanelView } from './components/GitPanelView'
+import { GitDiffTab, gitDiffKey, gitDiffLabel, type GitDiffSpec } from './components/GitDiffTab'
 import { FileManager } from './components/FileManager'
 import { KernelsPanel } from './components/KernelsPanel'
 import { PermissionsPanel } from './components/PermissionsPanel'
@@ -72,6 +73,8 @@ type Content =
   // `id` here is the Bash tool_use id — the registry's key, and a different namespace from
   // the agent tab's id, which is why this is its own arm rather than a flag on that one.
   | { kind: 'bashProc'; id: string; label: string }
+  // One git diff opened from the Git panel. Identity is gitDiffKey(spec).
+  | { kind: 'gitDiff'; spec: GitDiffSpec }
 // The set of content tabs + the focused one, tracked PER SESSION so panes travel
 // with the session you switch to.
 type Pane = { tabs: Content[]; active: Content | null }
@@ -431,6 +434,16 @@ function Shell() {
       active: { kind: 'file', path },
     }))
   }
+  // Open (or focus) the diff the Git panel is showing, as a content tab.
+  const openGitDiff = (spec: GitDiffSpec) => {
+    if (!activeId) return
+    const k = gitDiffKey(spec)
+    setPhonePane('content')
+    setPane(activeId, (p) => ({
+      tabs: p.tabs.some((t) => t.kind === 'gitDiff' && gitDiffKey(t.spec) === k) ? p.tabs : [...p.tabs, { kind: 'gitDiff', spec }],
+      active: { kind: 'gitDiff', spec },
+    }))
+  }
   // Focus an already-open notebook's tab (adding it if somehow absent) — used by the
   // Files dock's open-notebook and by the Kernels tab's notebook list.
   // `sid` is the session the user acted in, captured BEFORE any await by the caller: the open
@@ -491,6 +504,15 @@ function Shell() {
       setPane(activeId, (p) => {
         const tabs = p.tabs.filter((x) => !(x.kind === 'agent' && x.id === t.id))
         const nextActive = p.active?.kind === 'agent' && p.active.id === t.id ? (tabs[tabs.length - 1] ?? null) : p.active
+        return { tabs, active: nextActive }
+      })
+      return
+    }
+    if (t.kind === 'gitDiff') {
+      const k = gitDiffKey(t.spec)
+      setPane(activeId, (p) => {
+        const tabs = p.tabs.filter((x) => !(x.kind === 'gitDiff' && gitDiffKey(x.spec) === k))
+        const nextActive = p.active?.kind === 'gitDiff' && gitDiffKey(p.active.spec) === k ? (tabs[tabs.length - 1] ?? null) : p.active
         return { tabs, active: nextActive }
       })
       return
@@ -832,6 +854,9 @@ function Shell() {
         // registry they point into does not survive the engine, so a restored tab would
         // reliably open on "no longer in the registry" rather than occasionally.
         if (t.kind === 'bashProc') continue
+        // Git diff tabs are views of transient state (a commit or a pending change), opened
+        // from the panel in one click — not worth restoring.
+        if (t.kind === 'gitDiff') continue
         if (t.kind === 'file') { out.push({ kind: 'file', path: t.path }); continue }
         const path = nbPathById.get(t.id)
         if (!path) { pending = true; break }
@@ -861,6 +886,7 @@ function Shell() {
     }
     if (t.kind === 'agent') return { key: `a:${t.id}`, kind: 'agent', id: t.id, label: t.label, path: t.label, dirty: false }
     if (t.kind === 'bashProc') return { key: `bp:${t.id}`, kind: 'bashProc', id: t.id, label: t.label, path: t.label, dirty: false }
+    if (t.kind === 'gitDiff') return { key: gitDiffKey(t.spec), kind: 'gitDiff', id: gitDiffKey(t.spec), label: gitDiffLabel(t.spec), path: 'hash' in t.spec ? t.spec.subject : t.spec.path, dirty: false, spec: t.spec }
     return { key: `f:${t.path}`, kind: 'file', id: '', label: basename(t.path), path: t.path, dirty: false }
   })
 
@@ -898,7 +924,9 @@ function Shell() {
           ? <AgentDetail key={active.id} sessionId={activeId} agentId={active.id} />
           : active?.kind === 'bashProc' && activeId
             ? <BashProcDetail key={active.id} sessionId={activeId} toolId={active.id} />
-            : null}
+            : active?.kind === 'gitDiff'
+              ? <GitDiffTab key={gitDiffKey(active.spec)} spec={active.spec} />
+              : null}
     </>
   )
 
@@ -1144,7 +1172,7 @@ function Shell() {
                   </div>
                 </div>
               ) : dock === 'git' ? (
-                <GitPanelView key={termCwd} cwd={termCwd} onClose={() => setDock(null)} />
+                <GitPanelView key={termCwd} cwd={termCwd} onClose={() => setDock(null)} onOpenDiff={openGitDiff} />
               ) : !activeSession ? (
                 <div className="h-full flex items-center justify-center p-4 text-center text-xs text-ctp-overlay">
                   No session selected.
@@ -1209,13 +1237,14 @@ function CloseNotebookDialog({ target, onChoose }: {
   )
 }
 
-type Tab = { key: string; kind: 'notebook' | 'file' | 'agent' | 'bashProc'; id: string; label: string; path: string; dirty: boolean }
+type Tab = { key: string; kind: 'notebook' | 'file' | 'agent' | 'bashProc' | 'gitDiff'; id: string; label: string; path: string; dirty: boolean; spec?: GitDiffSpec }
 
 // A strip tab back to the pane entry it stands for.
 function tabToContent(t: Tab): Content {
   if (t.kind === 'notebook') return { kind: 'notebook', id: t.id }
   if (t.kind === 'agent') return { kind: 'agent', id: t.id, label: t.label }
   if (t.kind === 'bashProc') return { kind: 'bashProc', id: t.id, label: t.label }
+  if (t.kind === 'gitDiff' && t.spec) return { kind: 'gitDiff', spec: t.spec }
   return { kind: 'file', path: t.path }
 }
 
@@ -1251,6 +1280,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
     if (t.kind === 'notebook') return active.kind === 'notebook' && active.id === t.id
     if (t.kind === 'agent') return active.kind === 'agent' && active.id === t.id
     if (t.kind === 'bashProc') return active.kind === 'bashProc' && active.id === t.id
+    if (t.kind === 'gitDiff') return active.kind === 'gitDiff' && gitDiffKey(active.spec) === t.key
     return active.kind === 'file' && active.path === t.path
   }
   const toggle = (on: boolean) =>
@@ -1279,7 +1309,7 @@ function MainTabs({ tabs, active, onSelectChat, onSelectTab, onCloseTab, layout,
         )}
         {tabs.map((t) => (
           <span key={t.key} className={tab(isOn(t))}>
-            <span className={`shrink-0 ${t.kind === 'agent' ? 'text-ctp-mauve' : t.kind === 'bashProc' ? 'text-ctp-green' : ''}`}>{t.kind === 'notebook' ? '📓' : t.kind === 'agent' ? '◈' : t.kind === 'bashProc' ? '▶' : '📄'}</span>
+            <span className={`shrink-0 ${t.kind === 'agent' ? 'text-ctp-mauve' : t.kind === 'bashProc' ? 'text-ctp-green' : t.kind === 'gitDiff' ? 'text-ctp-peach' : ''}`}>{t.kind === 'notebook' ? '📓' : t.kind === 'agent' ? '◈' : t.kind === 'bashProc' ? '▶' : t.kind === 'gitDiff' ? '±' : '📄'}</span>
             <button onClick={() => onSelectTab(t)} className="truncate max-w-[150px]" title={t.path}>
               {t.label}{t.dirty && <span className="text-ctp-yellow"> ●</span>}
             </button>

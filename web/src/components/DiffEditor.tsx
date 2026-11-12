@@ -16,9 +16,12 @@ interface Props {
   proposed: string        // Claude's version (the "after"); the editable doc
   filename: string        // drives syntax colouring
   find: FindState         // shared with the file's own editor, so the query survives the flip
-  onDoc: (text: string) => void         // latest accepted text (proposed minus rejected hunks)
-  onAllResolved: (text: string) => void  // every hunk decided (accepted/rejected) → commit
+  onDoc?: (text: string) => void         // latest accepted text (proposed minus rejected hunks)
+  onAllResolved?: (text: string) => void  // every hunk decided (accepted/rejected) → commit
   scrollKey?: string      // remembers where you were when this diff reopens
+  // View-only (the git diff tab): no Accept/Reject controls and no editing. There is no
+  // decision to make there — the change is already on disk / in the index.
+  readOnly?: boolean
 }
 
 // A CodeMirror unified-merge view: renders Claude's proposed change as inline +/-
@@ -29,7 +32,7 @@ interface Props {
 // CodeEditor so the diff looks like the rest of the app.
 const NO_MATCHES: Match[] = []
 
-export function DiffEditor({ original, proposed, filename, find, onDoc, onAllResolved, scrollKey }: Props) {
+export function DiffEditor({ original, proposed, filename, find, onDoc, onAllResolved, scrollKey, readOnly = false }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
   // Reviewing a long diff and switching session used to drop you back at the top: this had
   // the same scroller shape as CodeEditor and simply was never wired. Same host div, same
@@ -73,10 +76,11 @@ export function DiffEditor({ original, proposed, filename, find, onDoc, onAllRes
             { key: 'Escape', run: () => { if (!findRef.current.open) return false; findRef.current.closeFind(); return true } },
           ])),
           // original = disk text; per-hunk Accept/Reject; strike-through deletions.
-          unifiedMergeView({ original, mergeControls: true, gutter: true, syntaxHighlightDeletions: true }),
+          unifiedMergeView({ original, mergeControls: !readOnly, gutter: true, syntaxHighlightDeletions: true }),
+          ...(readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
           EditorView.updateListener.of((u) => {
             if (u.docChanged) {
-              cbRef.current.onDoc(u.state.doc.toString())
+              cbRef.current.onDoc?.(u.state.doc.toString())
               // Accepting/rejecting a hunk rewrites the doc — re-search against it.
               if (findRef.current.open) setDoc(u.state.doc.toString())
             }
@@ -85,7 +89,7 @@ export function DiffEditor({ original, proposed, filename, find, onDoc, onAllRes
             if (n && n > 0) sawChunks = true
             if (n === 0 && sawChunks && !done) {
               done = true
-              cbRef.current.onAllResolved(u.state.doc.toString())
+              cbRef.current.onAllResolved?.(u.state.doc.toString())
             }
           }),
           EditorView.lineWrapping,
@@ -96,7 +100,7 @@ export function DiffEditor({ original, proposed, filename, find, onDoc, onAllRes
     viewRef.current = view
     // Report the initial (all-hunks-accepted) text once; seed sawChunks from the
     // initial diff so a single-hunk change auto-commits on its first decision.
-    cbRef.current.onDoc(view.state.doc.toString())
+    cbRef.current.onDoc?.(view.state.doc.toString())
     const init = getChunks(view.state)
     if (init && init.chunks.length > 0) sawChunks = true
     // Open ON the change rather than at line 1: an edit deep in a long file would

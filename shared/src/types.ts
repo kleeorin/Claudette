@@ -554,6 +554,8 @@ export type GitStatus =
   | { repo: 'error'; error: string }
 
 export type GitDiff = { ok: true; diff: string } | { ok: false; error: string }
+// Both full texts of one file, for a merge view. `binary` → both sides are ''.
+export type GitSides = { ok: true; original: string; modified: string; binary?: boolean } | { ok: false; error: string }
 export type GitResult = { ok: true } | { ok: false; error: string }
 
 export interface GitCommit {

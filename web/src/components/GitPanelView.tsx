@@ -3,18 +3,20 @@ import type { GitStatus, GitFileStatus, GitCommit } from '@claudette/shared'
 import { api } from '../api/client'
 import { DockShell } from './DockShell'
 import { useScrollMemory } from '../lib/scrollMemory'
+import type { GitDiffSpec } from './GitDiffTab'
 
 // Git panel (Phase 2). Ported from ClaudeMaster's GitPanelView, adapted to
 // Claudette's tab model: it's a full main-area view keyed to the active session's
 // cwd (git runs there), and its "close" returns to Chat rather than closing a
-// right-side dock. The CM "open diff in an editor tab" affordance is dropped until
-// a virtual file pane exists — the diff renders inline here.
+// right-side dock. The diff renders inline here; clicking it opens the same diff in
+// a full content tab (GitDiffTab).
 
 type Mode = 'changes' | 'log'
 
 interface Props {
   cwd: string       // session root — git commands run here
   onClose: () => void
+  onOpenDiff?: (spec: GitDiffSpec) => void  // open the selected diff in a content tab
 }
 
 // A selected file plus which side (staged/unstaged) its diff should show.
@@ -71,7 +73,7 @@ function FileRow({
   )
 }
 
-export function GitPanelView({ cwd, onClose }: Props) {
+export function GitPanelView({ cwd, onClose, onOpenDiff }: Props) {
   const [mode, setMode] = useState<Mode>('changes')
   const [status, setStatus] = useState<GitStatus | null>(null)
   const [selected, setSelected] = useState<Selected | null>(null)
@@ -196,6 +198,19 @@ export function GitPanelView({ cwd, onClose }: Props) {
     })
     return () => { cancelled = true }
   }, [selected, selectedCommit, staged, unstaged, cwd])
+
+  // Open what the diff pane is showing in a full content tab. A click that ends a text
+  // selection is a copy, not a request — leave it alone.
+  const openDiff = () => {
+    if (!onOpenDiff || window.getSelection()?.toString()) return
+    if (selectedCommit) {
+      const c = commits.find((x) => x.hash === selectedCommit)
+      onOpenDiff({ cwd, hash: selectedCommit, subject: c?.subject ?? '' })
+    } else if (selected) {
+      const f = (selected.staged ? staged : unstaged).find((x) => x.path === selected.path)
+      if (f) onOpenDiff({ cwd, path: f.path, staged: selected.staged, untracked: f.untracked, orig: f.orig })
+    }
+  }
 
   // Returns whether the operation SUCCEEDED, so callers with follow-up state (the
   // commit box) can tell "git said no" apart from "the call returned".
@@ -521,7 +536,12 @@ export function GitPanelView({ cwd, onClose }: Props) {
       {/* Diff (shared by both tabs) */}
       <div className="flex-1 min-h-0 flex flex-col bg-ctp-base">
         {selected || selectedCommit ? (
-          <div ref={diffRef} className="flex-1 min-h-0 overflow-auto">
+          <div
+            ref={diffRef}
+            onClick={openDiff}
+            title={onOpenDiff ? 'Click to open in a tab' : undefined}
+            className={`flex-1 min-h-0 overflow-auto ${onOpenDiff ? 'cursor-pointer hover:bg-ctp-surface0/30' : ''}`}
+          >
             <DiffView text={diff} />
           </div>
         ) : (
@@ -601,7 +621,7 @@ function Empty({ children }: { children: React.ReactNode }) {
 
 // Minimal unified-diff colouring. Hunk headers and +/- lines get tinted; the rest
 // renders as context.
-function DiffView({ text }: { text: string }) {
+export function DiffView({ text }: { text: string }) {
   if (!text.trim()) return <div className="h-full flex items-center justify-center text-xs text-ctp-overlay">No textual diff</div>
   const lines = text.split('\n')
   return (

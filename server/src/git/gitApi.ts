@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import type { GitStatus, GitDiff, GitLog, GitBranches, GitResult } from '@claudette/shared'
+import type { GitStatus, GitDiff, GitSides, GitLog, GitBranches, GitResult } from '@claudette/shared'
 import * as git from './gitManager'
 
 // HTTP surface for the Git panel. Reads are GET (cwd + params in the query);
@@ -21,6 +21,16 @@ export function registerGitRoutes(app: FastifyInstance): void {
       const { cwd, file } = req.query
       if (!cwd?.trim() || !file) return { ok: false, error: 'cwd and file are required' }
       return git.diff(cwd, file, req.query.staged === '1', req.query.untracked === '1')
+    },
+  )
+
+  // Both full texts of one file for the merge view. `orig` = a rename's source path.
+  app.get<{ Querystring: { cwd?: string; file?: string; orig?: string; staged?: string; untracked?: string } }>(
+    '/api/git/sides',
+    async (req): Promise<GitSides> => {
+      const { cwd, file, orig } = req.query
+      if (!cwd?.trim() || !file) return { ok: false, error: 'cwd and file are required' }
+      return git.sides(cwd, file, req.query.staged === '1', req.query.untracked === '1', orig || undefined)
     },
   )
 

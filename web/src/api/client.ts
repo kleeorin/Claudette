@@ -10,7 +10,7 @@ import type {
   RewindPoint, RewindMode, RewindPreview, RewindPointsResponse, RewindPreviewResponse, RewindResponse,
   TaskRecord, BashProcRecord, BashProcOutputResponse,
   FsListResponse, FilePreview, WriteResult,
-  GitStatus, GitDiff, GitLog, GitBranches, GitResult,
+  GitStatus, GitDiff, GitSides, GitLog, GitBranches, GitResult,
   ActivePane, KernelSpecsResponse, SandboxConfig, SandboxDefaultFolder, SandboxDefaultsResponse,
   AgentInfo, ListAgentsResponse,
   EffectivePermissions, PermissionScope, PermissionAction, PermissionsResponse,
@@ -624,6 +624,11 @@ export const api = {
       get<GitStatus>(`/api/git/status?cwd=${encodeURIComponent(cwd)}`),
     diff: (cwd: string, file: string, staged: boolean, untracked: boolean): Promise<GitDiff> =>
       get<GitDiff>(`/api/git/diff?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}&staged=${staged ? 1 : 0}&untracked=${untracked ? 1 : 0}`),
+    // Both full texts of one changed file (the merge-view tab): index→worktree when
+    // unstaged, HEAD→index when staged.
+    // `orig` = a rename's source path, used for the original side when `file` isn't there.
+    sides: (cwd: string, file: string, staged: boolean, untracked: boolean, orig?: string): Promise<GitSides> =>
+      get<GitSides>(`/api/git/sides?cwd=${encodeURIComponent(cwd)}&file=${encodeURIComponent(file)}&staged=${staged ? 1 : 0}&untracked=${untracked ? 1 : 0}${orig ? `&orig=${encodeURIComponent(orig)}` : ''}`),
     log: (cwd: string, limit = 100): Promise<GitLog> =>
       get<GitLog>(`/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=${limit}`),
     show: (cwd: string, hash: string): Promise<GitDiff> =>

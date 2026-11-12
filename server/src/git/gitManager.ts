@@ -1,5 +1,7 @@
 import { execFile } from 'child_process'
-import type { GitStatus, GitFileStatus, GitDiff, GitResult, GitLog, GitBranches } from '@claudette/shared'
+import { lstat, readFile, readlink } from 'fs/promises'
+import { isAbsolute, relative, resolve } from 'path'
+import type { GitStatus, GitFileStatus, GitDiff, GitSides, GitResult, GitLog, GitBranches } from '@claudette/shared'
 import { errMessage } from '../util/errMessage'
 
 // Local git operations for the Git panel (Phase 2). Ported from ClaudeMaster's
@@ -97,12 +99,20 @@ export async function status(dir: string): Promise<GitStatus> {
   }
 }
 
+// Status paths (porcelain) are relative to the REPO ROOT whatever the cwd, so every
+// op that takes one runs against the toplevel — from a subdirectory cwd, `-- <file>`
+// would otherwise resolve against the subdirectory and match nothing.
+async function toplevel(dir: string): Promise<string> {
+  return (await git(dir, ['rev-parse', '--show-toplevel'])).trim()
+}
+
 export async function diff(dir: string, file: string, staged: boolean, untracked: boolean): Promise<GitDiff> {
   try {
+    const top = await toplevel(dir)
     // Untracked files have no git-tracked counterpart; diff against /dev/null so
     // the whole file shows as added. --no-index exits 1 with the diff on stdout.
     if (untracked && !staged) {
-      const out = await git(dir, ['diff', '--no-index', '--', '/dev/null', file]).catch((e: Error) => {
+      const out = await git(top, ['diff', '--no-index', '--', '/dev/null', file]).catch((e: Error) => {
         const out = (e as Error & { stdout?: string }).stdout
         if (typeof out === 'string') return out
         return e.message
@@ -110,19 +120,94 @@ export async function diff(dir: string, file: string, staged: boolean, untracked
       return { ok: true, diff: out }
     }
     const args = ['diff', ...(staged ? ['--cached'] : []), '--', file]
-    return { ok: true, diff: await git(dir, args) }
+    return { ok: true, diff: await git(top, args) }
+  } catch (err) {
+    return { ok: false, error: errMessage(err) }
+  }
+}
+
+// --- Full sides (for the merge view) ---------------------------------------
+// `file` is a status-list path, which porcelain reports relative to the REPO ROOT
+// regardless of cwd — so blobs use root-anchored specs (`:0:<path>`, `HEAD:<path>`)
+// and the worktree read resolves against --show-toplevel, never against `dir`.
+
+const SIDES_CAP = 5 * 1024 * 1024
+const BINARY_PROBE = 8192
+const TOO_LARGE = 'file too large for diff view'
+
+// Like git(), but raw bytes — blob content must not be utf8-decoded before the
+// binary check.
+async function gitBuf(dir: string, args: string[]): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-C', dir, ...args], { maxBuffer: MAX_BUFFER, encoding: 'buffer' }, (err, stdout, stderr) => {
+      if (err) reject(wrap((stderr.toString() || err.message).trim(), (err as { code?: number | string }).code, ''))
+      else resolve(stdout)
+    })
+  })
+}
+
+// A blob's bytes, or null when `spec` names nothing (not in the index, no HEAD yet).
+async function blob(dir: string, spec: string): Promise<Buffer | null> {
+  let sha: string
+  try { sha = (await git(dir, ['rev-parse', '--verify', '--quiet', spec])).trim() } catch { return null }
+  if (!sha) return null
+  if (Number((await git(dir, ['cat-file', '-s', sha])).trim()) > SIDES_CAP) throw new Error(TOO_LARGE)
+  return gitBuf(dir, ['cat-file', 'blob', sha])
+}
+
+// The worktree file's bytes, or null if it's gone. A symlink yields its target
+// string, which is what git stores as the blob.
+async function worktreeFile(top: string, file: string): Promise<Buffer | null> {
+  const abs = resolve(top, file)
+  const rel = relative(top, abs)
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error('path is outside the repository')
+  const st = await lstat(abs).catch((e: NodeJS.ErrnoException) => {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return null
+    throw e
+  })
+  if (!st) return null
+  if (st.isSymbolicLink()) return Buffer.from(await readlink(abs))
+  if (!st.isFile()) throw new Error('not a regular file')
+  if (st.size > SIDES_CAP) throw new Error(TOO_LARGE)
+  return readFile(abs)
+}
+
+const isBinary = (b: Buffer | null) => !!b && b.subarray(0, BINARY_PROBE).includes(0)
+
+// Both full texts of `file`. Unstaged: index → worktree. Staged: HEAD → index.
+// Untracked: '' → worktree. `orig` (a rename's source path) is the fallback for
+// the original side when `file` itself isn't there.
+export async function sides(dir: string, file: string, staged: boolean, untracked: boolean, orig?: string): Promise<GitSides> {
+  try {
+    const top = await toplevel(dir)
+    const before = async (rev: string) =>
+      (await blob(top, `${rev}:${file}`)) ?? (orig ? await blob(top, `${rev}:${orig}`) : null)
+    let original: Buffer | null
+    let modified: Buffer | null
+    if (untracked && !staged) {
+      original = null
+      modified = await worktreeFile(top, file)
+    } else if (staged) {
+      original = await before('HEAD')
+      modified = await blob(top, `:0:${file}`)
+    } else {
+      original = await before(':0')
+      modified = await worktreeFile(top, file)
+    }
+    if (isBinary(original) || isBinary(modified)) return { ok: true, original: '', modified: '', binary: true }
+    return { ok: true, original: original?.toString('utf8') ?? '', modified: modified?.toString('utf8') ?? '' }
   } catch (err) {
     return { ok: false, error: errMessage(err) }
   }
 }
 
 export async function stage(dir: string, file: string): Promise<GitResult> {
-  try { await git(dir, ['add', '--', file]); return { ok: true } }
+  try { await git(await toplevel(dir), ['add', '--', file]); return { ok: true } }
   catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
 export async function unstage(dir: string, file: string): Promise<GitResult> {
-  try { await git(dir, ['reset', '-q', 'HEAD', '--', file]); return { ok: true } }
+  try { await git(await toplevel(dir), ['reset', '-q', 'HEAD', '--', file]); return { ok: true } }
   catch (err) { return { ok: false, error: errMessage(err) } }
 }
 
