@@ -1517,17 +1517,29 @@ export class SessionManager extends EventEmitter {
   // already seen their own optimistic echo. So the send must wait rather than race.
   //
   // Bounded, and it gives up rather than hanging: if the relaunch never completes we fall
-  // through and let sendUserTurn fail honestly, which surfaces as sendFailed. Polling rather
-  // than awaiting an event because `alive` is the property the send actually guards on — the
-  // same value, read the same way, instead of a second signal that could disagree with it.
+  // through and let sendUserTurn fail honestly, which surfaces as sendFailed.
   async applyModelForTurn(id: string): Promise<void> {
     if (!this.modelPending(id)) return
     this.relaunchApply(id)
-    const deadline = Date.now() + 15_000
-    while (Date.now() < deadline) {
+    await this.whenReady(id)
+  }
+
+  // Resolve true once session `id` can take a turn — exactly sendUserTurn's guard (engine
+  // up and alive, not mid-replace, not closing) — or false on timeout / the session dying.
+  // For callers of the fire-and-forget restarts (resumeInto, restartFresh, relaunchApply),
+  // whose new engine only appears later, on the old one's exit event.
+  //
+  // Polling rather than awaiting an event because `alive` is the property the send actually
+  // guards on — the same value, read the same way, instead of a second signal that could
+  // disagree with it.
+  async whenReady(id: string, timeoutMs = 15_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
       const s = this.sessions.get(id)
-      if (!s) return                                   // session went away; the send will fail
-      if (s.engine?.alive && !s.replacing && !s.closing) return
+      if (!s) return false                              // destroyed / cleaned up
+      if (s.engine?.alive && !s.replacing && !s.closing) return true
+      if (!s.engine && !s.replacing) return false        // relaunch failed fast → 'exited'
+      if (Date.now() >= deadline) return false
       await new Promise((r) => setTimeout(r, 50))
     }
   }

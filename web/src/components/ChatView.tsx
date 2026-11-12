@@ -7,7 +7,8 @@ import { ToolDetail, toolHeadline, toolArg, truncate } from '../lib/toolFormat'
 import { prettyPath, isNotebookPath } from '../lib/paths'
 import { Markdown } from './Markdown'
 import { ResumePicker } from './ResumePicker'
-import { RewindPicker } from './RewindPicker'
+import { RewindPicker, EditRewindDialog } from './RewindPicker'
+import { nothingToRestore } from '../lib/rewindPreview'
 import { SandboxControl } from './SandboxControl'
 import { FileIcon, fileKind } from './FileIcon'
 import { BypassConfirmDialog } from './BypassConfirmDialog'
@@ -138,6 +139,19 @@ export function ChatView({ sessionId, visible = true }: {
   }, [draft, sessionId])
   useEffect(() => () => saveDraft(sessionId, draftRef.current), [sessionId])
 
+  // Only your LAST message is editable (see editLast below). Not an undelivered one: it
+  // never reached Claude, so there is nothing to rewind — it already says to copy and resend.
+  const lastUserId = useMemo(() => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i]
+      if (it.kind === 'user') return it.undelivered ? null : it.id
+    }
+    return null
+  }, [items])
+  // Stable identity for the memoized Item; the ref always holds the current editLast.
+  const editRef = useRef<(text: string) => Promise<string | null>>(async () => null)
+  const onEdit = useCallback((text: string) => editRef.current(text), [])
+
   // The rendered transcript, memoized on `items` so composer keystrokes (which
   // re-render ChatView via `draft`) don't re-filter and re-build the whole list.
   const rendered = useMemo(() => {
@@ -163,10 +177,10 @@ export function ChatView({ sessionId, visible = true }: {
       // moment the user's own bubble rendered and could not fail. A transcript with no
       // role marker forces every browser harness into that kind of proxy.
       <div key={it.id} data-kind={it.kind} className={gapClass(it, shown[i - 1])}>
-        <Item item={it} />
+        <Item item={it} onEdit={it.id === lastUserId ? onEdit : undefined} />
       </div>
     ))
-  }, [items])
+  }, [items, lastUserId, onEdit])
   // Restored on mount (see Nav): a session switch mid-recall comes back exactly where
   // you left off, with the text you'd been writing still one Down away.
   const nav0 = useRef<Nav>(loadNav(sessionId))
@@ -410,18 +424,33 @@ export function ChatView({ sessionId, visible = true }: {
     // Mark as auto-resumed FIRST: emptying the transcript below is exactly the
     // auto-resume trigger, so without this the once-per-load effect would race in and
     // re-pull the old conversation — the "/clear did nothing, had to do it twice" bug.
-    if (t === '/clear') { autoResumed.add(sessionId); resumeAborted.add(sessionId); clearTranscript(sessionId); void api.http.restartFresh(sessionId); return true }
+    if (t === '/clear') {
+      autoResumed.add(sessionId); resumeAborted.add(sessionId); clearTranscript(sessionId)
+      // The route answers once the fresh claude can take a turn; a message sent before
+      // then would be dropped as undelivered, so submit holds it until this settles.
+      const p = api.http.restartFresh(sessionId).catch(() => null).finally(() => { if (restartRef.current === p) restartRef.current = null })
+      restartRef.current = p
+      return true
+    }
     if (t === '/resume') { setShowResume(true); return true }
     if (t === '/rewind') { setShowRewind(true); return true }
     return false
   }
 
+  const restartRef = useRef<Promise<unknown> | null>(null)   // an in-flight /clear restart
   const submit = () => {
     const t = draft.trim()
     if (!t) return
     pushHistory(draft)   // remember it for Up/Down recall (including slash commands, shell-style)
     resetNav()           // sent — back to a blank level 0, with no half-written levels left behind
     if (handleSlash(t)) { setDraft(''); return }
+    const restarting = restartRef.current
+    if (restarting) {
+      const text = draft
+      setDraft('')
+      void restarting.then(() => { sendTurn(sessionId, text); markBusy(sessionId) })
+      return
+    }
     sendTurn(sessionId, draft)
     markBusy(sessionId)   // show Working…/interrupt immediately, before the WS round-trip
     setDraft('')
@@ -444,11 +473,16 @@ export function ChatView({ sessionId, visible = true }: {
   // match the engine's new context. The next turn continues from that point.
   // Resolves to an error for the picker to show (it stays open), or null on success — a
   // failed restore that just closed the dialog was indistinguishable from a no-op.
-  const pickRewind = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean): Promise<string | null> => {
-    if (!session) return 'no session'
+  //
+  // Shared by /rewind and by editing your last message; resolves to an error, or whether
+  // the conversation moved (forked or cleared) as opposed to a code-only restore.
+  // A failure can come AFTER the conversation moved (claude did not restart in time): the
+  // fork/clear happened, so the pane is still synced to it and `moved` says so.
+  const rewindTo = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean): Promise<{ error: string; moved: boolean } | { moved: boolean }> => {
+    if (!session) return { error: 'no session', moved: false }
     const res = await api.http.rewind(sessionId, point.uuid, mode, deleteNewer)
-    if (!res.ok) return res.error || 'rewind failed'   // point vanished or restore failed — leave the pane as-is
-    setShowRewind(false)
+    // Point vanished or restore failed before anything moved — leave the pane as-is.
+    if (!res.ok && !res.newId && !res.cleared) return { error: res.error || 'rewind failed', moved: false }
     if (res.newId) {
       autoResumed.add(sessionId); resumeAborted.add(sessionId)   // explicit rewind — supersede any in-flight auto-resume
       clearTranscript(sessionId)
@@ -459,11 +493,66 @@ export function ChatView({ sessionId, visible = true }: {
       autoResumed.add(sessionId); resumeAborted.add(sessionId)
       clearTranscript(sessionId)
     }
+    const moved = !!(res.newId || res.cleared)
+    return res.ok ? { moved } : { error: res.error || 'rewind failed', moved }
+  }
+  const pickRewind = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean): Promise<string | null> => {
+    const r = await rewindTo(point, mode, deleteNewer)
+    if ('error' in r && !r.moved) return r.error
+    setShowRewind(false)
     // The conversation moved (forked or cleared) → drop the rewound-to prompt back into
     // the composer so it can be edited and re-sent, like Claude Code's /rewind. Code-only
     // rewinds leave the turn in the transcript, so don't duplicate it into the draft.
-    if (res.newId || res.cleared) { setDraft(point.text); caretToEnd() }
+    if (r.moved) { setDraft(point.text); caretToEnd() }
     return null
+  }
+
+  // Edit your last message = rewind to just before it, then send the new text. The
+  // rewind route returns only once the relaunched engine can take a turn, so the send
+  // that follows lands rather than being marked undelivered.
+  const stateRef = useRef(state)
+  stateRef.current = state
+  const [editAsk, setEditAsk] = useState<{ point: RewindPoint; text: string; settle: (r: string | null) => void } | null>(null)
+  const resend = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean, text: string): Promise<string | null> => {
+    const r = await rewindTo(point, mode, deleteNewer)
+    if ('error' in r) {
+      if (!r.moved) return r.error
+      // Rewound, but claude is not back yet: sending now would be dropped, and the bubble
+      // holding the edit is gone with the old conversation. Park the text in the composer.
+      setDraft(text); caretToEnd()
+      return null
+    }
+    sendTurn(sessionId, text)
+    pushHistory(text)
+    return null
+  }
+  editRef.current = async (text: string): Promise<string | null> => {
+    const original = itemsRef.current.find((it) => it.kind === 'user' && it.id === lastUserId)
+    if (original?.kind !== 'user') return 'that message is no longer the last one'
+    const t = text.trim()
+    if (!t || t === original.text.trim()) return null
+    // Stop a reply in flight first, so nothing more lands in the conversation being
+    // abandoned. The rewind restarts claude regardless, so a slow interrupt only waits.
+    if (stateRef.current === 'running' || stateRef.current === 'waiting') {
+      interrupt(sessionId)
+      const until = Date.now() + 10_000
+      while ((stateRef.current === 'running' || stateRef.current === 'waiting') && Date.now() < until) {
+        await new Promise((res) => setTimeout(res, 100))
+      }
+    }
+    // Chat bubbles carry client ids; rewind points carry the stored message uuid. Match
+    // on text, newest first — the newest point is not necessarily yours (a teammate's
+    // message is a user turn in the stored conversation too).
+    const points = await api.http.rewindPoints(sessionId).catch(() => [] as RewindPoint[])
+    const point = [...points].reverse().find((p) => p.text === original.text.trim())
+    if (!point) return "this message isn't in the saved conversation yet — try again in a moment"
+    // Files this session changed since → ask chat only vs chat + code (same dialog as
+    // /rewind). Nothing to restore → no question, just resend.
+    const preview = point.hasSnapshot ? await api.http.rewindPreview(sessionId, point.uuid).catch(() => null) : null
+    if (preview && !nothingToRestore(preview)) {
+      return new Promise((settle) => setEditAsk({ point, text: t, settle }))
+    }
+    return resend(point, 'conversation', false, t)
   }
 
   if (!session) {
@@ -478,6 +567,19 @@ export function ChatView({ sessionId, visible = true }: {
     <div className="relative flex flex-col h-full bg-ctp-base text-ctp-text">
       {showResume && <ResumePicker cwd={session.cwd} onPick={pickResume} onClose={() => setShowResume(false)} />}
       {showRewind && <RewindPicker sessionId={sessionId} onPick={pickRewind} onClose={() => setShowRewind(false)} />}
+      {editAsk && (
+        <EditRewindDialog
+          sessionId={sessionId}
+          point={editAsk.point}
+          onConfirm={async (mode, deleteNewer) => {
+            const err = await resend(editAsk.point, mode, deleteNewer, editAsk.text)
+            if (!err) { editAsk.settle(null); setEditAsk(null) }
+            return err
+          }}
+          // Cancelled: the bubble stays in edit mode with your text, nothing has moved.
+          onClose={() => { editAsk.settle(EDIT_CANCELLED); setEditAsk(null) }}
+        />
+      )}
       <MetaBar
         meta={meta}
         session={session}
@@ -745,12 +847,90 @@ function gapClass(it: TranscriptItem, prev?: TranscriptItem): string {
   }
 }
 
+// editLast's answer when the restore dialog was dismissed: not an error to show, and
+// the bubble stays in edit mode with the text as typed.
+export const EDIT_CANCELLED = '\u0000cancelled'
+
+// Your last message, with a pencil that turns it into a text box. Submitting rewinds the
+// conversation to just before it and sends the new text (ChatView.editLast). The pencil
+// shows on hover with a mouse and stays faintly visible on touch screens, where there is
+// no hover — a tap-the-bubble gesture would fight with selecting its text to copy.
+export function EditableUserBubble({ text, onEdit }: { text: string; onEdit: (text: string) => Promise<string | null> }) {
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState(text)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const taRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    if (!editing) return
+    const ta = taRef.current
+    if (ta) { ta.focus(); ta.selectionStart = ta.selectionEnd = ta.value.length }
+  }, [editing])
+  const cancel = () => { setEditing(false); setValue(text); setErr(null) }
+  const submit = async () => {
+    if (busy) return
+    setBusy(true); setErr(null)
+    const r = await onEdit(value)
+    setBusy(false)
+    if (r === null) setEditing(false)
+    else if (r !== EDIT_CANCELLED) setErr(r)
+  }
+  if (!editing) {
+    return (
+      <div className="group flex justify-end items-start gap-1.5 animate-fade-in">
+        <button
+          onClick={() => { setValue(text); setEditing(true) }}
+          title="Edit — rewinds to before this message and sends your new version"
+          aria-label="Edit message"
+          className="mt-1.5 shrink-0 w-6 h-6 flex items-center justify-center rounded text-ctp-overlay hover:text-ctp-text hover:bg-ctp-surface0 opacity-0 group-hover:opacity-100 focus:opacity-100 [@media(hover:none)]:opacity-60 transition-opacity"
+        >
+          <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round"><path d="M10.5 2.5l3 3L6 13H3v-3z" /></svg>
+        </button>
+        <div className="max-w-[85%] rounded-2xl rounded-br-md bg-ctp-accent/12 border border-ctp-accent/25 px-3.5 py-2 whitespace-pre-wrap text-ctp-text">
+          {text}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="flex justify-end animate-fade-in">
+      <div className="w-[85%] rounded-2xl rounded-br-md bg-ctp-accent/12 border border-ctp-accent/50 px-3 py-2">
+        <textarea
+          ref={taRef}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel() }
+            else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void submit() }
+          }}
+          disabled={busy}
+          rows={Math.min(12, value.split('\n').length + 1)}
+          className="w-full resize-none bg-transparent outline-none text-ctp-text text-[13px] leading-relaxed"
+        />
+        {err && <div className="mt-1 text-[11px] text-ctp-red">⚠ {err}</div>}
+        <div className="mt-1.5 flex items-center justify-end gap-2">
+          <span className="mr-auto text-[10px] text-ctp-overlay">Rewinds to before this message and sends the new version</span>
+          <button onClick={cancel} disabled={busy} className="px-2.5 py-1 text-xs text-ctp-subtext hover:text-ctp-text disabled:opacity-40">Cancel</button>
+          <button
+            onClick={() => void submit()}
+            disabled={busy || !value.trim() || value.trim() === text.trim()}
+            className="px-2.5 py-1 text-xs rounded-md bg-ctp-accent/90 text-ctp-crust font-medium hover:bg-ctp-accent disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {busy ? 'Sending…' : 'Send'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // Memoized: the reducer preserves object identity for every settled item, so a
 // streaming token (which only replaces the one growing item) re-renders that item
 // alone instead of the whole transcript.
-const Item = memo(function Item({ item }: { item: TranscriptItem }) {
+const Item = memo(function Item({ item, onEdit }: { item: TranscriptItem; onEdit?: (text: string) => Promise<string | null> }) {
   switch (item.kind) {
     case 'user':
+      if (onEdit) return <EditableUserBubble text={item.text} onEdit={onEdit} />
       // `undelivered` = the server told us this turn never reached a live claude process
       // (session:sendFailed). The bubble is appended optimistically the moment you hit
       // send, so WITHOUT this it keeps the ordinary accent styling and reads as delivered

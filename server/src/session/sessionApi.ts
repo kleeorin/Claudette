@@ -300,9 +300,10 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
     removeRule(req.body.cwd, req.body.scope, req.body.action, req.body.value))
 
   // /clear — restart the session on a brand-new conversation (fresh --session-id).
+  // Resolves once the fresh engine can take a turn (false on timeout) — see /rewind.
   app.post<{ Body: SessionIdRequest }>('/api/session/restartFresh', async (req): Promise<OkResponse> => {
     sessions.restartFresh(req.body.id)
-    return { ok: true }
+    return { ok: await sessions.whenReady(req.body.id) }
   })
 
   // /resume — rebind the session's engine to a past conversation (--resume <id>).
@@ -385,6 +386,13 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
       } else {
         newId = fork.newId
         sessions.resumeInto(id, newId)
+      }
+      // Answer only once the relaunched engine can take a turn: the restart is fire-and-forget,
+      // and a send that follows this response (edit-last-message) would otherwise land in the
+      // `replacing` window and be rejected as undelivered.
+      if (!(await sessions.whenReady(id))) {
+        const done = cleared ? 'The conversation was cleared' : 'The conversation was rewound (forked)'
+        return { ok: false, error: `${done}, but Claude did not restart in time`, newId, cleared, reverted, deleted }
       }
     }
     return { ok: true, newId, cleared, reverted, deleted }

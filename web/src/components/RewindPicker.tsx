@@ -86,15 +86,42 @@ export function RewindPicker({
   )
 }
 
+// Editing your last message (ChatView) rewinds to just before it and resends. When this
+// session has changed files since, it asks the same question as step 2 below — chat only,
+// or chat + code — so it reuses that step in edit mode, standalone in its own overlay.
+export function EditRewindDialog({
+  sessionId, point, onConfirm, onClose,
+}: {
+  sessionId: string
+  point: RewindPoint
+  onConfirm: (mode: RewindMode, deleteNewer: boolean) => Promise<string | null>
+  onClose: () => void
+}) {
+  useEscape(onClose)
+  return (
+    <div className="absolute inset-0 z-30 flex items-start justify-center pt-16 bg-ctp-crust/60" onClick={onClose}>
+      <div
+        className="w-[min(640px,90%)] max-h-[70%] flex flex-col rounded-lg border border-ctp-surface1 bg-ctp-mantle shadow-pop overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <RewindConfirm sessionId={sessionId} point={point} onBack={onClose} onConfirm={onConfirm} editing />
+      </div>
+    </div>
+  )
+}
+
 // Step 2: choose what to restore for the selected turn, with a live preview + confirm
-// when code is involved.
+// when code is involved. `editing` = reached from editing a message rather than /rewind:
+// a code-only restore makes no sense there (the chat must move to resend), so it is not
+// offered, and the labels say what actually happens.
 function RewindConfirm({
-  sessionId, point, onBack, onConfirm,
+  sessionId, point, onBack, onConfirm, editing = false,
 }: {
   sessionId: string
   point: RewindPoint
   onBack: () => void
   onConfirm: (mode: RewindMode, deleteNewer: boolean) => Promise<string | null>
+  editing?: boolean
 }) {
   const [mode, setMode] = useState<RewindMode>('conversation')
   const [deleteNewer, setDeleteNewer] = useState(true)
@@ -115,24 +142,25 @@ function RewindConfirm({
     return () => { live = false }
   }, [sessionId, point.uuid, wantsCode])
 
-  const modes: { key: RewindMode; label: string; hint: string; disabled?: boolean }[] = [
-    { key: 'conversation', label: 'Chat', hint: 'Rewind the conversation only' },
+  const allModes: { key: RewindMode; label: string; hint: string; disabled?: boolean }[] = [
+    { key: 'conversation', label: 'Chat', hint: editing ? 'Keep the files as they are now' : 'Rewind the conversation only' },
     { key: 'code', label: 'Code', hint: point.hasSnapshot ? 'Restore files only' : 'No snapshot for this turn', disabled: !point.hasSnapshot },
-    { key: 'both', label: 'Both', hint: point.hasSnapshot ? 'Chat + files' : 'No snapshot for this turn', disabled: !point.hasSnapshot },
+    { key: 'both', label: editing ? 'Chat + code' : 'Both', hint: point.hasSnapshot ? (editing ? 'Also restore the files to before this message' : 'Chat + files') : 'No snapshot for this turn', disabled: !point.hasSnapshot },
   ]
+  const modes = editing ? allModes.filter((m) => m.key !== 'code') : allModes
 
   return (
     <>
       <div className="px-4 py-2.5 border-b border-ctp-surface0 flex items-center gap-2">
-        <button onClick={onBack} className="text-ctp-overlay hover:text-ctp-text text-sm" title="Back to the turn list">←</button>
+        {!editing && <button onClick={onBack} className="text-ctp-overlay hover:text-ctp-text text-sm" title="Back to the turn list">←</button>}
         <div className="min-w-0">
-          <div className="text-sm font-medium text-ctp-text truncate">Rewind to #{point.ordinal}</div>
+          <div className="text-sm font-medium text-ctp-text truncate">{editing ? 'Edit message — this session changed files since' : `Rewind to #${point.ordinal}`}</div>
           <div className="text-[11px] text-ctp-overlay truncate">{firstLine(point.text)}</div>
         </div>
       </div>
 
       <div className="px-4 py-3 space-y-3 overflow-y-auto">
-        <div className="grid grid-cols-3 gap-2">
+        <div className={`grid gap-2 ${editing ? 'grid-cols-2' : 'grid-cols-3'}`}>
           {modes.map((m) => (
             <button
               key={m.key}
@@ -157,7 +185,8 @@ function RewindConfirm({
         {/* Chat effect — always applies. */}
         {(mode === 'conversation' || mode === 'both') && (
           <div className="text-[11px] text-ctp-subtext">
-            The conversation forks to just before this turn and continues from there. The original is kept (undo via <span className="font-mono">/resume</span>).
+            The conversation forks to just before this {editing ? 'message and your edited version is sent' : 'turn and continues from there'}. The original is kept (undo via <span className="font-mono">/resume</span>).
+            {editing && ' Shell commands, pushes and messages to teammates that already ran are not undone.'}
           </div>
         )}
 
@@ -217,7 +246,7 @@ function RewindConfirm({
           disabled={busy || (wantsCode && (preview === 'loading' || preview === null))}
           className="px-3 py-1.5 text-xs rounded-md bg-ctp-mauve/90 text-ctp-crust font-medium hover:bg-ctp-mauve disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          {mode === 'conversation' ? 'Rewind chat' : mode === 'code' ? 'Restore code' : 'Rewind both'}
+          {editing ? (mode === 'both' ? 'Restore code & resend' : 'Resend') : mode === 'conversation' ? 'Rewind chat' : mode === 'code' ? 'Restore code' : 'Rewind both'}
         </button>
       </div>
     </>
