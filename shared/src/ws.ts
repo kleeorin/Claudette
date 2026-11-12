@@ -43,7 +43,8 @@ export type WsClientMessage =
   // exists so the server can hand the SHELL id straight to engine.stopTask().
   | { type: 'session:killBash'; id: string; toolId: string }
   // Clear settled background-process rows from the SERVER's registry, so a row cleared on one
-  // device is cleared on every device. Replaces a browser-localStorage dismiss store, which
+  // device is cleared on every device. NOW MOSTLY UNUSED: the server removes a record by itself
+  // the moment it settles, so this only matters for a list rendered a moment earlier. Replaces a browser-localStorage dismiss store, which
   // left the phone still showing rows the desktop had cleared — and this product is
   // phone-first-class, so a desktop-only clear is a half-built control.
   // ★ The server REFUSES to remove a record that is still 'running'. Hiding a live process is
@@ -108,7 +109,9 @@ export type WsServerMessage =
   // even if the driving <task-notification> was evicted / never buffered.
   | { type: 'session:tasks'; id: string; tasks: TaskRecord[] }
   // Same contract as session:tasks, for backgrounded shells: broadcast on first sight, on ack
-  // and on settle, so a tab that missed the driving notification still converges.
+  // and on settle, so a tab that missed the driving notification still converges. The
+  // registry holds RUNNING shells only — a settle REMOVES the record, so a toolId missing
+  // from `procs` means that process finished.
   | { type: 'session:bashProcs'; id: string; procs: BashProcRecord[] }
   // Per-session streaming events (namespaced by session id).
   | { type: 'session:event'; id: string; event: ClaudeEvent }

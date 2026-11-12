@@ -374,6 +374,27 @@ function Shell() {
   const setPane = (sid: string, fn: (p: Pane) => Pane) =>
     setBySession((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? EMPTY_PANE) }))
 
+  // A background process's tab closes when its record leaves the registry: the server
+  // removes a process the moment it finishes, and a tab left behind could only say "no
+  // longer in the registry". Only a record this client has SEEN counts as gone — a tab
+  // can be on screen a beat before the registry broadcast that carries its record.
+  const { bashProcsFor } = useChat()
+  const seenProcs = useRef(new Set<string>())
+  useEffect(() => {
+    for (const [sid, p] of Object.entries(bySession)) {
+      const live = new Set(bashProcsFor(sid).map((r) => r.toolId))
+      for (const id of live) seenProcs.current.add(`${sid}:${id}`)
+      const gone = new Set(p.tabs.flatMap((t) =>
+        t.kind === 'bashProc' && !live.has(t.id) && seenProcs.current.has(`${sid}:${t.id}`) ? [t.id] : []))
+      if (!gone.size) continue
+      setPane(sid, (q) => {
+        const tabs = q.tabs.filter((x) => !(x.kind === 'bashProc' && gone.has(x.id)))
+        const active = q.active?.kind === 'bashProc' && gone.has(q.active.id) ? (tabs[tabs.length - 1] ?? null) : q.active
+        return { tabs, active }
+      })
+    }
+  }, [bySession, bashProcsFor]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // --- terminals (per session) -----------------------------------------------
   // The active session's terminal dock, plus a flat list of EVERY session's
   // terminals so they can all stay mounted (ptys survive session switches).
@@ -2204,10 +2225,9 @@ function SessionRow({ session, depth, inProject = false, active, finished, atten
                   also means "working" in the state label at the right of this row — judged
                   helpful (both do mean "something is happening") rather than confusing.
 
-                  The count is the TOTAL, and the dot pulses only while something is still
-                  running. A finished process's exit code is the whole reason it was
-                  backgrounded, so a count that emptied itself when the build finished would
-                  hide the answer at the moment it arrived. */}
+                  The server removes a process as soon as it finishes (the user asked for
+                  that: the outcome reaches them through Claude's own report in the chat), so
+                  in practice the count is the running ones; the dot pulses while they run. */}
               {procBadge && (
                 <button
                   onClick={(e) => { e.stopPropagation(); setProcsOpen((v) => !v) }}
@@ -2276,15 +2296,9 @@ function SessionRow({ session, depth, inProject = false, active, finished, atten
       )}
 
       {/* Expanded: this session's background processes, one line each. Click opens the
-          command's detail tab; ■ kills a running one.
-
-          NO "CLEAR FINISHED" HERE, unlike the agents list above, and its absence is
-          deliberate rather than unfinished. Clearing an agent card is a client-side filter
-          over a transcript the client cannot change. This list is a server-owned registry
-          that the server prunes itself, so a client-side clear would be a second mechanism
-          deciding what is visible — and the two would disagree the first time either one
-          changed. A real clear needs a message to the server, and that is worth designing
-          after somebody has actually used this panel, not before. */}
+          command's detail tab; ■ kills a running one. Finished rows are removed by the
+          server on completion, so × / "Clear finished" below only ever show for the brief
+          window before that broadcast lands. */}
       {procsOpen && myProcs.length > 0 && (
         <div style={{ marginLeft: (indent?.paddingLeft ?? 10) + 8 }} className="mt-0.5 mb-1 pl-2 border-l border-ctp-surface1 space-y-px animate-fade-in">
           {myProcs.map((p) => (

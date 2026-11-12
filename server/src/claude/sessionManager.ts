@@ -11,7 +11,7 @@ import {
   isSubagentTool, isAsyncLaunchAck, parseTaskNotification, parseSystemTaskNotification,
   parseTaskStarted, taskIdOfNotification,
   assistantToolUses, userToolResults, userEventText,
-  parseBackgroundAck, parseBashNotification, shellIdsOf, bashStatusFrom, exitCodeFrom,
+  parseBackgroundAck, parseBashNotification, shellIdsOf, bashStatusFrom, exitCodeFrom, isLiveBashStatus,
   isElevatedMode,
 } from '@claudette/shared'
 import { ClaudeEngine, claudeArgs } from './claudeEngine'
@@ -221,8 +221,8 @@ export class SessionManager extends EventEmitter {
 
   // Backgrounded shells, same shape and same discipline as `tasks` above: keyed by the Bash
   // tool_use id, fed from the same engine tap, persisted, and force-settled on engine death.
-  // Capped (see BASH_PROC_KEEP) because unlike subagents these accrue for the whole life of a
-  // long session and nothing on the client prunes them.
+  // Holds RUNNING shells only: a record is deleted the moment it settles (pruneBashProcs), so
+  // the sidebar rows disappear on their own as soon as each process finishes.
   private bashProcs = new Map<string, Map<string, BashProcRecord>>()
 
   constructor(private readonly opts: SessionManagerOpts = {}) { super() }
@@ -234,6 +234,9 @@ export class SessionManager extends EventEmitter {
   bashProcsOf(id: string): BashProcRecord[] { return [...(this.bashProcs.get(id)?.values() ?? [])] }
 
   // Remove settled background-process rows from the registry, and broadcast the result.
+  // Now mostly a no-op: settled records are already removed as they settle (pruneBashProcs),
+  // so this only matters for a client acting on a list it rendered a moment earlier. Kept
+  // because it is harmless and the WS message still exists.
   //
   // Returns how many were actually removed and how many were refused, so a caller can log the
   // difference. Nothing is painted from the return value — the client repaints from the
@@ -727,6 +730,10 @@ export class SessionManager extends EventEmitter {
       // The engine (and its in-process subagents) just died — settle any task still
       // marked running so no tray card is stranded, whatever exit path we take below.
       this.settleOpenTasks(id)
+      // Same for background shells: they are in the engine's process group, which kill()
+      // signals as a whole, and once the CLI is gone nothing can report or stop them anyway.
+      // Settles (→ removes) every running row.
+      this.settleOpenBashProcs(id)
       // If this was a host-mode session on a scrubbed config mirror, salvage a token it
       // refreshed into that mirror back to the shared config dir and drop the mirror
       // (configProtection.ts: an atomic-rename creds write replaces the symlink, so the
@@ -1053,12 +1060,6 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  // Cap: how many FINISHED shells to keep per session. Running ones are never counted
-  // against it and never evicted — a capped-out registry that dropped a live 20-minute build
-  // would hide precisely the process the panel exists to show, which is worse than a long
-  // list. The client ships no cap of its own and depends on this one.
-  private static readonly BASH_PROC_KEEP = 50
-
   // Fold one raw stream-json event into the background-shell registry. Same tap as
   // recordTask, three occasions, matching the contract in ws.ts:
   //   FIRST SIGHT — an assistant Bash tool_use with run_in_background
@@ -1159,16 +1160,16 @@ export class SessionManager extends EventEmitter {
     return changed
   }
 
-  // Drop the oldest FINISHED records once a session holds more than the cap. Running records
-  // are skipped entirely — they are never counted and never evicted.
+  // Drop every FINISHED record: a background shell's row is removed as soon as it leaves
+  // 'running' (the user's rule — no manual clear). Running records are never touched; hiding a
+  // live process is the one thing this registry must not do.
+  //
+  // ★ EVERY settle path must reach this, then emit 'bashProcs' + 'changed': recordBashProc
+  // (both notification shapes; a kill settles through the same notification),
+  // settleOpenBashProcs (engine death) and restore(). A path that settles without pruning
+  // leaves a finished row standing that nothing will ever retract.
   private pruneBashProcs(m: Map<string, BashProcRecord>): void {
-    const finished = [...m.values()].filter((r) => r.status !== 'running')
-    const excess = finished.length - SessionManager.BASH_PROC_KEEP
-    if (excess <= 0) return
-    finished
-      .sort((a, b) => (a.endedAt ?? a.startedAt) - (b.endedAt ?? b.startedAt))
-      .slice(0, excess)
-      .forEach((r) => m.delete(r.toolId))
+    for (const r of [...m.values()]) if (!isLiveBashStatus(r.status)) m.delete(r.toolId)
   }
 
   // Engine death: every still-running shell is a child of the CLI, which is a child of this
@@ -1191,11 +1192,8 @@ export class SessionManager extends EventEmitter {
       changed = true
     }
     if (changed) {
-      // ★ PRUNE HERE TOO. This is the single largest running→finished conversion in the system
-      // — every open record flips to 'unknown' at once — and the cap was applied only inside
-      // recordBashProc. With the engine dead there may be no further record event to trigger
-      // it, so the registry could sit above the cap indefinitely. The client ships NO cap and
-      // depends entirely on this one.
+      // ★ PRUNE HERE TOO: every open record just flipped to 'unknown', so all of them go. With
+      // the engine dead there may be no further record event to trigger a prune.
       this.pruneBashProcs(m)
       this.emit('bashProcs', id, this.bashProcsOf(id)); this.emit('changed')
     }
@@ -1627,10 +1625,9 @@ export class SessionManager extends EventEmitter {
         accountConnectors: s.accountConnectors,
         claudeSessionId: s.claudeSessionId,
         tasks: tasks.length ? tasks : undefined,
-        // Persisted for the same reason `tasks` is: without it every background-process row
-        // vanishes on a server restart, and the panel silently forgets a build the user
-        // started. `SavedSession.bashProcs` has been declared since the registry landed and
-        // was written by nothing, so the field existed while the behaviour did not.
+        // Only RUNNING records exist to persist (finished ones are removed as they settle), and
+        // restore() settles those to 'unknown' and so drops them too: their shells died with the
+        // old server. Still written so the shape round-trips; see restore().
         bashProcs: bashProcs.length ? bashProcs : undefined,
       }
     })
@@ -1708,10 +1705,9 @@ export class SessionManager extends EventEmitter {
                 summary: r.summary ?? 'Session stopped — outcome unknown' }
             : r)
         }
-        // The cap, for the same reason settleOpenBashProcs applies it: this is a mass
-        // running→finished conversion, and `pruneBashProcs` exempts running records, so a
-        // session restored with many open shells would otherwise sit over the cap with no
-        // further record event coming to trim it.
+        // Finished records are not kept (see pruneBashProcs) — and after a restart that is ALL
+        // of them, since every once-running shell just became 'unknown'. So a restored registry
+        // is empty, and a finished record persisted by an older build does not come back.
         this.pruneBashProcs(m)
         this.bashProcs.set(id, m)
       }

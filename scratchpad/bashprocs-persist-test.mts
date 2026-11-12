@@ -1,39 +1,18 @@
 // Background-process registry PERSISTENCE across a server restart — saved() → restore().
 //
-// ★ THE GAP THIS CLOSES. `SavedSession.bashProcs` was declared in shared/src/types.ts from the
-// day the registry landed, and was written by NOTHING: saved() serialised `tasks` and not
-// `bashProcs`, restore() rehydrated `tasks` and never looked at `s.bashProcs`. So the field
-// existed while the behaviour did not, and every background-process row vanished on restart —
-// a user who backgrounded a build and restarted the server lost the record of it silently.
-// A declared-but-unwritten field is the worst version of this: it reads as done.
-//
-// ★★ THE ASSERTION THAT MATTERS MOST: running → 'unknown', NEVER 'failed'.
-// The `tasks` block it sits beside settles running agents to 'failed', and copying that would
-// be the obvious-looking consistency. It is wrong here. An agent that died with its engine
-// genuinely failed — it owed a result and never produced one. A shell did not: `npm test` may
-// have passed thirty seconds before the restart. 'failed' asserts something false about the
-// user's own build; 'unknown' says the only true thing. The negative assertion below is the
-// one that catches a future "tidy-up" that makes the two blocks match.
+// ★ REWRITTEN 2026-11-12 FOR AUTO-REMOVAL. The registry now holds RUNNING shells only: a
+// record is deleted the moment it settles (pruneBashProcs; see bashprocs-autoremove-test.mts
+// for the live settle paths). Across a restart that means NOTHING comes back:
+//   • a persisted 'running' record — its shell died with the old server — settles to
+//     'unknown' on restore (never 'failed': the outcome is unknowable, not known-bad) and is
+//     therefore removed;
+//   • a persisted finished record (written by an older build that kept them) is not restored.
+// The previous version of this file asserted the opposite (finished rows restore unchanged,
+// round trips keep every toolId); those assertions encoded the old keep-50-finished policy.
 //
 // Asserts on the REGISTRY via bashProcsOf(newId) after restore — never on a return value.
-// restore() returns ids, not records, so a round-trip that silently dropped the registry would
-// return a perfectly good-looking array.
-//
-// MUTATIONS (measured 2026-10-01 against a COPY of server/, never the live file; ran=N is
-// reported because a mutant that fails to PARSE yields zero failures exactly like a clean
-// pass). All six at ran=16 — constant, which is what shows none crashed rather than failing:
-//   P1  saved() stops emitting bashProcs (the gap's WRITE half)   → red=3, all three
-//       round-trip cases. Nothing else sees it, because every other case hands restore() a
-//       hand-built array — which is exactly why the round-trip cases had to exist.
-//   P2  restore() stops rehydrating (the gap's READ half)         → red=12, i.e. everything
-//       except the no-registry case and the two negative assertions. That breadth is the
-//       honest shape of the original bug: the field was declared and nothing read it.
-//   P3  running settles to 'failed', copying the tasks block      → red=3, including the
-//       ★★ negative assertion written for precisely this "tidy-up".
-//   P4  EVERY record blanked to unknown, not just running ones    → red=3, all three
-//       already-settled controls. Without them, P3 could be "fixed" by blanking everything.
-//   P5  endedAt left unset on the settled record                  → red=1, alone.
-//   XX  a patch matching no text must REFUSE — it did, 0 matches, no run performed.
+// The old 'unknown, NOT failed' assertion is gone because the settled record is no longer
+// observable after restore. The conversion in restore() still writes 'unknown'.
 import { mkdtempSync, writeFileSync, chmodSync, copyFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import path from 'path'
@@ -73,52 +52,34 @@ try {
     { name: 'noProcs', cwd: work },
   ])
   const procsOf = (i: number) => sessions.bashProcsOf(ids[i])
-  const byId = (i: number, toolId: string) => procsOf(i).find((r) => r.toolId === toolId)
 
   check('restore() produced both sessions', ids.length === 2, `got ${ids.length}`)
-  check('a persisted registry is rehydrated at all', procsOf(0).length === 4, `got ${procsOf(0).length}`)
-
-  // ── THE RESTART-DISCIPLINE ASSERTIONS ────────────────────────────────────────────────────
-  const r = byId(0, 'running-1')
-  check("★ a persisted 'running' record comes back 'unknown'", r?.status === 'unknown', String(r?.status))
-  check('★★ …and NOT "failed" — the outcome is unknowable, not known-bad',
-    r?.status !== 'failed', String(r?.status))
-  check('…with endedAt set, so elapsed stops counting', typeof r?.endedAt === 'number', String(r?.endedAt))
-  check('…and a summary explaining why', !!r?.summary && r.summary.length > 0, String(r?.summary))
-
-  // ── THE CONTROLS: already-settled records restore UNCHANGED ──────────────────────────────
-  // Without these, a fix that blanked every status to 'unknown' would pass everything above.
-  const d = byId(0, 'done-1')
-  check("a persisted 'done' record restores unchanged", d?.status === 'done', String(d?.status))
-  check('…keeping its exitCode', d?.exitCode === 0, String(d?.exitCode))
-  check('…and its summary', d?.summary === 'ok', String(d?.summary))
-  check("a persisted 'failed' record stays 'failed'", byId(0, 'failed-1')?.status === 'failed', String(byId(0, 'failed-1')?.status))
-  check("a persisted 'stopped' record stays 'stopped'", byId(0, 'stopped-1')?.status === 'stopped', String(byId(0, 'stopped-1')?.status))
-
-  // ── A SESSION WITH NO REGISTRY ───────────────────────────────────────────────────────────
+  check("★ a persisted 'running' record does not come back (its shell died with the server)",
+    !procsOf(0).some((r) => r.toolId === 'running-1'), procsOf(0).map((r) => r.toolId).join(','))
+  check('★ persisted finished records (done/failed/stopped) are not restored',
+    !procsOf(0).some((r) => ['done-1', 'failed-1', 'stopped-1'].includes(r.toolId)), procsOf(0).map((r) => r.toolId).join(','))
+  check('…so the restored registry is empty', procsOf(0).length === 0, `got ${procsOf(0).length}`)
   check('a session persisted with no bashProcs restores with an empty registry, no crash',
     procsOf(1).length === 0, `got ${procsOf(1).length}`)
 
-  // ── THE ROUND TRIP: saved() must WRITE what restore() reads ──────────────────────────────
-  // ★ This is the half the gap actually was. restore() reading s.bashProcs is useless if
-  // saved() never emits it, and every assertion above would still pass — they feed restore()
-  // a hand-built array. Only this case exercises saved().
+  // ── THE ROUND TRIP ───────────────────────────────────────────────────────────────────────
   const dumped = sessions.saved()
-  const withProcs = dumped.find((x) => x.name === 'withProcs')
-  check('★ saved() EMITS the registry it just restored', (withProcs?.bashProcs?.length ?? 0) === 4,
-    String(withProcs?.bashProcs?.length))
-  check('…and omits it entirely for a session that has none',
+  check('saved() does not re-persist anything for the restored session',
+    dumped.find((x) => x.name === 'withProcs')?.bashProcs === undefined,
+    JSON.stringify(dumped.find((x) => x.name === 'withProcs')?.bashProcs))
+  check('…nor for a session that never had any',
     dumped.find((x) => x.name === 'noProcs')?.bashProcs === undefined,
     JSON.stringify(dumped.find((x) => x.name === 'noProcs')?.bashProcs))
 
-  const ids2 = sessions.restore(dumped)
-  const round = sessions.bashProcsOf(ids2[dumped.findIndex((x) => x.name === 'withProcs')])
-  check('★ a full saved()→restore() round trip keeps every toolId',
-    ['running-1', 'done-1', 'failed-1', 'stopped-1'].every((t) => round.some((x) => x.toolId === t)),
-    round.map((x) => x.toolId).join(','))
-  check('…and the once-running record stays settled rather than flipping again',
-    round.find((x) => x.toolId === 'running-1')?.status === 'unknown',
-    String(round.find((x) => x.toolId === 'running-1')?.status))
+  // A RUNNING record in a live registry IS written (the only kind that still exists).
+  ;(sessions as unknown as { bashProcs: Map<string, Map<string, BashProcRecord>> }).bashProcs
+    .set(ids[1], new Map([['live-1', rec({ toolId: 'live-1', status: 'running' })]]))
+  const live = sessions.saved().find((x) => x.name === 'noProcs')?.bashProcs
+  check('saved() writes a running record', live?.length === 1 && live[0].toolId === 'live-1', JSON.stringify(live))
+  const ids2 = sessions.restore(sessions.saved())
+  check('…and a saved()→restore() round trip drops it (settled to unknown → removed)',
+    ids2.every((i) => sessions.bashProcsOf(i).length === 0),
+    ids2.map((i) => sessions.bashProcsOf(i).length).join(','))
 } finally {
   sessions.shutdown()
   rmSync(work, { recursive: true, force: true })

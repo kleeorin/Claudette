@@ -234,9 +234,9 @@ export interface SavedSession {
   accountConnectors?: string[] // allowed account connectors (ditto)
   claudeSessionId?: string // claude's own --session-id, for --resume on restore
   tasks?: TaskRecord[]     // subagent lifecycle registry, so a restart doesn't strand tray cards
-  // Background-bash registry, beside `tasks` and for the same reason: without it a restart
-  // strands every panel row as "running" forever, and a row nothing can retract is
-  // indistinguishable from a live process.
+  // Background-bash registry (running shells only — finished ones are removed as they
+  // settle). restore() settles each to 'unknown' and so drops it: the shells died with the
+  // old server, and a row nothing can retract is indistinguishable from a live process.
   bashProcs?: BashProcRecord[]
 }
 
