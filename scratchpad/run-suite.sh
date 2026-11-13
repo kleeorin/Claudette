@@ -678,10 +678,11 @@ SUITE=(
   # READABLE must still be refused once the engine is gone, because a panel that remembers for
   # unconfined sessions and forgets for confined ones is the two-tier outcome this rejected.
   "none:bashproc-output-test.mts"
-  # The background-process registry surviving a server restart: saved() → restore(). Pins the
-  # restart discipline that differs DELIBERATELY from the `tasks` block beside it — a running
-  # shell settles to 'unknown', never 'failed', because its outcome is unknowable rather than
-  # known-bad. Asserts on bashProcsOf() after restore, never on restore()'s return value.
+  # The background-process registry across a server restart: saved() → restore(). Since
+  # auto-removal (2026-11-12) the registry holds RUNNING shells only, so nothing comes back:
+  # a once-running record settles to 'unknown' and is dropped, and finished records written
+  # by older builds are not restored. Asserts on bashProcsOf() after restore, never on
+  # restore()'s return value.
   "none:bashprocs-persist-test.mts"
   # The connector proxy's RESOURCE bound, as distinct from its time bound. Converts both
   # [open] notes in rt2-connectors-c.mts into assertions. Case 6 (silent upstream) passes
@@ -700,6 +701,23 @@ SUITE=(
   # is REFUSED: hiding a live process is the worst outcome this panel has, and a fix that just
   # deleted every requested id would pass every other case in the file.
   "none:clear-bashprocs-test.mts"
+  # Background shells REMOVED the moment they settle (the user's rule: no manual clear). Drives
+  # every settle path through the real recordBashProc tap — prose notification, orphan
+  # round-up by shell id, structured notification, a kill ("stopped") — plus ENGINE DEATH via a
+  # real stub-engine kill/exit/relaunch (settleOpenBashProcs had been defined and never called).
+  # Its control: a RUNNING record is never removed. Mutation-checked: dropping the exit-handler
+  # call reds 3, keeping finished reds 16, deleting running reds 12.
+  "none:bashprocs-autoremove-test.mts"
+  # SessionManager.whenReady and the routes that now wait on it (/rewind, /clear, /resume).
+  # resumeInto/restartFresh are fire-and-forget; a send in the `replacing` window is rejected
+  # as undelivered. Its controls prove the race is real in-harness (a send straight after the
+  # restart is refused) before asserting the wait closes it — real stub engine, real relaunch.
+  "none:when-ready-test.mts"
+  # Git panel: /api/git/sides (both full texts for the merge view) and the ROOT-vs-cwd path bug.
+  # Porcelain paths are repo-root-relative whatever the cwd, so diff/stage/unstage run against
+  # the toplevel. Every case runs from the root AND a subdirectory, with a control showing the
+  # raw cwd-relative `git -C sub diff -- sub/x` really is empty. Temp repos only, no server.
+  "none:git-sides-test.mts"
   # GROUP C. The unsaved-editor-buffer store: does a held buffer ever shadow a file that
   # changed on disk? The operator met this as "files open stale and don't record changes" —
   # nothing was failing to record; the new text was on disk and simply never displayed.

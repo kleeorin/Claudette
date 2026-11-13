@@ -100,6 +100,17 @@ export function ChatView({ sessionId, visible = true }: {
   const pinnedRef = useRef(true)
   const [showJump, setShowJump] = useState(false)
   const running = state === 'running' || state === 'waiting'
+  // An in-flight engine restart (/clear, /resume, auto-resume, rewind). Those routes answer
+  // once the relaunched claude can take a turn; a message sent before then is dropped as
+  // undelivered, so submit holds it until this settles. `holdSends` registers one.
+  const restartRef = useRef<Promise<unknown> | null>(null)
+  const holdSends = <T,>(p: Promise<T>): Promise<T> => {
+    // Settles either way (a failed restart still releases the held send) and clears itself
+    // only if no newer restart replaced it meanwhile.
+    const held: Promise<void> = p.then(() => {}, () => {}).finally(() => { if (restartRef.current === held) restartRef.current = null })
+    restartRef.current = held
+    return p
+  }
   // `@`-mention path autocomplete (interactive citation picker), anchored at cwd.
   const mention = useMentionComplete({ draft, setDraft, taRef, cwd: session?.cwd ?? '' })
 
@@ -401,7 +412,7 @@ export function ChatView({ sessionId, visible = true }: {
         // best, and it is the exact call that previously moved a correctly-restored subsession
         // onto its parent's conversation. Reading a transcript and moving a session are
         // different acts; only the first is wanted when we already know where we are.
-        if (plan.kind === 'byCwd') await api.http.resumeInto(sessionId, conversationId)
+        if (plan.kind === 'byCwd') await holdSends(api.http.resumeInto(sessionId, conversationId))
       } catch { /* best-effort; the user can still /resume manually */ }
     })()
   }, [session, sessionId, items.length, running, isFresh, clearTranscript, loadTranscript, sessions, metaFor])
@@ -426,10 +437,7 @@ export function ChatView({ sessionId, visible = true }: {
     // re-pull the old conversation — the "/clear did nothing, had to do it twice" bug.
     if (t === '/clear') {
       autoResumed.add(sessionId); resumeAborted.add(sessionId); clearTranscript(sessionId)
-      // The route answers once the fresh claude can take a turn; a message sent before
-      // then would be dropped as undelivered, so submit holds it until this settles.
-      const p = api.http.restartFresh(sessionId).catch(() => null).finally(() => { if (restartRef.current === p) restartRef.current = null })
-      restartRef.current = p
+      void holdSends(api.http.restartFresh(sessionId)).catch(() => null)
       return true
     }
     if (t === '/resume') { setShowResume(true); return true }
@@ -437,7 +445,6 @@ export function ChatView({ sessionId, visible = true }: {
     return false
   }
 
-  const restartRef = useRef<Promise<unknown> | null>(null)   // an in-flight /clear restart
   const submit = () => {
     const t = draft.trim()
     if (!t) return
@@ -462,9 +469,13 @@ export function ChatView({ sessionId, visible = true }: {
     setShowResume(false)
     if (!session) return
     autoResumed.add(sessionId); resumeAborted.add(sessionId)   // explicit pick — supersede any in-flight auto-resume
-    clearTranscript(sessionId)
-    loadTranscript(sessionId, await api.http.readConversation(session.cwd, meta.id))
-    await api.http.resumeInto(sessionId, meta.id)
+    // Held from the start, not just around resumeInto: until the engine is repointed a
+    // send would land in the conversation being left.
+    await holdSends((async () => {
+      clearTranscript(sessionId)
+      loadTranscript(sessionId, await api.http.readConversation(session.cwd, meta.id))
+      await api.http.resumeInto(sessionId, meta.id)
+    })()).catch(() => null)
   }
 
   // Rewind to a past turn. mode 'code' only restores files (conversation untouched);
@@ -480,7 +491,7 @@ export function ChatView({ sessionId, visible = true }: {
   // fork/clear happened, so the pane is still synced to it and `moved` says so.
   const rewindTo = async (point: RewindPoint, mode: RewindMode, deleteNewer: boolean): Promise<{ error: string; moved: boolean } | { moved: boolean }> => {
     if (!session) return { error: 'no session', moved: false }
-    const res = await api.http.rewind(sessionId, point.uuid, mode, deleteNewer)
+    const res = await holdSends(api.http.rewind(sessionId, point.uuid, mode, deleteNewer))
     // Point vanished or restore failed before anything moved — leave the pane as-is.
     if (!res.ok && !res.newId && !res.cleared) return { error: res.error || 'rewind failed', moved: false }
     if (res.newId) {

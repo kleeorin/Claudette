@@ -77,6 +77,14 @@ try {
   check('…and received', await delivered(id, 'after-route'))
   const r2 = await app.inject({ method: 'POST', url: '/api/session/restartFresh', payload: { id: 'no-such-id' } })
   check('restartFresh route on an unknown id → ok:false', r2.json().ok === false, r2.body)
+
+  // --- the /resume route: same wait ------------------------------------------
+  const r3 = await app.inject({ method: 'POST', url: '/api/session/resumeInto', payload: { id, claudeSessionId: crypto.randomUUID() } })
+  check('POST /api/session/resumeInto → ok:true', r3.statusCode === 200 && r3.json().ok === true, `${r3.statusCode} ${r3.body}`)
+  check('send immediately after the resumeInto route returns is delivered', (await sessions.sendUserTurn(id, 'after-resume-route')) === true)
+  check('…and received', await delivered(id, 'after-resume-route'))
+  const r4 = await app.inject({ method: 'POST', url: '/api/session/resumeInto', payload: { id: 'no-such-id', claudeSessionId: crypto.randomUUID() } })
+  check('resumeInto route on an unknown id → 200 ok:false, no throw', r4.statusCode === 200 && r4.json().ok === false, `${r4.statusCode} ${r4.body}`)
   await app.close()
 
   sessions.destroy(id)

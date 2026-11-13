@@ -307,9 +307,10 @@ export function registerSessionRoutes(app: FastifyInstance, sessions: SessionMan
   })
 
   // /resume — rebind the session's engine to a past conversation (--resume <id>).
+  // Resolves once the relaunched engine can take a turn (false on timeout) — see /rewind.
   app.post<{ Body: ResumeIntoRequest }>('/api/session/resumeInto', async (req): Promise<OkResponse> => {
     sessions.resumeInto(req.body.id, req.body.claudeSessionId)
-    return { ok: true }
+    return { ok: await sessions.whenReady(req.body.id) }
   })
 
   // The /resume picker: list resumable conversations for a folder, and read one back.
