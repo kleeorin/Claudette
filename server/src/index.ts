@@ -155,6 +155,9 @@ bridgePaneEvents(panes, hub)
 // Session persistence (P1.19): debounce-save the set whenever it changes so a
 // server restart restores it (each --resume'd into its saved conversation).
 let shuttingDown = false
+// False until start() has restored the saved set. A Ctrl-C during boot must not flush the
+// still-empty in-memory set over sessions.json — that would wipe every session on disk.
+let sessionsRestored = false
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 function persistSessions(): void {
   // Never persist while shutting down: shutdown() kills every engine, whose exit
@@ -253,7 +256,7 @@ function shutdown(): void {
   // whose exit handlers cleanup() the sessions and emit 'changed' — persisting that
   // empty set would clobber the state we restore next boot. Snapshot before killing.
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
-  void saveState(sessions.saved())
+  if (sessionsRestored) void saveState(sessions.saved())
   // Stop the mailbox before the engines die, so its drain/retry timers can't fire during
   // the 800ms grace and re-arm against sessions that are on their way out.
   teamMailbox.dispose()
@@ -401,11 +404,15 @@ async function start(): Promise<void> {
   // connector URLs, so the proxy needs a real port before restore() runs.
   const proxyPort = await connectorProxy.start()
   app.log.info(`Connector proxy on http://127.0.0.1:${proxyPort}${strictMode() ? ' (strict MCP mode ON)' : ''}`)
-  // Restore persisted sessions (each re-launched with --resume) before serving.
   // Projects load before sessions are restored, so the first list a client sees has both.
   await projects.load()
-  const restored = sessions.restore(await loadState())
-  if (restored.length) app.log.info(`Restored ${restored.length} session(s) from disk`)
+  const saved = await loadState()
+  // Bind BEFORE restoring. restore() relaunches every saved session synchronously (sandbox
+  // probe, mount checks) and can take many seconds; binding after it left the port closed
+  // that whole time, so the dev proxy and the browser got ECONNREFUSED on every call.
+  // Bound first, the kernel queues incoming connections, and because nothing below awaits
+  // until restore() returns, no request or socket is handled before the restored set is in
+  // place — a client never sees a partial list, and nothing persists over sessions.json.
   await app.listen({ host: HOST, port: PORT })
   app.server.on('upgrade', (req, socket, head) => {
     // Both upgrade paths carry the same-origin cookie; reject unauthenticated
@@ -420,6 +427,11 @@ async function start(): Promise<void> {
       socket.destroy()
     }
   })
+  // Restore persisted sessions (each re-launched with --resume). Must stay synchronous
+  // with the listen() above — see the note there.
+  const restored = sessions.restore(saved)
+  sessionsRestored = true
+  if (restored.length) app.log.info(`Restored ${restored.length} session(s) from disk`)
   app.log.info(`Claudette server ready on http://${HOST}:${PORT}`)
   if (auth.required) {
     app.log.info(`Access token REQUIRED (${maskToken(auth.token!)}). Authenticate a device once via <origin>/?token=…` +
